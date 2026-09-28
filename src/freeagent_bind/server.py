@@ -2559,7 +2559,9 @@ def render(name: str, data: dict) -> str:
         lines = [f"相談 {data.get('session_id')} / mode={data.get('mode')} / "
                  f"ラウンド{data.get('rounds_run')} / stage={data.get('stage')}",
                  f"合意度 {data.get('agreement')} / 確信度平均 {data.get('confidence_mean')}"]
-        for row in (data.get("failed") or []):
+        failed_rows = data.get("failed") or []
+        shown = {(row.get("model"), row.get("error")) for row in failed_rows}
+        for row in failed_rows:
             lines.append(f"  ✗ {row.get('model')}（このラウンドは脱落）: {truncate(row.get('error') or '', 90)}")
         for row in (data.get("consensus") or [])[:5]:
             conf = row.get("confidence")
@@ -2576,6 +2578,8 @@ def render(name: str, data: dict) -> str:
                 if p.get("strongest_objection"):
                     lines.append(f"      反論: {truncate(p['strongest_objection'], 120)}")
             for row in debate.get("dropped") or []:
+                if (row.get("model"), row.get("error")) in shown:
+                    continue  # 直近ラウンドの脱落として既に出している（二重表示しない）
                 lines.append(f"  ✗ {row.get('model')}（第{row.get('round')}ラウンド "
                              f"{row.get('kind')} で脱落）: {truncate(row.get('error') or '', 90)}")
         if data.get("open_questions_for_main"):
