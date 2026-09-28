@@ -2,6 +2,15 @@
 import os
 import sys
 
+# 日本語 Windows のコンソール（cp932/cp1252）でも出力を落とさない。CI の windows-latest は
+# cp1252 で、print() が UnicodeEncodeError になり **ゲートが落ちる**（実測）。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 from freeagent_bind import server as S
 

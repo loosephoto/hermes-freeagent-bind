@@ -15,6 +15,13 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13"]
 
+    # Windows ランナーの既定のコンソール符号化は cp1252 で、日本語の print が
+    # UnicodeEncodeError になる（実測: ゲートが落ちた）。スクリプト側でも自己防衛しているが、
+    # テストの失敗メッセージも日本語なのでジョブ全体で固定する。
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+
     steps:
       - uses: actions/checkout@v4
 

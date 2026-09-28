@@ -758,6 +758,25 @@ class TestOfflineTolerance(unittest.TestCase):
             self.assertIn("【並列】", desc, name)
 
 
+class TestHostEncodingTolerance(unittest.TestCase):
+    """日本語 Windows / CI の cp1252 コンソールでもゲートが落ちないこと。
+
+    実測: windows-latest のランナーは cp1252 で、`scripts/check_integrity.py` の日本語 print が
+    UnicodeEncodeError になり **CI が失敗した**（コードの不具合ではないが、ゲートとして機能しない）。
+    """
+
+    def test_gate_survives_non_utf8_console(self):
+        import subprocess
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        env.pop("PYTHONPATH", None)
+        proc = subprocess.run([sys.executable, os.path.join(root, "scripts", "check_integrity.py")],
+                              cwd=root, env=env, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=120)
+        self.assertEqual(proc.returncode, 0,
+                         f"cp1252 コンソールで落ちた: {proc.stdout[-300:]} {proc.stderr[-300:]}")
+
+
 class TestVersionConsistency(unittest.TestCase):
     def test_pyproject_matches_server_version(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

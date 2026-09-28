@@ -37,6 +37,10 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py   # モデル�
 
 終了コード 0 が正常。1 は失敗（レジストリ不一致・版不一致・例外漏れ・UTF-8 破綻・プロトコル破綻）。
 
+スクリプトは起動直後に `sys.stdout/stderr` を **UTF-8 に reconfigure** する（日本語 Windows の cp932 や
+CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になりゲート自体が落ちる — 実測）。
+`tests/test_freeagent_bind.py::TestHostEncodingTolerance` が再発を防ぐ。
+
 ## 守るべき規約
 
 1. **例外をツールの外へ漏らさない**。失敗は `structuredContent.error` で返す（`handle_tool_call` が最後の砦）。
