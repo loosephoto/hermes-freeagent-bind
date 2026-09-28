@@ -97,6 +97,10 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     自発率が 1/2 で頭打ちになる（実測）。変更後は `python scripts/measure_adoption.py` で**最低 2 標本**
     測る（実行中セッションは起動時のツール一覧を保持するので、測定は新プロセスで）。判断規則の文面は
     `scripts/apply_proactive.py` が出すものを単一の出典にする（文面を散らすと乖離する）。
+    **除外パターンは実ツール名に照合してから書く**（`fnmatchcase`。glob でなければ完全一致）。流布して
+    いた `ask_*` / `panel` / `consensus*` は現行 deliberation（実名 `ask-all` 等）に 1 件も一致せず、
+    **空振りのまま「設定した」気にさせる**（`apply_proactive.py --check` が、設定済みの除外の空振りを
+    exit 1 で検出する）。
 
 ## ライセンス
 

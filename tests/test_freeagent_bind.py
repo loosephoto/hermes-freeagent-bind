@@ -811,6 +811,89 @@ class TestAtomicWriteHygiene(unittest.TestCase):
         self.assertTrue(os.path.exists(other), "対象外のファイルを消してはいけない")
 
 
+class TestProactivePatternMatching(unittest.TestCase):
+    """除外パターンの照合（`fnmatchcase`・glob でなければ完全一致）と**空振り検出**。
+
+    実測: 広く流布していた `["ask_*", "panel", "consensus*"]` は、現行の deliberation サーバー
+    （実名 `ask-all` / `ask-one` … とハイフン区切り、`panel`/`consensus` は存在しない）で
+    **1 件も一致しなかった**。空振りの除外は何も変えずに「設定した」気にさせるので、
+    一致 0 件を検出できることを固定する。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(root, "scripts", "apply_proactive.py")
+        spec = importlib.util.spec_from_file_location("apply_proactive", path)
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    REAL = ["ask-all", "ask-one", "ask-gpt", "ask-gemini", "ask-grok", "ask-openrouter",
+            "codex-login", "analyze", "architect", "researcher", "session-get"]
+
+    def test_glob_matches_real_names(self):
+        self.assertEqual(len(self.mod.pattern_hits("ask-*", self.REAL)), 6)
+
+    def test_stale_underscore_pattern_matches_nothing(self):
+        self.assertEqual(self.mod.pattern_hits("ask_*", self.REAL), [])
+        self.assertEqual(self.mod.pattern_hits("panel", self.REAL), [])
+        self.assertEqual(self.mod.pattern_hits("consensus*", self.REAL), [])
+
+    def test_match_is_case_sensitive_and_exact(self):
+        self.assertEqual(self.mod.pattern_hits("ASK-ALL", self.REAL), [])   # fnmatchcase
+        self.assertEqual(self.mod.pattern_hits("ask", self.REAL), [])       # 部分一致にしない
+        self.assertEqual(self.mod.pattern_hits("ask-all", self.REAL), ["ask-all"])
+
+    def test_configured_exclude_parses_both_styles(self):
+        """`hermes config set` が書く 2 形式（ブロック / 1 行）を正しく読む。
+
+        実測: 6 スペースを期待した実装は 8 スペースの項目を読めず、**空リストを返して空振りを
+        見逃していた**（壊れた除外を「問題なし」と報告する）。
+        """
+        home = tempfile.mkdtemp(prefix="fa-home-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, ignore_errors=True))
+        block = (
+            "mcp_servers:\n"
+            "  deliberation:\n"
+            "    command: npx\n"
+            "    tools:\n"
+            "      exclude:\n"
+            "        - ask_*\n"
+            "        - panel\n"
+            "  other:\n"
+            "    command: x\n"
+        )
+        flow = (
+            "mcp_servers:\n"
+            "  deliberation:\n"
+            "    tools:\n"
+            "      exclude: ['ask-*', \"panel\"]\n"
+            "  other:\n"
+            "    command: x\n"
+        )
+        for body, expected in ((block, ["ask_*", "panel"]), (flow, ["ask-*", "panel"])):
+            with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as fh:
+                fh.write(body)
+            with unittest.mock.patch.dict(os.environ, {"HERMES_HOME": home}):
+                self.assertEqual(self.mod.configured_exclude("deliberation"), expected, body)
+                self.assertEqual(self.mod.configured_exclude("other"), [])
+
+    def test_check_reports_configured_but_stale_patterns(self):
+        """設定済みの除外が実名に一致しない＝**本当の空振り**を検出できること。"""
+        names = self.REAL
+        stale = [pat for pat in ["ask_*", "panel"] if not self.mod.pattern_hits(pat, names)]
+        self.assertEqual(stale, ["ask_*", "panel"])
+        self.assertEqual([p for p in ["ask-*"] if not self.mod.pattern_hits(p, names)], [])
+
+    def test_match_report_flags_empty_patterns(self):
+        matched, empty = self.mod.match_report(["ask-*", "panel", "consensus*"], self.REAL)
+        self.assertEqual(matched, ["ask-*"])
+        self.assertEqual(empty, ["panel", "consensus*"])
+        # 一致したものだけが設定値になる（空振りを設定に書かない）
+        self.assertEqual(matched, ["ask-*"])
+
+
 class TestVersionConsistency(unittest.TestCase):
     def test_pyproject_matches_server_version(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

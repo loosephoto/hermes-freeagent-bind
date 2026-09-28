@@ -196,6 +196,9 @@
   【無効・不通のとき】を全ツールに一括付与する（手書きで散らすとドリフトする）。
 - **実効レバーは記述だけでは足りない**（実測 1/2 で頭打ち）。効くのは「毎ターン注入される判断規則」と
   「競合の汎用面の除外」の併用（実測 2/2）。文面の単一の出典は `scripts/apply_proactive.py` の `SNIPPET`。
+- **除外パターンは実ツール名に照合する**（`fnmatchcase`。glob でなければ完全一致）。流布していた
+  `ask_*` / `panel` / `consensus*` は現行 deliberation（実名 `ask-all` 等）に**1 件も一致しない**。
+  `apply_proactive.py` は照合結果と一致 0 件を表示し、空振りがあれば exit 1 にする（設定を信用しない）。
 - 測定は回答本文ではなく **`state.db` の `messages.tool_calls`** で行う（`scripts/measure_adoption.py`）。
   遅延カタログ経由の呼び出しは `tool_call` として記録され、実名は `arguments.calls[].name` に入る。
 
