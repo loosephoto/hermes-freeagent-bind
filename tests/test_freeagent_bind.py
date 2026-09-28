@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -775,6 +776,39 @@ class TestHostEncodingTolerance(unittest.TestCase):
                               encoding="utf-8", errors="replace", timeout=120)
         self.assertEqual(proc.returncode, 0,
                          f"cp1252 コンソールで落ちた: {proc.stdout[-300:]} {proc.stderr[-300:]}")
+
+
+class TestAtomicWriteHygiene(unittest.TestCase):
+    """原子置換の副作用（書きかけの一時ファイルが残る）を掃除すること。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="fa-atomic-")
+        self.target = os.path.join(self.tmp, "state.json")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_stale_tmp_is_swept_recent_is_kept(self):
+        stale = f"{self.target}.999.888.tmp"
+        fresh = f"{self.target}.111.222.tmp"
+        for path in (stale, fresh):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("x")
+        old = time.time() - 3600
+        os.utime(stale, (old, old))
+        self.assertTrue(S._atomic_write(self.target, '{"a": 1}'))
+        self.assertFalse(os.path.exists(stale), "古い書きかけが残っている")
+        self.assertTrue(os.path.exists(fresh), "並行書き込み中の一時ファイルを消してはいけない")
+        self.assertEqual(S._load_json(self.target, None), {"a": 1})
+
+    def test_unrelated_files_are_untouched(self):
+        other = os.path.join(self.tmp, "cooldowns.json.1.2.tmp")   # 別の対象
+        with open(other, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        os.utime(other, (time.time() - 3600,) * 2)
+        S._atomic_write(self.target, "{}")
+        self.assertTrue(os.path.exists(other), "対象外のファイルを消してはいけない")
 
 
 class TestVersionConsistency(unittest.TestCase):

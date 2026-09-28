@@ -322,7 +322,37 @@ def truncate(text: str, limit: int) -> str:
 # 壊れたファイルは無視して空から始める（例外をツールへ漏らさない）。
 # トレースと品質統計には**本文を残さない**（外部 API へ送った内容をディスクに置かない方針）。
 
+def _sweep_stale_tmp(path: str, *, min_age_s: float = 60.0) -> int:
+    """同じ対象の**書きかけファイル**（`<name>.<pid>.<tid>.tmp`）を掃除する。
+
+    実測: 書き込みの途中でプロセスが落ちると（または os.replace が失敗すると）一時ファイルが
+    状態ディレクトリに**永久に残る**。再起動のたびに増えるので、原子置換の副作用として掃除する。
+    並行して書いている別スレッドの一時ファイルを壊さないよう、**古いものだけ**を対象にする
+    （単一ファイルへの書き込みは `threading.Lock` の内側なので、60 秒前の残骸は必ず放棄済み）。
+    """
+    directory = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    removed = 0
+    try:
+        now = time.time()
+        for name in os.listdir(directory):
+            if not (name.startswith(base + ".") and name.endswith(".tmp")):
+                continue
+            full = os.path.join(directory, name)
+            try:
+                if now - os.path.getmtime(full) < min_age_s:
+                    continue
+                os.remove(full)
+                removed += 1
+            except OSError:
+                continue          # 消せない（使用中・権限）ものは放置して続行
+    except OSError:
+        pass
+    return removed
+
+
 def _atomic_write(path: str, text: str) -> bool:
+    _sweep_stale_tmp(path)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
