@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-freeagent-bind"
+version = "0.1.0"
+description = "Hermes Agent の Free モデルをサブLLMとして並列に走らせ、外部知識（arXiv/Crossref/OpenAlex/Wikipedia/Wikidata/GitHub）で根拠づける MCP サーバー"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "loosephoto", email = "loosephoto@users.noreply.github.com" }]
+keywords = ["mcp", "llm", "sub-llm", "free-models", "orchestration", "grounding", "arxiv", "crossref", "openalex", "wikidata"]
+classifiers = [
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# 実行時依存はゼロ（Python 標準ライブラリのみ）。第三者の import を足したらここに追加する。
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/loosephoto/hermes-freeagent-bind"
+
+[project.scripts]
+hermes-freeagent-bind = "freeagent_bind.server:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# 秘匿情報・ローカル設定（APIキーはコミットしない）
+.env
+.env.*
+*.key
+*.pem
+
+# 実行時の生成物・ログ
+*.log
+.cache/
+output/
