@@ -12,12 +12,16 @@
    用途の近いサーバーが併存すると「先に見つけた方」が選ばれ、名前を明記しても覆らない。
 
 ただし**除外パターンは必ず実ツール名に照合してから書く**。Hermes の照合は `fnmatchcase`（大小文字
-区別）で、`*` / `?` / `[` を含まない項目は**完全一致**として扱われる。実測でここを踏んでいる:
-広く流布している例 `["ask_*", "panel", "consensus*"]` は、現行の deliberation サーバーでは
-**1 件も一致しない**（実名は `ask-all` / `ask-one` … と**ハイフン**区切りで、`panel` / `consensus`
-というツールは存在しない）。空振りの除外は**何も変えずに「設定した」気にさせる**ので、この道具は
-照合結果を表示し、**設定済みの除外パターンが一致 0 件なら終了コード 1** にする（存在しない候補は
-情報として表示するだけで、設定には書かない）。
+区別）で、`*` / `?` / `[` を含まない項目は**完全一致**として扱われる。実測で 2 回踏んでいる:
+
+1. `ask_*` は**どの実名にも一致しない**（実名は `ask-all` / `ask-one` / `consensus-step` … と
+   **ハイフン**区切り）。流布していた例をそのまま書くと**空振り**する。
+2. **`cache/mcp_schema_cache.json` は不完全**（実測: 18 件しか無く、実在する `panel` / `consensus` /
+   `consensus-step` が載っていなかった ＝ キャッシュを信じると「存在しない」と誤判定する）。
+
+そこで照合は **`hermes mcp test <server>` のライブ一覧を最優先**し、取れないときだけキャッシュへ
+落ちる（その場合は「キャッシュに無い」＝実在の否定ではない、と表示する）。設定済みの除外が一致 0 件
+なら**終了コード 1**（存在しない候補は情報表示のみで、設定には書かない）。
 
 使い方
 ------
@@ -155,11 +159,37 @@ def configured_exclude(server: str) -> list[str]:
     return out
 
 
-def live_tool_names(server: str) -> list[str] | None:
-    """`$HERMES_HOME/cache/mcp_schema_cache.json` からそのサーバーの実ツール名を取る。
+def _tool_names_from_test(server: str, timeout: float = 90.0) -> list[str] | None:
+    """`hermes mcp test <server>` の出力から**ライブの**ツール名を取る（最優先の情報源）。
 
-    取れないときは None（＝照合できない）。**照合できないことを隠さない**。
+    実測: この経路は実在するツールをすべて返す（deliberation で 21 件）。キャッシュ（18 件）は
+    取りこぼすので、**存在の判定はライブでしか行わない**。
     """
+    try:
+        proc = subprocess.run(["hermes", "mcp", "test", server], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    names: list[str] = []
+    started = False
+    for line in (proc.stdout or "").splitlines():
+        if "Tools discovered" in line:
+            started = True
+            continue
+        if not started:
+            continue
+        m = re.match(r"^\s{2,}([A-Za-z0-9_.\-]+)\s{2,}\S", line)
+        if m:
+            names.append(m.group(1))
+        elif names and not line.strip():
+            break
+    return names or None
+
+
+def _tool_names_from_cache(server: str) -> list[str] | None:
+    """schema キャッシュから取る（**不完全なことがある**。ライブが取れないときの代替）。"""
     path = os.path.join(hermes_home(), "cache", "mcp_schema_cache.json")
     try:
         with open(path, encoding="utf-8") as fh:
@@ -171,6 +201,17 @@ def live_tool_names(server: str) -> list[str] | None:
         return None
     return [str(t.get("name")) for t in entry["tools"]
             if isinstance(t, dict) and t.get("name")]
+
+
+def live_tool_names(server: str) -> tuple[list[str] | None, str]:
+    """実ツール名を返す。優先順: ライブ（`hermes mcp test`）→ schema キャッシュ。"""
+    names = _tool_names_from_test(server)
+    if names:
+        return names, "live"
+    names = _tool_names_from_cache(server)
+    if names:
+        return names, "cache"
+    return None, "none"
 
 
 def _is_glob(pattern: str) -> bool:
@@ -220,29 +261,37 @@ def main() -> int:
             if not args.check:
                 print(f"· {name}: 未登録なので対象外（競合が無ければ記述だけで選ばれる）")
             continue
-        names = live_tool_names(name)
-        if names is None:
+        names, source = live_tool_names(name)
+        if not names:
             broken += 1
-            print(f"· {name}: ⚠ 実ツール名を照合できません（schema キャッシュ無し）。"
+            print(f"· {name}: ⚠ 実ツール名を照合できません（ライブもキャッシュも取れない）。"
                   f"設定済み: {configured_exclude(name) or '（なし）'}")
             continue
         matched, empty = match_report(spec["patterns"], names)
         already = configured_exclude(name)
-        print(f"· {name}: 実ツール {len(names)} 件 "
-              f"({', '.join(names[:6])}{' …' if len(names) > 6 else ''})")
+        how = "ライブ（hermes mcp test）" if source == "live" else "schema キャッシュ（**不完全なことがある**）"
+        print(f"· {name}: 実ツール {len(names)} 件 / 情報源: {how}")
+        print(f"    {', '.join(names[:8])}{' …' if len(names) > 8 else ''}")
         for pat in matched:
             print(f"    ✓ {pat!r} → {len(pattern_hits(pat, names))} 件 "
                   f"({', '.join(pattern_hits(pat, names)[:6])})")
         for pat in empty:
-            # 候補に無い＝将来のバージョンで復活したとき用。**設定には書かない**ので害は無い（情報）。
-            print(f"    ℹ {pat!r} → 現行には存在しない（候補としてのみ保持。設定には書きません）")
+            if source == "live":
+                print(f"    ℹ {pat!r} → 現行には存在しない（候補としてのみ保持。設定には書きません）")
+            else:
+                print(f"    ? {pat!r} → キャッシュに無い（**実在の否定ではない**。"
+                      f"ライブで確かめること）")
         if already:
             stale = [pat for pat in already if not pattern_hits(pat, names)]
             print(f"    現在の設定: {already}")
             for pat in stale:
                 # **これが本当の空振り**: 設定済みなのに何にも一致していない。
-                broken += 1
-                print(f"    ✗ 設定済みの {pat!r} は一致 0 件（**空振り。設定しても何も変わらない**）")
+                if source == "live":
+                    broken += 1
+                    print(f"    ✗ 設定済みの {pat!r} は一致 0 件（**空振り。設定しても何も変わらない**）")
+                else:
+                    print(f"    ? 設定済みの {pat!r} はキャッシュに一致無し"
+                          f"（ライブで確認するまで判断しない）")
         if matched:
             commands.append(["hermes", "config", "set", f"mcp_servers.{name}.tools.exclude",
                              json.dumps(matched, ensure_ascii=False)])

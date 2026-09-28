@@ -44,12 +44,16 @@ python scripts/measure_adoption.py --sessions 20
 - **競合サーバーを丸ごと無効化しない**。使えるツール（`deliberation` の `researcher` / `code-reviewer` /
   `debugger` など）まで失う。**汎用面だけ**を外す。
 - **除外パターンは実ツール名に照合してから書く。** Hermes の照合は `fnmatchcase`（大小文字区別）で、
-  `*` / `?` / `[` を含まない項目は**完全一致**。実測では流布していた `["ask_*","panel","consensus*"]` が
-  **1 件も一致しなかった**（実名は `ask-all` / `ask-one` … と**ハイフン**区切りで、`panel` / `consensus`
-  というツールは存在しない）。空振りの除外は**何も変えずに「設定した」気にさせる**ので、
-  `python scripts/apply_proactive.py --check` で照合する（**設定済みの除外が空振りしていれば exit 1**。
-  存在しない名前は候補として表示されるだけで、設定には書かれない）。
-  正しい設定は `tools.exclude = ["ask-*"]`（6 件の汎用面を外し、専門 12 件は残す）。
+  `*` / `?` / `[` を含まない項目は**完全一致**。実測で 2 回踏んでいる:
+  1. `ask_*`（アンダースコア）は**どの実名にも一致しない**（実名は `ask-all` / `consensus-step` … と
+     ハイフン区切り）。流布している例をそのまま書くと空振りする。
+  2. **`cache/mcp_schema_cache.json` は不完全**（実測: 18 件しか無く、実在する `panel` / `consensus` /
+     `consensus-step` が載っていなかった）。キャッシュで照合すると「存在しない」と**誤判定**する。
+- したがって照合は **`hermes mcp test <server>` のライブ一覧**で行う（deliberation の実測 21 件）。
+  `python scripts/apply_proactive.py --check` が照合結果を出し、**設定済みの除外が一致 0 件なら exit 1**。
+  正しい設定は `tools.exclude = ["ask-*", "panel", "consensus*"]`
+  （汎用 9 件を外し、専門の `researcher` / `code-reviewer` / `debugger` / `architect` /
+  `security-analyst` / `scope-analyst` / `plan-reviewer` / `analyze` / `session-*` は残す）。
 - 依頼文にツール名を書いて測ると、**汎用面を外した効果**が消える（名前で選べてしまう）。
 
 ---

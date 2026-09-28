@@ -829,16 +829,23 @@ class TestProactivePatternMatching(unittest.TestCase):
         cls.mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.mod)
 
-    REAL = ["ask-all", "ask-one", "ask-gpt", "ask-gemini", "ask-grok", "ask-openrouter",
-            "codex-login", "analyze", "architect", "researcher", "session-get"]
+    # 実測（ライブ `hermes mcp test deliberation` の 21 件）。schema キャッシュは 18 件しか無く、
+    # panel / consensus / consensus-step が欠けていた（＝キャッシュを信じると誤判定する）。
+    REAL = ["ask-all", "consensus", "consensus-step", "codex-login", "panel", "ask-one", "analyze",
+            "ask-gpt", "ask-gemini", "ask-grok", "ask-openrouter", "architect", "plan-reviewer",
+            "scope-analyst", "code-reviewer", "security-analyst", "researcher", "debugger",
+            "session-get", "session-revisit", "session-annotate"]
 
     def test_glob_matches_real_names(self):
         self.assertEqual(len(self.mod.pattern_hits("ask-*", self.REAL)), 6)
 
     def test_stale_underscore_pattern_matches_nothing(self):
+        # `ask_*`（アンダースコア）は空振り。実名はハイフン区切り。
         self.assertEqual(self.mod.pattern_hits("ask_*", self.REAL), [])
-        self.assertEqual(self.mod.pattern_hits("panel", self.REAL), [])
-        self.assertEqual(self.mod.pattern_hits("consensus*", self.REAL), [])
+
+    def test_hyphenated_and_plain_patterns_match_real_names(self):
+        self.assertEqual(self.mod.pattern_hits("panel", self.REAL), ["panel"])
+        self.assertEqual(self.mod.pattern_hits("consensus*", self.REAL), ["consensus", "consensus-step"])
 
     def test_match_is_case_sensitive_and_exact(self):
         self.assertEqual(self.mod.pattern_hits("ASK-ALL", self.REAL), [])   # fnmatchcase
@@ -883,15 +890,19 @@ class TestProactivePatternMatching(unittest.TestCase):
         """設定済みの除外が実名に一致しない＝**本当の空振り**を検出できること。"""
         names = self.REAL
         stale = [pat for pat in ["ask_*", "panel"] if not self.mod.pattern_hits(pat, names)]
-        self.assertEqual(stale, ["ask_*", "panel"])
-        self.assertEqual([p for p in ["ask-*"] if not self.mod.pattern_hits(p, names)], [])
+        self.assertEqual(stale, ["ask_*"])          # panel は実在するので空振りではない
+        self.assertEqual([p for p in ["ask-*", "panel", "consensus*"]
+                          if not self.mod.pattern_hits(p, names)], [])
 
     def test_match_report_flags_empty_patterns(self):
+        # 正しい候補はすべて一致する（設定に書かれる）
         matched, empty = self.mod.match_report(["ask-*", "panel", "consensus*"], self.REAL)
-        self.assertEqual(matched, ["ask-*"])
-        self.assertEqual(empty, ["panel", "consensus*"])
-        # 一致したものだけが設定値になる（空振りを設定に書かない）
-        self.assertEqual(matched, ["ask-*"])
+        self.assertEqual(matched, ["ask-*", "panel", "consensus*"])
+        self.assertEqual(empty, [])
+        # 空振りの候補は設定に書かない
+        matched2, empty2 = self.mod.match_report(["ask_*", "panel"], self.REAL)
+        self.assertEqual(matched2, ["panel"])
+        self.assertEqual(empty2, ["ask_*"])
 
 
 class TestVersionConsistency(unittest.TestCase):
