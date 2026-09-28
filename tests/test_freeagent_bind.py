@@ -463,6 +463,13 @@ class TestMultiProvider(unittest.TestCase):
         self.assertIn("権限", S._auth_hint("openrouter", 403, "only available"))
         self.assertNotIn("OPENROUTER_API_KEY", S._auth_hint("openrouter", 403, "forbidden"))
         self.assertIn("有効化", S._auth_hint("nvidia", 403, "forbidden"))
+        # 402 はクレジット枯渇（キー・権限ではない）。実測: HF の月次無料枠が尽きると全モデルが 402。
+        quota = S._auth_hint("huggingface", 402, '{"error":"You have depleted your monthly included credits"}')
+        self.assertIn("クレジット枯渇", quota)
+        self.assertNotIn("HF_TOKEN", quota)
+        self.assertFalse(S._is_auth_error(402, "depleted your monthly included credits"),
+                         "クレジット枯渇をプロバイダ記憶（認証失敗）に入れない")
+        self.assertIn(402, S._FALLBACK_STATUS, "402 は代替へ回す（入れないと即エラーで止まる）")
         # HF の 403 は 2 種類ある: 権限不足（トークンを直す）と**提供元/CDN の拒否**（トークンは無実）。
         # 後者でトークンを疑わせると、正しいトークンを何度も作り直す羽目になる（実測: Together 経由が
         # Cloudflare Error 1010 を返した）。

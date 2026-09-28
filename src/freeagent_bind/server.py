@@ -1118,7 +1118,7 @@ def resolve_ref(ref: str, free_only: bool = True) -> tuple[str, str]:
 #   * 遮断（接続不可・403）はホスト単位で記憶して fail fast する。素の呼び出しを投げると 1 回で
 #     分単位に固まり、並列で走っている他の呼び出しまで待たされる（実測: 120 秒以上無応答）。
 
-_FALLBACK_STATUS = {400, 401, 403, 404, 410, 429, 500, 502, 503, 504}
+_FALLBACK_STATUS = {402, 400, 401, 403, 404, 410, 429, 500, 502, 503, 504}
 _MAX_ATTEMPTS = 4
 
 
@@ -1240,6 +1240,12 @@ def _auth_hint(provider: str, status: int, body: str) -> str:
     permissions to call Inference Providers` を返す（fine-grained トークンに推論権限が無い）。
     """
     tail = truncate((body or "").replace("\n", " "), 160)
+    if status == 402:
+        # クレジット枯渇。キーや権限の問題ではないので取り違えさせない（実測: HF の月次無料枠は
+        # 生存確認やパネルを繰り返すと尽き、全モデルが 402 になる）。翌月に回復するため
+        # **プロバイダ記憶（15 分）には入れない**。
+        return (f"HTTP 402（{provider}）: クレジット枯渇（キーや権限の問題ではありません）。"
+                f"別のプロバイダへ回します / 応答: {tail}")
     if provider == "huggingface":
         if "inference providers" in (body or "").lower():
             return ("HTTP 403（huggingface）: トークンに Inference Providers の権限がありません。"
@@ -1300,7 +1306,7 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
             elif exc.status in (404, 410):
                 note_unavailable(cand, exc.status)
                 skipped.append(cand)
-            elif exc.status in (401, 403):
+            elif exc.status in (401, 403, 402):
                 # キー不備・権限なし。原因を残し、**認証の署名があるときだけ**プロバイダ単位で覚える。
                 # 提供元都合の 403（モデル単位の制限・CDN のエラー）でプロバイダ全体を止めないため。
                 last_error = _auth_hint(c_provider, exc.status, exc.body)

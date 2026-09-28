@@ -21,7 +21,7 @@ Hermes Agent の **Free モデルをサブ LLM として並列に走らせる**�
 | `nous` | ローカルプロキシ | 不要（`hermes proxy start` が必要） | Hermes のプロキシが返すモデル群 |
 | `openrouter` | 未認証でも可 | `OPENROUTER_API_KEY` | 無料は `:free` / pricing が 0。**21 件中 11 件が実応答**（実測） |
 | `nvidia` | 未認証でも可 | `NVIDIA_API_KEY` | 無料クレジット枠。**一覧 82 件中 55 件は 404=EOL**（実測） |
-| `huggingface` | **未認証でも可** | `HF_TOKEN`（**Inference Providers の権限が必要**） | 料金・文脈長は**提供元ごと**（`providers[]`）。**3 件中 1 件が実応答**（実測） |
+| `huggingface` | **未認証でも可** | `HF_TOKEN`（**Inference Providers の権限が必要**） | 料金・文脈長は**提供元ごと**（`providers[]`）。無料枠は**月次クレジット**（尽きると全モデルが 402） |
 
 ### 一覧は実態と乖離する — だから「検索 → 生存確認 → 利用」の 3 段で使う
 
@@ -177,6 +177,9 @@ hermes config set mcp_servers.freeagent-bind.enabled true
   `Inference Providers` 権限を持つトークンが必要。権限が無いと全モデルが 403 になり
   （実測: fine-grained トークンで `does not have sufficient permissions to call Inference
   Providers`）、サーバーは理由と直し方を返して**そのプロバイダを自動選抜から外す**。
+- **HF の無料枠は月次クレジット**で、尽きると全モデルが **402 `You have depleted your monthly included
+  credits`** になる（実測: 生存確認とパネルを繰り返すと枯渇した）。402 はキー・権限の問題ではないので
+  サーバーは**記憶せず、別プロバイダへ回す**（翌月に回復する）。枯渇中は他の 3 プロバイダを使うこと。
 - **HF の 403 は 2 種類ある**（サーバーは署名で区別する）: 権限不足（トークンを直す）と
   **提供元/CDN の拒否**（実測: `prism-ml/…:together` が **Cloudflare Error 1010 "Access denied"**）。
   後者はトークンが正しくても起きるので、`model:提供元`（例: `:novita`）で別経路を試す。
