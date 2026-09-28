@@ -463,6 +463,14 @@ class TestMultiProvider(unittest.TestCase):
         self.assertIn("権限", S._auth_hint("openrouter", 403, "only available"))
         self.assertNotIn("OPENROUTER_API_KEY", S._auth_hint("openrouter", 403, "forbidden"))
         self.assertIn("有効化", S._auth_hint("nvidia", 403, "forbidden"))
+        # HF の 403 は 2 種類ある: 権限不足（トークンを直す）と**提供元/CDN の拒否**（トークンは無実）。
+        # 後者でトークンを疑わせると、正しいトークンを何度も作り直す羽目になる（実測: Together 経由が
+        # Cloudflare Error 1010 を返した）。
+        upstream = S._auth_hint("huggingface", 403, '{"title":"Error 1010: Access denied"}')
+        self.assertNotIn("HF_TOKEN が未設定", upstream)
+        self.assertIn("提供元", upstream)
+        self.assertIn("HTTP 403", upstream)
+        self.assertNotIn("401", upstream.split("（")[0])
 
 
 class TestProbeSelectionAndAuthMemory(unittest.TestCase):
@@ -558,7 +566,11 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
         def fake_call(ref, prompt, **kw):
             self.assertFalse(kw.get("allow_fallback"), "生存確認は代替へ回ってはいけない")
             table = {"nvidia/gone-1": {"error": 'HTTP 404: {"detail":"Not Found"}'},
-                     "huggingface/auth-1": {"error": "HTTP 403（huggingface）: 権限なし"},
+                     # 実際の HF の文言（英語の署名がある 403 だけを権限なしとして扱う）
+                     "huggingface/auth-1": {"error": 'HTTP 403（huggingface）: / 応答: {"error":'
+                                                      '"This authentication method does not have '
+                                                      'sufficient permissions to call Inference '
+                                                      'Providers on behalf of user x"}'},
                      "nvidia/slow-1": {"error": "TimeoutError: The read operation timed out"},
                      "openrouter/alive-1": {"text": "2", "served_by": "openrouter/alive-1"}}
             return table[ref.split(":", 1)[0]]
@@ -577,6 +589,68 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
             self.assertEqual(got["query"]["probe_slow"], 1)
             self.assertEqual(sorted(r["verdict"] for r in got["query"]["probe_dropped"]),
                              ["auth", "gone"])
+
+    def test_is_auth_error_needs_a_signature(self):
+        """403 を全部「認証失敗」にすると**プロバイダ全体を15分止める**（実測の誤り）。"""
+        self.assertTrue(S._is_auth_error(401, ""))          # 401 は定義上ずっと認証
+        self.assertTrue(S._is_auth_error(403, '{"error":"This authentication method does not have '
+                                              'sufficient permissions to call Inference Providers"}'))
+        self.assertTrue(S._is_auth_error(403, "invalid api key"))
+        self.assertTrue(S._is_auth_error(403, "Unauthorized"))
+        # 提供元都合の 403 / CDN の 403 は認証ではない（生きている他モデルまで選抜から消さない）
+        self.assertFalse(S._is_auth_error(403, '{"error":"x/y:free is only available to paid accounts"}'))
+        self.assertFalse(S._is_auth_error(
+            403, '{"type":"https://developers.cloudflare.com/support/troubleshooting/'
+                 'http-status-codes/cloudflare-1xxx-errors/"}'))
+
+    def test_probe_treats_cdn_403_as_retryable_not_auth(self):
+        """HF の `prism-ml/…:together` が返す Cloudflare 403 は「権限なし」ではない → 残す。"""
+        rows = [{"id": "cdn-1", "provider": "huggingface", "free": True, "free_via": ["together"]}]
+
+        def fake_call(ref, prompt, **kw):
+            return {"error": 'HTTP 403（huggingface）: 403 Forbidden / 応答: {"type":"https://developers.'
+                             'cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/"}'}
+
+        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
+             unittest.mock.patch.object(S, "provider_status", lambda: []), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: []), \
+             unittest.mock.patch.object(S, "call_model", fake_call):
+            got = S.tool_models({"all": True, "probe": True, "probe_limit": 3, "limit": 3})
+            self.assertEqual([m["ref"] for m in got["models"]], ["huggingface/cdn-1"])
+            self.assertEqual([r["verdict"] for r in got["query"]["probe_dropped"]], [])
+            self.assertEqual(got["query"]["probe_slow"] + got["query"]["probe_alive"], 0)
+
+    def test_requested_ref_with_provider_suffix_is_accepted(self):
+        """`モデル:提供元` を依頼で受ける（HF は提供元ごとに無料/有料・生死が違うため経路指定が要る）。
+
+        在庫一覧は提供元サフィックス無しの ID を返すので、素の突き合わせだと**黙って除外**され、
+        依頼 4 体が 3 体で走る（実測）。除外するなら理由を出さなければならない。
+        """
+        free = ["huggingface/inclusionAI/Ling-3.0-flash-Fin", "openrouter/x/y:free"]
+        with unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: list(free)), \
+             unittest.mock.patch.object(S, "cooling_refs", lambda: {}):
+            chosen, info = S.select_models(2, ["huggingface/inclusionAI/Ling-3.0-flash-Fin:novita",
+                                               "openrouter/x/y:free"])
+            self.assertEqual(chosen[0], "huggingface/inclusionAI/Ling-3.0-flash-Fin:novita",
+                             "経路指定はそのまま残す（呼び出し時に使う）")
+            self.assertEqual(info["notes"], [], "在庫にあるので除外ノートは出ない")
+            chosen2, info2 = S.select_models(2, ["huggingface/ghost/model:novita"])
+            # 依頼は「拘束」ではなく優先（足りない分は在庫から補充する）。未知のものは入らない。
+            self.assertNotIn("huggingface/ghost/model:novita", chosen2)
+            self.assertTrue(any("未知/未提供" in n for n in info2["notes"]),
+                            "除外するなら理由を出す")
+
+    def test_render_prepends_selection_notes(self):
+        """依頼と参加の差を content に出す（黙って減らさない）。"""
+        text = S.render("freeagent_panel", {
+            "question": "q", "answered": 3, "answers": [], "agreement": 1.0,
+            "failed": 0, "models": ["a/b", "c/d", "e/f"],
+            "selection": {"notes": ["未知/未提供のモデルを除外: huggingface/ghost/model:novita"]}})
+        self.assertTrue(text.startswith("⚠️ 未知/未提供のモデルを除外"), text[:60])
+        # ノートが無ければ何も足さない
+        plain = S.render("freeagent_panel", {"question": "q", "answered": 0, "answers": [],
+                                             "selection": {"notes": []}})
+        self.assertFalse(plain.startswith("⚠️"))
 
     def test_models_probe_off_by_default(self):
         with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: []), \

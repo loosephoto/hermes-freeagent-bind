@@ -60,7 +60,7 @@
 | `nous` | ローカルプロキシ | プロキシの申告 | 要プロキシ起動 | プロキシ停止中は接続エラー |
 | `openrouter` | `openrouter.ai/api/v1` | `:free` または pricing が全部 0 | **未認証可** | 458 モデル / Free 21 / 生存 11 |
 | `nvidia` | `integrate.api.nvidia.com/v1` | `free_kind="credit"`（全件が無料枠） | **未認証可** | 82 モデル / **55 件が 404=EOL** / 生存 15 |
-| `huggingface` | `router.huggingface.co/v1` | **提供元単位**（`providers[].is_free` または pricing 0） | **未認証可** | 137 モデル / Free 3 / 生存 0（権限不足で 403） |
+| `huggingface` | `router.huggingface.co/v1` | **提供元単位**（`providers[].is_free` または pricing 0） | **未認証可** | 137 モデル / Free 3 / 生存 1（`:together` は Cloudflare Error 1010 で要再確認） |
 
 - **HF はトップレベルに料金と文脈長を持たない**。`providers[]` の各要素が `pricing` / `context_length` /
   `is_free` / `status` を持つので、`status == "live"` かつ無料の提供元があるときだけ Free と判定する
@@ -71,6 +71,13 @@
 - `freeagent_models` の `probe: true` は候補を**実際に 1 回呼ぶ**。判定は 4 分類:
   **404/410 → `gone`（除外）** / **401/403 → `auth`（除外）** / **timeout・空応答 → `slow`（残す）** /
   **429・5xx → `error`（残す）**。**生きているが今は応えない**ものを永久に隠さないため。
+- **403 を全部「権限なし」にしない**（`_is_auth_error` の署名一致で判定。401 だけは無条件で認証）。
+  実測で 403 の出所は 3 つある: (a) トークン権限不足（`does not have sufficient permissions…`）＝
+  プロバイダ記憶の対象、(b) モデル単位の提供元制限（OpenRouter の `:free`）、(c) **CDN のブロック**
+  （HF の `:together` 経由が **Cloudflare Error 1010 "Access denied"**）。(b)(c) を認証失敗にすると
+  **プロバイダ全体を 15 分止めて、生きている他モデルまで選抜から消える**。
+- エラー文言に `HTTP 401/403` のような**曖昧な表記を書かない**。生存確認はエラー文字列の
+  `http 401` を部分一致で見るため、403 の文言が 401 に誤マッチした（実測）。ステータスは実際の値を書く。
 - 生存確認は **`allow_fallback=False`** で行う。フォールバックを有効にすると他プロバイダの応答が
   「生存」と誤判定する（実測: HF の 403 が OpenRouter の応答で隠れた）。
 - 生存確認のタイムアウトは短く（既定 25 秒）。モデル既定の 180 秒だと 1 件の遅いモデルが探索全体を止める。

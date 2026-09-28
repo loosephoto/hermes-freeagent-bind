@@ -709,13 +709,20 @@ def select_models(size: int, requested: list[str] | None = None, *,
     notes: list[str] = []
     chosen: list[str] = []
 
+    def is_available(ref: str) -> bool:
+        """在庫（一覧）にあるか。**`モデル:提供元` の経路指定も受ける**（HF は同じモデルでも
+        提供元ごとに無料/有料・生死が違うので、`inclusionAI/…:novita` のように指定して使う。
+        在庫一覧は提供元サフィックス無しの ID を返すため、素の突き合わせだと除外されてしまう）。
+        """
+        return ref in avail_set or ref.rsplit(":", 1)[0] in avail_set
+
     def add(refs: list[str]) -> None:
         for ref in refs:
-            if ref in avail_set and ref not in chosen:
+            if is_available(ref) and ref not in chosen:
                 chosen.append(ref)
 
     if requested:
-        unknown = [r for r in requested if r not in avail_set]
+        unknown = [r for r in requested if not is_available(r)]
         add(requested)
         if unknown:
             notes.append(f"未知/未提供のモデルを除外: {', '.join(unknown[:5])}")
@@ -1208,6 +1215,24 @@ def _candidates(ref: str, free_only: bool = True) -> list[str]:
     return out
 
 
+def _is_auth_error(status: int, body: str) -> bool:
+    """401/403 が**認証の失敗**なのかを署名で判定する。
+
+    実測: 403 は認証だけでは起きない。HF は権限不足（`does not have sufficient permissions to call
+    Inference Providers`）だが、同じ HF の `prism-ml/…:together` は **Cloudflare の 403** を返し、
+    OpenRouter の `:free` は「このモデルは使えない」の 403 を返す。これらを認証失敗として扱うと
+    **プロバイダ全体を 15 分ブロックしてしまう**（生きている他モデルまで選抜から消える）。
+    """
+    if status == 401:
+        return True          # 401 は定義上ずっと認証（未認証・無効トークン）
+    low = (body or "").lower()
+    return any(sign in low for sign in (
+        "insufficient permissions", "authentication method", "unauthorized",
+        "authorization failed", "authorization missing", "no cookie auth",
+        "invalid api key", "invalid_api_key", "incorrect api key", "not authorized",
+    ))
+
+
 def _auth_hint(provider: str, status: int, body: str) -> str:
     """認証エラーは**原因と直し方**を返す（「すべての候補で失敗しました」だけでは直しようがない）。
 
@@ -1221,8 +1246,14 @@ def _auth_hint(provider: str, status: int, body: str) -> str:
                     "https://huggingface.co/settings/tokens で「Make calls to Inference Providers」を"
                     "有効にしたトークンを作り、env の HF_TOKEN に設定してください"
                     f" / 応答: {tail}")
-        return ("HTTP 401/403（huggingface）: HF_TOKEN が未設定か無効です。"
-                f"Inference Providers の権限があるトークンを設定してください / 応答: {tail}")
+        if status == 401:
+            return ("HTTP 401（huggingface）: HF_TOKEN が未設定か無効です。"
+                    f"Inference Providers の権限があるトークンを設定してください / 応答: {tail}")
+        # 403 でも権限の文言が無い = 認証ではなく**提供元/CDN 側**の拒否（実測: Together 経由が
+        # Cloudflare Error 1010 "Access denied" を返す）。トークンを疑わせない。
+        return ("HTTP 403（huggingface）: トークンの権限ではなく**提供元側**で拒否されました"
+                "（Cloudflare のブロックや提供元の障害）。`model:提供元` で別の提供元を試してください"
+                f" / 応答: {tail}")
     hints = {
         "openrouter": ("OPENROUTER_API_KEY が未設定か無効です" if status == 401 else
                        "キーは有効ですが、このモデルを使う権限・プランがありません"
@@ -1270,10 +1301,11 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
                 note_unavailable(cand, exc.status)
                 skipped.append(cand)
             elif exc.status in (401, 403):
-                # キー不備・権限なし。プロバイダ単位で覚えて**自動選抜から外す**（明示指定では再挑戦できる）。
-                # 原因を last_error に残す: 空のままだと「すべての候補で失敗しました」しか出ず直しようがない。
+                # キー不備・権限なし。原因を残し、**認証の署名があるときだけ**プロバイダ単位で覚える。
+                # 提供元都合の 403（モデル単位の制限・CDN のエラー）でプロバイダ全体を止めないため。
                 last_error = _auth_hint(c_provider, exc.status, exc.body)
-                note_provider_auth(c_provider, exc.status, exc.body or last_error)
+                if _is_auth_error(exc.status, exc.body):
+                    note_provider_auth(c_provider, exc.status, exc.body or last_error)
                 _debug("auth_error", {"ref": cand, "status": exc.status})
             if exc.status not in _FALLBACK_STATUS:
                 break
@@ -2000,7 +2032,12 @@ def tool_models(args: dict) -> dict:
                     verdict = "slow"
                 elif "http 404" in err_l or "http 410" in err_l or "not found" in err_l:
                     verdict = "gone"
-                elif "http 401" in err_l or "http 403" in err_l:
+                elif "http 403" in err_l:
+                    # 403 は**署名があるときだけ**権限なし扱い。Cloudflare のブロック（Error 1010 等）や
+                    # 提供元の障害・モデル単位の制限は、プロバイダ全体の問題ではないので `error`（残す）。
+                    # 401 より先に見る（"HTTP 401/403" のような表記が 401 に誤マッチしていた実測がある）。
+                    verdict = "auth" if _is_auth_error(403, err) else "error"
+                elif "http 401" in err_l:
                     verdict = "auth"
                 else:
                     # 429（提供元が一時制限）や 5xx。**除外しない**（生きているが今は応えない）。
@@ -2789,6 +2826,19 @@ HANDLERS = {
 # 注記・要約は数値から生成し、structuredContent と食い違わせない。
 
 def render(name: str, data: dict) -> str:
+    """表示の入口。**選抜ノートを必ず先頭に付ける**。
+
+    実測: 4 体を指定して 3 体で走ったとき、除外理由が content に出ておらず「元から 3 体」と読めた
+    （`:提供元` 付きの参照が在庫照合で落ちていた）。失敗・除外を隠さないのは表示の規約。
+    """
+    body = _render_body(name, data)
+    notes = (data.get("selection") or {}).get("notes") if isinstance(data, dict) else None
+    if notes and not data.get("error"):
+        return "\n".join(f"⚠️ {n}" for n in notes) + "\n" + body
+    return body
+
+
+def _render_body(name: str, data: dict) -> str:
     if not isinstance(data, dict):
         return str(data)[:2000]
     if data.get("error"):
