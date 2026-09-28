@@ -179,14 +179,29 @@ freeagent_map で、以下のタイトル 30 件を 1 件ずつ 1 行に要約�
 
 | 手順 | なぜ |
 |---|---|
-| `python scripts/apply_proactive.py --apply` | 用途の近い競合（`deliberation` の `ask_*` / `panel`）の**汎用面だけ**を外す。サーバーごと止めると使えるツールまで失う |
+| `python scripts/apply_proactive.py --apply` | 用途の近い競合（`deliberation` の `ask-*` / `panel` / `consensus*` = **9 件の汎用面だけ**）を外す。サーバーごと止めると専門ツール 12 件まで失う |
 | 表示される文面を memory（または `SOUL.md`）へ入れる | **毎ターン注入される場所に判断規則を置く**のが唯一効くレバー。`AGENTS.md` は cwd 依存で全セッションには効かない |
 | **Hermes を再起動** | MCP はホットリロードしない |
+| `python scripts/apply_proactive.py --check` | 除外が**実ツール名に一致しているか**を照合する（空振りなら exit 1） |
 | `python scripts/measure_adoption.py --sessions 20` | 効いたかどうかを `state.db` で測る。**最低 2 標本**（1/2 と 2/2 は標本 1 つでは区別できない） |
+
+設定後の実測（依頼は「意見が割れている。独立した複数の視点から検討して」＝**ツール名を含まない**）:
+
+| 標本 | 実際の呼び出し | 競合の使用 |
+|---|---|---|
+| 1 | `freeagent_consult`×2 / `freeagent_panel`×2 / `freeagent_models`×1 / `web_search`×1 | `deliberation.ask-*` **0 回** |
+| 2 | `freeagent_panel`×3 / `freeagent_consult`×2 | `deliberation.ask-*` **0 回** |
 
 > MCP の `instructions`（`initialize` 応答）は **Hermes では読まれません**（ソース確認済み）。他の
 > クライアント向けに返しています。頼み方は[プロンプト例](#4-メイン-llm-に頼むプロンプト例)のように
 > 用途で書くのが確実です（ツール名を書くと「名前で選ぶ」を測ってしまうので、測定時は書かない）。
+>
+> **除外パターンは写経しないでください。** Hermes の照合は `fnmatchcase`（大小文字区別）で、glob でなければ
+> **完全一致**です。よく出回る `ask_*`（アンダースコア）は実名（`ask-all` / `consensus-step` … ハイフン区切り）
+> に **1 件も一致せず、何も変えずに「設定した」気にさせます**。`--check` がこれを検出します。照合は
+> **ライブの一覧**（`hermes mcp test deliberation` = 実測 21 件）で行います — `cache/mcp_schema_cache.json`
+> は**不完全**（実測 18 件で、実在する `panel` / `consensus` / `consensus-step` が欠けている）ため、
+> キャッシュだけで照合すると実在するツールを「存在しない」と誤判定します。
 
 ### OFF にしても壊れない
 
@@ -197,6 +212,10 @@ freeagent_map で、以下のタイトル 30 件を 1 件ずつ 1 行に要約�
 - 不通では**状態を書かない**（統計・トレース・クールダウンに痕跡を残さない）
 - `scripts/apply_proactive.py` が出す文面に「**無効なら代替で完遂し、実際に応答した独立ソースの件数を
   明記する**」を含めてある（1 件しか取れていないのに「複数視点で検討した」と書かないため）
+
+**一時的に止めたいだけなら、`enabled false` よりキーを外す／バックエンドを届かない状態にする方が安全**です
+（サーバーは起動したまま、推論だけが失敗し、上の `next_action` と「状態を書かない」が働きます。再起動も不要）。
+蓄積ストアは `enabled false` にしても**削除不要**です（クールダウンと認証記憶は 15 分で切れます）。
 
 詳しい手順・落とし穴・実測値は **[docs/proactive-usage.md](docs/proactive-usage.md)** にあります。
 
@@ -364,6 +383,7 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 | 応答が空 | 思考トークンで予算を使い切った | `max_tokens` を上げる（サーバーも 1 回だけ自動で再試行する） |
 | `freeagent_*` を呼ぶが毎回失敗する | プロキシ停止・キー未設定（`next_action.kind` を見る） | 応答の `next_action.advice` に従う。`hermes proxy start` / キー設定 |
 | 少し待っても選ばれない（自発しない） | 競合の汎用面が残っている・判断規則が毎ターンの場所に無い | `python scripts/apply_proactive.py --apply` → memory へ文面 → 再起動 → 測定 |
+| 除外したはずの競合がまだ出てくる | パターンが実ツール名に一致していない（例: `ask_*` は実名 `ask-all` に一致しない） | `python scripts/apply_proactive.py --check`（空振りなら exit 1）で照合し、一致したパターンだけを設定 |
 | 依頼した数より参加が少ない | 在庫に無い ref を指定した | content の `⚠️` に出る除外理由を確認（[出力の読み方](#出力の読み方)） |
 
 ---
@@ -489,6 +509,20 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
   （実測: 依頼 4 体が 3 体で走り、理由がどこにも出ていなかった）。
 - **蓄積するのは作業状態だけ**（品質統計・クールダウン・進行中の相談）。知識は蓄積しない。
 - **arXiv は 3 秒間隔で直列化**する（連続アクセスで CDN が 406 を返す実測による）。
+- **不通（プロキシ停止・DNS 不達・タイムアウト）では状態を一切書かない**。環境障害は**モデルの成績では
+  ない**ので、統計に入れると「落ちていた数分」が全モデルの評価を下げ、**復旧後も選抜が歪む**。トレースにも
+  意味のある情報が無い（切り分けは `FREEAGENT_DEBUG_LOG`）。モデルの失敗（429 など）は従来どおり記録する。
+- **失敗のたびに「次の一手」を `structuredContent.next_action` で返す**。無効・不通でも利用者のターンは
+  続くので、ここで「再試行するな／代替はこれ」を返さないと、存在しないツールを掘り続けるか同じ失敗を
+  繰り返してターンと時間を捨てる（旧実装の実測）。**`content` には書かない**（人間が読むチャネル）。
+- **自発利用は記述の工夫だけでは足りない**。`description` に競合名と差分を書いても **1/2 で頭打ち**、
+  「毎ターン注入される判断規則」＋「競合の汎用面の除外」の併用で **2/2**（実測）。MCP の `instructions` は
+  **Hermes では読まれない**（ソース確認済み）ので当てにしない。測定は回答本文ではなく `state.db` の記録で行う。
+- **除外パターンはライブの実ツール名に照合する**。`fnmatchcase` の照合で、流布している `ask_*` は実名
+  （`ask-all` 等）に一致しない。`cache/mcp_schema_cache.json` は**不完全**（実測 18 件 < ライブ 21 件）で、
+  実在するツールを「存在しない」と誤判定するため、照合は `hermes mcp test` を優先する。
+- **原子置換の書きかけを掃除する**。`os.replace` の前に `<name>.<pid>.<tid>.tmp` の古い残骸を消す
+  （実測: 途中で落ちた書きかけが残り、再起動のたびに増えた。60 秒より古いものだけを対象にする）。
 
 ---
 
@@ -502,6 +536,7 @@ python scripts/smoke_stdio.py                # 実クライアント経路（std
 python scripts/check_offline.py              # バックエンド全滅でも例外漏れ・ハング・状態汚染なし
 python scripts/measure_adoption.py           # 自発利用率を state.db から測る
 python scripts/apply_proactive.py            # 率先して使わせる設定（既定は表示のみ）
+python scripts/apply_proactive.py --check    # 除外パターンが実ツール名に一致するか（空振りなら exit 1）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存も確認
 env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py          # 鍵で実推論できるか
 env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py --page 25  # 生存確認を永続ストアへ
