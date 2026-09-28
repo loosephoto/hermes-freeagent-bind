@@ -2047,7 +2047,13 @@ def tool_consult(args: dict) -> dict:
                                 "unresolved": truncate(labels.get("未解決") or "", 400)})
         rounds.append({"round": round_no + 1, "kind": "debate", "answers": debate_rows})
         initial = {row["model"]: row.get("conclusion") for row in round_rows if not row.get("error")}
+        # ラウンド途中で脱落した参加者を**明示的に残す**（実測: deep 討論の 2 ラウンド目で 1 体が落ち、
+        # content には 1 体しか出ず「元から 1 体だった」ように見えた。失敗は隠さない）。
+        dropped = [{"round": r["round"], "kind": r["kind"], "model": a.get("model"),
+                    "error": truncate(a.get("error") or "", 160)}
+                   for r in rounds for a in r["answers"] if a.get("error")]
         debate_summary = {
+            "dropped": dropped,
             "agreement_by_round": [agreement_of([a.get("conclusion") or a.get("text") or ""
                                                  for a in r["answers"] if not a.get("error")])
                                    for r in rounds],
@@ -2087,6 +2093,8 @@ def tool_consult(args: dict) -> dict:
         "agreement_note": "表層合意度。正しさの確率ではありません。",
         "confidence_mean": round(sum(conf) / len(conf), 1) if conf else None,
         "consensus": last,
+        "failed": [{"model": row.get("model"), "error": truncate(row.get("error") or "", 160)}
+                   for row in rounds[-1]["answers"] if row.get("error")],
         "open_questions_for_main": [q["question"] for q in open_questions],
         "debate_summary": debate_summary,
         "next_call": ({"tool": "freeagent_consult",
@@ -2551,6 +2559,8 @@ def render(name: str, data: dict) -> str:
         lines = [f"相談 {data.get('session_id')} / mode={data.get('mode')} / "
                  f"ラウンド{data.get('rounds_run')} / stage={data.get('stage')}",
                  f"合意度 {data.get('agreement')} / 確信度平均 {data.get('confidence_mean')}"]
+        for row in (data.get("failed") or []):
+            lines.append(f"  ✗ {row.get('model')}（このラウンドは脱落）: {truncate(row.get('error') or '', 90)}")
         for row in (data.get("consensus") or [])[:5]:
             conf = row.get("confidence")
             suffix = f"（確信度 {conf}）" if isinstance(conf, int) else ""
@@ -2565,6 +2575,9 @@ def render(name: str, data: dict) -> str:
                              + ("（立場変更）" if p.get("changed") else ""))
                 if p.get("strongest_objection"):
                     lines.append(f"      反論: {truncate(p['strongest_objection'], 120)}")
+            for row in debate.get("dropped") or []:
+                lines.append(f"  ✗ {row.get('model')}（第{row.get('round')}ラウンド "
+                             f"{row.get('kind')} で脱落）: {truncate(row.get('error') or '', 90)}")
         if data.get("open_questions_for_main"):
             lines.append("⚠️ メインに確認したい点:")
             lines += [f"  - {q}" for q in data["open_questions_for_main"][:5]]

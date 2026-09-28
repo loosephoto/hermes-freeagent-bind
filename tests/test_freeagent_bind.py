@@ -339,6 +339,18 @@ class TestMeasuredRegressions(unittest.TestCase):
             {"model": "m", "conclusion": "c", "confidence": None}]})
         self.assertNotIn("確信度 None", consult)
 
+    def test_render_shows_dropped_participants(self):
+        """討論ラウンドで脱落した参加者を content に出す（実測: 見えないと「元から1体」に見えた）。"""
+        text = S.render("freeagent_consult", {
+            "session_id": "s", "rounds_run": 2, "stage": "complete", "consensus": [],
+            "failed": [{"model": "p/b", "error": "全候補がクールダウン中です"}],
+            "debate_summary": {"agreement_by_round": [0.27, 0.0], "participants": [],
+                               "dropped": [{"round": 2, "kind": "debate", "model": "p/b",
+                                            "error": "HTTP 429"}]}})
+        self.assertIn("脱落", text)
+        self.assertIn("p/b", text)
+        self.assertIn("HTTP 429", text)
+
     def test_select_prefers_non_cooling(self):
         """クールダウン中は除外せず後回し（空きが足りないときだけ補充）。"""
         free = ["p/ready1", "p/cool", "p/ready2"]

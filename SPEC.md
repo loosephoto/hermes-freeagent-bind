@@ -82,7 +82,7 @@
 | wikidata | `www.wikidata.org/w/api.php` | 不要 | ラベル欠落（`label` は `title` ではない） |
 | arxiv | `https://export.arxiv.org/api/query` | 不要 | **http は 301 の先で 406**。連続アクセスで 406 → **3 秒間隔で直列化** |
 | crossref | `api.crossref.org/works` | 不要 | `mailto` 未設定だと polite pool に入れない |
-| openalex | `api.openalex.org/works` | **検索は API キー必須** | 匿名検索は提供元が停止中（`503 Anonymous search is paused`） |
+| openalex | `api.openalex.org/works` | **検索は API キー必須** | 匿名検索は提供元が制限中（実測 `503 Anonymous search is paused` / `429 Rate limit exceeded`） |
 | github | `api.github.com/search/*` | トークン推奨（コード検索は必須） | 未認証は 10 リクエスト/分 |
 
 - 結果は**必ず `citation`（source / title / url / year / summary）に正規化**する。表示も注入もこの形だけを使う。

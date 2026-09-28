@@ -118,8 +118,10 @@ hermes config set mcp_servers.freeagent-bind.enabled true
 - **arXiv の HTTP 406**: 同一リクエストでも Python クライアントに確率的に 406 を返す（curl では
   常に 200）。レート・問いの内容には依存しない。スロットル + 最大 3 回の再試行で緩和しているが、
   落ちることはある（その場合 `results.arxiv.error` に出る）。
-- **OpenAlex の匿名検索停止**: 提供元側で匿名検索が一時停止されており `503 Anonymous search is
-  paused` を返す。`OPENALEX_API_KEY` を設定するまで検索は失敗する（単一 work の取得はキー無しでも通る）。
+- **OpenAlex の匿名検索**: 提供元側で匿名検索が制限されており、実測では `503 Anonymous search is
+  paused` と `429 Rate limit exceeded (Anonymous ...)` の両方が返る。`OPENALEX_API_KEY` を設定するまで
+  検索系は失敗する（単一 work の取得はキー無しでも通る）。他 5 ソースは影響を受けず、失敗は
+  `results.openalex.error` に隔離される。
 - **`freeagent_delegate` は既定で無効**（起動コストが高く、独立した Hermes プロセスを立てるため）。
 
 ## 検証
