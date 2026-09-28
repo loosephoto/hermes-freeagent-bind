@@ -373,6 +373,229 @@ class TestMeasuredRegressions(unittest.TestCase):
             self.assertTrue(any("クールダウン中" in n for n in info["notes"]))
 
 
+class TestMultiProvider(unittest.TestCase):
+    """OpenRouter / NVIDIA NIM / Hugging Face を同じ「検索→利用」に乗せるための契約。"""
+
+    def test_registry_has_four_providers(self):
+        for name in ("nous", "openrouter", "nvidia", "huggingface"):
+            self.assertIn(name, S.PROVIDER_SPECS)
+            self.assertIn(name, S.PROVIDER_ORDER, "PROVIDER_ORDER に無いと一覧に出ない")
+        self.assertEqual(S.PROVIDER_ORDER[0], "nous")
+
+    def test_hf_free_detection(self):
+        """HF はモデルではなく**提供元**に料金が付く（実測: providers[].is_free / pricing）。"""
+        self.assertTrue(S._is_free("huggingface", {"id": "a/b", "providers": [
+            {"provider": "novita", "status": "live", "is_free": True, "pricing": {"input": 0.4, "output": 3}}]}))
+        self.assertTrue(S._is_free("huggingface", {"id": "a/b", "providers": [
+            {"provider": "together", "status": "live", "pricing": {"input": 0, "output": 0}}]}))
+        self.assertFalse(S._is_free("huggingface", {"id": "a/b", "providers": [
+            {"provider": "novita", "status": "live", "pricing": {"input": 0.4, "output": 3}}]}))
+        self.assertFalse(S._is_free("huggingface", {"id": "a/b", "providers": []}))
+
+    def test_hf_ignores_non_live_providers(self):
+        """停止中の提供元を「無料で使える」と数えたら嘘になる。"""
+        row = {"id": "a/b", "providers": [
+            {"provider": "x", "status": "staging", "is_free": True, "pricing": {"input": 0, "output": 0}}]}
+        self.assertFalse(S._is_free("huggingface", row))
+        self.assertEqual(S._free_providers(row), [])
+
+    def test_hf_free_via_names(self):
+        row = {"id": "a/b", "providers": [
+            {"provider": "novita", "status": "live", "is_free": True},
+            {"provider": "together", "status": "live", "is_free": False, "pricing": {"input": 1, "output": 1}}]}
+        self.assertEqual(S._free_providers(row), ["novita"])
+
+    def test_hf_context_length_is_max_over_providers(self):
+        row = {"id": "a/b", "providers": [{"context_length": 1000}, {"context_length": 262144}]}
+        self.assertEqual(S._context_length("huggingface", row), 262144)
+        self.assertEqual(S._context_length("nous", {"context_length": 4096}), 4096)
+
+    def test_nvidia_credit_counts_all(self):
+        self.assertTrue(S._is_free("nvidia", {"id": "meta/llama-3.1-8b"}))
+
+    def test_openrouter_free_only_priced_zero(self):
+        self.assertTrue(S._is_free("openrouter", {"id": "x/y:free"}))
+        self.assertTrue(S._is_free("openrouter", {"id": "x/y", "pricing": {"prompt": "0", "completion": "0"}}))
+        self.assertFalse(S._is_free("openrouter", {"id": "x/y", "pricing": {"prompt": "0.1"}}))
+
+    def test_models_search_filters_and_ranks_free_first(self):
+        rows = [
+            {"id": "paid/qwen-a", "provider": "openrouter", "free": False, "free_via": []},
+            {"id": "qwen/qwen-b:free", "provider": "openrouter", "free": True, "free_via": []},
+            {"id": "Qwen/Qwen-c", "provider": "huggingface", "free": True, "free_via": ["novita"]},
+            {"id": "meta/llama", "provider": "nvidia", "free": True, "free_via": []},
+        ]
+        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
+             unittest.mock.patch.object(S, "provider_status", lambda: []), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: []), \
+             unittest.mock.patch.object(S, "provider_ready", lambda p: True):
+            got = S.tool_models({"query": "qwen"})
+            self.assertEqual(got["query"]["matched"], 3, "ID の部分一致で絞る（大文字小文字を問わない）")
+            self.assertEqual(got["query"]["matched_free"], 2)
+            self.assertTrue(got["models"][0]["free"], "Free を先に並べる")
+            self.assertIn("huggingface/Qwen/Qwen-c", [m["ref"] for m in got["models"]])
+            got_hf = S.tool_models({"provider": "huggingface"})
+            self.assertEqual([m["ref"] for m in got_hf["models"]], ["huggingface/Qwen/Qwen-c"])
+            got_none = S.tool_models({"query": "no-such-model-xyz"})
+            self.assertEqual(got_none["models"], [])
+
+    def test_models_search_render(self):
+        text = S.render("freeagent_models", {
+            "providers": [], "free_candidates": 0, "usable_now": 0, "total_models": 0,
+            "default_model": "x", "query": {"query": "qwen", "provider": "huggingface",
+                                            "matched": 2, "matched_free": 1, "shown": 1},
+            "models": [{"ref": "huggingface/Qwen/Q", "free": True, "free_via": ["novita"],
+                        "context_length": 262144, "usable": False}]})
+        self.assertIn("🔍", text)
+        self.assertIn("novita", text)
+        self.assertIn("キー未設定", text)
+
+    def test_auth_hint_explains_hf_permission_and_missing_keys(self):
+        hf = S._auth_hint("huggingface", 403,
+                          '{"error":"This authentication method does not have sufficient permissions '
+                          'to call Inference Providers on behalf of user x"}')
+        self.assertIn("Inference Providers", hf)
+        self.assertIn("HF_TOKEN", hf)
+        self.assertIn("huggingface.co/settings/tokens", hf)
+        self.assertIn("OPENROUTER_API_KEY", S._auth_hint("openrouter", 401, "unauthorized"))
+        self.assertIn("NVIDIA_API_KEY", S._auth_hint("nvidia", 401, "unauthorized"))
+        # 403 は「キー未設定」ではなく**権限・提供元の制限**（キーは有効でも起きる）。取り違えない。
+        self.assertIn("権限", S._auth_hint("openrouter", 403, "only available"))
+        self.assertNotIn("OPENROUTER_API_KEY", S._auth_hint("openrouter", 403, "forbidden"))
+        self.assertIn("有効化", S._auth_hint("nvidia", 403, "forbidden"))
+
+
+class TestProbeSelectionAndAuthMemory(unittest.TestCase):
+    """一覧が実態と乖離する世界での「検索→利用」: 生存確認・多様性・認証記憶。"""
+
+    def test_as_flag_accepts_bool_and_strings(self):
+        for truthy in (True, "true", "1", "yes", "on", "TRUE"):
+            self.assertTrue(S.as_flag(truthy), f"{truthy!r}")
+        for falsy in (False, "false", "0", "", None, "no"):
+            self.assertFalse(S.as_flag(falsy), f"{falsy!r}")
+
+    def test_diverse_order_interleaves_providers(self):
+        """同点時にアルファベット順で 1 プロバイダが枠を独占するのを防ぐ（実測の不具合）。"""
+        refs = ["huggingface/a", "huggingface/b", "huggingface/c", "nvidia/a", "openrouter/a"]
+        self.assertEqual(S.diverse_order(refs),
+                         ["huggingface/a", "nvidia/a", "openrouter/a",
+                          "huggingface/b", "huggingface/c"])
+        self.assertEqual(S.diverse_order([]), [])
+        self.assertEqual(S.diverse_order(["nous/x"]), ["nous/x"])
+
+    def test_provider_auth_memory_roundtrip_and_clear(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "auth.json")
+            with unittest.mock.patch.dict(os.environ, {"FREEAGENT_AUTH_PATH": path}):
+                S._AUTH.clear()
+                S._AUTH_LOADED = False
+                self.assertIsNone(S.provider_auth_blocked("huggingface"))
+                S.note_provider_auth("huggingface", 403, "no inference scope")
+                entry = S.provider_auth_blocked("huggingface")
+                self.assertIsNotNone(entry)
+                self.assertEqual(entry["status"], 403)
+                self.assertTrue(os.path.exists(path))
+                # 別プロセス相当（メモリを捨てる）でもディスクから復元する
+                S._AUTH.clear()
+                S._AUTH_LOADED = False
+                self.assertIsNotNone(S.provider_auth_blocked("huggingface"))
+                S.clear_provider_auth("huggingface")
+                self.assertIsNone(S.provider_auth_blocked("huggingface"))
+                S._AUTH.clear()
+                S._AUTH_LOADED = False
+
+    def test_select_skips_auth_blocked_provider_with_note(self):
+        rows = [
+            {"id": "hf-1", "provider": "huggingface", "free": True},
+            {"id": "or-1", "provider": "openrouter", "free": True},
+        ]
+        with tempfile.TemporaryDirectory() as tmp, \
+             unittest.mock.patch.dict(os.environ, {"FREEAGENT_AUTH_PATH": os.path.join(tmp, "a.json")}), \
+             unittest.mock.patch.object(S, "free_model_refs",
+                                        lambda free_only=True: ["huggingface/hf-1", "openrouter/or-1"]), \
+             unittest.mock.patch.object(S, "cooling_refs", lambda: {}):
+            S._AUTH.clear()
+            S._AUTH_LOADED = False
+            S.note_provider_auth("huggingface", 403, "no inference scope")
+            chosen, info = S.select_models(2)
+            self.assertNotIn("huggingface/hf-1", chosen, "認証で失敗中のプロバイダは自動選抜から外す")
+            self.assertIn("openrouter/or-1", chosen)
+            self.assertTrue(any("認証で失敗中" in n for n in info["notes"]),
+                            "除外したことを黙って隠さない")
+            # 明示指定は試す（キーを直したときに即復帰できる）
+            chosen2, _ = S.select_models(2, ["huggingface/hf-1"])
+            self.assertIn("huggingface/hf-1", chosen2)
+            S._AUTH.clear()
+            S._AUTH_LOADED = False
+
+    def test_models_free_only_and_offset(self):
+        rows = [
+            {"id": "free-a", "provider": "openrouter", "free": True},
+            {"id": "paid-a", "provider": "openrouter", "free": False},
+            {"id": "free-b", "provider": "openrouter", "free": True},
+        ]
+        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
+             unittest.mock.patch.object(S, "provider_status", lambda: []), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: []):
+            got = S.tool_models({"provider": "openrouter", "all": True, "free_only": True})
+            self.assertEqual([m["id"] for m in got["models"]], ["free-a", "free-b"])
+            self.assertEqual(got["query"]["matched"], 2)
+            self.assertTrue(got["query"]["free_only"])
+            page2 = S.tool_models({"provider": "openrouter", "all": True, "free_only": True,
+                                   "offset": 1, "limit": 10})
+            self.assertEqual([m["id"] for m in page2["models"]], ["free-b"])
+            self.assertEqual(page2["query"]["matched"], 2, "offset しても総数は減らさない")
+
+    def test_models_probe_classifies_gone_auth_slow_alive(self):
+        """生存確認の判定: 404=除外 / 403=除外 / 遅い=残す / 空応答=残す（実測の 4 分類）。"""
+        rows = [
+            {"id": "gone-1", "provider": "nvidia", "free": True},
+            {"id": "auth-1", "provider": "huggingface", "free": True},
+            {"id": "slow-1", "provider": "nvidia", "free": True},
+            {"id": "alive-1", "provider": "openrouter", "free": True},
+        ]
+
+        def fake_call(ref, prompt, **kw):
+            self.assertFalse(kw.get("allow_fallback"), "生存確認は代替へ回ってはいけない")
+            table = {"nvidia/gone-1": {"error": 'HTTP 404: {"detail":"Not Found"}'},
+                     "huggingface/auth-1": {"error": "HTTP 403（huggingface）: 権限なし"},
+                     "nvidia/slow-1": {"error": "TimeoutError: The read operation timed out"},
+                     "openrouter/alive-1": {"text": "2", "served_by": "openrouter/alive-1"}}
+            return table[ref.split(":", 1)[0]]
+
+        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
+             unittest.mock.patch.object(S, "provider_status", lambda: []), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: []), \
+             unittest.mock.patch.object(S, "call_model", fake_call):
+            got = S.tool_models({"all": True, "probe": True, "probe_limit": 10, "limit": 10})
+            refs = [m["ref"] for m in got["models"]]
+            self.assertIn("nvidia/alive-1".replace("nvidia", "openrouter"), refs)
+            self.assertNotIn("nvidia/gone-1", refs, "404 は呼べないので一覧から外す")
+            self.assertNotIn("huggingface/auth-1", refs, "403 も外す")
+            self.assertIn("nvidia/slow-1", refs, "遅い/空応答は生存側に倒して残す")
+            self.assertEqual(got["query"]["probe_alive"], 1)
+            self.assertEqual(got["query"]["probe_slow"], 1)
+            self.assertEqual(sorted(r["verdict"] for r in got["query"]["probe_dropped"]),
+                             ["auth", "gone"])
+
+    def test_models_probe_off_by_default(self):
+        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: []), \
+             unittest.mock.patch.object(S, "provider_status", lambda: []), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: []), \
+             unittest.mock.patch.object(S, "call_model",
+                                        lambda *a, **k: self.fail("probe 無しで呼んではいけない")):
+            got = S.tool_models({"all": True})
+            self.assertFalse(got["query"]["probed"])
+
+    def test_search_mode_skips_free_models_list(self):
+        """検索時は free_models を返さない（出力が二重になる）。"""
+        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: []), \
+             unittest.mock.patch.object(S, "provider_status", lambda: []), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: ["a/b"]):
+            self.assertNotIn("free_models", S.tool_models({"query": "x"}))
+            self.assertIn("free_models", S.tool_models({}))
+
+
 class TestVersionConsistency(unittest.TestCase):
     def test_pyproject_matches_server_version(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

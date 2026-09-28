@@ -8,7 +8,9 @@
 行い、目次をこの docstring に保つ。目次が実装とずれたら、それは設計が崩れた合図。
 
 目次
-  §0 定数・設定        §1 ユーティリティ     §2 永続ストア
+  §0 定数・設定        §1 ユーティリティ     §2 永続ストア（§2.1 クールダウン / §2.2 品質統計 /
+                                             §2.3 トレース / §2.4 相談セッション /
+                                             §2.5 プロバイダ認証の記憶）
   §3 プロバイダとモデル  §4 サブLLM呼び出し    §5 知識バックエンド
   §6 ツール実装        §7 ツール定義         §8 表示（content）
   §9 JSON-RPC / stdio
@@ -19,6 +21,8 @@
   * content（人間向けテキスト）と structuredContent（LLM向け純粋JSON）を両方返す
   * 外部 HTTP は (connect, read) のタイムアウト必須・429 は Retry-After を尊重して記憶する
   * 数値引数は防御的に変換する（不正値で例外を外へ出さない）
+  * **モデル一覧を信じない**（実測: NVIDIA は 82 件中 55 件が 404=EOL、HF の無料 3 件は権限不足で 403）。
+    `freeagent_models(probe=true)` で生存確認し、404/410・401/403 だけを除外する
   * protocolVersion は**クライアントが提示した版をそのまま返す**（交渉）。固定すると
     新しい版を提示するクライアントが接続直後に tools/list を cancel し「60秒タイムアウト」に見える
   * stdout へは **必ず UTF-8 バイト列**で書く（日本語 Windows は cp932 に落ち、応答が黙って捨てられる）
@@ -44,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -118,12 +122,24 @@ PROVIDER_SPECS: dict[str, dict] = {
         "base_url": os.environ.get("FREEAGENT_NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
         "key": os.environ.get("NVIDIA_API_KEY", ""),
         "key_env": "NVIDIA_API_KEY", "free_kind": "credit", "always_ready": False,
-        "note": "NVIDIA NIM（無料クレジット枠。一覧は未認証でも取得可・推論はキー必須）",
+        # 実測: 一覧 82 件の大半が 410（EOL）や 404（アカウントで未有効）で、**一覧を信じると呼べない**。
+        # `freeagent_models` の `probe: true` で生存確認してから使うこと。
+        "note": "NVIDIA NIM（無料クレジット枠。一覧には廃止・未有効のモデルが混在 → probe で確認）",
+    },
+    # Hugging Face は OpenAI 互換の **Inference Providers router** を使う。料金はモデルではなく
+    # **提供元（novita / together 等）ごと**に付くので、free 判定は提供元単位で行う（実測: 一覧の
+    # 各モデルが providers[] を持ち、各要素に pricing と is_free がある）。
+    "huggingface": {
+        "base_url": os.environ.get("FREEAGENT_HF_BASE_URL", "https://router.huggingface.co/v1"),
+        "key": (os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY")
+                or os.environ.get("HUGGINGFACEHUB_API_TOKEN") or ""),
+        "key_env": "HF_TOKEN", "free_kind": "hf_providers", "always_ready": False,
+        "note": "Hugging Face Inference Providers（router。一覧は未認証でも取得可・推論はトークン必須）",
     },
 }
 PROVIDER_ORDER = [n.strip() for n in os.environ.get(
-    "FREEAGENT_PROVIDER_ORDER", "nous,openrouter,nvidia").split(",") if n.strip() in PROVIDER_SPECS] \
-    or ["nous"]
+    "FREEAGENT_PROVIDER_ORDER", "nous,openrouter,nvidia,huggingface").split(",")
+    if n.strip() in PROVIDER_SPECS] or ["nous"]
 
 # 知識バックエンドの識別用 User-Agent。MediaWiki / OpenAlex / Crossref は連絡先入りの UA を求める。
 KB_USER_AGENT = os.environ.get(
@@ -208,6 +224,13 @@ def as_list(value) -> list:
 
 def as_str(value, default: str = "") -> str:
     return value if isinstance(value, str) and value.strip() else default
+
+
+def as_flag(value) -> bool:
+    """真偽引数。MCP クライアントは bool でも文字列（"true" / "1"）でも送ってくるので両方受ける。"""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 def as_str_list(value) -> list[str]:
@@ -411,6 +434,86 @@ def is_cooling(ref: str) -> bool:
     return ref in cooling_refs()
 
 
+# ---------------------------------------------------------------- §2.5 プロバイダ認証の記憶
+#
+# 実測: HF のトークンに推論権限が無いと **無料候補 3 件すべてが 403**、OpenRouter の一部の `:free` も
+# 提供元側の制限で 403 になる。これを記憶しないと、パネルを組むたびに同じプロバイダを引き当て、
+# 失敗 → 代替へ回る分だけ呼び出しと待ち時間を浪費する（実測: 4 体選抜のうち 3 体が HF、かつ既知の
+# 死んだ NVIDIA モデル）。**自動選抜からだけ**外し、明示指定は常に試す（キーを直せば即復帰）。
+
+_AUTH: dict[str, dict] = {}
+_AUTH_LOADED = False
+_AUTH_LOCK = threading.Lock()
+AUTH_TTL_S = _env_float("FREEAGENT_AUTH_TTL", 900.0)
+
+
+def auth_path() -> str:
+    return os.environ.get("FREEAGENT_AUTH_PATH") or os.path.join(state_dir(), "provider_auth.json")
+
+
+def _auth_prune(entries: dict, now: float) -> dict:
+    return {p: e for p, e in entries.items()
+            if isinstance(e, dict) and as_float(e.get("until"), 0.0) > now}
+
+
+def _ensure_auth_loaded() -> None:
+    global _AUTH_LOADED
+    if _AUTH_LOADED:
+        return
+    with _AUTH_LOCK:
+        if _AUTH_LOADED:
+            return
+        data = _load_json(auth_path(), {})
+        saved = data.get("providers") if isinstance(data, dict) else None
+        if isinstance(saved, dict):
+            _AUTH.update(_auth_prune(saved, now_ts()))
+        _AUTH_LOADED = True
+
+
+def _auth_save() -> bool:
+    with _AUTH_LOCK:
+        payload = {"version": 1, "saved_at": now_ts(),
+                   "providers": _auth_prune(_AUTH, now_ts())}
+    return _atomic_write(auth_path(), json.dumps(payload, ensure_ascii=False))
+
+
+def note_provider_auth(provider: str, status: int, detail: str = "") -> float:
+    """プロバイダ単位の認証失敗を覚える。既存の期限が長いときは伸ばさない。"""
+    if not provider:
+        return 0.0
+    _ensure_auth_loaded()
+    until = now_ts() + max(1.0, AUTH_TTL_S)
+    with _AUTH_LOCK:
+        cur = _AUTH.get(provider)
+        if cur and as_float(cur.get("until"), 0.0) > until:
+            return as_float(cur.get("until"), 0.0)
+        _AUTH[provider] = {"until": until, "status": int(status), "at": now_ts(),
+                           "detail": truncate(detail or "", 200)}
+    _auth_save()
+    return until
+
+
+def clear_provider_auth(provider: str) -> None:
+    """呼び出しが通ったら記憶を消す（キーを直したのに古い記憶で避け続けるのを防ぐ）。"""
+    _ensure_auth_loaded()
+    with _AUTH_LOCK:
+        if provider not in _AUTH:
+            return
+        _AUTH.pop(provider, None)
+    _auth_save()
+
+
+def provider_auth_blocked(provider: str) -> dict | None:
+    """認証失敗の記憶が生きていればその内容を返す（自動選抜の除外判断に使う）。"""
+    _ensure_auth_loaded()
+    now = now_ts()
+    with _AUTH_LOCK:
+        entry = _AUTH.get(provider)
+        if not entry or as_float(entry.get("until"), 0.0) <= now:
+            return None
+        return dict(entry)
+
+
 # ---------------------------------------------------------------- §2.2 品質統計
 #
 # 「どの Free モデルが実際に使えるか」を実測から学ぶ。記録するのはメタデータだけ:
@@ -573,6 +676,28 @@ def rank_models(refs: list[str]) -> list[str]:
     return sorted(refs, key=lambda r: (-score(r), r))
 
 
+def diverse_order(refs: list[str]) -> list[str]:
+    """プロバイダを巡回させて並べる。
+
+    品質観測が無いモデルは同点になるため、素の rank 順だと **ID のアルファベット順**で並び、
+    `huggingface/...` のような早い名前のプロバイダが枠を独占する（実測: 4 体選抜のうち 3 体が HF）。
+    パネルの意味は多様性なので、プロバイダ交互に取り、プロバイダの順序は最良モデルの順位で決める
+    （品質順を捨てない）。
+    """
+    buckets: dict[str, list[str]] = {}
+    for ref in refs:
+        buckets.setdefault(ref.split("/", 1)[0], []).append(ref)
+    ranked_index = {ref: i for i, ref in enumerate(refs)}
+    order = sorted(buckets, key=lambda p: ranked_index[buckets[p][0]])
+    out: list[str] = []
+    while any(buckets.get(p) for p in order):
+        for provider in order:
+            pool = buckets.get(provider) or []
+            if pool:
+                out.append(pool.pop(0))
+    return out
+
+
 def select_models(size: int, requested: list[str] | None = None, *,
                   prefer: list[str] | None = None, exclude: list[str] | None = None,
                   free_only: bool = True) -> tuple[list[str], dict]:
@@ -607,12 +732,20 @@ def select_models(size: int, requested: list[str] | None = None, *,
         # クールダウン中を**先に選ばない**（除外ではなく後回し）。選んだ直後に 429 が記録されると
         # 「全候補がクールダウン中」で 1 体へ縮退し、失敗に見える（実測）。空きが足りないときだけ補充する。
         cooling = cooling_refs()
+        # **認証で駄目だったプロバイダを自動選抜から外す**（実測: HF の権限不足で 3 体が空振りし、
+        # 代替へ回る分だけ遅くなる）。明示 `requested` は上の add() で既に入っているので影響しない。
+        auth_blocked = {p: provider_auth_blocked(p) for p in PROVIDER_ORDER}
+        blocked = {p for p, e in auth_blocked.items() if e}
+        if blocked:
+            pool = [r for r in pool if r.split("/", 1)[0] not in blocked]
+            notes.append("認証で失敗中のため自動選抜から除外: " + ", ".join(sorted(blocked))
+                         + "（明示指定すれば試します。キー/権限を直せば数分で戻ります）")
         ready = [r for r in pool if r not in cooling]
         waiting = [r for r in pool if r in cooling]
         need = size - len(chosen)
-        picked = rank_models(ready)[:need]
+        picked = diverse_order(rank_models(ready))[:need]
         if len(picked) < need and waiting:
-            picked += rank_models(waiting)[:need - len(picked)]
+            picked += diverse_order(rank_models(waiting))[:need - len(picked)]
             notes.append(f"空きが足りずクールダウン中から補充: {', '.join(waiting[:3])}")
         chosen.extend(picked)
     if exclude:
@@ -817,10 +950,43 @@ def provider_http(path: str, provider: str = "nous", payload: dict | None = None
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
+def _is_hf(provider: str) -> bool:
+    """HF（Inference Providers router）か。料金と文脈長が**提供元ごと**という違いを 1 か所で判定する。"""
+    return (PROVIDER_SPECS.get(provider) or {}).get("free_kind") == "hf_providers"
+
+
+def _free_providers(row: dict) -> list[str]:
+    """HF の一覧で**無料で使える提供元**を列挙する（`is_free` か、価格が全部 0 のもの）。
+
+    実測: HF の `/v1/models` は各モデルに `providers[]` を持ち、要素は
+    `{provider, status, context_length, pricing:{input,output}, is_free, ...}`。停止中（status が
+    live 以外）の提供元は数えない（数えると「無料で使える」と嘘をつくことになる）。
+    """
+    out: list[str] = []
+    for p in (row.get("providers") or []):
+        if not isinstance(p, dict) or p.get("status") != "live":
+            continue
+        name = as_str(p.get("provider"))
+        if not name:
+            continue
+        if p.get("is_free") is True:
+            out.append(name)
+            continue
+        pricing = p.get("pricing") or {}
+        vals = [float(pricing[k]) for k in ("input", "output")
+                if isinstance(pricing.get(k), (int, float))]
+        if vals and all(v == 0.0 for v in vals):
+            out.append(name)
+    return out
+
+
 def _is_free(provider: str, row: dict) -> bool:
-    """Free 判定。NIM は「無料クレジット枠」なので全モデルが対象、他は pricing が 0 のもの。"""
-    if (PROVIDER_SPECS.get(provider) or {}).get("free_kind") == "credit":
+    """Free 判定。NIM は「無料クレジット枠」なので全モデルが対象、HF は提供元単位、他は pricing が 0。"""
+    kind = (PROVIDER_SPECS.get(provider) or {}).get("free_kind")
+    if kind == "credit":
         return True
+    if _is_hf(provider):
+        return bool(_free_providers(row))
     if str(row.get("id") or "").endswith(":free"):
         return True
     pricing = row.get("pricing")
@@ -835,6 +1001,15 @@ def _is_free(provider: str, row: dict) -> bool:
         except (TypeError, ValueError):
             return False
     return bool(vals) and all(v == 0.0 for v in vals)
+
+
+def _context_length(provider: str, raw: dict):
+    """文脈長。HF は**トップレベルに無く提供元ごと**にあるので最大値を採る（実測）。"""
+    if _is_hf(provider):
+        lens = [p.get("context_length") for p in (raw.get("providers") or [])
+                if isinstance(p, dict) and isinstance(p.get("context_length"), (int, float))]
+        return int(max(lens)) if lens else None
+    return raw.get("context_length") or raw.get("context_window")
 
 
 def fetch_provider_models(provider: str, ttl: float = 600.0) -> list[dict]:
@@ -854,7 +1029,9 @@ def fetch_provider_models(provider: str, ttl: float = 600.0) -> list[dict]:
                 "id": str(raw.get("id")),
                 "provider": provider,
                 "free": _is_free(provider, raw),
-                "context_length": raw.get("context_length") or raw.get("context_window"),
+                # 無料で使える**経路**（HF は提供元名。他プロバイダでは空）。呼び出しのヒントになる。
+                "free_via": _free_providers(raw) if _is_hf(provider) else [],
+                "context_length": _context_length(provider, raw),
                 "pricing": raw.get("pricing") or {},
                 "access": raw.get("access"),
             })
@@ -982,7 +1159,8 @@ def _extract_text(data: dict) -> str:
 
 
 def _call_once(provider: str, model: str, prompt: str, system: str,
-               max_tokens: int, temperature: float | None) -> dict:
+               max_tokens: int, temperature: float | None,
+               timeout: float | None = None) -> dict:
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -992,7 +1170,7 @@ def _call_once(provider: str, model: str, prompt: str, system: str,
         payload["temperature"] = temperature
     started = now_ts()
     try:
-        data = provider_http("/chat/completions", provider=provider, payload=payload)
+        data = provider_http("/chat/completions", provider=provider, payload=payload, timeout=timeout)
     except urllib.error.HTTPError as exc:
         body = ""
         try:
@@ -1030,9 +1208,36 @@ def _candidates(ref: str, free_only: bool = True) -> list[str]:
     return out
 
 
+def _auth_hint(provider: str, status: int, body: str) -> str:
+    """認証エラーは**原因と直し方**を返す（「すべての候補で失敗しました」だけでは直しようがない）。
+
+    実測: HF の既存トークンは有効でも `403 This authentication method does not have sufficient
+    permissions to call Inference Providers` を返す（fine-grained トークンに推論権限が無い）。
+    """
+    tail = truncate((body or "").replace("\n", " "), 160)
+    if provider == "huggingface":
+        if "inference providers" in (body or "").lower():
+            return ("HTTP 403（huggingface）: トークンに Inference Providers の権限がありません。"
+                    "https://huggingface.co/settings/tokens で「Make calls to Inference Providers」を"
+                    "有効にしたトークンを作り、env の HF_TOKEN に設定してください"
+                    f" / 応答: {tail}")
+        return ("HTTP 401/403（huggingface）: HF_TOKEN が未設定か無効です。"
+                f"Inference Providers の権限があるトークンを設定してください / 応答: {tail}")
+    hints = {
+        "openrouter": ("OPENROUTER_API_KEY が未設定か無効です" if status == 401 else
+                       "キーは有効ですが、このモデルを使う権限・プランがありません"
+                       "（`:free` でも提供元側の制限で 403 になるものがあります）"),
+        "nvidia": ("NVIDIA_API_KEY が未設定か無効です" if status == 401 else
+                   "このモデルはアカウントで有効化されていません（一覧に出ても呼べないものがあります）"),
+    }
+    hint = hints.get(provider, "キーまたは権限を確認してください")
+    return f"HTTP {status}（{provider}）: {hint} / 応答: {tail}"
+
+
 def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800,
                temperature: float | None = None, kind: str = "ask",
-               allow_fallback: bool = True, free_only: bool = True) -> dict:
+               allow_fallback: bool = True, free_only: bool = True,
+               timeout: float | None = None) -> dict:
     """1 つのサブLLM呼び出し。**例外を外へ漏らさず**、失敗も dict で返す。"""
     provider, model = resolve_ref(ref, free_only=free_only)
     if not model:
@@ -1053,7 +1258,8 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
         if not c_model:
             continue
         try:
-            result = _call_once(c_provider, c_model, prompt, system, max_tokens, temperature)
+            result = _call_once(c_provider, c_model, prompt, system, max_tokens, temperature,
+                                timeout=timeout)
         except HttpStatusError as exc:
             last_error = f"HTTP {exc.status}: {exc.body[:200]}"
             if exc.status == 429:
@@ -1064,7 +1270,10 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
                 note_unavailable(cand, exc.status)
                 skipped.append(cand)
             elif exc.status in (401, 403):
-                # キー不備・権限なし。プロバイダごと駄目なので記憶せず次のプロバイダへ。
+                # キー不備・権限なし。プロバイダ単位で覚えて**自動選抜から外す**（明示指定では再挑戦できる）。
+                # 原因を last_error に残す: 空のままだと「すべての候補で失敗しました」しか出ず直しようがない。
+                last_error = _auth_hint(c_provider, exc.status, exc.body)
+                note_provider_auth(c_provider, exc.status, exc.body or last_error)
                 _debug("auth_error", {"ref": cand, "status": exc.status})
             if exc.status not in _FALLBACK_STATUS:
                 break
@@ -1080,7 +1289,8 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
             if max_tokens < _EMPTY_RETRY_CAP:
                 bumped = min(max(max_tokens * 3, _EMPTY_TOKEN_FLOOR), _EMPTY_RETRY_CAP)
                 try:
-                    retry = _call_once(c_provider, c_model, prompt, system, bumped, temperature)
+                    retry = _call_once(c_provider, c_model, prompt, system, bumped, temperature,
+                                       timeout=timeout)
                     if (retry.get("text") or "").strip():
                         result, text = retry, retry["text"]
                 except Exception:
@@ -1097,6 +1307,7 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
                "truncated": result["truncated"], "tokens": result["tokens"],
                "cot_leak": _cot_leak(text), "kind": kind,
                "fallback": cand != ref, "skipped_cooling": skipped or None}
+        clear_provider_auth(c_provider)   # 通ったら「認証で駄目」の記憶を消す
         observe_call(out, kind, text)
         return out
 
@@ -1710,10 +1921,19 @@ def _consensus_groups(entries: list[dict]) -> list[dict]:
 
 
 def tool_models(args: dict) -> dict:
-    """利用可能なモデルと Free 状況、品質統計を返す。"""
+    """利用可能なモデルを**検索**し、必要なら**生存確認**する。
+
+    `query` / `provider` を付けると、その条件に合うモデルを（Free かどうか付きで）返す。引数なしなら
+    プロバイダの要約と Free モデル一覧を返す。`probe=true` なら候補を実際に 1 回ずつ呼び、
+    **一覧に載っているが呼べないモデル**（廃止 410 / アカウント未有効 404 など）を除外する。
+    ここで得た `provider/model`（HF は `:提供元` を付けられる）は他ツールの `models` 引数に渡せる。
+    """
     status = provider_status()
     free = free_model_refs()
     usable = [ref for ref in free if not is_cooling(ref)]
+    query = as_str(args.get("query")) or as_str(args.get("q"))
+    provider_filter = as_str(args.get("provider"))
+    limit = as_int(args.get("limit"), 40, 1, 200)
     data = {
         "providers": status,
         "total_models": sum(row["models"] for row in status),
@@ -1723,13 +1943,108 @@ def tool_models(args: dict) -> dict:
         "cooling": {ref: row for ref, row in cooling_refs().items()},
         "ranking_enabled": RANK_ENABLED,
     }
+
+    searching = bool(query or provider_filter or args.get("all") or args.get("probe"))
+    free_only = as_flag(args.get("free_only"))
+    if searching:
+        rows = all_models()
+        needle = query.lower()
+        matched = [r for r in rows
+                   if (not provider_filter or r.get("provider") == provider_filter)
+                   and (not free_only or r.get("free"))
+                   and (not needle or needle in str(r.get("id", "")).lower())]
+        matched.sort(key=lambda r: (not r.get("free"), str(r.get("id", ""))))
+        matched_free = sum(1 for r in matched if r.get("free"))   # ページ前の総数（offset で減らさない）
+        offset = as_int(args.get("offset"), 0, 0, 5000)
+        matched = matched[offset:]
+        data["query"] = {
+            "query": query, "provider": provider_filter or None,
+            "offset": offset,
+            "free_only": free_only,
+            "matched": len(matched) + offset,
+            "matched_free": matched_free,
+            "shown": min(len(matched), limit),
+            "probed": False,
+        }
+        shown = matched[:limit]
+        if args.get("probe") and shown:
+            # 一覧は実態と乖離する（実測: NVIDIA の一覧 82 件の大半が 410 EOL、HF は権限で 403）。
+            # 実際に 1 回だけ呼んで**呼べるものだけ**を残す。件数は絞る（呼び出しは課金・レートに触れる）。
+            probe_limit = as_int(args.get("probe_limit"), min(len(shown), 12), 1, 40)
+            shown = shown[:probe_limit]
+            probe_prompt = as_str(args.get("probe_prompt")) or "1+1=? 数字1つだけ。"
+            probe_tokens = as_int(args.get("probe_max_tokens"), 16, 1, 64)
+            probe_timeout = _env_float("FREEAGENT_PROBE_TIMEOUT", 25.0)
+            probe_workers = max(1, min(8, _env_int("FREEAGENT_PROBE_WORKERS", 8),
+                                       len(shown))) if shown else 1
+
+            def check(row: dict) -> dict:
+                model = row["id"]
+                if _is_hf(row["provider"]) and row.get("free_via"):
+                    model = f"{model}:{row['free_via'][0]}"
+                # **フォールバックを切る**: 有効なままだと他プロバイダが答えて「生存」と誤判定する
+                # （実測: HF の 403 が OpenRouter の応答で隠れ、生きているように見えた）。
+                # 読み取りタイムアウトは短くする（既定 180 秒だと 1 件の遅いモデルが探索全体を止める）。
+                res = call_model(make_ref(row["provider"], model), probe_prompt,
+                                 max_tokens=probe_tokens, kind="probe", allow_fallback=False,
+                                 timeout=probe_timeout)
+                err = res.get("error") or ""
+                err_l = err.lower()
+                if not err:
+                    verdict = "alive"
+                elif "timed out" in err_l or "timeout" in err_l:
+                    # **遅いだけかもしれない**（NVIDIA はコールドスタートが長い）。死んだ扱いにしない。
+                    verdict = "slow"
+                elif "空応答" in err:
+                    # 応答自体は返っている（思考トークンで probe の予算を使い切った）。生存側に倒す。
+                    verdict = "slow"
+                elif "http 404" in err_l or "http 410" in err_l or "not found" in err_l:
+                    verdict = "gone"
+                elif "http 401" in err_l or "http 403" in err_l:
+                    verdict = "auth"
+                else:
+                    # 429（提供元が一時制限）や 5xx。**除外しない**（生きているが今は応えない）。
+                    verdict = "error"
+                return {"model": row, "verdict": verdict, "served_by": res.get("served_by"),
+                        "error": truncate(err, 200),
+                        "sample": truncate((res.get("text") or "").strip(), 60)}
+
+            probed = run_parallel(shown, check, max_workers=probe_workers)
+            # 消えたもの（404/410）と権限で拒否されたものだけ一覧から外す。**遅い・一時エラーは残す**
+            # （残さないと「まだ生きているが遅い」モデルを永久に隠すことになる）。
+            dropped = {"gone", "auth"}
+            alive = [r["model"] for r in probed if r["verdict"] == "alive"]
+            kept = [r["model"] for r in probed if r["verdict"] not in dropped]
+            data["query"].update({
+                "probed": True, "probe_attempted": len(probed),
+                "probe_alive": len(alive),
+                "probe_slow": sum(1 for r in probed if r["verdict"] == "slow"),
+                "probe_dropped": [{"ref": make_ref(r["model"]["provider"], r["model"]["id"]),
+                                   "verdict": r["verdict"], "error": r["error"]}
+                                  for r in probed if r["verdict"] in dropped],
+                "probe_errors": [{"ref": make_ref(r["model"]["provider"], r["model"]["id"]),
+                                  "verdict": r["verdict"], "error": r["error"]}
+                                 for r in probed if r["verdict"] in ("slow", "error")],
+            })
+            by_id = {(r["model"]["provider"], r["model"]["id"]): r["verdict"] for r in probed}
+            shown = [dict(m, probe=by_id.get((m["provider"], m["id"])) or "alive") for m in kept]
+        data["models"] = [{
+            "ref": make_ref(r["provider"], r["id"]),
+            "provider": r["provider"],
+            "id": r["id"],
+            "free": bool(r.get("free")),
+            "free_via": r.get("free_via") or [],
+            "context_length": r.get("context_length"),
+            "usable": provider_ready(r["provider"]),
+            "probe": r.get("probe"),
+        } for r in shown]
     if args.get("stats"):
         data["stats"] = [
             {"model": ref, "status": model_status(ref), "quality": model_quality(ref),
              "observations": model_observations(ref)}
             for ref in free
         ]
-    else:
+    elif not searching:
         data["free_models"] = free
     return data
 
@@ -2238,13 +2553,29 @@ TOOLS: list[dict] = [
     {
         "name": "freeagent_models",
         "description": (
-            "【使う条件】参加モデルを自分で選びたい／Free モデルの残数・品質統計・クールダウンを確認したいとき。"
+            "【使う条件】使えるモデルを**検索**したい（どのプロバイダにどんな Free モデルがあるか）／"
+            "品質統計やクールダウンを確認したいとき。"
+            "【差分】`query`（ID の部分一致）と `provider`（nous / openrouter / nvidia / huggingface）で絞り込む。"
+            "返る `ref` は他ツールの `models` 引数にそのまま渡せる（HF は `:提供元` を付けて経路を固定できる）。"
             "【使わない条件】通常は不要（panel/consult 等が自動で選ぶ）。"
-            "【差分】ここに出る model 参照（provider/model）は他のツールの models 引数にそのまま渡せる。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "query": {"type": "string", "description": "モデル ID の部分一致（例: qwen / llama / :free）"},
+                "q": {"type": "string", "description": "query の別名"},
+                "provider": {"type": "string",
+                             "description": "nous / openrouter / nvidia / huggingface のいずれか"},
+                "limit": {"type": "integer", "description": "表示件数（既定 40・最大 200）"},
+                "offset": {"type": "integer", "description": "読み飛ばす件数（ページ送り）"},
+                "free_only": {"type": "boolean", "description": "有料モデルを除き、Free だけを対象にする"},
+                "all": {"type": "boolean", "description": "検索モードを強制（引数なしで全件を見たいとき）"},
+                "probe": {"type": "boolean",
+                          "description": "候補を実際に呼んで生存確認し、**呼べないモデルを除外**する"
+                                         "（一覧は廃止・未有効を含むため。呼び出しが発生する）"},
+                "probe_limit": {"type": "integer", "description": "生存確認する件数（既定 12・最大 40）"},
+                "probe_prompt": {"type": "string", "description": "生存確認に使う短い問い"},
+                "probe_max_tokens": {"type": "integer", "description": "生存確認の上限トークン（既定 16）"},
                 "stats": {"type": "boolean", "description": "品質統計（形式適合・CoT混入・切断の観測）を含める"},
             },
         },
@@ -2467,7 +2798,7 @@ def render(name: str, data: dict) -> str:
         lines = []
         for row in data.get("providers") or []:
             mark = "✓" if row.get("ready") else "—"
-            note = f"  [{row['key_env']} 未設定]" if not row.get("ready") and row.get("key_env") else ""
+            note = f"  [{row['key_env']} 未設定 → 検索のみ]" if not row.get("ready") and row.get("key_env") else ""
             lines.append(f"  {mark} {row['provider']:11} {row['models']:4} モデル / Free {row['free']:3}{note}")
             if row.get("error"):
                 lines.append(f"      エラー: {row['error'][:100]}")
@@ -2477,6 +2808,35 @@ def render(name: str, data: dict) -> str:
                  f" / 全 {data.get('total_models')} モデル\n既定: {data.get('default_model')}")
         if data.get("cooling"):
             head += "\nクールダウン中: " + ", ".join(data["cooling"])
+        q = data.get("query")
+        if q:
+            head += (f"\n\n🔍 検索: query={q.get('query')!r} provider={q.get('provider')}"
+                     + (" free 限定" if q.get("free_only") else "")
+                     + (f" offset={q['offset']}" if q.get("offset") else "")
+                     + f" → {q.get('matched')} 件（Free {q.get('matched_free')}）"
+                     f"／表示 {q.get('shown')} 件")
+            if q.get("probed"):
+                head += (f"\n   生存確認: 試行 {q.get('probe_attempted')} / 応答 {q.get('probe_alive')}"
+                         + (f" / 遅い {q.get('probe_slow')}" if q.get("probe_slow") else "")
+                         + "（404=廃止・403=権限なしは一覧から除外）")
+                for row in (q.get("probe_dropped") or []):
+                    head += f"\n     ✗ {row['ref']} [{row.get('verdict')}]: {(row.get('error') or '')[:80]}"
+                for row in (q.get("probe_errors") or []):
+                    head += f"\n     ◷ {row['ref']} [{row.get('verdict')}]: {(row.get('error') or '')[:80]}"
+            for m in (data.get("models") or []):
+                tags = []
+                if m.get("free"):
+                    tags.append("Free" + (f" via {','.join(m['free_via'])}" if m.get("free_via") else ""))
+                if not m.get("usable"):
+                    tags.append("キー未設定")
+                if m.get("probe") and m["probe"] != "alive":
+                    tags.append(f"要再確認={m['probe']}")
+                ctx = f" ctx={m['context_length']}" if m.get("context_length") else ""
+                head += f"\n  • {m['ref']}{ctx} [{', '.join(tags) or '有料'}]"
+            if not (data.get("models") or []):
+                hint = ("該当なし。query を短くするか provider を外してください" if not q.get("probed")
+                        else "生存確認で全滅しました（キー・権限を確認してください）")
+                head += f"\n  （{hint}）"
         for row in (data.get("stats") or [])[:12]:
             head += (f"\n  • {row['model']} [{row['status']}] 品質 {row['quality']}"
                      f" 観測 {row['observations']}")

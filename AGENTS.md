@@ -26,9 +26,10 @@ python scripts/smoke_stdio.py
 ```bash
 python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # TOOLS/HANDLERS の一致・スキーマ・版・content の規約
-python -m unittest discover -s tests         # オフライン回帰（47 件・ネットワーク不要）
+python -m unittest discover -s tests         # オフライン回帰（65 件・ネットワーク不要）
 python scripts/smoke_stdio.py                # 実クライアント経路（initialize/tools/list/tools/call）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存（プロキシが要る）
+env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py   # モデルの生存確認を定着（数分）
 ```
 
 終了コード 0 が正常。1 は失敗（レジストリ不一致・版不一致・例外漏れ・UTF-8 破綻・プロトコル破綻）。
@@ -57,7 +58,18 @@ FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存
 14. **stdout へは必ず UTF-8**（cp932 に落ちると応答が黙って捨てられる）。
 15. 蓄積データは `FREEAGENT_STATE_DIR`（既定 `%LOCALAPPDATA%\hermes-freeagent-bind`）。**一時領域に置かない**。
     書き込みは tmp + `os.replace` + `Lock`。知識は蓄積しない（作業状態だけ）。
-16. ツールを増減したら `README.md` のツール表・`SPEC.md`・`tests/`・`scripts/` を同一変更内で更新する。
+16. **モデル一覧を信じない**。実測: NVIDIA は 82 件中 55 件が 404（EOL）、HF の無料 3 件は権限不足で 403、
+    OpenRouter の `:free` にも提供元都合の 403 がある。`freeagent_models` の `probe: true` で生存確認し、
+    **404/410 と 401/403 だけ除外**する。**timeout・空応答・429・5xx は残す**（生きているが今は応えない
+    ものを永久に隠さない）。生存確認は `allow_fallback=False`（有効だと他プロバイダの応答が「生存」に化ける）。
+17. **認証失敗はプロバイダ単位で覚える**（`provider_auth.json`・既定 15 分）。覚えないと毎回同じ
+    プロバイダを引き当てて空振りする（実測: 4 体選抜のうち 3 体が HF）。**自動選抜からだけ外し、明示指定は
+    試す**（キーを直せば即復帰）。除外は必ず `notes` に出す。
+18. **選抜はプロバイダを巡回させる**（`diverse_order`）。品質観測が無いと同点になり、素の順序では
+    モデル ID のアルファベット順で 1 プロバイダが枠を独占する。プロバイダ順は最良モデルの順位で決める。
+19. HF の料金・文脈長は**提供元単位**（`providers[]`）。`status == "live"` かつ `is_free`／価格 0 の
+    提供元があるときだけ Free と判定する（`_is_hf` / `_free_providers` / `_context_length`）。
+20. ツールを増減したら `README.md` のツール表・`SPEC.md`・`tests/`・`scripts/` を同一変更内で更新する。
 
 ## ライセンス
 

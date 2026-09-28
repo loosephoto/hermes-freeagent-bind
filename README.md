@@ -14,6 +14,40 @@ Hermes Agent の **Free モデルをサブ LLM として並列に走らせる**�
 旧リポジトリは削除となったため、名前空間（`freeagent_*` / `FREEAGENT_*`）と識別子をすべて新しくした。
 コードの丸写しはしていない（コピーではなく、旧実装で実測して裏づけの取れた規約だけを持ち込んでいる）。
 
+## 推論バックエンド（4 プロバイダ）
+
+| プロバイダ | 一覧の取得 | 推論に必要な資格情報 | 備考 |
+|---|---|---|---|
+| `nous` | ローカルプロキシ | 不要（`hermes proxy start` が必要） | Hermes のプロキシが返すモデル群 |
+| `openrouter` | 未認証でも可 | `OPENROUTER_API_KEY` | 無料は `:free` / pricing が 0。**21 件中 11 件が実応答**（実測） |
+| `nvidia` | 未認証でも可 | `NVIDIA_API_KEY` | 無料クレジット枠。**一覧 82 件中 55 件は 404=EOL**（実測） |
+| `huggingface` | **未認証でも可** | `HF_TOKEN`（**Inference Providers の権限が必要**） | 料金・文脈長は**提供元ごと**（`providers[]`） |
+
+### 一覧は実態と乖離する — だから「検索 → 生存確認 → 利用」の 3 段で使う
+
+各社の `/v1/models` は**呼べないモデルを含む**（NVIDIA は EOL が 55/82、HF は権限不足で全滅、
+OpenRouter の `:free` にも提供元都合の 403 がある）。`freeagent_models` はこの 3 段を 1 つの道具で回す:
+
+```jsonc
+// 1. 検索: 語句・プロバイダ・無料限定で絞る
+{"query": "nemotron", "free_only": true, "limit": 20}
+// 2. 生存確認: 実際に 1 回呼び、404=廃止 / 403=権限なし を一覧から除外（429 や timeout は残す）
+{"provider": "nvidia", "free_only": true, "all": true, "probe": true, "probe_limit": 25}
+// 3. 得た ref をそのまま他ツールへ
+{"prompt": "...", "models": ["nvidia/nvidia/nemotron-3-super-120b-a12b"]}
+```
+
+```bash
+# 生存確認の結果を**永続ストア**へ定着させる（モデルは週単位で入れ替わるので定期実行）
+env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py --page 25
+
+# プロバイダごとに「鍵で実際に推論できるか」を 1 件ずつ確かめる（鍵の設定直後の切り分け用）
+env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
+```
+
+生存確認の結果は `cooldowns.json`（404/410 は 1 時間）/ `model_stats.json` / `provider_auth.json`
+（プロバイダ単位で 15 分）に残り、以後の**自動選抜が生きているモデルだけを選ぶ**。
+
 ## 6 つの知識バックエンド
 
 | ソース | 用途 | 認証 |
@@ -32,7 +66,7 @@ Hermes Agent の **Free モデルをサブ LLM として並列に走らせる**�
 
 | ツール | 用途 |
 |---|---|
-| `freeagent_models` | 利用可能なモデル・Free 残数・品質統計・クールダウン |
+| `freeagent_models` | **モデル検索**（`query` / `provider` / `free_only` / `offset`）＋**生存確認**（`probe`）＋ Free 残数・品質統計 |
 | `freeagent_ask` | 1 モデルへ 1 回（下読み・分類・下書き） |
 | `freeagent_fanout` | プロンプト × モデルを並列実行（相互検証・ベストオブN） |
 | `freeagent_panel` | 同じ問いを複数モデルへ。合意度・不一致・確信度を構造化 |
@@ -86,11 +120,18 @@ hermes config set mcp_servers.freeagent-bind.enabled true
 | `FREEAGENT_MAX_WORKERS` | 4 | 並列度（1〜16） |
 | `FREEAGENT_MAX_CALLS_PER_RUN` | 40 | 1 呼び出しで許す最大推論回数 |
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |
+| `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface` | 一覧に出すプロバイダと優先順 |
+| `FREEAGENT_AUTH_TTL` | 900 | 認証失敗を覚えて自動選抜から外す時間（秒） |
+| `FREEAGENT_PROBE_TIMEOUT` | 25.0 | 生存確認 1 件の読み取りタイムアウト（秒） |
+| `FREEAGENT_PROBE_WORKERS` | 8 | 生存確認の並列度（1〜8） |
 | `FREEAGENT_SESSIONS` | 1 | 相談セッションを永続化する |
 | `FREEAGENT_SESSION_TTL` | 3600 | 相談セッションの寿命（秒） |
 | `FREEAGENT_ALLOW_AGENT` | 0 | `freeagent_delegate`（Hermes 本体の起動）を許可 |
 | `FREEAGENT_ARXIV_INTERVAL` | 3.0 | arXiv の最小呼び出し間隔（秒） |
 | `FREEAGENT_EMPTY_TOKEN_FLOOR` / `_CAP` | 512 / 2048 | 空応答時の予算引き上げ幅 |
+| `OPENROUTER_API_KEY` | 空 | OpenRouter の推論に必要 |
+| `NVIDIA_API_KEY` | 空 | NVIDIA NIM の推論に必要（一覧は未認証でも取れる） |
+| `HF_TOKEN` | 空 | Hugging Face の推論に必要（**Inference Providers 権限**。一覧は未認証でも取れる） |
 | `OPENALEX_API_KEY` | 空 | OpenAlex の検索に必要（後述） |
 | `KB_MAILTO` | 空 | Crossref/OpenAlex の polite pool 用メールアドレス |
 | `GITHUB_TOKEN` / `GH_TOKEN` | 空 | GitHub のレート制限緩和・コード検索 |
@@ -110,6 +151,15 @@ hermes config set mcp_servers.freeagent-bind.enabled true
   429 が記録されると「全候補がクールダウン中」で 1 体へ縮退し、失敗に見える。
 - **合意度は表層の一致であって正しさの確率ではない**。返り値にもその旨を明記する。
 - **決定はメイン LLM が行う**。サブの出力は仮説・根拠として返す。
+- **モデル一覧を信じない**。実測で NVIDIA は 82 件中 55 件が 404（EOL）、HF は無料 3 件すべてが 403
+  （トークン権限）、OpenRouter の `:free` にも提供元都合の 403 がある。`probe` で生存確認し、
+  404/410（廃止）と 401/403（権限）だけを除外する。**429 と timeout は残す**（生きているが今は
+  応えないだけのものを永久に隠さない）。
+- **認証失敗はプロバイダ単位で覚え、自動選抜からだけ外す**（実測: HF の権限不足で 4 体選抜のうち 3 体が
+  HF になり、失敗→代替で無駄が積み上がった）。明示指定は常に試すので、キーを直せば即復帰する。
+- **選抜はプロバイダを巡回させる**。品質観測が無いモデルは同点になり、素の順序だとモデル ID の
+  アルファベット順で 1 プロバイダが枠を独占する（`huggingface/…` が最初に来る）。パネルの意味は
+  多様性なので、プロバイダ交互に取り、プロバイダ順は最良モデルの順位で決める（品質順は捨てない）。
 - **蓄積するのは作業状態だけ**（品質統計・クールダウン・進行中の相談）。知識は蓄積しない。
 - **arXiv は 3 秒間隔で直列化**する（連続アクセスで CDN が 406 を返す実測による）。
 
@@ -123,6 +173,12 @@ hermes config set mcp_servers.freeagent-bind.enabled true
   検索系は失敗する（単一 work の取得はキー無しでも通る）。他 5 ソースは影響を受けず、失敗は
   `results.openalex.error` に隔離される。
 - **`freeagent_delegate` は既定で無効**（起動コストが高く、独立した Hermes プロセスを立てるため）。
+- **Hugging Face はトークン権限が要る**: 一覧（検索）は未認証でも取れるが、推論は
+  `Inference Providers` 権限を持つトークンが必要。権限が無いと全モデルが 403 になり
+  （実測: 既存の fine-grained トークンで `does not have sufficient permissions to call Inference
+  Providers`）、サーバーは理由と直し方を返して**そのプロバイダを自動選抜から外す**。
+- **NVIDIA の一覧は古い**: 82 件のうち 55 件が 404（EOL）。`probe` / `scripts/warmup_models.py` で
+  生存確認してから使うこと。
 
 ## 検証
 
