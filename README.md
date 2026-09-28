@@ -1,37 +1,263 @@
 # hermes-freeagent-bind
 
-Hermes Agent の **Free モデルをサブ LLM として並列に走らせる**ための MCP サーバー。メイン LLM の
-知識補助として **arXiv / Crossref / OpenAlex / Wikipedia / Wikidata / GitHub** を引き、出典つきで
-回答を組み立てる。
+**Hermes Agent の Free モデルを「サブ LLM」として並列に走らせ、外部知識で根拠づける MCP サーバー。**
 
-- **実行時依存ゼロ**（Python 3.11+ の標準ライブラリのみ・`pip install` 不要）
-- **stdout に UTF-8 の改行区切り JSON-RPC 2.0** を自分で書く（クライアント非依存）
-- **単一ファイルのモノリス**（`src/freeagent_bind/server.py`）— 肥大化を前提に §区画で増築する
+メインの LLM が判断するための材料 —— **複数モデルの意見と一致・不一致**、**出典つきの知識**、**大量要素の
+並列処理結果** —— を、無料枠だけで組み立てます。ツールは 10 個（`freeagent_*`）です。
 
-## 出自
+- **実行時依存ゼロ**（Python 3.11+ の標準ライブラリのみ。`pip install` 不要）
+- **モデルは 4 プロバイダ横断**（Nous / OpenRouter / NVIDIA NIM / Hugging Face）で、生きている Free を自動選抜
+- **知識は 6 ソース**（arXiv / Crossref / OpenAlex / Wikipedia / Wikidata / GitHub）を LLM を介さず取得
 
-旧 `hermes-memex` の**設計と実測知見を継承**しつつ、**実装は新規に書き直した**もの。名称の重複により
-旧リポジトリは削除となったため、名前空間（`freeagent_*` / `FREEAGENT_*`）と識別子をすべて新しくした。
-コードの丸写しはしていない（コピーではなく、旧実装で実測して裏づけの取れた規約だけを持ち込んでいる）。
+**向いている用途**
 
-## 推論バックエンド（4 プロバイダ）
+- 判断が割れる問いを**複数モデルに当てて、一致点と対立点を洗い出す**（設計レビュー、リスク抽出、要約の検証）
+- 大量の下読み・分類・下書きを**並列に流す**（メイン LLM が 1 件ずつ考えるより速く安い）
+- **出典つきの事実**が欲しい（ハルシネーションを混ぜたくない調査）
+- 100 件のタイトルへ同じ指示を一括適用して統合する
+
+**向いていない用途**
+
+- サブの出力をそのまま最終回答にすること。**合意度は「表層の一致」であって正しさの確率ではありません**
+  ので、決定はメイン LLM が行う設計です
+- 長時間のエージェント実行や、課金モデル前提の高品質推論（**Free 枠のみ**を扱います）
+
+---
+
+## 目次
+
+1. [30 秒でわかる使い方](#30-秒でわかる使い方)
+2. [どのツールを使うか](#どのツールを使うか)
+3. [出力の読み方](#出力の読み方)
+4. [API キー](#api-キー)
+5. [推論バックエンド](#推論バックエンド)
+6. [知識バックエンド](#知識バックエンド)
+7. [つまずいたとき](#つまずいたとき)
+8. [環境変数](#環境変数)
+9. [既知の制約](#既知の制約) ・ [設計判断](#設計判断) ・ [検証](#検証) ・ [出自](#出自)
+
+---
+
+## 30 秒でわかる使い方
+
+**必要なもの**: Python 3.11+ と Hermes Agent。このサーバー自体の追加インストールは不要です（依存ゼロ）。
+
+### 1. 登録する（4 コマンド）
+
+```bash
+hermes config set mcp_servers.freeagent-bind.command <python の絶対パス>
+hermes config set mcp_servers.freeagent-bind.args '["<ABS_PATH>/src/freeagent_bind/server.py"]'
+hermes config set mcp_servers.freeagent-bind.connect_timeout 45
+hermes config set mcp_servers.freeagent-bind.enabled true
+```
+
+`<python の絶対パス>` は `python -c "import sys; print(sys.executable)"` で分かります。
+`hermes mcp add` は**対話式**で、TTY が無い環境では `Cancelled.` になり設定が書かれません。
+**`hermes config set` で非対話に組む**のが確実です。
+
+### 2. キーを入れる（任意 — 入れなくても動きます）
+
+```bash
+# Free モデルで推論したいプロバイダのキーを、必要なぶんだけ
+hermes config set mcp_servers.freeagent-bind.env.OPENROUTER_API_KEY '<値>'
+hermes config set mcp_servers.freeagent-bind.env.NVIDIA_API_KEY     '<値>'
+hermes config set mcp_servers.freeagent-bind.env.HF_TOKEN           '<値>'
+# 知識検索を安定させたいとき
+hermes config set mcp_servers.freeagent-bind.env.OPENALEX_API_KEY   '<値>'
+hermes config set mcp_servers.freeagent-bind.env.GITHUB_TOKEN       '<値>'
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_MAILTO   'you@example.com'
+```
+
+**キーが 1 つも無くてもサーバーは使えます**（モデル一覧の検索と知識検索は動きます）。入手先と挙動の詳細は
+[API キー](#api-キー)を参照してください。
+
+### 3. Hermes を再起動して確認
+
+```bash
+hermes proxy start              # nous プロバイダ（ローカルプロキシ）を使うなら
+hermes mcp test freeagent-bind  # → Connected / 10 tools なら成功
+```
+
+**MCP はホットリロードしません。** 設定やキーを変えたら Hermes を再起動してください。
+
+### 4. メイン LLM に頼む（プロンプト例）
+
+```
+freeagent_panel で size=4 にして、この設計案のリスクを挙げて。
+一致した指摘と、モデルごとに割れた指摘を分けて出して。
+```
+
+```
+freeagent_lookup で「宇宙エレベータの材料研究」を arXiv と Crossref から調べて、
+出典番号つきで 5 件まとめて。本文は要約せず、根拠として引用して。
+```
+
+```
+freeagent_map で、以下のタイトル 30 件を 1 件ずつ 1 行に要約して。
+最後に reduce で全体の傾向を 3 行にまとめて。
+```
+
+---
+
+## どのツールを使うか
+
+目的から選んでください。どのツールも `size` を省略すると、Free の中から**生きているモデルだけを
+プロバイダ巡回で自動選抜**します。
+
+| やりたいこと | ツール | 主な引数 |
+|---|---|---|
+| **使えるモデルを探す／生きているか確かめる** | `freeagent_models` | `query` `provider` `free_only` `probe` `limit` `offset` |
+| 1 モデルに 1 回だけ聞く（下読み・分類・下書き） | `freeagent_ask` | `prompt` `model` `system` `max_tokens` |
+| **同じ問いを複数モデルへ**（合意・不一致の把握） | `freeagent_panel` | `question` `size` `models` `prefer` `exclude` |
+| 複数プロンプト × 複数モデルを並列（ベストオブ N） | `freeagent_fanout` | `prompts` `models` `size` `system` |
+| **出典を注入してから**複数モデルに答えさせる | `freeagent_grounded` | `question` `sources` `limit` `models` `size` |
+| **出典つきの知識だけ**取る（LLM を経由しない） | `freeagent_lookup` | `query` `sources` `limit` `lang` `github_kind` |
+| 多数の要素へ同じ指示 ＋ 必要なら統合 | `freeagent_map` | `items` `instruction` `model` `reduce` `reduce_model` |
+| メイン ↔ サブの**往復相談**（`debate_depth="deep"` で 3 段討論） | `freeagent_consult` | `question` `session_id` `main_reply` `mode` `debate_depth` |
+| サブが**自分で知識ツールを呼ぶ**調査ループ（読み取り専用） | `freeagent_agent` | `task` `models` `size` `max_steps` `main_reply` |
+| Hermes 本体を別プロセスで起動（**既定では無効**・opt-in） | `freeagent_delegate` | `task` `timeout` |
+
+**迷ったら**: 意見の食い違いを見たい → `freeagent_panel` / 事実が欲しい → `freeagent_lookup` /
+件数が多い → `freeagent_map` / 1 回だけ聞きたい → `freeagent_ask`。
+
+`freeagent_models` で得た ref（`provider/model` の形）は、そのまま他のツールの `models` に渡せます。
+`model:提供元`（例 `inclusionAI/Ling-3.0-flash-Fin:novita`）の形で経路を固定することもできます。
+
+---
+
+## 出力の読み方
+
+`freeagent_models` の先頭はプロバイダの状態です。
+
+| 表示 | 意味 |
+|---|---|
+| `✓ openrouter 458 モデル / Free 21` | 資格情報があり、一覧も取れている |
+| `— nvidia 82 モデル / Free 82 [NVIDIA_API_KEY 未設定 → 検索のみ]` | 一覧は取れるが**推論はできない**（キーを入れれば使える） |
+| `⚠ nous 0 モデル … 到達不可: URLError …` | 一覧が取れていない。理由が出る（例: プロキシ停止） |
+
+**Free 候補 N 件（うち今すぐ使用可 M）** の `M` が「キーがあり、生きている」数です。`N` をそのまま
+「使える数」と読み替えないでください（[生存確認の 3 段](#生存確認の-3-段)）。
+
+`freeagent_models(probe=true)` の生存確認は 5 分類で返ります。
+
+| 判定 | 意味 | 一覧での扱い |
+|---|---|---|
+| `alive` | 実際に応答した | 使える |
+| `slow` | timeout・空応答（コールドスタートなど） | **残す**（今は応えないだけ） |
+| `gone` | `404` / `410`（未有効・廃止） | 除外 |
+| `auth` | `401` / `403`（キー・権限） | 除外（プロバイダ単位で 15 分記憶） |
+| `error` | `429`・`5xx`・`402`（クレジット枯渇）・CDN の 403 | **残す** |
+
+**「要再確認」** と付いたモデルは `slow` / `error` です。消してはいません（生きているが今は応えない、
+またはキーや枠の問題）。**クールダウン中**のモデルは除外ではなく後回しにされ、呼び出し結果の
+`skipped_cooling` に現れます。
+
+---
+
+## API キー
+
+各キーの意味・入手先・未設定時の挙動です。
+
+**置き場所は MCP クライアントの env**（`mcp_servers.freeagent-bind.env.<NAME>`）。サーバーはキーを
+**保存もログ出力もしません**（蓄積ストア `FREEAGENT_STATE_DIR` にも残りません）。`.env` の自動読み込みは
+しないので、`hermes config set` か OS の環境変数で渡してください。
+
+| キー | 対象 | 必須度 | 未設定時の挙動 | 入手先 |
+|---|---|---|---|---|
+| `OPENROUTER_API_KEY` | `openrouter` の推論 | 任意 | 一覧は取れる。表示が `[未設定 → 検索のみ]` になり推論候補から外れる | <https://openrouter.ai/settings/keys> |
+| `NVIDIA_API_KEY` | `nvidia`（NIM）の推論 | 任意 | 同上（一覧は未認証で取れる） | <https://build.nvidia.com>（プロフィール → API Keys） |
+| `HF_TOKEN` | `huggingface` の推論 | 任意 | 同上。**無認証の推論は 401** | <https://huggingface.co/settings/tokens> |
+| `OPENALEX_API_KEY` | `openalex` の検索 | 任意（実質推奨） | 匿名検索が提供元側で停止され `503 Anonymous search is paused` / `429` になりうる（キーで日次予算 10 倍） | <https://openalex.org/settings/api> |
+| `GITHUB_TOKEN` / `GH_TOKEN` | `github` の検索 | コード検索は**必須** | `kind="code"` は明示エラー。`repo`/`issue` は未認証枠 60 req/h で動く | <https://github.com/settings/tokens> |
+| `FREEAGENT_MAILTO` | Crossref / OpenAlex の polite pool | 任意 | 動くが共有レート枠で不利 | 自分のメールアドレス（登録不要） |
+| `FREEAGENT_API_KEY` | `nous`（ローカルプロキシ） | **不要** | プロキシが実資格情報を付与するため**形だけ**の値でよい | 不要（`hermes proxy start` が必要） |
+
+**キーが無くても全体は止まりません。** `freeagent_models` は 4 プロバイダの一覧を常に集め、推論の可否だけを
+キーの有無で分けます（`ready`）。キー未設定のプロバイダも「今どの Free モデルが存在するか」は見えるので、
+「このキーを入れればこのモデルが使える」という誘導ができます。ただし**一覧の件数を使える数と思わない**
+でください（[生存確認の 3 段](#生存確認の-3-段)）。
+
+### 設定する
+
+```bash
+# 値は config.yaml（自分のマシン内）にだけ書かれます。チャットに貼らない・コミットしない。
+hermes config set mcp_servers.freeagent-bind.env.OPENROUTER_API_KEY '<値>'
+hermes config set mcp_servers.freeagent-bind.env.NVIDIA_API_KEY     '<値>'
+hermes config set mcp_servers.freeagent-bind.env.HF_TOKEN           '<値>'
+hermes config set mcp_servers.freeagent-bind.env.OPENALEX_API_KEY   '<値>'
+hermes config set mcp_servers.freeagent-bind.env.GITHUB_TOKEN       '<値>'
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_MAILTO   'you@example.com'
+
+# 鍵で「実際に推論できるか」を 1 件ずつ確かめる（設定直後の切り分け）
+env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
+```
+
+**MCP はホットリロードしない**ので、キーを足したらクライアント（Hermes）を再起動してください。設定が
+届いていれば `freeagent_models` の先頭行が `✓ openrouter … / ✓ nvidia …` に変わります。
+
+### プロバイダごとの実測（キーの挙動）
+
+**`OPENROUTER_API_KEY`** — `sk-or-...`。無料の `:free` SKU を使うだけでもキーが要ります。実測: 458 モデル /
+Free 21 件 / **実応答 11 件**。`:free` でも **403（モデル単位の提供元制限）** と **429（レート）** があります。
+未認証で叩くと `401 No cookie auth credentials found`。残量は `GET /api/v1/key` で確認できます。
+
+**`NVIDIA_API_KEY`** — `nvapi-...`。**一覧 82 件のうち 55 件は 404（アカウントで未有効）か 410（EOL）**で
+呼べないので、`freeagent_models(probe=true)` か `scripts/warmup_models.py` で生存確認してから使ってください。
+症状の読み分け: キー無し `401 authorization missing` / 不正キー `403 Authorization failed` /
+未有効モデル `404` / 廃止 `410`。
+
+**`HF_TOKEN`** — `hf_...`。別名 `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
+**fine-grained トークンでは「Make calls to Inference Providers」を有効にする**必要があり、読み取りだけの
+トークンは全モデル 403 になります（実測: `does not have sufficient permissions to call Inference Providers`）。
+**キーが有効でも推論できるとは限りません。** 加えて **無料枠は月次クレジット**で、尽きると全モデルが
+`402 You have depleted your monthly included credits` になります（サーバーは 402 を記憶せず別プロバイダへ
+回します）。`:together` 経由は **Cloudflare Error 1010** を返すことがあるので、その場合は `model:提供元`
+（例: `inclusionAI/Ling-3.0-flash-Fin:novita`）で別経路を試してください。
+
+**`OPENALEX_API_KEY`** — **無料**。キー無しでも基本利用はできますが、キーがあると日次予算が 10 倍になります
+（提供元の記載では無料枠 100,000 credits/日・毎秒 100 リクエスト。超えると `429`）。
+詳細は <https://help.openalex.org/api/authentication/>、残量は
+<https://api.openalex.org/rate-limit?api_key=…> で確認できます。
+**未設定だと匿名検索が提供元側で停止されうる**（実測: `503 Anonymous search is paused` と
+`429 Rate limit exceeded (Anonymous ...)` の両方）。単一 work の取得はキー無しでも通ります。失敗は
+`results.openalex.error` に隔離され、他の 5 ソースは影響を受けません。
+
+**`GITHUB_TOKEN` / `GH_TOKEN`** — コード検索（`kind="code"`）は**トークン必須**で、無いとサーバーが
+`コード検索は GITHUB_TOKEN（または GH_TOKEN）が必要です` と返します（黙って空を返しません）。
+`repo` / `issue` は未認証でも動きますが 60 req/h。`GH_TOKEN` は gh CLI と共用できます（`gh auth token`）。
+取得は classic なら `public_repo`、fine-grained なら public リポジトリの読み取り権限で足ります。
+
+**`FREEAGENT_MAILTO`** — キーではありませんが、Crossref と OpenAlex は連絡先を入れた UA / `mailto` を
+求めます（polite pool）。未設定でも動きますが、混雑時に共有枠へ回されます。
+
+**`FREEAGENT_API_KEY` / `FREEAGENT_BASE_URL`** — `nous` プロバイダ（ローカルプロキシ）用。**キーは不要**で、
+`FREEAGENT_API_KEY` の既定値は形だけのプレースホルダ（プロキシが実資格情報を付与します）。プロキシが
+停止していると到達不可（`WinError 10061`）になり、表示は `⚠ nous … 到達不可` になります。
+`hermes proxy start` で復帰します。
+
+---
+
+## 推論バックエンド
+
+4 プロバイダから Free モデルを集めます。
 
 | プロバイダ | 一覧の取得 | 推論に必要な資格情報 | 備考 |
 |---|---|---|---|
 | `nous` | ローカルプロキシ | 不要（`hermes proxy start` が必要） | Hermes のプロキシが返すモデル群 |
 | `openrouter` | 未認証でも可 | `OPENROUTER_API_KEY` | 無料は `:free` / pricing が 0。**21 件中 11 件が実応答**（実測） |
 | `nvidia` | 未認証でも可 | `NVIDIA_API_KEY` | 無料クレジット枠。**一覧 82 件中 55 件は 404=EOL**（実測） |
-| `huggingface` | **未認証でも可** | `HF_TOKEN`（**Inference Providers の権限が必要**） | 料金・文脈長は**提供元ごと**（`providers[]`）。無料枠は**月次クレジット**（尽きると全モデルが 402） |
+| `huggingface` | **未認証でも可** | `HF_TOKEN`（**Inference Providers の権限が必要**） | 料金・文脈長は**提供元ごと**（`providers[]`）。**137 モデル / Free 3 / 生存 1**（実測）。無料枠は**月次クレジット**（尽きると全モデルが 402） |
 
-### 一覧は実態と乖離する — だから「検索 → 生存確認 → 利用」の 3 段で使う
+### 生存確認の 3 段
 
-各社の `/v1/models` は**呼べないモデルを含む**（NVIDIA は EOL が 55/82、HF は権限不足で全滅、
-OpenRouter の `:free` にも提供元都合の 403 がある）。`freeagent_models` はこの 3 段を 1 つの道具で回す:
+一覧は実態と乖離します。各社の `/v1/models` は**呼べないモデルを含み**（NVIDIA は EOL が 55/82、HF は
+権限不足で全滅した実測、OpenRouter の `:free` にも提供元都合の 403）、件数をそのまま使える数として
+提示してはいけません。`freeagent_models` は次の 3 段を 1 つの道具で回します。
 
 ```jsonc
 // 1. 検索: 語句・プロバイダ・無料限定で絞る
 {"query": "nemotron", "free_only": true, "limit": 20}
-// 2. 生存確認: 実際に 1 回呼び、404=廃止 / 403=権限なし を一覧から除外（429 や timeout は残す）
+// 2. 生存確認: 実際に 1 回呼び、404=廃止 / 401・403=キー・権限 を一覧から除外（429・timeout・402 は残す）
 {"provider": "nvidia", "free_only": true, "all": true, "probe": true, "probe_limit": 25}
 // 3. 得た ref をそのまま他ツールへ
 {"prompt": "...", "models": ["nvidia/nvidia/nemotron-3-super-120b-a12b"]}
@@ -45,88 +271,15 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py --page 25
 env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 ```
 
-生存確認の結果は `cooldowns.json`（404/410 は 1 時間）/ `model_stats.json` / `provider_auth.json`
-（プロバイダ単位で 15 分）に残り、以後の**自動選抜が生きているモデルだけを選ぶ**。
+> `env -u PYTHONPATH` を前置しているのは、環境によって Hermes 側の `PYTHONPATH` が混ざって import が
+> 壊れるためです（本 README のスクリプト実行例はすべてこの形にしています）。
 
-## API キー — 各キーの意味・入手先・未設定時の挙動
+生存確認の結果は `cooldowns.json`（404/410 は 1 時間）/ `model_stats.json`（品質統計）/ `provider_auth.json`
+（プロバイダ単位で 15 分）に残り、以後の**自動選抜が生きているモデルだけを選びます**。
 
-**置き場所は MCP クライアントの env**（`mcp_servers.freeagent-bind.env.<NAME>`）。サーバーはキーを
-**保存もログ出力もしない**（蓄積ストア `FREEAGENT_STATE_DIR` にも残らない）。`.env` の自動読み込みは
-しないので、`hermes config set` か OS の環境変数で渡すこと。
+---
 
-| キー | 対象 | 必須度 | 未設定時の挙動 | 入手先 |
-|---|---|---|---|---|
-| `OPENROUTER_API_KEY` | `openrouter` の推論 | 任意 | 一覧は取れる。表示が `[未設定 → 検索のみ]` になり推論候補から外れる | <https://openrouter.ai/settings/keys> |
-| `NVIDIA_API_KEY` | `nvidia`（NIM）の推論 | 任意 | 同上（一覧は未認証で取れる） | <https://build.nvidia.com>（プロフィール → API Keys） |
-| `HF_TOKEN` | `huggingface` の推論 | 任意 | 同上。**無認証の推論は 401** | <https://huggingface.co/settings/tokens> |
-| `OPENALEX_API_KEY` | `openalex` の検索 | 任意（実質推奨） | 匿名検索が提供元側で停止され `503 Anonymous search is paused` / `429` になりうる（キーで日次予算 10 倍） | <https://openalex.org/settings/api> |
-| `GITHUB_TOKEN` / `GH_TOKEN` | `github` の検索 | コード検索は**必須** | `kind="code"` は明示エラー。`repo`/`issue` は未認証枠 60 req/h で動く | <https://github.com/settings/tokens> |
-| `FREEAGENT_MAILTO` | Crossref / OpenAlex の polite pool | 任意 | 動くが共有レート枠で不利 | 自分のメールアドレス（登録不要） |
-| `FREEAGENT_API_KEY` | `nous`（ローカルプロキシ） | **不要** | プロキシが実資格情報を付与するため**形だけ**の値でよい | 不要（`hermes proxy start` が必要） |
-
-**キーが無くても全体は止まらない**。`freeagent_models` は 4 プロバイダの一覧を常に集め、推論の可否だけを
-キーの有無で分ける（`ready`）。キー未設定のプロバイダも「今どの Free モデルが存在するか」は見えるので、
-「このキーを入れればこのモデルが使える」という誘導ができる。ただし**一覧の件数を使える数と思わない**こと
-（下記の生存確認を参照）。
-
-### 設定する
-
-```bash
-# 値は config.yaml（自分のマシン内）にだけ書かれる。チャットに貼らない・コミットしない。
-hermes config set mcp_servers.freeagent-bind.env.OPENROUTER_API_KEY '<値>'
-hermes config set mcp_servers.freeagent-bind.env.NVIDIA_API_KEY     '<値>'
-hermes config set mcp_servers.freeagent-bind.env.HF_TOKEN           '<値>'
-hermes config set mcp_servers.freeagent-bind.env.OPENALEX_API_KEY   '<値>'
-hermes config set mcp_servers.freeagent-bind.env.GITHUB_TOKEN       '<値>'
-hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_MAILTO   'you@example.com'
-
-# 鍵で「実際に推論できるか」を 1 件ずつ確かめる（設定直後の切り分け）
-env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
-```
-
-**MCP はホットリロードしない**ので、キーを足したらクライアント（Hermes）を再起動する。設定が届いて
-いれば `freeagent_models` の先頭行が `✓ openrouter … / ✓ nvidia …` に変わる。`hermes mcp add` は対話式で
-TTY が無いと `Cancelled.` になり設定が書かれないため、**`hermes config set` で非対話に組む**のが確実。
-
-### プロバイダごとの実測（キーの挙動）
-
-**`OPENROUTER_API_KEY`** — `sk-or-...`。無料の `:free` SKU を使うだけでもキーが要る。実測: 458 モデル /
-Free 21 件 / **実応答 11 件**。`:free` でも **403（モデル単位の提供元制限）** と **429（レート）** がある。
-未認証で叩くと `401 No cookie auth credentials found`。残量は `GET /api/v1/key` で確認できる。
-
-**`NVIDIA_API_KEY`** — `nvapi-...`。**一覧 82 件のうち 55 件は 404（アカウントで未有効）か 410（EOL）**で
-呼べないので、`freeagent_models(probe=true)` か `scripts/warmup_models.py` で生存確認してから使う。
-症状の読み分け: キー無し `401 authorization missing` / 不正キー `403 Authorization failed` /
-未有効モデル `404` / 廃止 `410`。
-
-**`HF_TOKEN`** — `hf_...`。別名 `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読む。
-**fine-grained トークンでは「Make calls to Inference Providers」を有効にする**必要があり、読み取りだけの
-トークンは全モデル 403 になる（実測: `does not have sufficient permissions to call Inference Providers`）。
-キーが有効でも推論できるとは限らない。加えて **無料枠は月次クレジット**で、尽きると全モデルが
-`402 You have depleted your monthly included credits` になる（サーバーは 402 を記憶せず別プロバイダへ回す）。
-`:together` 経由は **Cloudflare Error 1010** を返すことがあるので、その場合は `model:提供元`
-（例: `inclusionAI/Ling-3.0-flash-Fin:novita`）で別経路を試す。
-
-**`OPENALEX_API_KEY`** — **無料**。キー無しでも基本利用はできるが、キーがあると日次予算が 10 倍になる
-（提供元の記載では無料枠 100,000 credits/日・毎秒 100 リクエスト。超えると `429`）。<https://help.openalex.org/api/authentication/> / <https://api.openalex.org/rate-limit?api_key=…> で残量確認。
-**未設定だと匿名検索が提供元側で停止されうる**（実測: `503 Anonymous search is paused` と `429 Rate limit exceeded (Anonymous ...)` の両方）。
-単一 work の取得はキー無しでも通る。失敗は `results.openalex.error` に隔離され、他の 5 ソースは影響を
-受けない。
-
-**`GITHUB_TOKEN` / `GH_TOKEN`** — コード検索（`kind="code"`）は**トークン必須**で、無いとサーバーが
-`コード検索は GITHUB_TOKEN（または GH_TOKEN）が必要です` と返す（黙って空を返さない）。`repo` / `issue` は
-未認証でも動くが 60 req/h。`GH_TOKEN` は gh CLI と共用できる（`gh auth token`）。取得は classic なら
-`public_repo`、fine-grained なら public リポジトリの読み取り権限で足りる。
-
-**`FREEAGENT_MAILTO`** — キーではないが、Crossref と OpenAlex は連絡先を入れた UA / `mailto` を求める
-（polite pool）。未設定でも動くが、混雑時に共有枠へ回される。
-
-**`FREEAGENT_API_KEY` / `FREEAGENT_BASE_URL`** — `nous` プロバイダ（ローカルプロキシ）用。**キーは不要**
-で、`FREEAGENT_API_KEY` の既定値は形だけのプレースホルダ（プロキシが実資格情報を付与する）。プロキシが
-停止していると到達不可（`WinError 10061`）になり、表示は `⚠ nous … 到達不可` になる。`hermes proxy start`
-で復帰する。
-
-## 6 つの知識バックエンド
+## 知識バックエンド
 
 | ソース | 用途 | 認証 |
 |---|---|---|
@@ -138,58 +291,37 @@ Free 21 件 / **実応答 11 件**。`:free` でも **403（モデル単位の�
 | `github` | リポジトリ / Issue / コード | `GITHUB_TOKEN` / `GH_TOKEN`（コード検索は必須） |
 
 `freeagent_lookup` と `freeagent_grounded` は 6 ソースを**並列に**引いて、重複を除いた出典リスト
-（`[1] タイトル URL`）を返す。**LLM を経由しないので幻覚が混入しない**。
+（`[1] タイトル URL`）を返します。**LLM を経由しないので幻覚が混入しません。**
 
-## ツール
+---
 
-| ツール | 用途 |
-|---|---|
-| `freeagent_models` | **モデル検索**（`query` / `provider` / `free_only` / `offset`）＋**生存確認**（`probe`）＋ Free 残数・品質統計 |
-| `freeagent_ask` | 1 モデルへ 1 回（下読み・分類・下書き） |
-| `freeagent_fanout` | プロンプト × モデルを並列実行（相互検証・ベストオブN） |
-| `freeagent_panel` | 同じ問いを複数モデルへ。合意度・不一致・確信度を構造化 |
-| `freeagent_lookup` | 外部知識を出典つきで取得（LLM 不使用） |
-| `freeagent_grounded` | 根拠を注入してから複数モデルに回答させる（引用番号つき） |
-| `freeagent_map` | 多数要素へ同一指示を並列適用し、必要なら reduce で統合 |
-| `freeagent_consult` | メイン↔サブの双方向相談。`debate_depth="deep"` で 3 段討論 |
-| `freeagent_agent` | サブ LLM が自分で知識ツールを呼ぶ調査ループ（読み取り専用） |
-| `freeagent_delegate` | Hermes 本体を独立プロセスで起動（**既定では無効**・opt-in） |
+## つまずいたとき
 
-## セットアップ
+症状から引いてください。
 
-```bash
-# 1. 推論バックエンド（Hermes のプロキシ）を起動しておく
-hermes proxy start
+| 症状 | 原因 | 対処 |
+|---|---|---|
+| `freeagent_*` ツールが出てこない | 未登録、または設定後に再起動していない | `hermes mcp test freeagent-bind` → 直したら**Hermes を再起動** |
+| `Free候補 0 件` | キー未設定、または全部クールダウン中 | キーを設定 / `freeagent_models(probe=true)` で生存確認 / 少し待つ |
+| `⚠ nous … 到達不可 WinError 10061` | ローカルプロキシが停止 | `hermes proxy start` |
+| どの候補でも `401` で失敗 | キー未設定・無効 | 該当キーを設定（[API キー](#api-キー)） |
+| HF が全モデル `403` | トークンに Inference Providers 権限が無い | fine-grained トークンで権限を有効化して差し替え |
+| HF が全モデル `402` | 月次クレジット枯渇 | 他プロバイダを使う（翌月に回復） |
+| HF の一部だけ `403`（`:together` 等） | 提供元/CDN のブロック（実測: Cloudflare 1010） | `model:提供元` で別経路（例 `:novita`） |
+| NVIDIA が `404` / `410` | モデルが未有効 / 廃止（82 件中 55 件） | `probe` で生存確認し、生きているものだけ使う |
+| OpenAlex だけ `503` / `429` | 匿名検索が提供元側で停止 | `OPENALEX_API_KEY` を設定（他の 5 ソースは影響なし） |
+| コード検索だけ失敗 | トークンが無い（コード検索は必須） | `GITHUB_TOKEN` を設定、または `kind="repo"` / `"issue"` を使う |
+| arXiv が時々 `406` | 既知の提供元挙動（curl では再現しない） | 再試行（`results.arxiv.error` に出る。他ソースは生きる） |
+| クールダウンだらけで 1 体に縮退した | 429 が続けて記録された | キーを設定するか少し待つ（後回しにされるので補充される） |
+| 応答が空 | 思考トークンで予算を使い切った | `max_tokens` を上げる（サーバーも 1 回だけ自動で再試行する） |
+| 依頼した数より参加が少ない | 在庫に無い ref を指定した | content の `⚠️` に出る除外理由を確認（[出力の読み方](#出力の読み方)） |
 
-# 2. 動作確認
-python -m compileall -q src/freeagent_bind
-python scripts/check_integrity.py
-python -m unittest discover -s tests
-python scripts/smoke_stdio.py
-```
-
-`pip install -e .` は不要（依存ゼロ）。インストールする場合のみ:
-
-```bash
-pip install -e .
-hermes-freeagent-bind      # entry point
-# または
-python -m freeagent_bind
-```
-
-### Hermes への登録
-
-```bash
-hermes config set mcp_servers.freeagent-bind.command <python 実行ファイル>
-hermes config set mcp_servers.freeagent-bind.args '["<ABS_PATH>/src/freeagent_bind/server.py"]'
-hermes config set mcp_servers.freeagent-bind.connect_timeout 45
-hermes config set mcp_servers.freeagent-bind.enabled true
-```
-
-`hermes mcp add` は対話式で、TTY が無いと `Cancelled.` になり設定が書かれない。**`hermes config set`
-で非対話に組む**のが確実。環境変数を渡す場合は `mcp_servers.freeagent-bind.env.<NAME>` を使う。
+---
 
 ## 環境変数
+
+**通常は既定のままで使えます。** 変えるのは、各プロバイダのキーと `FREEAGENT_STATE_DIR`
+（置き場を移したいとき）くらいです。
 
 | 変数 | 既定 | 意味 |
 |---|---|---|
@@ -245,7 +377,38 @@ hermes config set mcp_servers.freeagent-bind.enabled true
 | `FREEAGENT_TRACE_PATH` | `traces.jsonl`（トレース） |
 | `FREEAGENT_SESSIONS_PATH` | `consult_sessions.json`（相談セッション） |
 
-## 設計判断（実測に基づく）
+---
+
+## 既知の制約
+
+- **arXiv の HTTP 406**: 同一リクエストでも Python クライアントに確率的に 406 を返す（curl では
+  常に 200）。レート・問いの内容には依存しない。スロットル + 最大 3 回の再試行で緩和しているが、
+  落ちることはある（その場合 `results.arxiv.error` に出る）。
+- **OpenAlex の匿名検索**: 提供元側で匿名検索が制限されており、実測では `503 Anonymous search is
+  paused` と `429 Rate limit exceeded (Anonymous ...)` の両方が返る。`OPENALEX_API_KEY` を設定するまで
+  検索系は失敗する（単一 work の取得はキー無しでも通る）。他 5 ソースは影響を受けず、失敗は
+  `results.openalex.error` に隔離される。
+- **`freeagent_delegate` は既定で無効**（起動コストが高く、独立した Hermes プロセスを立てるため）。
+  `FREEAGENT_ALLOW_AGENT=1` で許可する。
+- **Hugging Face はトークン権限が要る**: 一覧（検索）は未認証でも取れるが、推論は
+  `Inference Providers` 権限を持つトークンが必要。権限が無いと全モデルが 403 になり
+  （実測: fine-grained トークンで `does not have sufficient permissions to call Inference
+  Providers`）、サーバーは理由と直し方を返して**そのプロバイダを自動選抜から外す**。
+- **HF の無料枠は月次クレジット**で、尽きると全モデルが **402 `You have depleted your monthly included
+  credits`** になる（実測: 生存確認とパネルを繰り返すと枯渇した）。402 はキー・権限の問題ではないので
+  サーバーは**記憶せず、別プロバイダへ回す**（翌月に回復する）。枯渇中は他の 3 プロバイダを使うこと。
+- **HF の 403 は 2 種類ある**（サーバーは署名で区別する）: 権限不足（トークンを直す）と
+  **提供元/CDN の拒否**（実測: `prism-ml/…:together` が **Cloudflare Error 1010 "Access denied"**）。
+  後者はトークンが正しくても起きるので、`model:提供元`（例: `:novita`）で別経路を試す。
+  サーバーはこれを**除外せず「要再確認」として残す**。
+- **NVIDIA の一覧は古い**: 82 件のうち 55 件が 404（EOL）。`probe` / `scripts/warmup_models.py` で
+  生存確認してから使うこと。
+
+---
+
+## 設計判断
+
+実測に基づく実装判断です（開発者向け）。
 
 - **実行時依存ゼロ**。遅延 import するネイティブ拡張は、stdio 起動後に import すると**ツールが
   無応答になる環境がある**ため、必要なものは起動前に import する。
@@ -262,39 +425,22 @@ hermes config set mcp_servers.freeagent-bind.enabled true
 - **決定はメイン LLM が行う**。サブの出力は仮説・根拠として返す。
 - **モデル一覧を信じない**。実測で NVIDIA は 82 件中 55 件が 404（EOL）、HF は無料 3 件すべてが 403
   （トークン権限）、OpenRouter の `:free` にも提供元都合の 403 がある。`probe` で生存確認し、
-  404/410（廃止）と 401/403（権限）だけを除外する。**429 と timeout は残す**（生きているが今は
+  404/410（廃止）と 401/403（権限）だけを除外する。**429・timeout・402 は残す**（生きているが今は
   応えないだけのものを永久に隠さない）。
+- **403 を「キー未設定」と決め打たない**。エラーの署名で判定する（`401` だけは無条件で認証）。提供元の
+  都合による 403（モデル単位の制限）や CDN の 403 を認証失敗にすると、**プロバイダ全体を 15 分止めて
+  生きているモデルまで選抜から消える**（実測）。
 - **認証失敗はプロバイダ単位で覚え、自動選抜からだけ外す**（実測: HF の権限不足で 4 体選抜のうち 3 体が
   HF になり、失敗→代替で無駄が積み上がった）。明示指定は常に試すので、キーを直せば即復帰する。
 - **選抜はプロバイダを巡回させる**。品質観測が無いモデルは同点になり、素の順序だとモデル ID の
   アルファベット順で 1 プロバイダが枠を独占する（`huggingface/…` が最初に来る）。パネルの意味は
   多様性なので、プロバイダ交互に取り、プロバイダ順は最良モデルの順位で決める（品質順は捨てない）。
+- **依頼と参加の差を隠さない**。`モデル:提供元` の経路指定や除外理由（`notes`）を content にも出す
+  （実測: 依頼 4 体が 3 体で走り、理由がどこにも出ていなかった）。
 - **蓄積するのは作業状態だけ**（品質統計・クールダウン・進行中の相談）。知識は蓄積しない。
 - **arXiv は 3 秒間隔で直列化**する（連続アクセスで CDN が 406 を返す実測による）。
 
-## 既知の制約
-
-- **arXiv の HTTP 406**: 同一リクエストでも Python クライアントに確率的に 406 を返す（curl では
-  常に 200）。レート・問いの内容には依存しない。スロットル + 最大 3 回の再試行で緩和しているが、
-  落ちることはある（その場合 `results.arxiv.error` に出る）。
-- **OpenAlex の匿名検索**: 提供元側で匿名検索が制限されており、実測では `503 Anonymous search is
-  paused` と `429 Rate limit exceeded (Anonymous ...)` の両方が返る。`OPENALEX_API_KEY` を設定するまで
-  検索系は失敗する（単一 work の取得はキー無しでも通る）。他 5 ソースは影響を受けず、失敗は
-  `results.openalex.error` に隔離される。
-- **`freeagent_delegate` は既定で無効**（起動コストが高く、独立した Hermes プロセスを立てるため）。
-- **Hugging Face はトークン権限が要る**: 一覧（検索）は未認証でも取れるが、推論は
-  `Inference Providers` 権限を持つトークンが必要。権限が無いと全モデルが 403 になり
-  （実測: fine-grained トークンで `does not have sufficient permissions to call Inference
-  Providers`）、サーバーは理由と直し方を返して**そのプロバイダを自動選抜から外す**。
-- **HF の無料枠は月次クレジット**で、尽きると全モデルが **402 `You have depleted your monthly included
-  credits`** になる（実測: 生存確認とパネルを繰り返すと枯渇した）。402 はキー・権限の問題ではないので
-  サーバーは**記憶せず、別プロバイダへ回す**（翌月に回復する）。枯渇中は他の 3 プロバイダを使うこと。
-- **HF の 403 は 2 種類ある**（サーバーは署名で区別する）: 権限不足（トークンを直す）と
-  **提供元/CDN の拒否**（実測: `prism-ml/…:together` が **Cloudflare Error 1010 "Access denied"**）。
-  後者はトークンが正しくても起きるので、`model:提供元`（例: `:novita`）で別経路を試す。
-  サーバーはこれを**除外せず「要再確認」として残す**。
-- **NVIDIA の一覧は古い**: 82 件のうち 55 件が 404（EOL）。`probe` / `scripts/warmup_models.py` で
-  生存確認してから使うこと。
+---
 
 ## 検証
 
@@ -307,6 +453,26 @@ FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存
 env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py          # 鍵で実推論できるか
 env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py --page 25  # 生存確認を永続ストアへ
 ```
+
+`pip install -e .` は不要（依存ゼロ）。インストールする場合のみ:
+
+```bash
+pip install -e .
+hermes-freeagent-bind      # entry point
+# または
+python -m freeagent_bind
+```
+
+---
+
+## 出自
+
+旧 `hermes-memex` の**設計と実測知見を継承**しつつ、**実装は新規に書き直した**もの。名称の重複により
+旧リポジトリは削除となったため、名前空間（`freeagent_*` / `FREEAGENT_*`）と識別子をすべて新しくした。
+コードの丸写しはしていない（コピーではなく、旧実装で実測して裏づけの取れた規約だけを持ち込んでいる）。
+
+- **stdout に UTF-8 の改行区切り JSON-RPC 2.0** を自分で書く（クライアント非依存）
+- **単一ファイルのモノリス**（`src/freeagent_bind/server.py`）— 肥大化を前提に §区画で増築する
 
 ## ライセンス
 
