@@ -48,6 +48,84 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 生存確認の結果は `cooldowns.json`（404/410 は 1 時間）/ `model_stats.json` / `provider_auth.json`
 （プロバイダ単位で 15 分）に残り、以後の**自動選抜が生きているモデルだけを選ぶ**。
 
+## API キー — 各キーの意味・入手先・未設定時の挙動
+
+**置き場所は MCP クライアントの env**（`mcp_servers.freeagent-bind.env.<NAME>`）。サーバーはキーを
+**保存もログ出力もしない**（蓄積ストア `FREEAGENT_STATE_DIR` にも残らない）。`.env` の自動読み込みは
+しないので、`hermes config set` か OS の環境変数で渡すこと。
+
+| キー | 対象 | 必須度 | 未設定時の挙動 | 入手先 |
+|---|---|---|---|---|
+| `OPENROUTER_API_KEY` | `openrouter` の推論 | 任意 | 一覧は取れる。表示が `[未設定 → 検索のみ]` になり推論候補から外れる | <https://openrouter.ai/settings/keys> |
+| `NVIDIA_API_KEY` | `nvidia`（NIM）の推論 | 任意 | 同上（一覧は未認証で取れる） | <https://build.nvidia.com>（プロフィール → API Keys） |
+| `HF_TOKEN` | `huggingface` の推論 | 任意 | 同上。**無認証の推論は 401** | <https://huggingface.co/settings/tokens> |
+| `OPENALEX_API_KEY` | `openalex` の検索 | 任意（実質推奨） | 匿名検索が提供元側で停止され `503 Anonymous search is paused` / `429` になりうる（キーで日次予算 10 倍） | <https://openalex.org/settings/api> |
+| `GITHUB_TOKEN` / `GH_TOKEN` | `github` の検索 | コード検索は**必須** | `kind="code"` は明示エラー。`repo`/`issue` は未認証枠 60 req/h で動く | <https://github.com/settings/tokens> |
+| `FREEAGENT_MAILTO` | Crossref / OpenAlex の polite pool | 任意 | 動くが共有レート枠で不利 | 自分のメールアドレス（登録不要） |
+| `FREEAGENT_API_KEY` | `nous`（ローカルプロキシ） | **不要** | プロキシが実資格情報を付与するため**形だけ**の値でよい | 不要（`hermes proxy start` が必要） |
+
+**キーが無くても全体は止まらない**。`freeagent_models` は 4 プロバイダの一覧を常に集め、推論の可否だけを
+キーの有無で分ける（`ready`）。キー未設定のプロバイダも「今どの Free モデルが存在するか」は見えるので、
+「このキーを入れればこのモデルが使える」という誘導ができる。ただし**一覧の件数を使える数と思わない**こと
+（下記の生存確認を参照）。
+
+### 設定する
+
+```bash
+# 値は config.yaml（自分のマシン内）にだけ書かれる。チャットに貼らない・コミットしない。
+hermes config set mcp_servers.freeagent-bind.env.OPENROUTER_API_KEY '<値>'
+hermes config set mcp_servers.freeagent-bind.env.NVIDIA_API_KEY     '<値>'
+hermes config set mcp_servers.freeagent-bind.env.HF_TOKEN           '<値>'
+hermes config set mcp_servers.freeagent-bind.env.OPENALEX_API_KEY   '<値>'
+hermes config set mcp_servers.freeagent-bind.env.GITHUB_TOKEN       '<値>'
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_MAILTO   'you@example.com'
+
+# 鍵で「実際に推論できるか」を 1 件ずつ確かめる（設定直後の切り分け）
+env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
+```
+
+**MCP はホットリロードしない**ので、キーを足したらクライアント（Hermes）を再起動する。設定が届いて
+いれば `freeagent_models` の先頭行が `✓ openrouter … / ✓ nvidia …` に変わる。`hermes mcp add` は対話式で
+TTY が無いと `Cancelled.` になり設定が書かれないため、**`hermes config set` で非対話に組む**のが確実。
+
+### プロバイダごとの実測（キーの挙動）
+
+**`OPENROUTER_API_KEY`** — `sk-or-...`。無料の `:free` SKU を使うだけでもキーが要る。実測: 458 モデル /
+Free 21 件 / **実応答 11 件**。`:free` でも **403（モデル単位の提供元制限）** と **429（レート）** がある。
+未認証で叩くと `401 No cookie auth credentials found`。残量は `GET /api/v1/key` で確認できる。
+
+**`NVIDIA_API_KEY`** — `nvapi-...`。**一覧 82 件のうち 55 件は 404（アカウントで未有効）か 410（EOL）**で
+呼べないので、`freeagent_models(probe=true)` か `scripts/warmup_models.py` で生存確認してから使う。
+症状の読み分け: キー無し `401 authorization missing` / 不正キー `403 Authorization failed` /
+未有効モデル `404` / 廃止 `410`。
+
+**`HF_TOKEN`** — `hf_...`。別名 `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読む。
+**fine-grained トークンでは「Make calls to Inference Providers」を有効にする**必要があり、読み取りだけの
+トークンは全モデル 403 になる（実測: `does not have sufficient permissions to call Inference Providers`）。
+キーが有効でも推論できるとは限らない。加えて **無料枠は月次クレジット**で、尽きると全モデルが
+`402 You have depleted your monthly included credits` になる（サーバーは 402 を記憶せず別プロバイダへ回す）。
+`:together` 経由は **Cloudflare Error 1010** を返すことがあるので、その場合は `model:提供元`
+（例: `inclusionAI/Ling-3.0-flash-Fin:novita`）で別経路を試す。
+
+**`OPENALEX_API_KEY`** — **無料**。キー無しでも基本利用はできるが、キーがあると日次予算が 10 倍になる
+（提供元の記載では無料枠 100,000 credits/日・毎秒 100 リクエスト。超えると `429`）。<https://help.openalex.org/api/authentication/> / <https://api.openalex.org/rate-limit?api_key=…> で残量確認。
+**未設定だと匿名検索が提供元側で停止されうる**（実測: `503 Anonymous search is paused` と `429 Rate limit exceeded (Anonymous ...)` の両方）。
+単一 work の取得はキー無しでも通る。失敗は `results.openalex.error` に隔離され、他の 5 ソースは影響を
+受けない。
+
+**`GITHUB_TOKEN` / `GH_TOKEN`** — コード検索（`kind="code"`）は**トークン必須**で、無いとサーバーが
+`コード検索は GITHUB_TOKEN（または GH_TOKEN）が必要です` と返す（黙って空を返さない）。`repo` / `issue` は
+未認証でも動くが 60 req/h。`GH_TOKEN` は gh CLI と共用できる（`gh auth token`）。取得は classic なら
+`public_repo`、fine-grained なら public リポジトリの読み取り権限で足りる。
+
+**`FREEAGENT_MAILTO`** — キーではないが、Crossref と OpenAlex は連絡先を入れた UA / `mailto` を求める
+（polite pool）。未設定でも動くが、混雑時に共有枠へ回される。
+
+**`FREEAGENT_API_KEY` / `FREEAGENT_BASE_URL`** — `nous` プロバイダ（ローカルプロキシ）用。**キーは不要**
+で、`FREEAGENT_API_KEY` の既定値は形だけのプレースホルダ（プロキシが実資格情報を付与する）。プロキシが
+停止していると到達不可（`WinError 10061`）になり、表示は `⚠ nous … 到達不可` になる。`hermes proxy start`
+で復帰する。
+
 ## 6 つの知識バックエンド
 
 | ソース | 用途 | 認証 |
@@ -55,9 +133,9 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 | `wikipedia` | 百科（言語指定可） | 不要 |
 | `wikidata` | 構造化データ（QID・ラベル・説明） | 不要 |
 | `arxiv` | プレプリント検索 | 不要（**3 秒間隔のスロットル内蔵**） |
-| `crossref` | 出版論文のメタデータ・DOI | 不要（`KB_MAILTO` 推奨） |
-| `openalex` | 論文グラフ・被引用数 | 検索は `OPENALEX_API_KEY` が必要（後述） |
-| `github` | リポジトリ / Issue / コード | `GITHUB_TOKEN` 推奨（コード検索は必須） |
+| `crossref` | 出版論文のメタデータ・DOI | 不要（`FREEAGENT_MAILTO` 推奨） |
+| `openalex` | 論文グラフ・被引用数 | 検索は `OPENALEX_API_KEY` を推奨（無いと匿名検索が止められうる） |
+| `github` | リポジトリ / Issue / コード | `GITHUB_TOKEN` / `GH_TOKEN`（コード検索は必須） |
 
 `freeagent_lookup` と `freeagent_grounded` は 6 ソースを**並列に**引いて、重複を除いた出典リスト
 （`[1] タイトル URL`）を返す。**LLM を経由しないので幻覚が混入しない**。
@@ -129,12 +207,43 @@ hermes config set mcp_servers.freeagent-bind.enabled true
 | `FREEAGENT_ALLOW_AGENT` | 0 | `freeagent_delegate`（Hermes 本体の起動）を許可 |
 | `FREEAGENT_ARXIV_INTERVAL` | 3.0 | arXiv の最小呼び出し間隔（秒） |
 | `FREEAGENT_EMPTY_TOKEN_FLOOR` / `_CAP` | 512 / 2048 | 空応答時の予算引き上げ幅 |
-| `OPENROUTER_API_KEY` | 空 | OpenRouter の推論に必要 |
-| `NVIDIA_API_KEY` | 空 | NVIDIA NIM の推論に必要（一覧は未認証でも取れる） |
-| `HF_TOKEN` | 空 | Hugging Face の推論に必要（**Inference Providers 権限**。一覧は未認証でも取れる） |
-| `OPENALEX_API_KEY` | 空 | OpenAlex の検索に必要（後述） |
-| `KB_MAILTO` | 空 | Crossref/OpenAlex の polite pool 用メールアドレス |
-| `GITHUB_TOKEN` / `GH_TOKEN` | 空 | GitHub のレート制限緩和・コード検索 |
+| `FREEAGENT_USER_AGENT` | `hermes-freeagent-bind/0.1 (+…/hermes-freeagent-bind)` | 知識 API に名乗る UA（連絡先入りが望ましい） |
+| `FREEAGENT_MAILTO` | 空 | Crossref / OpenAlex の polite pool 用メールアドレス |
+| `FREEAGENT_CONNECT_TIMEOUT` / `FREEAGENT_READ_TIMEOUT` | 10.0 / 180.0 | 外部 HTTP の (connect, read) タイムアウト（秒） |
+| `FREEAGENT_KB_TTL` / `FREEAGENT_KB_TIMEOUT` | 1800.0 / 20.0 | 知識取得のキャッシュ TTL・読み取りタイムアウト（秒） |
+| `FREEAGENT_TRACE` / `FREEAGENT_STATS` / `FREEAGENT_COOLDOWN` | 1 | トレース・品質統計・クールダウンの記録 |
+| `FREEAGENT_DEBUG_LOG` | 空 | 指定パスへ stdio の送受信を 1 行ずつ追記（クライアント互換の切り分け用） |
+| `FREEAGENT_HERMES_BIN` | `hermes`（`which` で探索） | `freeagent_delegate` / サブエージェント起動に使う実行ファイル |
+
+**キー（プロバイダの資格情報）**
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `OPENROUTER_API_KEY` | 空 | OpenRouter の推論。無料 `:free` SKU でも必須（一覧は未認証でも取れる） |
+| `NVIDIA_API_KEY` | 空 | NVIDIA NIM の推論（一覧は未認証でも取れる。生存確認が必須） |
+| `HF_TOKEN`（別名 `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN`） | 空 | Hugging Face の推論。**Inference Providers 権限**が必要 |
+| `OPENALEX_API_KEY` | 空 | OpenAlex の検索。無いと匿名検索が停止されうる |
+| `GITHUB_TOKEN` / `GH_TOKEN` | 空 | GitHub のレート制限緩和（コード検索は必須） |
+| `FREEAGENT_API_KEY` | `proxy-attaches-real-credentials` | `nous` プロキシ用のダミー（実資格情報はプロキシが付与） |
+
+**接続先の上書き（通常は触らない）**
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `FREEAGENT_BASE_URL` | `http://127.0.0.1:8645/v1` | `nous` の接続先 |
+| `FREEAGENT_OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter の接続先 |
+| `FREEAGENT_NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | NVIDIA NIM の接続先 |
+| `FREEAGENT_HF_BASE_URL` | `https://router.huggingface.co/v1` | HF Inference Providers の接続先 |
+
+**蓄積ストアのパス上書き**（既定は `FREEAGENT_STATE_DIR` 配下。**ユーザーの予定・統計が消えない場所**に置く）
+
+| 変数 | 既定のファイル名 |
+|---|---|
+| `FREEAGENT_COOLDOWN_PATH` | `cooldowns.json`（404/410 は 1 時間、429 は `Retry-After`） |
+| `FREEAGENT_AUTH_PATH` | `provider_auth.json`（プロバイダ単位の認証失敗・`FREEAGENT_AUTH_TTL` 秒） |
+| `FREEAGENT_STATS_PATH` | `model_stats.json`（品質統計） |
+| `FREEAGENT_TRACE_PATH` | `traces.jsonl`（トレース） |
+| `FREEAGENT_SESSIONS_PATH` | `consult_sessions.json`（相談セッション） |
 
 ## 設計判断（実測に基づく）
 
@@ -195,6 +304,8 @@ python scripts/check_integrity.py            # レジストリ・スキーマ・
 python -m unittest discover -s tests         # オフライン回帰テスト
 python scripts/smoke_stdio.py                # 実クライアント経路（stdio）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存も確認
+env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py          # 鍵で実推論できるか
+env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py --page 25  # 生存確認を永続ストアへ
 ```
 
 ## ライセンス
