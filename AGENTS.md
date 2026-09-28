@@ -26,8 +26,11 @@ python scripts/smoke_stdio.py
 ```bash
 python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # TOOLS/HANDLERS の一致・スキーマ・版・content の規約
-python -m unittest discover -s tests         # オフライン回帰（65 件・ネットワーク不要）
+python -m unittest discover -s tests         # オフライン回帰（75 件・ネットワーク不要）
 python scripts/smoke_stdio.py                # 実クライアント経路（initialize/tools/list/tools/call）
+python scripts/check_offline.py              # バックエンド全滅: 例外漏れ・ハング・状態汚染が無いこと
+python scripts/measure_adoption.py           # 自発利用率の測定（state.db を読むだけ・副作用なし）
+python scripts/apply_proactive.py            # 率先利用の設定（既定は表示のみ。--apply で適用）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存（プロキシが要る）
 env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py   # モデルの生存確認を定着（数分）
 ```
@@ -75,6 +78,21 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py   # モデル�
 19. HF の料金・文脈長は**提供元単位**（`providers[]`）。`status == "live"` かつ `is_free`／価格 0 の
     提供元があるときだけ Free と判定する（`_is_hf` / `_free_providers` / `_context_length`）。
 20. ツールを増減したら `README.md` のツール表・`SPEC.md`・`tests/`・`scripts/` を同一変更内で更新する。
+21. **不通（プロキシ停止・DNS 不達・TCP 拒否・タイムアウト）では状態を一切書かない**（`is_env_failure` →
+    `observe_call` が no-op）。環境障害は**モデルの成績ではない**ので、統計に入れると「プロキシが落ちて
+    いた数分」が全モデルの評価を下げ、復旧後も選抜が歪む。トレースにも意味のある情報が無い（切り分けは
+    `FREEAGENT_DEBUG_LOG`）。この契約は `python scripts/check_offline.py` が**状態ディレクトリにファイルが
+    増えないこと**で検証する。**モデルの失敗（429 など）は従来どおり記録する**（no-op を広げすぎない）。
+22. **失敗応答には `structuredContent.next_action`（`kind` / `advice` / `fallback_tools` / `check` /
+    `reenable`）を付ける**。無効化・不通でも利用者のターンは続くので、ここで「再試行するな／代替はこれ」を
+    返さないと、存在しないツールを掘り続けるか同じ失敗を繰り返してターンと時間を捨てる（旧実装の実測）。
+    `content` には書かない（人間が読むチャネル。規約 3）。
+23. **自発利用の実効レバーは `description` ＋ 毎ターン注入される判断規則（memory / `SOUL.md`）＋
+    競合サーバーの汎用面を外すこと**（`mcp_servers.<name>.tools.exclude`）。MCP `instructions` は
+    **Hermes では読まれない**ので当てにしない（他クライアント向けに返すだけ）。記述の工夫だけでは
+    自発率が 1/2 で頭打ちになる（実測）。変更後は `python scripts/measure_adoption.py` で**最低 2 標本**
+    測る（実行中セッションは起動時のツール一覧を保持するので、測定は新プロセスで）。判断規則の文面は
+    `scripts/apply_proactive.py` が出すものを単一の出典にする（文面を散らすと乖離する）。
 
 ## ライセンス
 

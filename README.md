@@ -29,12 +29,13 @@
 1. [30 秒でわかる使い方](#30-秒でわかる使い方)
 2. [どのツールを使うか](#どのツールを使うか)
 3. [出力の読み方](#出力の読み方)
-4. [API キー](#api-キー)
-5. [推論バックエンド](#推論バックエンド)
-6. [知識バックエンド](#知識バックエンド)
-7. [つまずいたとき](#つまずいたとき)
-8. [環境変数](#環境変数)
-9. [既知の制約](#既知の制約) ・ [設計判断](#設計判断) ・ [検証](#検証) ・ [出自](#出自)
+4. [率先して使わせる（と、OFF でも壊れない）](#率先して使わせるoff-でも壊れない)
+5. [API キー](#api-キー)
+6. [推論バックエンド](#推論バックエンド)
+7. [知識バックエンド](#知識バックエンド)
+8. [つまずいたとき](#つまずいたとき)
+9. [環境変数](#環境変数)
+10. [既知の制約](#既知の制約) ・ [設計判断](#設計判断) ・ [検証](#検証) ・ [出自](#出自)
 
 ---
 
@@ -151,6 +152,53 @@ freeagent_map で、以下のタイトル 30 件を 1 件ずつ 1 行に要約�
 **「要再確認」** と付いたモデルは `slow` / `error` です。消してはいません（生きているが今は応えない、
 またはキーや枠の問題）。**クールダウン中**のモデルは除外ではなく後回しにされ、呼び出し結果の
 `skipped_cooling` に現れます。
+
+### 失敗したとき（`structuredContent.next_action`）
+
+失敗した呼び出しには **`next_action`** が付きます。`kind` で状況が分かり、`advice` に次の一手、
+`fallback_tools` に代替手段が入ります（`delegate_task` / `web_search` / `web_extract` など）。
+
+| `kind` | 意味 | すること |
+|---|---|---|
+| `unknown_tool` | ツールが無い（無効化されている可能性） | 探し直さない。`hermes mcp list` で確認し代替で続行 |
+| `unavailable_backend` | プロキシ停止・キー未設定・Free 0 件 | **再試行しない**（同じ失敗が返る）。代替へ回る |
+| `auth` | キー・権限の問題 | キーを直す（直せば即復帰） |
+| `rate_limited` | `429` | クールダウン期限まで待つ／別モデルへ回す |
+| `cooling` / `empty_answer` | 全候補が休止中／空応答 | 待つ・`models` を明示・`max_tokens` を上げて 1 回だけ再試行 |
+
+**不通のときは状態を一切書きません。** 接続不可・タイムアウトは「モデルの成績」ではないので、統計・
+トレース・クールダウンのどれにも記録しません（プロキシが落ちていた数分でモデルの評価が下がり、
+復旧後も選抜が歪むのを避けるため）。この契約は `python scripts/check_offline.py` が機械的に検証します。
+
+---
+
+## 率先して使わせる（OFF でも壊れない）
+
+**置けば使われるものではありません。** 実測では `description` の工夫だけでは自発率が **1/2 で頭打ち**、
+次を併用して **2/2** になりました。
+
+| 手順 | なぜ |
+|---|---|
+| `python scripts/apply_proactive.py --apply` | 用途の近い競合（`deliberation` の `ask_*` / `panel`）の**汎用面だけ**を外す。サーバーごと止めると使えるツールまで失う |
+| 表示される文面を memory（または `SOUL.md`）へ入れる | **毎ターン注入される場所に判断規則を置く**のが唯一効くレバー。`AGENTS.md` は cwd 依存で全セッションには効かない |
+| **Hermes を再起動** | MCP はホットリロードしない |
+| `python scripts/measure_adoption.py --sessions 20` | 効いたかどうかを `state.db` で測る。**最低 2 標本**（1/2 と 2/2 は標本 1 つでは区別できない） |
+
+> MCP の `instructions`（`initialize` 応答）は **Hermes では読まれません**（ソース確認済み）。他の
+> クライアント向けに返しています。頼み方は[プロンプト例](#4-メイン-llm-に頼むプロンプト例)のように
+> 用途で書くのが確実です（ツール名を書くと「名前で選ぶ」を測ってしまうので、測定時は書かない）。
+
+### OFF にしても壊れない
+
+`hermes config set mcp_servers.freeagent-bind.enabled false`（＋再起動）で無効にできます。無効・不通でも、
+**メイン LLM が代替で回答を完遂する**ように作ってあります。
+
+- 失敗のたびに `structuredContent.next_action` で**次の一手**を返す（存在しないツールを掘り続けない）
+- 不通では**状態を書かない**（統計・トレース・クールダウンに痕跡を残さない）
+- `scripts/apply_proactive.py` が出す文面に「**無効なら代替で完遂し、実際に応答した独立ソースの件数を
+  明記する**」を含めてある（1 件しか取れていないのに「複数視点で検討した」と書かないため）
+
+詳しい手順・落とし穴・実測値は **[docs/proactive-usage.md](docs/proactive-usage.md)** にあります。
 
 ---
 
@@ -314,6 +362,8 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 | arXiv が時々 `406` | 既知の提供元挙動（curl では再現しない） | 再試行（`results.arxiv.error` に出る。他ソースは生きる） |
 | クールダウンだらけで 1 体に縮退した | 429 が続けて記録された | キーを設定するか少し待つ（後回しにされるので補充される） |
 | 応答が空 | 思考トークンで予算を使い切った | `max_tokens` を上げる（サーバーも 1 回だけ自動で再試行する） |
+| `freeagent_*` を呼ぶが毎回失敗する | プロキシ停止・キー未設定（`next_action.kind` を見る） | 応答の `next_action.advice` に従う。`hermes proxy start` / キー設定 |
+| 少し待っても選ばれない（自発しない） | 競合の汎用面が残っている・判断規則が毎ターンの場所に無い | `python scripts/apply_proactive.py --apply` → memory へ文面 → 再起動 → 測定 |
 | 依頼した数より参加が少ない | 在庫に無い ref を指定した | content の `⚠️` に出る除外理由を確認（[出力の読み方](#出力の読み方)） |
 
 ---
@@ -449,6 +499,9 @@ python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # レジストリ・スキーマ・版の整合
 python -m unittest discover -s tests         # オフライン回帰テスト
 python scripts/smoke_stdio.py                # 実クライアント経路（stdio）
+python scripts/check_offline.py              # バックエンド全滅でも例外漏れ・ハング・状態汚染なし
+python scripts/measure_adoption.py           # 自発利用率を state.db から測る
+python scripts/apply_proactive.py            # 率先して使わせる設定（既定は表示のみ）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存も確認
 env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py          # 鍵で実推論できるか
 env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py --page 25  # 生存確認を永続ストアへ

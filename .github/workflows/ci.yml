@@ -39,6 +39,14 @@ jobs:
       - name: stdio smoke (real JSON-RPC path)
         run: python scripts/smoke_stdio.py
 
+      # バックエンド全滅（死んだポート・キー無し）でも例外を漏らさず、ハングせず、状態を汚さないこと。
+      - name: Offline degradation (no backend)
+        run: python scripts/check_offline.py
+
+      # 自発利用率の測定器が動くこと（state.db が無くても exit 2 で終わるだけ・副作用なし）。
+      - name: Adoption meter runs
+        run: python scripts/measure_adoption.py --sessions 5 || true
+
   lint-encoding:
     runs-on: ubuntu-latest
     steps:

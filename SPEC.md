@@ -41,7 +41,8 @@
 | `provider_auth.json` | 認証で失敗したプロバイダ（15 分・自動選抜から外す） | 消えてよい（次の 403 で再記録） |
 
 いずれも **tmp へ書いて `os.replace` で原子置換**し、`threading.Lock` で保護する。**一時領域には
-置かない**（統計とクールダウンが消えると挙動が巻き戻る）。
+置かない**（統計とクールダウンが消えると挙動が巻き戻る）。**環境障害（`is_env_failure`）の経路では
+どれも書かない**（§10 の 2）。つまりバックエンドが全滅している間、このディレクトリは**空のまま**になる。
 
 ## 3. 数値引数の契約
 
@@ -154,6 +155,8 @@
 - `initialize` の `protocolVersion` は**クライアント提示値をそのまま返す**。固定すると新しめの
   クライアントが `tools/list` を取り消し、60 秒タイムアウトに見える。
 - 未知メソッドは `-32601`、未知ツールは `isError: true` の結果として返す（JSON-RPC を壊さない）。
+- `initialize` の応答に **`instructions`**（`PROACTIVE_INSTRUCTIONS`）を載せる。ただし **Hermes は読まない**
+  （ソース確認済み）ので、Hermes での自発利用は `description` と memory / `SOUL.md` の判断規則で作る。
 
 ## 9. 拡張の手順（新しいツールを足すとき）
 
@@ -164,13 +167,44 @@
 5. `tests/` に回帰テストを足し、`scripts/check_integrity.py` と `scripts/smoke_stdio.py` を通す。
 6. README のツール表と、この SPEC の該当節を更新する（同一変更内で）。
 
-## 10. 検証
+## 10. OFF・不通時の縮退（副作用を残さない）
+
+無効化（`enabled false`）やバックエンド全滅でも**利用者のターンは続く**。ここで副作用を残すと、
+利用者からは「MCP を入れたら壊れた」と見える。契約は 3 つ。
+
+1. **例外を漏らさず、ハングしない。** 全ツールが `isError` か正常応答で返り、各呼び出しは
+   (connect, read) タイムアウトで打ち切られる（TCP が blackhole したホストへ素の呼び出しを投げると
+   分単位で固まり、並列で走っている他の呼び出しまで待たされる）。
+2. **不通では状態を書かない**（`is_env_failure` → `observe_call` が no-op）。環境障害はモデルの成績では
+   ないので、統計に入れると復旧後も選抜が歪む。トレース・クールダウンも同様に書かない。
+   **モデルの失敗（429・404・空応答など）は従来どおり記録する**（no-op にするのは環境障害だけ）。
+3. **失敗には次の一手を返す**（`structuredContent.next_action`）。`kind` は `unknown_tool` /
+   `unavailable_backend` / `auth` / `rate_limited` / `cooling` / `empty_answer` / `error` の 7 種で、
+   `advice` と（該当時）`fallback_tools` / `check` / `reenable` を伴う。**`content` には書かない**。
+   判断規則（memory / `SOUL.md`）側にも「無効なら代替で完遂し、実際に応答した独立ソースの件数を明記する」
+   を置く。これが無いと、OFF のまま存在しないツールを掘り続ける（旧実装の実測）。
+
+検証: `python scripts/check_offline.py`（死んだポートとキー無しで全ツールを呼び、
+例外漏れ 0・20 秒以内・`next_action` あり・**状態ディレクトリにファイルが増えない**ことを確認する）。
+
+## 11. 自発利用の設計（率先して使わせる）
+
+- モデルが見る唯一の窓口は **`description`**。共通サフィックス（§7.1）で【競合より優先】【並列】
+  【無効・不通のとき】を全ツールに一括付与する（手書きで散らすとドリフトする）。
+- **実効レバーは記述だけでは足りない**（実測 1/2 で頭打ち）。効くのは「毎ターン注入される判断規則」と
+  「競合の汎用面の除外」の併用（実測 2/2）。文面の単一の出典は `scripts/apply_proactive.py` の `SNIPPET`。
+- 測定は回答本文ではなく **`state.db` の `messages.tool_calls`** で行う（`scripts/measure_adoption.py`）。
+  遅延カタログ経由の呼び出しは `tool_call` として記録され、実名は `arguments.calls[].name` に入る。
+
+## 12. 検証
 
 ```bash
 python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # レジストリ・スキーマ・版の整合
-python -m unittest discover -s tests         # オフライン回帰（65 件）
+python -m unittest discover -s tests         # オフライン回帰（75 件）
 python scripts/smoke_stdio.py                # 実クライアント経路
+python scripts/check_offline.py              # 全滅時の縮退（例外漏れ・ハング・状態汚染なし）
+python scripts/measure_adoption.py           # 自発利用率（state.db を読むだけ）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存
 env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py   # モデルの生存確認を定着
 ```

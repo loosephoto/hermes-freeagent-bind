@@ -13,7 +13,7 @@
                                              §2.5 プロバイダ認証の記憶）
   §3 プロバイダとモデル  §4 サブLLM呼び出し    §5 知識バックエンド
   §6 ツール実装        §7 ツール定義         §8 表示（content）
-  §9 JSON-RPC / stdio
+  §8.5 失敗時の「次の一手」（structuredContent.next_action）   §9 JSON-RPC / stdio
 
 設計方針（旧 hermes-memex の実測で裏づけられた規約を継承）
   * 実行時依存ゼロ（標準ライブラリのみ）・stdio の JSON-RPC 2.0 を自前実装
@@ -48,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -137,6 +137,21 @@ PROVIDER_SPECS: dict[str, dict] = {
         "note": "Hugging Face Inference Providers（router。一覧は未認証でも取得可・推論はトークン必須）",
     },
 }
+# MCP の `initialize` 応答に載せる `instructions`。**Hermes はこれを読まない**（実測: 旧実装で
+# 自発率が上がらず、現行版のソース `tools/mcp_tool_*.py` にも参照が無いことを確認）。それでも
+# 他クライアント（Claude Desktop 等）は読むため返すが、**Hermes で効かせる唯一のレバーは
+# `description` と、毎ターン注入される memory / AGENTS.md の判断規則**（旧実装の実測: 記述だけでは
+# 1/2 で頭打ち、memory ＋ 競合の汎用面除外で 2/2）。
+PROACTIVE_INSTRUCTIONS = (
+    "Free モデルをサブ LLM として並列に走らせるサーバー。1 ターンで複数の freeagent_* を"
+    "並列に呼んでよい。独立した複数視点が要るとき（設計判断・リスク抽出・意見が割れそうな問い）は "
+    "freeagent_panel / freeagent_consult、出典が要るときは freeagent_lookup / freeagent_grounded、"
+    "大量要素の一括処理は freeagent_map を使う。delegate_task は同一モデルの分身で多様性が無い。"
+    "**このサーバーが無効・不通のときは、存在しないツールを探さず通常の手段で回答を完遂し、"
+    "実際に応答した独立ソースの件数を回答に明記する**（1 件しか取れていないのに「複数視点で検討した」"
+    "と書かない）。"
+)
+
 PROVIDER_ORDER = [n.strip() for n in os.environ.get(
     "FREEAGENT_PROVIDER_ORDER", "nous,openrouter,nvidia,huggingface").split(",")
     if n.strip() in PROVIDER_SPECS] or ["nous"]
@@ -588,6 +603,28 @@ def classify_error(err: str) -> str:
     return "other"
 
 
+# 環境障害（**モデルやプロバイダの責任ではない**失敗）。プロキシ停止・DNS 不達・TCP 拒否・
+# タイムアウトなど。品質統計に入れると「プロキシが落ちていた 10 分」が全モデルの成績を下げ、
+# 復旧後も選抜が歪む（副作用）。記録は残すが**統計には数えない**。
+_ENV_FAILURE_SIGNS = (
+    "urlerror", "winerror", "connection refused", "connectionrefused",
+    "connection reset", "connectionreset", "connection aborted",
+    "timed out", "timeout", "getaddrinfo", "name resolution", "network is unreachable",
+    "temporary failure in name resolution", "ssl", "proxy error", "no route to host",
+)
+
+
+def is_env_failure(err: str) -> bool:
+    """接続不可・タイムアウト等（＝モデルの成績ではない失敗）かどうか。"""
+    low = (err or "").lower()
+    if not low:
+        return False
+    if any(sign in low for sign in _ENV_FAILURE_SIGNS):
+        return True
+    # 「モデルが解決できませんでした（Free モデルが 0 件の可能性）」「推論可能な Free モデルが 0 件です」
+    return "モデルが 0 件" in err or "モデルが解決できませんでした" in err
+
+
 def note_observation(ref: str, kind: str, *, error: str = "", leak: bool = False,
                      trunc: bool = False, empty: bool = False, lat_ms: float = 0.0) -> None:
     """1 回の呼び出し結果を記録する（ok は「エラーが無く、空でもなく、切断もされていない」）。"""
@@ -817,6 +854,13 @@ def observe_call(result: dict, kind: str, text: str = "") -> None:
     if not ref:
         return
     error = as_str(result.get("error"))
+    if is_env_failure(error):
+        # **環境障害（プロキシ停止・DNS 不達・TCP 拒否）は状態を一切書かない。** モデルの成績ではないので
+        # 統計に入れると復旧後も選抜が歪み、トレースにも意味のある情報が無い（切り分けは
+        # FREEAGENT_DEBUG_LOG で足りる）。ここを no-op にすることで「不通でも副作用ゼロ」を
+        # `scripts/check_offline.py` が検証できる（状態ディレクトリにファイルが増えないこと）。
+        _debug("env_failure", {"ref": ref, "kind": kind, "error": error[:160]})
+        return
     note_observation(ref, kind,
                      error=error,
                      leak=bool(result.get("cot_leak")),
@@ -2826,6 +2870,43 @@ HANDLERS = {
 }
 
 
+# ---------------------------------------------------------------- §7.1 記述の共通サフィックス
+#
+# モデルが見る唯一の窓口は `description` 文字列（Hermes は MCP `instructions` を読まない。§0 参照）。
+# 旧実装の実測では、条件と差分だけでは自発率が **1/2 で頭打ち**だった（競合の実名を書いても同じ）。
+# 効くのは「毎ターン注入される場所の判断規則」と「競合の汎用面を外すこと」だが、記述側でも
+# **競合の実名**と**無効・不通時の振る舞い**を書いておくと、読まれた場合の選択が正しくなる。
+_EXTRA_DESC: dict[str, str] = {
+    "freeagent_panel": "【競合より優先】`delegate_task`（同一モデルの分身＝多様性ゼロ）や "
+                       "`deliberation` の ask_* を N 回並べる代わりにこれを使う。",
+    "freeagent_consult": "【競合より優先】`deliberation`（単発の意見集約）にはラウンド・合意度の推移・"
+                         "少数意見の保持が無い。往復して前提を更新したいならこれ。",
+    "freeagent_grounded": "【競合より優先】`web_search` は単一視点で根拠が本文に埋もれる。"
+                          "出典番号つきで複数モデルに答えさせたいならこれ。",
+    "freeagent_lookup": "【競合より優先】`web_search` より学術ソース（arXiv / Crossref / OpenAlex）と"
+                        "構造化データ（Wikidata）に強い。**LLM を経由しないので幻覚が混入しない**。",
+    "freeagent_agent": "【競合より優先】`delegate_task` は Hermes 本体を丸ごと起動する重い委譲。"
+                       "読み取り専用の調査で足りるならこれ（副作用なし）。",
+    "freeagent_delegate": "【競合より優先】`delegate_task` より独立性が高い（別プロセス）。"
+                          "ただし既定では無効（`FREEAGENT_ALLOW_AGENT=1` が要る）。",
+}
+_DESC_FALLBACK = (
+    "【無効・不通のとき】このサーバーが使えない場合（`enabled false` / バックエンド全滅）は、"
+    "**存在しないツールを探さず**、`delegate_task` / `web_search` / `web_extract` で回答を完遂し、"
+    "実際に応答した独立ソースの件数を回答に明記する（1 件で「複数視点で検討した」と書かない）。"
+)
+_DESC_PARALLEL = (
+    "【並列】1 ターンで他の freeagent_* と同時に呼んでよい（サーバーは同期本体をスレッドへ逃がす）。"
+)
+_PARALLEL_TOOLS = {"freeagent_models", "freeagent_ask", "freeagent_fanout", "freeagent_panel",
+                   "freeagent_lookup", "freeagent_grounded", "freeagent_map", "freeagent_consult"}
+
+for _tool in TOOLS:
+    _extra = _EXTRA_DESC.get(_tool["name"], "")
+    _parallel = _DESC_PARALLEL if _tool["name"] in _PARALLEL_TOOLS else ""
+    _tool["description"] = f'{_tool["description"]}{_extra}{_parallel}{_DESC_FALLBACK}'
+
+
 # ================================================================ §8 表示（content）
 #
 # content は**人間が読むチャネル**。LLM 向けの指示文を混ぜない（読み手に意味不明な文が出る）。
@@ -3048,6 +3129,76 @@ def _render_body(name: str, data: dict) -> str:
     return truncate(json.dumps(data, ensure_ascii=False), 2000)
 
 
+# ================================================================ §8.5 失敗時の「次の一手」
+#
+# この MCP が**無効化されている**（`enabled false`）か**バックエンドが全滅**していても、利用者の
+# ターンは続く。そこで「無理に探すな／代替はこれ」を機械可読で返さないと、存在しないツールを探す
+# 空振りや同一失敗の再試行でターンと時間を捨てる（旧実装の実測: OFF のまま「使う」と指示してあると
+# 存在しないツールを掘り続けた）。**content ではなく structuredContent に置く**（content は人間が
+# 読むチャネルで、指示文が混ざると意味不明な文が表示される）。
+
+def error_advice(data: dict) -> dict:
+    """失敗の種類に応じて、メイン LLM が次に取るべき行動を返す。"""
+    err = as_str(data.get("error"))
+    if not err and data.get("unknown_tool"):
+        err = "unknown tool"
+    advice: dict = {"tool_available": False}
+
+    if data.get("unknown_tool"):
+        advice.update({
+            "kind": "unknown_tool",
+            "advice": ("このツール名は存在しない（サーバーが無効化されているか、提供されていない）。"
+                       "tool_search / tool_describe で掘り直さない。多視点が必要なら別の手段で続行する。"),
+            "check": "hermes mcp list | grep freeagent-bind  → ✓ enabled / ✗ disabled",
+            "reenable": "hermes config set mcp_servers.freeagent-bind.enabled true   # 反映には再起動",
+        })
+    elif is_env_failure(err) or "Free モデルが 0 件" in err or "モデルが解決できませんでした" in err:
+        advice.update({
+            "kind": "unavailable_backend",
+            "advice": ("推論バックエンドに到達できない。**同じ呼び出しを繰り返さない**（同じ失敗が返る）。"
+                       "この MCP に依存せずターンを完遂し、多視点が必要なら下の fallback_tools を使う。"
+                       "代替に落ちたら、実際に応答した独立ソースの件数を回答に明記する。"),
+            "fallback_tools": ["delegate_task", "web_search", "web_extract"],
+            "check": "hermes proxy start  → curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8645/v1/models",
+            "reenable": "hermes proxy start（プロキシ）／キー設定（hermes config set "
+                        "mcp_servers.freeagent-bind.env.<NAME> '<値>'）→ 反映には再起動",
+        })
+    elif classify_error(err) == "auth":
+        advice.update({
+            "kind": "auth",
+            "advice": ("キーまたは権限の問題。このプロバイダは自動選抜から外れる（明示指定なら試される）。"
+                       "キーを直せば即復帰する。直すまでは他のプロバイダか fallback_tools で続行する。"),
+            "fallback_tools": ["delegate_task", "web_search"],
+            "check": "env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py",
+        })
+    elif classify_error(err) == "rate_limited":
+        advice.update({
+            "kind": "rate_limited",
+            "advice": ("レート上限（429）。クールダウンの期限まで待つか、別モデル・別プロバイダへ回す。"
+                       "即時の再試行は上限を悪化させるだけで、同じ結果になる。"),
+            "fallback_tools": ["web_search", "delegate_task"],
+        })
+    elif "クールダウン中" in err:
+        advice.update({
+            "kind": "cooling",
+            "advice": ("全候補がクールダウン中。待つか、他のモデルを `models` で明示して呼ぶ。"),
+        })
+    elif "空応答" in err:
+        advice.update({
+            "kind": "empty_answer",
+            "advice": ("空応答（思考トークンで予算を使い切った可能性）。`max_tokens` を増やして 1 回だけ"
+                       "再試行する。増やしても空なら、そのモデルを回答として扱わない。"),
+        })
+    else:
+        advice.update({
+            "kind": "error",
+            "advice": ("失敗。**同一引数での即時再試行は避ける**（同じ結果になる）。入力を変えるか、"
+                       "fallback_tools で続行する。"),
+            "fallback_tools": ["web_search"],
+        })
+    return advice
+
+
 # ================================================================ §9 JSON-RPC / stdio
 
 def write_line(line: str) -> None:
@@ -3096,7 +3247,10 @@ def handle_tool_call(params: dict) -> dict:
         args = {}
     handler = HANDLERS.get(name)
     if handler is None:
-        return {"content": [{"type": "text", "text": f"未知のツール: {name}"}], "isError": True}
+        data = {"error": f"未知のツール: {name}", "unknown_tool": True}
+        data["next_action"] = error_advice(data)
+        return {"content": [{"type": "text", "text": f"未知のツール: {name}（無効化されている可能性）"}],
+                "structuredContent": data, "isError": True}
     try:
         data = handler(args)
     except Exception as exc:  # ツールは絶対に例外を漏らさない
@@ -3104,6 +3258,9 @@ def handle_tool_call(params: dict) -> dict:
     if not isinstance(data, dict):
         data = {"error": f"internal error: handler returned {type(data).__name__}"}
     is_error = bool(data.get("error"))
+    if is_error:
+        # 失敗してもターンは続く。**次の一手**を機械可読で返す（content には書かない）。
+        data.setdefault("next_action", error_advice(data))
     text = render(name, data)
     if is_error:
         text = "⚠️ 実行は失敗しました。structuredContent.error を確認してください。\n" + text
@@ -3136,6 +3293,8 @@ def serve() -> None:
                 "protocolVersion": negotiate_protocol(offered),
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                # 他クライアント向け（Hermes は読まない。§0 の実測メモを参照）。
+                "instructions": PROACTIVE_INSTRUCTIONS,
             })
         elif method in ("notifications/initialized", "initialized"):
             continue

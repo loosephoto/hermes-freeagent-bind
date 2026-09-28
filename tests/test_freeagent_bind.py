@@ -677,6 +677,87 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
             self.assertIn("free_models", S.tool_models({}))
 
 
+class TestOfflineTolerance(unittest.TestCase):
+    """不通・OFF でも副作用を残さない（旧実装の「OFF 時のエラー処理」を再構成した部分）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="fa-offline-test-")
+        self.env = unittest.mock.patch.dict(os.environ, {
+            "FREEAGENT_STATS_PATH": os.path.join(self.tmp, "model_stats.json"),
+            "FREEAGENT_TRACE_PATH": os.path.join(self.tmp, "traces.jsonl"),
+            "FREEAGENT_COOLDOWN_PATH": os.path.join(self.tmp, "cooldowns.json"),
+        })
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_env_failure_signatures(self):
+        for err in ["<urlopen error [WinError 10061] 対象のコンピューターによって拒否された",
+                    "URLError: connection refused", "HTTPSConnectionPool: Read timed out.",
+                    "ConnectionResetError", "getaddrinfo failed",
+                    "URLError: tunnel connection failed: 502 Bad Gateway (proxy error)"]:
+            self.assertTrue(S.is_env_failure(err), f"{err!r} は環境障害のはず")
+        # モデルの責任である失敗は環境障害にしない（統計から消えてはいけない）
+        for err in ["HTTP 429", "HTTP 404", "HTTP 402", "HTTP 401", "空応答", ""]:
+            self.assertFalse(S.is_env_failure(err), f"{err!r} を環境障害にしてはいけない")
+
+    def test_env_failure_writes_no_state(self):
+        """プロキシ停止・DNS 不達では、統計にもトレースにもクールダウンにも**書かない**。"""
+        S.observe_call({"ref": "m:free", "error": "URLError: [WinError 10061] connection refused"},
+                       "ask", "")
+        self.assertEqual(sorted(os.listdir(self.tmp)), [], "状態ファイルが作られている（副作用）")
+
+    def test_model_failure_still_recorded(self):
+        """モデルの失敗（429 等）は従来どおり記録する（環境障害だけを no-op にする）。"""
+        S.observe_call({"ref": "m:free", "error": "HTTP 429 rate limited"}, "ask", "")
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "traces.jsonl")),
+                        "モデルの失敗はトレースに残る")
+        row = S._STATS["models"]["m:free"]["kinds"]["ask"]
+        self.assertEqual(row["err"].get("rate_limited"), 1, "429 は統計に数える")
+
+    def test_error_advice_kinds(self):
+        cases = [
+            ({"error": "未知のツール: freeagent_x", "unknown_tool": True}, "unknown_tool"),
+            ({"error": "推論可能な Free モデルが 0 件です。`hermes proxy start`"}, "unavailable_backend"),
+            ({"error": "接続できません: URLError connection refused"}, "unavailable_backend"),
+            ({"error": "HTTP 401 invalid api key"}, "auth"),
+            ({"error": "HTTP 429 rate limited"}, "rate_limited"),
+            ({"error": "候補はすべてクールダウン中です"}, "cooling"),
+            ({"error": "空応答（max_tokens 不足の可能性）"}, "empty_answer"),
+            ({"error": "謎の失敗"}, "error"),
+        ]
+        for data, kind in cases:
+            got = S.error_advice(dict(data))
+            self.assertEqual(got["kind"], kind, f"{data!r} → {got['kind']}")
+            self.assertFalse(got["tool_available"])
+            self.assertTrue(got["advice"], "advice が空")
+        # 代替手段まで落ちる種類には fallback_tools がある（再試行でターンを捨てない）
+        self.assertIn("web_search", S.error_advice({"error": "URLError connection refused"})["fallback_tools"])
+
+    def test_handle_tool_call_attaches_next_action(self):
+        r = S.handle_tool_call({"name": "freeagent_does_not_exist", "arguments": {}})
+        self.assertTrue(r["isError"])
+        sc = r["structuredContent"]
+        self.assertEqual(sc["next_action"]["kind"], "unknown_tool")
+        self.assertIn("reenable", sc["next_action"])
+        # content は人間向け（指示文を混ぜない）
+        text = r["content"][0]["text"]
+        self.assertNotIn("structuredContent", text)
+
+    def test_instructions_and_description_carry_offline_rule(self):
+        self.assertTrue(S.PROACTIVE_INSTRUCTIONS)
+        self.assertIn("無効", S.PROACTIVE_INSTRUCTIONS)
+        for d in S.TOOLS:
+            self.assertIn("【無効・不通のとき】", d["description"], d["name"])
+        for name in ("freeagent_panel", "freeagent_consult", "freeagent_grounded", "freeagent_lookup"):
+            desc = next(d["description"] for d in S.TOOLS if d["name"] == name)
+            self.assertIn("【競合より優先】", desc, name)
+            self.assertIn("【並列】", desc, name)
+
+
 class TestVersionConsistency(unittest.TestCase):
     def test_pyproject_matches_server_version(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
