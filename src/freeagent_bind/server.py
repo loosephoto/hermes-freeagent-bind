@@ -2797,17 +2797,28 @@ def render(name: str, data: dict) -> str:
     if name == "freeagent_models":
         lines = []
         for row in data.get("providers") or []:
-            mark = "✓" if row.get("ready") else "—"
+            # ✓ は「資格情報がある」だけでなく「一覧が取れている」ことも表す。取れていないのに ✓ だと、
+            # モデル 0 件の理由（プロキシ停止など）が分からない（実測: nous が ✓ 0 件で並んだ）。
+            if row.get("ready") and not row.get("error"):
+                mark = "✓"
+            elif row.get("ready"):
+                mark = "⚠"
+            else:
+                mark = "—"
             note = f"  [{row['key_env']} 未設定 → 検索のみ]" if not row.get("ready") and row.get("key_env") else ""
             lines.append(f"  {mark} {row['provider']:11} {row['models']:4} モデル / Free {row['free']:3}{note}")
             if row.get("error"):
-                lines.append(f"      エラー: {row['error'][:100]}")
+                lines.append(f"      到達不可: {row['error'][:100]}")
         head = (f"サブLLMバックエンド（{sum(1 for r in data.get('providers') or [] if r.get('ready'))} プロバイダ有効）\n"
                 + "\n".join(lines))
         head += (f"\nFree候補 {data.get('free_candidates')} 件（うち今すぐ使用可 {data.get('usable_now')}）"
                  f" / 全 {data.get('total_models')} モデル\n既定: {data.get('default_model')}")
-        if data.get("cooling"):
-            head += "\nクールダウン中: " + ", ".join(data["cooling"])
+        cooling = data.get("cooling") or {}
+        if cooling:
+            # 全部並べると 1 行が長すぎて読めない（実測: 55 件で画面が埋まった）。先頭だけ出して件数を添える。
+            shown = list(cooling)[:8]
+            head += (f"\nクールダウン中 {len(cooling)} 件: " + ", ".join(shown)
+                     + (f" … 他 {len(cooling) - len(shown)} 件" if len(cooling) > len(shown) else ""))
         q = data.get("query")
         if q:
             head += (f"\n\n🔍 検索: query={q.get('query')!r} provider={q.get('provider')}"
