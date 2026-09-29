@@ -12,7 +12,7 @@
                                              §2.3 トレース / §2.4 相談セッション /
                                              §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 /
                                              §2.7 思考台帳の構造（分解・改訂・分岐・仮説））
-  §3 プロバイダとモデル  §4 サブLLM呼び出し    §5 知識バックエンド
+  §3 プロバイダとモデル  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切りつきの並列取得）
   §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案）
   §7 ツール定義         §8 表示（content）
   §8.5 失敗時の「次の一手」（structuredContent.next_action）
@@ -2266,9 +2266,69 @@ KB_BACKENDS = {
 }
 
 
+# ---------------------------------------------------------------- §5.8 締め切りつきの並列取得
+#
+# 旧実装は `run_parallel` で**全ソースの完了を待っていた**。1 リクエストの上限は KB_TIMEOUT（20 秒）で、
+# Wikidata は最大 3 回を直列に呼ぶため、1 つが遅れると全体がそれだけ待たされた。さらに並列数が
+# min(ソース数, MAX_WORKERS=4) で、6 ソースでは 2 つが前の完了待ちになっていた（コードで確認）。
+#   * ソースごとに専用スレッド（ソースはすべて別ホストなので、ホスト単位のリクエスト数は増えない）
+#   * 全体の締め切り KB_DEADLINE（既定 8 秒。平常時の実測は 6 ソースとも 0.4〜2.4 秒）まで待ち、
+#     間に合わなかったソースは `timed_out` の**脱落として返す**（隠さない）
+#   * 脱落したソースの取得は裏で続ける。各ソースは `_kb_cached` を通るので、完了すれば次の呼び出しで
+#     キャッシュから即座に返る（同じ問いの再試行が速くなる）
+#   * ソースごとの所要秒を `timings` に載せる（遅いソースと時間帯を後から特定するため）
+KB_DEADLINE = max(1.0, min(120.0, _env_float("FREEAGENT_KB_DEADLINE", 8.0)))
+
+
+def _kb_gather(picked: list[str], query: str, limit: int, opts: dict,
+               deadline: float | None = None) -> tuple[dict, dict]:
+    """(ソース → 結果, ソース → 所要秒) を返す。締め切りを過ぎたソースは timed_out の結果にする。"""
+    deadline = KB_DEADLINE if deadline is None else deadline
+    done: dict[str, dict] = {}
+    spent: dict[str, float] = {}
+    lock = threading.Lock()
+    finished = threading.Event()
+    remaining = [len(picked)]
+
+    def work(src: str) -> None:
+        start = time.monotonic()
+        try:
+            res = KB_BACKENDS[src](query, limit, opts)
+        except Exception as exc:  # 例外を外へ漏らさない（規約 1）
+            res = {"error": f"{type(exc).__name__}: {exc}"}
+        with lock:
+            done[src] = res if isinstance(res, dict) else {"error": "不正な結果"}
+            spent[src] = round(time.monotonic() - start, 2)
+            remaining[0] -= 1
+            if remaining[0] <= 0:
+                finished.set()
+
+    if not picked:
+        return {}, {}
+    for src in picked:
+        threading.Thread(target=work, args=(src,), name=f"kb-{src}", daemon=True).start()
+    finished.wait(deadline)
+    with lock:
+        by_source = {src: done[src] for src in picked if src in done}
+        timings = dict(spent)
+    for src in picked:
+        if src not in by_source:
+            by_source[src] = {
+                "error": (f"締め切り {deadline:g} 秒に間に合いませんでした（取得は続けており、"
+                          "終われば同じ問いの次回はキャッシュから返ります）"),
+                "timed_out": True, "items": [], "citations": []}
+            timings[src] = None
+    return {src: by_source[src] for src in picked}, timings
+
+
 def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int = 3,
-                     lang: str = "ja", kind: str = "repo", max_workers: int | None = None) -> dict:
-    """指定ソースを**並列に**引いて、出典つきでまとめる。LLM を使わないので幻覚が入らない。"""
+                     lang: str = "ja", kind: str = "repo", max_workers: int | None = None,
+                     deadline: float | None = None) -> dict:
+    """指定ソースを**並列に**引いて、出典つきでまとめる。LLM を使わないので幻覚が入らない。
+
+    全体の締め切り（`KB_DEADLINE`）までに届いた分だけ返す（§5.8）。`max_workers` は互換のため
+    受け取るが使わない（ソースごとに専用スレッド）。
+    """
     query = as_str(query)
     if not query:
         return {"error": "query は必須です", "query": query}
@@ -2282,10 +2342,7 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
                 "errors": {"sources": message}, "error": message, "llm_used": False}
     limit = as_int(limit, 3, 1, 10)
     opts = {"lang": as_str(lang, "ja"), "kind": as_str(kind, "repo")}
-    results = run_parallel(
-        picked, lambda src: KB_BACKENDS[src](query, limit, opts),
-        max_workers=max_workers or min(len(picked), MAX_WORKERS))
-    by_source = {src: res for src, res in zip(picked, results)}
+    by_source, timings = _kb_gather(picked, query, limit, opts, deadline)
     citations: list[dict] = []
     errors = {}
     for src, res in by_source.items():
@@ -2294,9 +2351,14 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
         if res.get("error"):
             errors[src] = res["error"]
         citations.extend(res.get("citations") or [])
-    return {"query": query, "sources": picked, "unknown_sources": unknown,
-            "results": by_source, "citations": citations, "citation_count": len(citations),
-            "errors": errors, "llm_used": False}
+    late = [src for src, res in by_source.items() if isinstance(res, dict) and res.get("timed_out")]
+    out = {"query": query, "sources": picked, "unknown_sources": unknown,
+           "results": by_source, "citations": citations, "citation_count": len(citations),
+           "errors": errors, "llm_used": False, "timings": timings,
+           "deadline_s": KB_DEADLINE if deadline is None else deadline}
+    if late:
+        out["timed_out"] = late
+    return out
 
 
 # ================================================================ §6 ツール実装
@@ -4271,13 +4333,26 @@ def _render_body(name: str, data: dict) -> str:
         return "\n".join(lines)
 
     if name == "freeagent_lookup":
-        lines = [f"出典 {data.get('citation_count')} 件（{', '.join(data.get('sources') or [])}）"]
+        timings = data.get("timings") or {}
+        late = data.get("timed_out") or []
+        head = f"出典 {data.get('citation_count')} 件（{', '.join(data.get('sources') or [])}）"
+        if late:
+            head += f" / 締め切り {data.get('deadline_s')} 秒に間に合わず {len(late)} 件"
+        lines = [head]
+
+        def secs(src: str) -> str:
+            t = timings.get(src)
+            return f"・{t:.1f} 秒" if isinstance(t, (int, float)) else ""
+
         for src, res in (data.get("results") or {}).items():
             items = res.get("items") or []
-            if not items:
-                lines.append(f"  × {src}: {(res.get('error') or '該当なし')[:90]}")
+            if res.get("timed_out"):
+                lines.append(f"  ⏱ {src}: 締め切りに間に合いませんでした（取得は継続・次回はキャッシュから）")
                 continue
-            lines.append(f"  ✓ {src} ({len(items)} 件)")
+            if not items:
+                lines.append(f"  × {src}{secs(src)}: {(res.get('error') or '該当なし')[:90]}")
+                continue
+            lines.append(f"  ✓ {src} ({len(items)} 件{secs(src)})")
             for item in items[:2]:
                 title = item.get("title") or item.get("label") or ""
                 lines.append(f"      {truncate(title, 90)} — {item.get('url', '')}")

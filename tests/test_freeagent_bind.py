@@ -1694,6 +1694,125 @@ class TestFallbackIndependence(unittest.TestCase):
         self.assertEqual(S.parse_alternatives("代替", truncated=True), [])
 
 
+class TestKnowledgeDeadline(unittest.TestCase):
+    """§5.8: 知識取得は締め切りまでに届いた分だけ返し、遅いソースで全体を待たせない。"""
+
+    def _backends(self, **delays):
+        def make(name, delay):
+            def fn(q, limit, opts):
+                if delay == "raise":
+                    raise RuntimeError("boom")
+                time.sleep(delay)
+                return {"items": [{"title": name, "url": f"https://x/{name}"}],
+                        "citations": [{"source": name, "title": name, "url": f"https://x/{name}"}]}
+            return fn
+        return unittest.mock.patch.dict(S.KB_BACKENDS, {k: make(k, v) for k, v in delays.items()}, clear=True)
+
+    def test_slow_source_is_reported_not_waited_for(self):
+        with self._backends(fast=0.0, slow=3.0):
+            t = time.monotonic()
+            out = S.knowledge_lookup("q", ["fast", "slow"], deadline=0.4)
+            spent = time.monotonic() - t
+        self.assertLess(spent, 1.5, "遅いソースの完了を待たない")
+        self.assertEqual(out["timed_out"], ["slow"])
+        self.assertTrue(out["results"]["slow"]["timed_out"])
+        self.assertIn("slow", out["errors"], "脱落を隠さない")
+        self.assertEqual(out["citation_count"], 1)
+        self.assertIsInstance(out["timings"]["fast"], float)
+        self.assertIsNone(out["timings"]["slow"])
+        self.assertEqual(list(out["results"]), ["fast", "slow"], "要求した順を保つ")
+
+    def test_all_sources_run_at_once(self):
+        """旧実装は並列 4 で 6 ソース中 2 つが待ち行列に入った。"""
+        names = {f"s{i}": 0.5 for i in range(6)}
+        with self._backends(**names):
+            t = time.monotonic()
+            out = S.knowledge_lookup("q", list(names), deadline=5)
+            spent = time.monotonic() - t
+        self.assertNotIn("timed_out", out)
+        self.assertLess(spent, 0.95, f"6 ソースが同時に走っていない（{spent:.2f} 秒）")
+
+    def test_backend_exception_does_not_leak(self):
+        with self._backends(ok=0.0, bad="raise"):
+            out = S.knowledge_lookup("q", ["ok", "bad"], deadline=2)
+        self.assertIn("RuntimeError", out["errors"]["bad"])
+        self.assertEqual(out["citation_count"], 1)
+
+    def test_late_result_lands_in_cache_for_next_call(self):
+        key = f"test-late:{time.time()}"
+
+        def slow(q, limit, opts):
+            return S._kb_cached(key, lambda: (time.sleep(0.5), {"items": [{"title": "late"}],
+                                                                "citations": [{"title": "late"}]})[1])
+        with unittest.mock.patch.dict(S.KB_BACKENDS, {"slow": slow}, clear=True):
+            first = S.knowledge_lookup("q", ["slow"], deadline=0.1)
+            self.assertEqual(first["timed_out"], ["slow"])
+            time.sleep(0.8)
+            t = time.monotonic()
+            second = S.knowledge_lookup("q", ["slow"], deadline=0.3)
+            self.assertLess(time.monotonic() - t, 0.25, "裏で完了した分はキャッシュから即座に返る")
+        self.assertNotIn("timed_out", second)
+        self.assertEqual(second["citation_count"], 1)
+        with S._KB_CACHE_LOCK:
+            S._KB_CACHE.pop(key, None)
+
+    def test_render_shows_seconds_and_timeouts(self):
+        with self._backends(fast=0.0, slow=3.0):
+            out = S.knowledge_lookup("q", ["fast", "slow"], deadline=0.3)
+        text = S.render("freeagent_lookup", out)
+        self.assertIn("間に合わず 1 件", text)
+        self.assertIn("⏱ slow", text)
+        self.assertRegex(text, r"✓ fast \(1 件・\d+\.\d 秒\)")
+
+    def test_measure_kb_round_report_and_trim(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "measure_kb", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                       "scripts", "measure_kb.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as tmp, \
+             unittest.mock.patch.dict(os.environ, {"FREEAGENT_KB_LATENCY_PATH": os.path.join(tmp, "k.jsonl")}), \
+             self._backends(a=0.0, b="raise"):
+            rows = mod.measure_round(0)
+            self.assertEqual({r["source"] for r in rows}, {"a", "b"})
+            self.assertFalse(any(r["env_failure"] for r in rows), "片方だけの失敗はネットワーク障害ではない")
+            self.assertNotIn("title", json.dumps(rows), "本文（タイトル等）は記録しない")
+            mod.append(rows)
+            with unittest.mock.patch.object(mod, "MAX_LINES", 3):
+                mod.append(rows)
+                mod.append(rows)
+            with open(os.path.join(tmp, "k.jsonl"), encoding="utf-8") as fh:
+                self.assertEqual(len(fh.readlines()), 3, "上限を超えたら古い行から捨てる")
+            buf = __import__("io").StringIO()
+            with unittest.mock.patch.object(sys, "stdout", buf):
+                self.assertEqual(mod.report(), 0)
+            self.assertIn("ソース別", buf.getvalue())
+        with unittest.mock.patch.dict(S.KB_BACKENDS, {
+                "x": lambda q, l, o: {"error": "URLError: <urlopen error [WinError 10061]>"},
+                "y": lambda q, l, o: {"error": "TimeoutError: timed out"}}, clear=True):
+            self.assertTrue(all(r["env_failure"] for r in mod.measure_round(0)),
+                            "全滅かつ接続系ならこちらのネットワーク障害として区別する")
+
+    def test_scheduled_tick_counts_down_and_unschedules(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "measure_kb2", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                        "scripts", "measure_kb.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, \
+             unittest.mock.patch.dict(os.environ, {"FREEAGENT_KB_LATENCY_PATH": os.path.join(tmp, "k.jsonl")}), \
+             unittest.mock.patch.object(mod, "unschedule", lambda: calls.append(1) or 0):
+            mod._write_remaining(2)
+            self.assertTrue(mod._scheduled_tick())
+            self.assertEqual(calls, [])
+            self.assertTrue(mod._scheduled_tick(), "最後の 1 回は計測する")
+            self.assertEqual(calls, [1], "最後の 1 回でタスクを消す")
+            self.assertFalse(mod._scheduled_tick(), "残りが無ければ計測しない")
+
+
 class TestVersionConsistency(unittest.TestCase):
     def test_pyproject_matches_server_version(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
