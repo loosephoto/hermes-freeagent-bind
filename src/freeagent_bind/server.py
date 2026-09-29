@@ -1649,6 +1649,36 @@ def _kb_cached(key: str, producer):
             event.set()
 
 
+def _plain_text(text: str, limit: int = 600) -> str:
+    """マークアップ（JATS/HTML）と余分な空白を落として本文だけにする。
+
+    Crossref の abstract は `<jats:p>…</jats:p>` 形式で返るため、そのまま注入すると
+    タグが本文を占めてサブLLMが読めない。
+    """
+    return truncate(" ".join(re.sub(r"<[^>]+>", " ", text or "").split()), limit)
+
+
+def _openalex_abstract(row: dict, limit: int = 500) -> str:
+    """OpenAlex は本文を `abstract_inverted_index`（語 → 位置の配列）で返すので復元する。
+
+    そのままでは人間にもサブLLMにも読めず、citation の summary が空になっていた。
+    """
+    inv = row.get("abstract_inverted_index")
+    if not isinstance(inv, dict):
+        return ""
+    placed: dict[int, str] = {}
+    for word, positions in inv.items():
+        if not isinstance(positions, (list, tuple)):
+            continue
+        for pos in positions:
+            index = as_int(pos, -1, 0, 10**6)
+            if index >= 0:
+                placed.setdefault(index, str(word))
+    if not placed:
+        return ""
+    return truncate(" ".join(placed[k] for k in sorted(placed)), limit)
+
+
 def _cite(source: str, title: str, url: str, **extra) -> dict:
     row = {"source": source, "title": truncate((title or "").strip(), 300), "url": url}
     for key, value in extra.items():
@@ -1689,7 +1719,8 @@ def kb_wikipedia(query: str, lang: str = "ja", limit: int = 3) -> dict:
             summary = re.sub(r"<[^>]+>", "", as_str(hit.get("extract")))
             items.append({"title": title, "url": page_url, "summary": truncate(summary, 1200),
                           "snippet": truncate(summary, 300)})
-            cites.append(_cite("wikipedia", title, page_url, lang=lang))
+            cites.append(_cite("wikipedia", title, page_url, lang=lang,
+                               summary=_plain_text(summary, 600)))
         return {"source": "wikipedia", "lang": lang, "items": items, "citations": cites,
                 "error": "" if items else "該当なし"}
 
@@ -1761,7 +1792,8 @@ def kb_wikidata(query: str, lang: str = "ja", limit: int = 3) -> dict:
             items.append({"id": qid, "label": hit.get("label") or "",
                           "description": hit.get("description") or "",
                           "url": url, "claims": rows})
-            cites.append(_cite("wikidata", hit.get("label") or qid, url, qid=qid))
+            cites.append(_cite("wikidata", hit.get("label") or qid, url, qid=qid,
+                               summary=_plain_text(hit.get("description") or "", 300)))
         return {"source": "wikidata", "lang": lang, "items": items, "citations": cites,
                 "error": "" if items else "該当なし"}
 
@@ -1836,7 +1868,8 @@ def kb_arxiv(query: str, limit: int = 5) -> dict:
             })
             cites.append(_cite("arxiv", title, link,
                                year=(entry.findtext("a:published", "", ns) or "")[:4],
-                               authors=authors[:3]))
+                               authors=authors[:3],
+                               summary=_plain_text(summary, 600)))
         return {"source": "arxiv", "items": items, "citations": cites,
                 "error": "" if items else "該当なし"}
 
@@ -1851,7 +1884,7 @@ def kb_crossref(query: str, limit: int = 5) -> dict:
 
     def produce() -> dict:
         params = {"query": query, "rows": limit,
-                  "select": "DOI,title,author,issued,container-title,type,URL,is-referenced-by-count,publisher"}
+                  "select": "DOI,title,author,issued,container-title,type,URL,abstract,is-referenced-by-count,publisher"}
         if KB_MAILTO:
             params["mailto"] = KB_MAILTO
         data, err = kb_json("https://api.crossref.org/works?" + urllib.parse.urlencode(params))
@@ -1874,7 +1907,8 @@ def kb_crossref(query: str, limit: int = 5) -> dict:
                           "publisher": row.get("publisher") or "",
                           "cited_by": row.get("is-referenced-by-count"),
                           "authors": authors[:8], "url": url})
-            cites.append(_cite("crossref", title, url, year=year, doi=row.get("DOI") or ""))
+            cites.append(_cite("crossref", title, url, year=year, doi=row.get("DOI") or "",
+                               summary=_plain_text(row.get("abstract") or "", 500)))
         return {"source": "crossref", "items": items, "citations": cites,
                 "error": "" if items else "該当なし"}
 
@@ -1918,7 +1952,8 @@ def kb_openalex(query: str, limit: int = 5) -> dict:
                           "oa_url": oa.get("oa_url") or "", "is_oa": bool(oa.get("is_oa")),
                           "type": row.get("type") or ""})
             cites.append(_cite("openalex", title, url, year=row.get("publication_year"),
-                               cited_by=row.get("cited_by_count")))
+                               cited_by=row.get("cited_by_count"),
+                               summary=_openalex_abstract(row)))
         return {"source": "openalex", "items": items, "citations": cites,
                 "error": "" if items else "該当なし"}
 
@@ -1970,7 +2005,11 @@ def kb_github(query: str, kind: str = "repo", limit: int = 5) -> dict:
                 items.append({"title": title, "url": row.get("html_url") or "",
                               "repository": ((row.get("repository") or {}).get("full_name")) or "",
                               "path": row.get("path") or ""})
-            cites.append(_cite("github", title, row.get("html_url") or "", kind=kind))
+            body_text = (row.get("description") or "") if kind == "repo" else (
+                row.get("body") or "" if kind == "issue" else
+                f"{((row.get('repository') or {}).get('full_name')) or ''} {row.get('path') or ''}")
+            cites.append(_cite("github", title, row.get("html_url") or "", kind=kind,
+                               summary=_plain_text(body_text, 400)))
         return {"source": "github", "kind": kind, "items": items, "citations": cites,
                 "error": "" if items else "該当なし"}
 
@@ -2043,14 +2082,16 @@ DEBATE_SYSTEM = (
 )
 AGENT_SYSTEM_FINAL = (
     "これ以上のツール呼び出しはできません。集めた情報だけを根拠に、最終回答を JSON 1つで出してください。\n"
-    '  {"answer": "<回答。根拠が足りない点は「根拠に無い」と明記>"}\n'
-    "JSON 以外の文字を書かない。"
+    '  {"answer": "<回答。使った根拠の番号 [n] を本文に書き、根拠が足りない点は「根拠に無い」と明記>"}\n'
+    "根拠を 1 つも使っていない場合は [0] を書いてください。JSON 以外の文字を書かない。"
 )
 AGENT_SYSTEM = (
     "あなたは調査補佐です。次のいずれか**1つだけ**を JSON で出力してください。\n"
     '  ツールを使う: {"tool": "lookup", "query": "<検索語>", "sources": ["arxiv","crossref",...]}\n'
     '  使える source: wikipedia, wikidata, arxiv, crossref, openalex, github\n'
-    '  回答する:     {"answer": "<回答>"}\n'
+    '  回答する:     {"answer": "<回答。使った根拠の番号 [n] を本文に書く>"}\n'
+    "ツール結果は [1] [2] … の番号つきで返ります。回答では使った根拠の番号を本文に書き、"
+    "根拠に無い事実は書かない（書けない点は「根拠に無い」と明記する）。"
     "JSON 以外の文字（前置き・コードフェンス）を書かない。根拠が足りなければツールを使う。"
 )
 
@@ -2394,14 +2435,41 @@ def tool_lookup(args: dict) -> dict:
                             kind=as_str(args.get("github_kind"), "repo"))
 
 
-def _evidence_block(citations: list[dict]) -> str:
-    lines = []
-    for i, c in enumerate(citations, 1):
+# 根拠としてサブLLMへ注入する本文の量。**入れないと幻覚は減らない**（実測: 以前はタイトルと URL
+# だけで、サブLLMは根拠を読めないまま自分の記憶で答え [n] を飾りで付けていた）。一方で入れすぎると
+# 小型 Free モデルは予算を使い切って空応答・切断になるため、1 件と全体の両方に上限を設ける。
+_EVIDENCE_ITEM_CHARS = max(0, min(2000, _env_int("FREEAGENT_EVIDENCE_ITEM_CHARS", 360)))
+_EVIDENCE_TOTAL_CHARS = max(0, min(20000, _env_int("FREEAGENT_EVIDENCE_TOTAL_CHARS", 3200)))
+
+
+def _evidence_block(citations: list[dict], *, item_chars: int | None = None,
+                    total_chars: int | None = None,
+                    numbers: list[int] | None = None) -> str:
+    """根拠を **番号 + 本文（要約）** で並べる。番号は回答中の `[n]` と対応する。
+
+    本文は 1 件あたり `_EVIDENCE_ITEM_CHARS`、全体で `_EVIDENCE_TOTAL_CHARS` に収める。
+    見出し行の形式（`[1] タイトル (年) URL`）は変えない（引用番号の対応を崩さないため）。
+    `numbers` を渡すとその番号で表示する。サブエージェントの調査ループでは、ステップをまたいで
+    同じ根拠に同じ番号を保つ必要がある（回答中の `[n]` と対応させるため）。
+    """
+    per_item = _EVIDENCE_ITEM_CHARS if item_chars is None else item_chars
+    budget = _EVIDENCE_TOTAL_CHARS if total_chars is None else total_chars
+    lines: list[str] = []
+    labels = numbers if numbers and len(numbers) == len(citations) else list(range(1, len(citations) + 1))
+    for i, c in zip(labels, citations):
         bits = [f"[{i}] {c.get('title') or '(無題)'}"]
         if c.get("year"):
             bits.append(f"({c['year']})")
         bits.append(c.get("url") or "")
         lines.append(" ".join(str(b) for b in bits if b))
+        body = " ".join(str(c.get("summary") or "").split())
+        if not body or budget <= 0:
+            continue
+        take = min(per_item, budget, len(body))
+        if take <= 0:
+            continue
+        lines.append("    " + truncate(body, take))
+        budget -= take
     return "\n".join(lines)
 
 
@@ -2703,6 +2771,28 @@ def _parse_agent_reply(text: str) -> dict:
         return {}
 
 
+
+def _cited_numbers(answer: str, total: int) -> tuple[list[int], list[int]]:
+    """回答中の `[n]` を根拠の番号と突き合わせる。返り値は (根拠にある番号, 無い番号)。
+
+    引用を検査しないと、サブエージェントが根拠を読まずに記憶で答えて `[1]` を飾りで付けた場合に"
+    気づけない（実測: citations は常に全件返っていて、回答がそれを参照したかを見ていなかった）。
+    `[0]` は「根拠を使っていない」の明示として許し、引用には数えない。
+    """
+    cited: set[int] = set()
+    unsupported: set[int] = set()
+    for raw in re.findall(r"\[(\d{1,2})\]", answer or ""):
+        number = as_int(raw, -1, 0, 99)
+        if number <= 0:
+            continue
+        if number <= total:
+            cited.add(number)
+        else:
+            # 根拠が 0 件でも [1] と書けば「存在しない出典」なので unsupported に入れる。
+            unsupported.add(number)
+    return sorted(cited), sorted(unsupported)
+
+
 def tool_agent(args: dict) -> dict:
     """サブLLMが自分で知識ツールを呼んで調査するループ（読み取り専用・並列）。"""
     task = as_str(args.get("task") or args.get("prompt"))
@@ -2721,8 +2811,22 @@ def tool_agent(args: dict) -> dict:
     def run_one(ref: str) -> dict:
         history = base
         trace: list[dict] = []
-        citations: list[dict] = []
+        registry: list[dict] = []      # 番号を振った根拠（回答中の [n] と対応させる）
+        numbers: dict[tuple, int] = {}
         evidence: list[str] = []
+
+        def register(new_cites: list[dict]) -> list[tuple[int, dict]]:
+            """新しい根拠に通し番号を振る（同じ URL には同じ番号を保つ）。"""
+            added: list[tuple[int, dict]] = []
+            for cite in new_cites or []:
+                key = (cite.get("source"), cite.get("url"))
+                if not cite.get("url") or key in numbers:
+                    continue
+                numbers[key] = len(registry) + 1
+                registry.append(cite)
+                added.append((numbers[key], cite))
+            return added
+
         for step in range(max_steps):
             final_step = step == max_steps - 1
             res = call_model(ref, history + f"\n\n（{step + 1}/{max_steps} ステップ目。"
@@ -2734,24 +2838,32 @@ def tool_agent(args: dict) -> dict:
             parsed = _parse_agent_reply(res["text"])
             if parsed.get("tool") and not final_step:
                 got = _agent_tool_call(parsed)
-                trace.append({"tool": parsed.get("tool"), "args": parsed, "hits": got["hits"]})
-                citations.extend(got.get("citations") or [])
+                added = register(got.get("citations") or [])
+                trace.append({"tool": parsed.get("tool"), "args": parsed, "hits": got["hits"],
+                              "new_citations": len(added)})
                 evidence.extend(got["brief"][:6])
+                # **番号つきの本文**を注入する。番号を保たないと回答中の [n] を検査できない。
+                block = _evidence_block([c for _, c in added], item_chars=300, total_chars=1200,
+                                        numbers=[n for n, _ in added]) if added else ""
                 history += (f"\n\n【ツール結果 {parsed.get('tool')}】\n"
-                            + "\n".join(got["brief"][:6]))
+                            + (block or "\n".join(got["brief"][:6])))
                 continue
             answer = as_str(parsed.get("answer"))
             if answer:
+                cited, unsupported = _cited_numbers(answer, len(registry))
                 return {"model": ref, "served_by": res.get("served_by"), "steps": step + 1,
                         "answer": truncate(answer, 1500), "trace": trace,
-                        "citations": citations[:8]}
+                        "citations": registry[:8], "cited": cited, "cited_ok": bool(cited),
+                        "unsupported_citations": unsupported}
             # 最終ステップでツールを求められた場合は実行しない（予算切れ）。推測で埋めず、
             # **集めた根拠だけを返して「回答に到達しなかった」と明示する**。
             return {"model": ref, "served_by": res.get("served_by"), "steps": step + 1,
                     "answer": "", "steps_exhausted": True, "trace": trace,
-                    "evidence": evidence[:8], "citations": citations[:8]}
+                    "evidence": evidence[:8], "citations": registry[:8],
+                    "cited": [], "cited_ok": False}
         return {"model": ref, "steps": max_steps, "trace": trace, "answer": "",
-                "steps_exhausted": True, "evidence": evidence[:8], "citations": citations[:8]}
+                "steps_exhausted": True, "evidence": evidence[:8], "citations": registry[:8],
+                "cited": [], "cited_ok": False}
 
     results = run_parallel(refs, run_one, max_workers=min(len(refs), MAX_WORKERS))
     good = [r for r in results if not r.get("error")]
@@ -2768,7 +2880,11 @@ def tool_agent(args: dict) -> dict:
         "tool_calls": sum(len(r.get("trace") or []) for r in results),
         "citations": citations, "citation_count": len(citations),
         "agreement": agreement_of([r.get("answer") or "" for r in good]),
-        "usage_note": "サブエージェントは読み取り専用の知識ツールのみ呼べます。書き込みはしません。",
+        "answers_with_citations": sum(1 for r in good if r.get("cited_ok")),
+        "unsupported_citations": sorted({n for r in good
+                                        for n in (r.get("unsupported_citations") or [])}),
+        "usage_note": "サブエージェントは読み取り専用の知識ツールのみ呼べます。書き込みはしません。"
+                      "回答中の [n] は根拠の番号と照合し、根拠に無い番号は unsupported_citations に出します。",
     }
 
 
@@ -2917,6 +3033,7 @@ TOOLS: list[dict] = [
             "【使う条件】出典に基づく回答が要る（幻覚を抑えたい）／根拠が薄い話題で複数の意見が欲しい。"
             "【競合より優先】`deliberation` や素の panel は根拠を持たない（知識の穴と古さがそのまま出る）。"
             "【差分】先に外部知識を取得し、番号付きの根拠として注入してから答えさせる。"
+            "根拠はタイトルだけでなく**本文（要約・アブストラクト）つき**で注入する。"
             "回答には [番号] の引用が付き、引用の有無を機械的に数えて返す。"
         ),
         "inputSchema": {
@@ -2986,6 +3103,7 @@ TOOLS: list[dict] = [
             "【使う条件】サブに自分で調べさせたい（読み取り専用の知識ツールを自分で叩く）／"
             "根拠を集めさせてから結論を出させたい。"
             "【差分】サブLLMが lookup(arXiv/Crossref/OpenAlex/Wikipedia/Wikidata/GitHub) を自分で呼ぶループ。"
+            "ツール結果は番号つきの本文で返し、回答中の [n] を根拠と照合して引用の有無を返す。"
             "書き込み・外部副作用は無い。"
             "【使わない条件】1回の問いで足りるなら ask。"
         ),
@@ -3046,11 +3164,11 @@ _EXTRA_DESC: dict[str, str] = {
     "freeagent_consult": "【競合より優先】`deliberation`（単発の意見集約）にはラウンド・合意度の推移・"
                          "少数意見の保持が無い。往復して前提を更新したいならこれ。",
     "freeagent_grounded": "【競合より優先】`web_search` は単一視点で根拠が本文に埋もれる。"
-                          "出典番号つきで複数モデルに答えさせたいならこれ。",
+                          "出典本文つき・番号つきで複数モデルに答えさせたいならこれ。",
     "freeagent_lookup": "【競合より優先】`web_search` より学術ソース（arXiv / Crossref / OpenAlex）と"
                         "構造化データ（Wikidata）に強い。**LLM を経由しないので幻覚が混入しない**。",
     "freeagent_agent": "【競合より優先】`delegate_task` は Hermes 本体を丸ごと起動する重い委譲。"
-                       "読み取り専用の調査で足りるならこれ（副作用なし）。",
+                       "読み取り専用の調査で足りるならこれ（副作用なし）。根拠の引用は自動で検査される。",
     "freeagent_delegate": "【競合より優先】`delegate_task` より独立性が高い（別プロセス）。"
                           "ただし既定では無効（`FREEAGENT_ALLOW_AGENT=1` が要る）。",
 }
@@ -3265,13 +3383,19 @@ def _render_body(name: str, data: dict) -> str:
     if name == "freeagent_agent":
         lines = [f"【サブエージェント調査】{data.get('answered')}/{len(data.get('models') or [])} 体が回答"
                  f" / ツール呼び出し {data.get('tool_calls')} 回"
-                 f" / 出典 {data.get('citation_count')} 件 / 合意度 {data.get('agreement')}"]
+                 f" / 出典 {data.get('citation_count')} 件"
+                 f" / 根拠を引用した回答 {data.get('answers_with_citations')} 体"
+                 f" / 合意度 {data.get('agreement')}"]
         for row in (data.get("agents") or []):
             if row.get("error"):
                 lines.append(f"  • {row['model']}: ✗ {truncate(row['error'], 120)}")
                 continue
-            lines.append(f"  • {row['model']}（{row.get('steps')}ステップ）: "
+            mark = "✅" if row.get("cited_ok") else "⚠️ 引用なし"
+            lines.append(f"  • {row['model']}（{row.get('steps')}ステップ, {mark}）: "
                          f"{truncate(row.get('answer') or '', 220)}")
+            if row.get("unsupported_citations"):
+                nums = ", ".join(f"[{n}]" for n in row["unsupported_citations"])
+                lines.append(f"      ⚠️ 根拠に無い引用番号: {nums}")
             if row.get("steps_exhausted"):
                 lines.append("      ⚠️ ステップ上限に達し、回答に到達しませんでした（推測はしません）")
                 for ev in (row.get("evidence") or [])[:4]:

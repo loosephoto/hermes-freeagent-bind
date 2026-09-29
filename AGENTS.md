@@ -26,7 +26,7 @@ python scripts/smoke_stdio.py
 ```bash
 python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # TOOLS/HANDLERS の一致・スキーマ・版・content の規約
-python -m unittest discover -s tests         # オフライン回帰（102 件・ネットワーク不要）
+python -m unittest discover -s tests         # オフライン回帰（118 件・ネットワーク不要）
 python scripts/smoke_stdio.py                # 実クライアント経路（initialize/tools/list/tools/call）
 python scripts/check_offline.py              # バックエンド全滅: 例外漏れ・ハング・状態汚染が無いこと
 python scripts/measure_adoption.py           # 自発利用率の測定（state.db を読むだけ・副作用なし）

@@ -185,6 +185,173 @@ class TestAuditRegressions(unittest.TestCase):
             got = S.tool_consult({"question": "Q"})
         self.assertEqual(got["open_questions_for_main"], ["予算？"])
 
+    # ---------------------------------------------------------------- 根拠注入と引用検査
+
+    def test_evidence_block_injects_summary_and_respects_budgets(self):
+        cites = [{"title": "A", "url": "u1", "summary": "S" * 500},
+                 {"title": "B", "url": "u2", "summary": "T" * 500}]
+        block = S._evidence_block(cites)
+        self.assertIn("[1] A u1", block)
+        self.assertIn("S" * 100, block)
+        # 1 件あたりの上限を超えて詰め込まない
+        self.assertLessEqual(max(len(line.strip()) for line in block.splitlines()), 400)
+        tight = S._evidence_block(cites, item_chars=100, total_chars=150)
+        self.assertIn("S" * 100, tight)
+        self.assertIn("T" * 50, tight)
+        self.assertNotIn("T" * 60, tight)
+
+    def test_evidence_block_keeps_header_only_when_summary_is_missing(self):
+        block = S._evidence_block([{"title": "A", "url": "u1", "year": 2020},
+                                   {"title": "B", "url": "u2"}])
+        self.assertEqual(block.splitlines(), ["[1] A (2020) u1", "[2] B u2"])
+
+    def test_evidence_block_honours_external_numbering(self):
+        block = S._evidence_block([{"title": "A", "url": "u1"}, {"title": "B", "url": "u2"}],
+                                  numbers=[3, 4])
+        self.assertIn("[3] A u1", block)
+        self.assertIn("[4] B u2", block)
+
+    def test_plain_text_strips_jats_markup(self):
+        self.assertEqual(S._plain_text("<jats:p>Hello  <b>world</b></jats:p>"), "Hello world")
+
+    def test_openalex_abstract_is_rebuilt_from_inverted_index(self):
+        row = {"abstract_inverted_index": {"We": [0], "propose": [1], "Transformer": [2]}}
+        self.assertEqual(S._openalex_abstract(row), "We propose Transformer")
+        self.assertEqual(S._openalex_abstract({"abstract_inverted_index": None}), "")
+
+    def test_wikipedia_citation_carries_summary(self):
+        S._KB_CACHE.pop("wiki:ja:cite-summary:1", None)
+        page = {"query": {"pages": {"1": {"title": "T", "index": 1,
+                                          "extract": "<p>Body text</p>"}}}}
+        with mock.patch.object(S, "kb_json", return_value=(page, "")):
+            got = S.kb_wikipedia("cite-summary", limit=1)
+        self.assertEqual(got["citations"][0]["summary"], "Body text")
+        self.assertIn("Body text", S._evidence_block(got["citations"]))
+
+    def test_arxiv_citation_carries_summary(self):
+        S._KB_CACHE.pop("arxiv:all:cite-summary:1", None)
+        atom = ("<feed xmlns='http://www.w3.org/2005/Atom'>"
+                "<entry><id>i1</id><title>Paper Title</title>"
+                "<summary>Abstract body</summary><published>2020-01-01T00:00:00Z</published>"
+                "<link rel='alternate' href='https://arxiv.org/abs/1'/></entry></feed>")
+        with mock.patch.object(S, "_arxiv_throttle"), \
+             mock.patch.object(S, "kb_http", return_value=(200, atom)):
+            got = S.kb_arxiv("cite-summary", limit=1)
+        self.assertEqual(got["citations"][0]["summary"], "Abstract body")
+
+    def test_crossref_citation_carries_abstract_without_tags(self):
+        S._KB_CACHE.pop("crossref:cite-summary:1", None)
+        payload = {"message": {"items": [{"title": ["T"], "DOI": "10.1/x",
+                                        "abstract": "<jats:p>Plain abstract</jats:p>",
+                                        "URL": "https://doi.org/10.1/x"}]}}
+        with mock.patch.object(S, "kb_json", return_value=(payload, "")):
+            got = S.kb_crossref("cite-summary", limit=1)
+        self.assertEqual(got["citations"][0]["summary"], "Plain abstract")
+
+    def test_openalex_citation_carries_rebuilt_abstract(self):
+        S._KB_CACHE.pop("openalex:cite-summary:1", None)
+        payload = {"results": [{"title": "T", "id": "https://openalex.org/W1",
+                                "abstract_inverted_index": {"Body": [0], "text": [1]}}]}
+        with mock.patch.object(S, "kb_json", return_value=(payload, "")):
+            got = S.kb_openalex("cite-summary", limit=1)
+        self.assertEqual(got["citations"][0]["summary"], "Body text")
+
+    def test_github_citation_carries_description(self):
+        S._KB_CACHE.pop("gh:repo:cite-summary:1:False", None)
+        payload = {"items": [{"full_name": "o/r", "html_url": "https://github.com/o/r",
+                              "description": "Repo description"}]}
+        with mock.patch.object(S, "kb_json", return_value=(payload, "")):
+            got = S.kb_github("cite-summary", kind="repo", limit=1)
+        self.assertEqual(got["citations"][0]["summary"], "Repo description")
+
+    def test_wikidata_citation_carries_description(self):
+        S._KB_CACHE.pop("wd:ja:cite-summary:1", None)
+        responses = [
+            ({"search": [{"id": "Q1", "label": "Thing", "description": "A thing"}]}, ""),
+            ({"entities": {"Q1": {"claims": {}}}}, ""),
+        ]
+        with mock.patch.object(S, "kb_json", side_effect=responses):
+            got = S.kb_wikidata("cite-summary", limit=1)
+        self.assertEqual(got["citations"][0]["summary"], "A thing")
+
+    def test_cited_numbers_separates_real_and_phantom_citations(self):
+        self.assertEqual(S._cited_numbers("見解 [1] と [2]", 2), ([1, 2], []))
+        self.assertEqual(S._cited_numbers("見解 [7]", 2), ([], [7]))
+        self.assertEqual(S._cited_numbers("根拠なし [0]", 0), ([], []))
+        self.assertEqual(S._cited_numbers("[1]", 0), ([], [1]))
+
+    def test_grounded_injects_evidence_body_into_the_sub_prompt(self):
+        kb = {"citations": [{"source": "arxiv", "title": "Paper", "url": "https://x/1",
+                             "summary": "Unique evidence sentence."}],
+              "sources": ["arxiv"], "errors": {}}
+        seen: list[str] = []
+
+        def fake_ask(refs, prompt, **kwargs):
+            seen.append(prompt)
+            return [{"ref": refs[0], "served_by": refs[0], "text": "答え [1]"}]
+
+        with mock.patch.object(S, "knowledge_lookup", return_value=kb), \
+             mock.patch.object(S, "_select_or_error", return_value=(["nous/a"], {})), \
+             mock.patch.object(S, "ask_many", side_effect=fake_ask):
+            got = S.tool_grounded({"question": "Q"})
+        self.assertIn("Unique evidence sentence.", seen[0])
+        self.assertEqual(got["answers_with_citations"], 1)
+
+    def test_agent_loop_numbers_evidence_and_verifies_citations(self):
+        lookup = {"results": {"wikipedia": {"items": [{"title": "T", "summary": "Body"}]}},
+                  "citations": [{"source": "wikipedia", "title": "T", "url": "u1",
+                                 "summary": "Body"}],
+                  "errors": {}}
+        replies = [{"ref": "nous/a", "served_by": "nous/a",
+                    "text": '{"tool": "lookup", "query": "q"}'},
+                   {"ref": "nous/a", "served_by": "nous/a", "text": '{"answer": "結論は [1] です"}'}]
+        prompts: list[str] = []
+
+        def fake_call(ref, prompt, *, system="", **kwargs):
+            prompts.append(prompt)
+            return replies[len(prompts) - 1]
+
+        with mock.patch.object(S, "_select_or_error", return_value=(["nous/a"], {})), \
+             mock.patch.object(S, "call_model", side_effect=fake_call), \
+             mock.patch.object(S, "knowledge_lookup", return_value=lookup):
+            got = S.tool_agent({"task": "t", "max_steps": 2})
+        row = got["agents"][0]
+        self.assertEqual(row["cited"], [1])
+        self.assertTrue(row["cited_ok"])
+        self.assertEqual(got["answers_with_citations"], 1)
+        # 注入された根拠は番号つきの本文（タイトルだけでは幻覚が減らない）
+        self.assertIn("[1] T u1", prompts[1])
+        self.assertIn("Body", prompts[1])
+
+    def test_agent_loop_flags_phantom_citation_numbers(self):
+        lookup = {"results": {"wikipedia": {"items": [{"title": "T", "summary": "Body"}]}},
+                  "citations": [{"source": "wikipedia", "title": "T", "url": "u1",
+                                 "summary": "Body"}],
+                  "errors": {}}
+        replies = [{"ref": "nous/a", "text": '{"tool": "lookup", "query": "q"}'},
+                   {"ref": "nous/a", "text": '{"answer": "根拠は [5] です"}'}]
+        with mock.patch.object(S, "_select_or_error", return_value=(["nous/a"], {})), \
+             mock.patch.object(S, "call_model", side_effect=replies), \
+             mock.patch.object(S, "knowledge_lookup", return_value=lookup):
+            got = S.tool_agent({"task": "t", "max_steps": 2})
+        row = got["agents"][0]
+        self.assertEqual(row["cited"], [])
+        self.assertFalse(row["cited_ok"])
+        self.assertEqual(row["unsupported_citations"], [5])
+        self.assertEqual(got["unsupported_citations"], [5])
+        self.assertEqual(got["answers_with_citations"], 0)
+
+    def test_agent_marks_answers_that_used_no_evidence(self):
+        replies = [{"ref": "nous/a", "text": '{"answer": "記憶で答えます [0]"}'}]
+        with mock.patch.object(S, "_select_or_error", return_value=(["nous/a"], {})), \
+             mock.patch.object(S, "call_model", side_effect=replies):
+            got = S.tool_agent({"task": "t", "max_steps": 1})
+        row = got["agents"][0]
+        self.assertEqual(row["cited"], [])
+        self.assertEqual(row["unsupported_citations"], [])
+        self.assertFalse(row["cited_ok"])
+        self.assertIn("引用なし", S.render("freeagent_agent", got))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

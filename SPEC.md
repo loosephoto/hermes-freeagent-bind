@@ -137,6 +137,13 @@
 - 結果は**必ず `citation`（source / title / url / year / summary）に正規化**する。表示も注入もこの形だけを使う。
 - 取得はメモリ TTL キャッシュ + ホスト単位の遮断記憶。**同一キーは single-flight** で同時取得を 1 回にまとめ、エラー応答はキャッシュしない（回復後の再取得を妨げない）。キャッシュ値は複製して返し、呼び出し側の変更が共有状態に伝播しない。**LLM を介さない**（＝幻覚が入らない経路）。
 - Wikipedia の言語コードはホスト名へ埋め込む前に検証し、許可形式以外はネットワークへ送らない。検索結果と要約は `generator=search` + `extracts` の 1 API 呼び出しで取得する。
+- **citation には本文（`summary`）を必ず入れる**。実測: 全バックエンドで `summary` が空のまま返っており、
+  `grounded` が注入する【根拠】がタイトルと URL だけになっていた＝サブLLMは根拠を読めず、記憶で答えて
+  `[n]` を飾りで付けていた。Crossref の `abstract`（JATS タグ除去）と OpenAlex の
+  `abstract_inverted_index`（語→位置の配列を復元）も本文として使う。
+- 注入する本文は 1 件あたり `FREEAGENT_EVIDENCE_ITEM_CHARS`（既定 360）、全体で
+  `FREEAGENT_EVIDENCE_TOTAL_CHARS`（既定 3200）に収める。入れすぎると小型 Free モデルが予算を
+  使い切って空応答・切断になる（逆効果）。
 - `sources` を明示した場合は指定された有効ソースだけを検索する。無効な名前だけなら全ソースへフォールバックせず、利用可能な名前を返す。
 - 1 ソースの失敗で全体を落とさない（`errors` に集約し、成功分だけ返す）。
 
@@ -155,6 +162,9 @@
 - `freeagent_consult` の deep 討論では討論ラウンドの立場を最終結論として合意度を計算し、初回ラウンドのメインへの質問を保持する。同じ質問は一つにまとめ、「未解決: なし」は未解決意見に数えない。
 - 代替モデルへ fallback するとき、指定モデルがクールダウン中でも残り候補を試し、認証失敗中プロバイダは代替先から外す。
 - セッション ID は同一秒・同一プロセス内でも衝突しない乱数成分を持つ。
+- サブエージェント（`freeagent_agent`）は根拠に**通し番号**を振り、ツール結果を番号つきの本文で注入する。
+  回答中の `[n]` は番号と照合し、根拠に無い番号は `unsupported_citations`、引用が 0 件の回答は
+  `cited_ok: false` として返す（引用検査が無いと「根拠を読まずに記憶で答えた」ことを検出できない）。
 - サブエージェント（`freeagent_agent`）は**最終ステップでツールを封じ、回答を要求する**。封じないと
   全ステップを調査に使い、回答が永久に出ない（実測）。到達しなかった場合は推測で埋めず、
   `steps_exhausted` と収集済みの根拠を返す。
@@ -215,7 +225,7 @@
 ```bash
 python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # レジストリ・スキーマ・版の整合
-python -m unittest discover -s tests         # オフライン回帰（102 件）
+python -m unittest discover -s tests         # オフライン回帰（118 件）
 python scripts/smoke_stdio.py                # 実クライアント経路
 python scripts/check_offline.py              # 全滅時の縮退（例外漏れ・ハング・状態汚染なし）
 python scripts/measure_adoption.py           # 自発利用率（state.db を読むだけ）

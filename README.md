@@ -35,7 +35,7 @@
 | 並列で超高速になる | **ならない** | 速くなるのは**メインが待たずに走らせられる部分だけ**。1 体が数秒〜数十秒かかるので、往復する `freeagent_consult` は**分単位**です（実測: 4 体の `freeagent_panel` は 14〜20 秒、多段討議を含む 1 ターンは **3分52秒**、別の標本は 420 秒を超えても継続）。多くの場合、総時間はむしろ延びます |
 | 多数決を取れば正解が保証される | **保証されない** | 同系統の Free モデルは**同じ誤りを共有**しやすい。**投げ先も減ります**: 実測で `nous` はプロキシ停止で 0 モデル（到達不可）、HF の無料 3 件はクレジット枯渇で 402、NVIDIA は 82 件中 55 件が 404（廃止）。応答が返っても中身は玉石混交で、実測の 4 体には **6.7B のコーダーモデルが API 設計の問いに答えていました**。だから「独立意見は N 体・うち応答 M 体」と留保を付けて返します |
 | 合意度が高ければ正しい | **別物** | 合意度は**表層の一致**（言い回しの類似）であって、正しさの確率ではありません。**確信度の自己申告は当てになりません**（実測: 確信度 `confidence_mean` **90.5** に対し合意度 `agreement` **0.094** の回がありました＝自信満々でも言っていることがバラバラ） |
-| 出典が付くので幻覚が消える | **消えない** | `freeagent_lookup` / `freeagent_grounded` は LLM を介さず事実を取りますが、**解釈・推論は各モデルの出力**です。保証されるのは「取得した事実」までです |
+| 出典が付くので幻覚が消える | **消えない** | `freeagent_lookup` / `freeagent_grounded` は LLM を介さず事実を取りますが、**解釈・推論は各モデルの出力**です。保証されるのは「取得した事実」までです。ただし `grounded` は**根拠の本文**を注入し、`agent` は回答中の `[n]` を根拠と照合するので、「根拠を使った回答か」は機械的に判定できます |
 | 常時 ON にすると他のツールが遅くなる | **ならない** | 固定費は起動と一覧で**約 0.17 秒**（実測: spawn → `tools/list` 完了まで **170 ms**）、スキーマは **10 ツールで 9,451 文字**。実タスクの差はノイズ程度です |
 | OFF にすれば速くなる | **ならない** | 浮くのは上の分だけ。相談が要る場面では代替手段（`delegate_task` / `deliberation` を N 回）の方が遅いことがあります |
 
@@ -382,6 +382,8 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 `freeagent_lookup` と `freeagent_grounded` は 6 ソースを**並列に**引いて、重複を除いた出典リスト
 （`[1] タイトル URL`）を返します。**LLM を経由しないので幻覚が混入しません。** Wikipedia は検索結果と要約を 1 回の API 呼び出しで取得します。未知の `sources` だけが指定された場合は、誤って全ソースへ問い合わせず、有効なソース名を案内します。混在指定なら有効なソースだけを検索し、未知名も報告します。
 
+各出典には**本文**（Wikipedia の本文・arXiv/Crossref/OpenAlex のアブストラクト・GitHub の説明・Wikidata の説明）が付きます。`freeagent_grounded` はこれを番号つきでサブLLMへ注入してから答えさせ、回答中の `[n]` を検査します。`freeagent_agent` も自分で集めた根拠に通し番号を振り、回答が根拠を引用したかどうか（`cited_ok`）と、**根拠に無い番号**（`unsupported_citations`）を返します。「出典らしき番号を付けただけ」の回答はここで見分けられます。注入する本文量は `FREEAGENT_EVIDENCE_ITEM_CHARS` / `_TOTAL_CHARS` で調整できます（小型モデルは増やしすぎると空応答になります）。
+
 ---
 
 ## つまずいたとき
@@ -430,6 +432,7 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 | `FREEAGENT_SESSION_TTL` | 3600 | 相談セッションの寿命（秒） |
 | `FREEAGENT_ALLOW_AGENT` | 0 | `freeagent_delegate`（Hermes 本体の起動）を許可 |
 | `FREEAGENT_ARXIV_INTERVAL` | 3.0 | arXiv の最小呼び出し間隔（秒） |
+| `FREEAGENT_EVIDENCE_ITEM_CHARS` / `_TOTAL_CHARS` | 360 / 3200 | 根拠本文をサブLLMへ注入する 1 件あたり・全体の上限（0 で本文を入れない） |
 | `FREEAGENT_EMPTY_TOKEN_FLOOR` / `_CAP` | 512 / 2048 | 空応答時の予算引き上げ幅 |
 | `FREEAGENT_USER_AGENT` | `hermes-freeagent-bind/0.1 (+…/hermes-freeagent-bind)` | 知識 API に名乗る UA（連絡先入りが望ましい） |
 | `FREEAGENT_MAILTO` | 空 | Crossref / OpenAlex の polite pool 用メールアドレス |
