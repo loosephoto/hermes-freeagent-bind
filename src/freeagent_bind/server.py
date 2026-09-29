@@ -15,7 +15,8 @@
   §3 プロバイダとモデル  §4 サブLLM呼び出し    §5 知識バックエンド
   §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案）
   §7 ツール定義         §8 表示（content）
-  §8.5 失敗時の「次の一手」（structuredContent.next_action）   §9 JSON-RPC / stdio
+  §8.5 失敗時の「次の一手」（structuredContent.next_action）
+  §8.6 ハーネス判別（Hermes 以外で起動されたときの警告）   §9 JSON-RPC / stdio
 
 設計方針（旧 hermes-memex の実測で裏づけられた規約を継承）
   * 実行時依存ゼロ（標準ライブラリのみ）・stdio の JSON-RPC 2.0 を自前実装
@@ -1604,8 +1605,13 @@ def _auth_hint(provider: str, status: int, body: str) -> str:
 def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800,
                temperature: float | None = None, kind: str = "ask",
                allow_fallback: bool = True, free_only: bool = True,
-               timeout: float | None = None) -> dict:
-    """1 つのサブLLM呼び出し。**例外を外へ漏らさず**、失敗も dict で返す。"""
+               timeout: float | None = None, claims: "_ModelClaims | None" = None) -> dict:
+    """1 つのサブLLM呼び出し。**例外を外へ漏らさず**、失敗も dict で返す。
+
+    `claims` を渡すと、フォールバック先に**同じ呼び出しの他の枠が使っている／除外されたモデル**を
+    選ばない（`ask_many` が渡す）。渡さないと 2 枠が同じモデルで埋まり「独立 2 体」の表示が
+    実質 1 体になる（実測: 代替案の提案者の枠を、同じ呼び出しの検証者と同じモデルが埋めた）。
+    """
     provider, model = resolve_ref(ref, free_only=free_only)
     if not model:
         return {"error": "モデルが解決できませんでした（Free モデルが 0 件の可能性）",
@@ -1620,7 +1626,11 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
 
     last_error = ""
     skipped: list[str] = []
+    avoided: list[str] = []
     for idx, cand in enumerate(attempts):
+        if claims is not None and cand != ref and not claims.take(cand):
+            avoided.append(cand)   # 他の枠が使用中／除外済み。独立性を守るため取らない
+            continue
         c_provider, c_model = resolve_ref(cand, free_only=free_only)
         if not c_model:
             continue
@@ -1691,8 +1701,32 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
     fail = {"error": last_error or "すべての候補で失敗しました", "ref": ref, "kind": kind,
             "skipped_cooling": skipped or None,
             "rate_limited": any(r in cooling_refs() for r in attempts)}
+    if avoided and not last_error:
+        fail["error"] = ("フォールバック先がすべて同じ呼び出しの他の枠で使用中か除外済みでした"
+                         "（独立性を守るため同じモデルで枠を埋めていません）")
+    if avoided:
+        fail["avoided_duplicates"] = len(avoided)
     observe_call(fail, kind, "")
     return fail
+
+
+class _ModelClaims:
+    """1 回の並列呼び出し（`ask_many`）の中で**使用中のモデル**を記録する（フォールバックの重複防止）。
+
+    各枠の本来のモデルと除外モデルを最初から「使用中」にしておき、フォールバックで新たに取る
+    モデルはロック内で 1 回だけ確保できる（2 枠が同時に同じ予備モデルへ落ちるのを防ぐ）。
+    """
+
+    def __init__(self, refs, avoid=()):
+        self._lock = threading.Lock()
+        self._taken = {r for r in list(refs) + list(avoid or ()) if isinstance(r, str) and r}
+
+    def take(self, ref: str) -> bool:
+        with self._lock:
+            if ref in self._taken:
+                return False
+            self._taken.add(ref)
+            return True
 
 
 def run_parallel(jobs: list, worker, max_workers: int | None = None) -> list:
@@ -1720,12 +1754,18 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None) -> list:
 
 
 def ask_many(refs: list[str], prompt: str, *, system: str = "", max_tokens: int = 800,
-             temperature: float | None = None, kind: str = "panel") -> list[dict]:
-    """同じプロンプトを複数モデルへ**同時に**投げる（1 ターン待たずに走るのが並列の利点）。"""
+             temperature: float | None = None, kind: str = "panel",
+             avoid: list[str] | None = None) -> list[dict]:
+    """同じプロンプトを複数モデルへ**同時に**投げる（1 ターン待たずに走るのが並列の利点）。
+
+    「独立した複数の意見」を返す経路なので、フォールバックが**他の枠と同じモデル**や `avoid`
+    （除外・同じ手順で既に使ったモデル）に落ちないようにする（`_ModelClaims`）。
+    """
+    claims = _ModelClaims(refs, avoid)
     return run_parallel(
         list(refs),
         lambda ref: call_model(ref, prompt, system=system, max_tokens=max_tokens,
-                               temperature=temperature, kind=kind),
+                               temperature=temperature, kind=kind, claims=claims),
         max_workers=min(len(refs), MAX_WORKERS))
 
 
@@ -2458,6 +2498,9 @@ def tool_models(args: dict) -> dict:
         "cooling": {ref: row for ref, row in cooling_refs().items()},
         "ranking_enabled": RANK_ENABLED,
     }
+    harness = harness_status()   # §8.6（initialize 前は None）
+    if harness:
+        data["harness"] = harness
 
     searching = bool(query or provider_filter or args.get("all") or args.get("probe"))
     free_only = as_flag(args.get("free_only"))
@@ -2652,7 +2695,8 @@ def tool_panel(args: dict) -> dict:
     if not refs:
         return _no_models()
     results = ask_many(refs, question, system=as_str(args.get("system")) or CONSULT_SYSTEM,
-                       max_tokens=as_int(args.get("max_tokens"), 500, 16, 4000), kind="panel")
+                       max_tokens=as_int(args.get("max_tokens"), 500, 16, 4000), kind="panel",
+                       avoid=as_str_list(args.get("exclude")) or None)
     answers = []
     for ref, res in zip(refs, results):
         if res.get("error"):
@@ -2759,7 +2803,7 @@ def tool_grounded(args: dict) -> dict:
         f"【根拠】\n{_evidence_block(citations)}\n\n【質問】\n{question}"
     )
     results = ask_many(refs, prompt, max_tokens=as_int(args.get("max_tokens"), 700, 16, 4000),
-                       kind="grounded")
+                       kind="grounded", avoid=as_str_list(args.get("exclude")) or None)
     answers = []
     for ref, res in zip(refs, results):
         if res.get("error"):
@@ -2877,7 +2921,8 @@ def tool_consult(args: dict) -> dict:
     # 第1ラウンド（または再開時の再検討）
     round_no = len(rounds) + 1
     prompt = _consult_prompt(question, main_reply, round_no, mode=mode, draft=draft)
-    results = ask_many(refs, prompt, system=CONSULT_SYSTEM, max_tokens=max_tokens, kind="consult")
+    results = ask_many(refs, prompt, system=CONSULT_SYSTEM, max_tokens=max_tokens, kind="consult",
+                       avoid=as_str_list(args.get("exclude")) or None)
     round_rows = []
     for ref, res in zip(refs, results):
         if res.get("error"):
@@ -2896,7 +2941,8 @@ def tool_consult(args: dict) -> dict:
         peers = [row for row in round_rows if not row.get("error")]
         rebuttal_prompt = _consult_prompt(question, main_reply, round_no, peers=peers)
         rebuttal = ask_many(refs, rebuttal_prompt, system=DEBATE_SYSTEM,
-                            max_tokens=max_tokens, kind="debate")
+                            max_tokens=max_tokens, kind="debate",
+                            avoid=as_str_list(args.get("exclude")) or None)
         debate_rows = []
         for ref, res in zip(refs, rebuttal):
             if res.get("error"):
@@ -3422,7 +3468,8 @@ def tool_think(args: dict) -> dict:
         if not refs:
             return _no_models()   # 状態を書かない（環境障害で台帳を汚さない）
         results = ask_many(refs, _think_prompt(question, steps, step, preview), system=THINK_CRITIC_SYSTEM,
-                           max_tokens=as_int(args.get("max_tokens"), 400, 16, 2000), kind="think")
+                           max_tokens=as_int(args.get("max_tokens"), 400, 16, 2000), kind="think",
+                           avoid=as_str_list(args.get("exclude")) or None)
         rows: list[dict] = []
         for ref, res in zip(refs, results):
             if res.get("error"):
@@ -3547,9 +3594,16 @@ _LABEL_ALT = re.compile(
 _BULLET = re.compile(r"^(?:[-*・•]|\d+[.)．、])\s+(.+)")
 
 
-def parse_alternatives(text, limit: int = 3) -> list[str]:
-    """提案者の「代替: …」行を取り出す。ラベルが 1 つも無ければ箇条書きだけを拾う（推測で埋めない）。"""
+def parse_alternatives(text, limit: int = 3, *, truncated: bool = False) -> list[str]:
+    """提案者の「代替: …」行を取り出す。ラベルが 1 つも無ければ箇条書きだけを拾う（推測で埋めない）。
+
+    `truncated`（max_tokens で打ち切られた応答）のときは、**本文の最終行にあたる案**を捨てる。
+    打ち切りは最終行の途中で起きるので、それを案として渡すと文の途中で切れた提案が
+    完全な案として台帳に残る（実測「代替: 親プロセスのコマン」）。
+    """
     lines = [ln.strip() for ln in (text if isinstance(text, str) else "").splitlines() if ln.strip()]
+    if truncated and lines:
+        lines = lines[:-1]
     labeled = [m.group(1) for m in (_LABEL_ALT.match(ln) for ln in lines) if m]
     picked = labeled or [m.group(1) for m in (_BULLET.match(ln) for ln in lines) if m]
     out: list[str] = []
@@ -3707,22 +3761,29 @@ def _think_view(sid: str, stored: dict | None) -> dict:
 def _think_alternatives(args: dict, question: str, steps: list[dict], step: dict, row: dict,
                         *, exclude: list[str]) -> dict:
     """生成者・検証者とは別のモデルに**代替案**を出させる。不通なら error を返す（呼び出し側は書かない）。"""
+    user_exclude = as_str_list(args.get("exclude")) or []
     refs, info = select_models(as_int(args.get("size"), 2, 1, 4), None,
                                prefer=as_str_list(args.get("prefer")) or None,
-                               exclude=(as_str_list(args.get("exclude")) or []) + list(exclude))
+                               exclude=user_exclude + list(exclude))
     if not refs:
         return _no_models()
     prompt = _think_prompt(question, steps, step, row).rsplit("\n\n", 1)[0] + (
         "\n\n上の道筋とは異なる代替の仮説・解法・道筋を「代替: …」の形式で最大3行だけ挙げてください。")
+    # 既定 400 のまま: 上げると proxy 経由で CONNECT_TIMEOUT（10 秒）を超えやすい（SPEC §3 の実測）。
+    # 打ち切り（truncated）で文の途中で切れた最後の案は parse_alternatives が捨てる（実測「代替: 親プロセスのコマン」）。
+    # avoid: フォールバックが同じ呼び出しの**検証者**に落ちると「検証者とも別のモデル」が破れる（実測）。
     results = ask_many(refs, prompt, system=THINK_ALT_SYSTEM,
-                       max_tokens=as_int(args.get("max_tokens"), 400, 16, 2000), kind="think")
+                       max_tokens=as_int(args.get("max_tokens"), 400, 16, 2000), kind="think",
+                       avoid=user_exclude + list(exclude))
     rows: list[dict] = []
     for ref, res in zip(refs, results):
         if res.get("error"):
             rows.append({"model": ref, "error": res["error"]})
             continue
         rows.append({"model": ref, "served_by": res.get("served_by"),
-                     "items": parse_alternatives(res.get("text")), "text": truncate(res.get("text") or "", 600)})
+                     "items": parse_alternatives(res.get("text"), truncated=bool(res.get("truncated"))),
+                     "truncated": bool(res.get("truncated")),
+                     "text": truncate(res.get("text") or "", 600)})
     answered = [r for r in rows if not r.get("error")]
     failed = [r for r in rows if r.get("error")]
     if not answered and failed and all(is_env_failure(r.get("error") or "") for r in failed):
@@ -4133,6 +4194,11 @@ def _render_body(name: str, data: dict) -> str:
             shown = list(cooling)[:8]
             head += (f"\nクールダウン中 {len(cooling)} 件: " + ", ".join(shown)
                      + (f" … 他 {len(cooling) - len(shown)} 件" if len(cooling) > len(shown) else ""))
+        harness = data.get("harness") or {}
+        if harness:
+            label = {"hermes": "Hermes Agent", "other": "Hermes 以外", "unknown": "判別不能"}.get(
+                harness.get("kind"), harness.get("kind"))
+            head += f"\nハーネス: {label}（{harness.get('reason')}）"
         q = data.get("query")
         if q:
             head += (f"\n\n🔍 検索: query={q.get('query')!r} provider={q.get('provider')}"
@@ -4463,6 +4529,175 @@ def error_advice(data: dict) -> dict:
     return advice
 
 
+# ================================================================ §8.6 ハーネス判別（Hermes 以外で起動されたときの警告）
+#
+# このサーバーは Hermes Agent 前提の部分を持つ: 推論の既定の接続先は `hermes proxy`
+# （127.0.0.1:8645 の nous プロバイダ）で、自発利用の設定（SOUL.md・tools.exclude）も Hermes 専用。
+# 他のハーネス（Claude Code など）で起動されたら、止めずに**警告だけ**出す。
+#
+# 判別の実測（`hermes mcp test` にプローブを繋いで確認）:
+#   * Hermes の clientInfo は MCP Python SDK 既定の {"name": "mcp", "version": "0.1.0"} で**Hermes 固有でない**
+#   * HERMES_* の環境変数は子に渡らない（許可リスト方式: PATH/HOME/TMPDIR/TEMP など）
+#   * 設定の `env:` ブロックはそのまま渡る → **明示の目印 FREEAGENT_HARNESS=hermes** を入れるのが唯一確実
+#   * 親プロセス名は Windows 11 で wmic が無く取れず、PowerShell/CIM は起動が秒単位で遅い → 使わない
+# よって判定は三値: hermes（目印あり／clientInfo に hermes を含む）・other（SDK 既定以外の名前）・
+# unknown（名前が "mcp" で目印なし＝目印を入れる前の Hermes がほぼこれ）。
+#
+# 出し方（重複させない）:
+#   other   → initialize の instructions 先頭に注記（Hermes は読まないが他クライアントは読む）
+#             ＋ stderr に 1 行 ＋ notifications/message(level=warning)（表示はクライアント次第＝補助）
+#             ＋ **最初のツール結果だけ** content に ⚠ 1 行
+#   unknown → stderr に 1 行と、最初のツール結果の structuredContent.harness だけ（Hermes 利用者を煩わせない）
+#   hermes  → 何も出さない
+# FREEAGENT_HARNESS_WARN=0 で警告を止める（判定結果は structuredContent.harness に残す）。
+
+HARNESS_MARKER_ENV = "FREEAGENT_HARNESS"
+HARNESS_WARN_ENV = "FREEAGENT_HARNESS_WARN"
+_SDK_DEFAULT_CLIENT = "mcp"
+_LOG_LEVELS = ("debug", "info", "notice", "warning", "error", "critical", "alert", "emergency")
+_HARNESS_LOCK = threading.Lock()
+_HARNESS: dict = {"info": None, "announced": False, "notified": False, "log_level": "info"}
+
+
+def detect_harness(params, env=None) -> dict:
+    """initialize の params と環境変数からハーネスを判定する（文字列比較だけ・サブプロセスなし）。"""
+    env = os.environ if env is None else env
+    params = params if isinstance(params, dict) else {}
+    client = params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else {}
+    name = client.get("name") if isinstance(client.get("name"), str) else ""
+    version = client.get("version") if isinstance(client.get("version"), str) else ""
+    marker = (env.get(HARNESS_MARKER_ENV) or "").strip()
+    info = {"client": name, "client_version": version, "marker": marker}
+    if marker:
+        kind = "hermes" if marker.lower() == "hermes" else "other"
+        return {**info, "kind": kind, "source": "env",
+                "reason": f"{HARNESS_MARKER_ENV}={marker}"}
+    if "hermes" in name.lower():
+        return {**info, "kind": "hermes", "source": "clientInfo", "reason": f"clientInfo.name={name}"}
+    if name and name != _SDK_DEFAULT_CLIENT:
+        return {**info, "kind": "other", "source": "clientInfo", "reason": f"clientInfo.name={name}"}
+    return {**info, "kind": "unknown", "source": "none",
+            "reason": (f"clientInfo.name={name or '（なし）'}（MCP SDK の既定値で Hermes と区別できない）"
+                       f"・{HARNESS_MARKER_ENV} 未設定")}
+
+
+def harness_warn_enabled(env=None) -> bool:
+    env = os.environ if env is None else env
+    return (env.get(HARNESS_WARN_ENV) or "").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _harness_backend_is_default() -> bool:
+    return PROVIDER_SPECS["nous"]["base_url"].startswith("http://127.0.0.1:8645")
+
+
+def harness_message(info: dict) -> str:
+    """人間向けの 1 段落（stderr・content・ログ通知で共用）。LLM への指示は書かない（規約 3）。"""
+    if not info or info.get("kind") == "hermes":
+        return ""
+    fix = f"hermes config set mcp_servers.freeagent-bind.env.{HARNESS_MARKER_ENV} hermes"
+    if info.get("kind") == "unknown":
+        return (f"ハーネスを判別できません（{info.get('reason')}）。Hermes Agent で使っているなら "
+                f"`{fix}` で目印を入れると判別できます。")
+    parts = [f"Hermes Agent 以外のクライアント（{info.get('client') or info.get('marker') or '不明'}）で"
+             "動作しています。"]
+    if _harness_backend_is_default():
+        parts.append("既定の推論先 hermes proxy（127.0.0.1:8645）が無いと nous プロバイダは使えません"
+                     "（FREEAGENT_BASE_URL で変更可。OpenRouter / NVIDIA / Hugging Face はキーがあれば使えます）。")
+    parts.append("自発利用の設定（SOUL.md・tools.exclude・apply_proactive.py）は Hermes 専用です。")
+    parts.append(f"この警告は {HARNESS_WARN_ENV}=0 で止められます。")
+    return "".join(parts)
+
+
+def harness_instructions(info: dict) -> str:
+    """initialize.instructions の先頭に付ける注記（other のときだけ。他クライアントは instructions を読む）。"""
+    if not info or info.get("kind") != "other" or not harness_warn_enabled():
+        return PROACTIVE_INSTRUCTIONS
+    note = ("【注意】このサーバーは Hermes Agent 向けです。推論の既定の接続先は hermes proxy で、"
+            "つながらないときは freeagent_models で使えるプロバイダを確認してから使う。"
+            "失敗応答の structuredContent.next_action に従い、同じ呼び出しを繰り返さない。")
+    return note + PROACTIVE_INSTRUCTIONS
+
+
+def harness_on_initialize(params) -> dict:
+    """initialize で呼ぶ。判定を保存し、stderr に 1 回だけ書く。initialize 応答（dict）を返す。"""
+    info = detect_harness(params)
+    announce = False
+    with _HARNESS_LOCK:
+        _HARNESS["info"] = info
+        if not _HARNESS["announced"] and info["kind"] != "hermes" and harness_warn_enabled():
+            _HARNESS["announced"] = announce = True
+    if announce:
+        try:
+            sys.stderr.write(f"[freeagent-bind] {harness_message(info)}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    offered = params.get("protocolVersion", "") if isinstance(params, dict) else ""
+    return {
+        "protocolVersion": negotiate_protocol(offered),
+        # logging: サーバーが notifications/message を送るなら宣言が MUST（MCP 2025-11-25 Logging）。
+        "capabilities": {"tools": {"listChanged": False}, "logging": {}},
+        "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+        "instructions": harness_instructions(info),
+    }
+
+
+def harness_set_level(params) -> dict | None:
+    """logging/setLevel。不正な値は -32602（仕様どおり）。"""
+    level = params.get("level") if isinstance(params, dict) else None
+    if level not in _LOG_LEVELS:
+        return {"code": -32602, "message": f"invalid log level: {level}"}
+    with _HARNESS_LOCK:
+        _HARNESS["log_level"] = level
+    return None
+
+
+def harness_log_notification() -> dict | None:
+    """notifications/initialized の後に 1 回だけ送るログ通知（other のときだけ）。送らないなら None。"""
+    with _HARNESS_LOCK:
+        info = _HARNESS["info"]
+        if (_HARNESS["notified"] or not info or info.get("kind") != "other" or not harness_warn_enabled()
+                or _LOG_LEVELS.index(_HARNESS["log_level"]) > _LOG_LEVELS.index("warning")):
+            return None
+        _HARNESS["notified"] = True
+    return {"jsonrpc": "2.0", "method": "notifications/message",
+            "params": {"level": "warning", "logger": "freeagent-bind.harness",
+                       "data": {"harness": info["kind"], "client": info.get("client"),
+                                "message": harness_message(info)}}}
+
+
+def harness_first_call(data: dict) -> str:
+    """最初のツール結果にだけ判定結果を載せる。content に前置する文字列（other のときだけ ⚠ 1 行）を返す。"""
+    with _HARNESS_LOCK:
+        info = _HARNESS["info"]
+        if not info or _HARNESS.get("first_call_done"):
+            return ""
+        _HARNESS["first_call_done"] = True
+    if info["kind"] == "hermes":
+        return ""
+    data["harness"] = {k: info[k] for k in ("kind", "client", "source", "reason")}
+    if info["kind"] == "other" and harness_warn_enabled():
+        return f"⚠️ {harness_message(info)}\n"
+    return ""
+
+
+def harness_status() -> dict | None:
+    """freeagent_models が常に返す判定結果（未判定＝initialize 前なら None）。"""
+    with _HARNESS_LOCK:
+        info = _HARNESS["info"]
+    if not info:
+        return None
+    return {**{k: info[k] for k in ("kind", "client", "client_version", "source", "reason")},
+            "warn": harness_warn_enabled()}
+
+
+def _harness_reset() -> None:
+    """テスト用: 判定状態を初期化する。"""
+    with _HARNESS_LOCK:
+        _HARNESS.clear()
+        _HARNESS.update({"info": None, "announced": False, "notified": False, "log_level": "info"})
+
+
 # ================================================================ §9 JSON-RPC / stdio
 
 def write_line(line: str) -> None:
@@ -4538,6 +4773,10 @@ def handle_tool_call(params: dict) -> dict:
         text = "表示の生成に失敗しました。structuredContent.error を確認してください。"
     if is_error:
         text = "⚠️ 実行は失敗しました。structuredContent.error を確認してください。\n" + text
+    try:
+        text = harness_first_call(data) + text   # §8.6（最初の結果だけ）
+    except Exception:
+        pass
     return {"content": [{"type": "text", "text": text}],
             "structuredContent": data, "isError": is_error}
 
@@ -4552,15 +4791,18 @@ def _dispatch_batch(items: list) -> None:
             continue
         method, msg_id = item["method"], item.get("id")
         params = item.get("params") or {}
-        if method in ("notifications/initialized", "initialized") or msg_id is None:
+        if method in ("notifications/initialized", "initialized"):
+            note = harness_log_notification()   # §8.6（other のときだけ・1 回）
+            if note:
+                replies.append(note)
+            continue
+        if msg_id is None:
             continue
         if method == "initialize":
-            offered = params.get("protocolVersion", "") if isinstance(params, dict) else ""
-            result = {"protocolVersion": negotiate_protocol(offered),
-                      "capabilities": {"tools": {"listChanged": False}},
-                      "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                      "instructions": PROACTIVE_INSTRUCTIONS}
-            replies.append({"jsonrpc": "2.0", "id": msg_id, "result": result})
+            replies.append({"jsonrpc": "2.0", "id": msg_id, "result": harness_on_initialize(params)})
+        elif method == "logging/setLevel":
+            err = harness_set_level(params)
+            replies.append({"jsonrpc": "2.0", "id": msg_id, **({"error": err} if err else {"result": {}})})
         elif method == "tools/list":
             replies.append({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
         elif method == "tools/call":
@@ -4581,15 +4823,20 @@ def _dispatch_message(msg: dict, pool: ThreadPoolExecutor) -> None:
     msg_id = msg.get("id")
     params = msg.get("params") or {}
     if method == "initialize":
-        offered = params.get("protocolVersion", "") if isinstance(params, dict) else ""
-        respond(msg_id, {
-            "protocolVersion": negotiate_protocol(offered),
-            "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-            "instructions": PROACTIVE_INSTRUCTIONS,
-        })
+        respond(msg_id, harness_on_initialize(params))   # §8.6
     elif method in ("notifications/initialized", "initialized"):
+        note = harness_log_notification()   # §8.6（other のときだけ・1 回）
+        if note:
+            _debug("out", note)
+            with WRITE_LOCK:
+                write_line(json.dumps(note, ensure_ascii=False))
         return
+    elif method == "logging/setLevel":
+        err = harness_set_level(params)
+        if err:
+            respond(msg_id, error=err)
+        else:
+            respond(msg_id, {})
     elif method == "tools/list":
         respond(msg_id, {"tools": TOOLS})
     elif method == "tools/call":

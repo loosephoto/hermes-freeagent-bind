@@ -42,20 +42,32 @@ def main() -> int:
     env["FREEAGENT_STATE_DIR"] = env.get("FREEAGENT_STATE_DIR") or os.path.join(
         os.environ.get("TEMP", "/tmp"), "freeagent-smoke")
     env["PYTHONIOENCODING"] = "utf-8"
+    env.pop("FREEAGENT_HARNESS", None)        # §8.6 を「Hermes 以外（clientInfo=smoke）」で決定的に試す
+    env.pop("FREEAGENT_HARNESS_WARN", None)
 
     proc = subprocess.Popen([sys.executable, "-m", "freeagent_bind"],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace", env=env, bufsize=1)
+    notifications: list[dict] = []
     try:
         def send(msg: dict) -> dict | None:
+            """id の一致する応答まで読む。途中の通知（id なし。§8.6 のログ通知など）は取っておく。"""
             assert proc.stdin and proc.stdout
             proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
             proc.stdin.flush()
             if "id" not in msg:
                 return None
-            line = proc.stdout.readline()
-            check(bool(line.strip()), f"応答がありません（{msg.get('method')}）")
-            return json.loads(line) if line.strip() else None
+            while True:
+                line = proc.stdout.readline()
+                if not line.strip():
+                    check(False, f"応答がありません（{msg.get('method')}）")
+                    return None
+                reply = json.loads(line)
+                if "id" not in reply:
+                    notifications.append(reply)
+                    continue
+                check(reply.get("id") == msg["id"], f"応答の id がずれています: {reply.get('id')} != {msg['id']}")
+                return reply
 
         init = send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                      "params": {"protocolVersion": "2025-06-18", "capabilities": {},
@@ -66,6 +78,11 @@ def main() -> int:
         check((init or {}).get("result", {}).get("protocolVersion") == "2025-06-18",
               "protocolVersion が提示された版で交渉されていない")
 
+        # §8.6 ハーネス判別: "smoke" は Hermes 以外 → logging 宣言・ログ通知・最初の結果の ⚠
+        caps = ((init or {}).get("result") or {}).get("capabilities") or {}
+        check("logging" in caps, "notifications/message を送るのに capabilities.logging を宣言していません")
+        check(str(((init or {}).get("result") or {}).get("instructions", "")).startswith("【注意】"),
+              "Hermes 以外のクライアントに instructions の注記がありません")
         send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
 
         listing = send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
@@ -84,6 +101,12 @@ def main() -> int:
         check(isinstance(result.get("structuredContent"), dict),
               "structuredContent が返っていません")
         check("⚠️" in text, "日本語（絵文字含む）が往復していません（エンコーディング破綻）")
+        check(text.startswith("⚠️ Hermes Agent 以外"), "最初のツール結果にハーネスの警告がありません")
+        check((result.get("structuredContent") or {}).get("harness", {}).get("kind") == "other",
+              "structuredContent.harness が返っていません")
+        logs = [n for n in notifications if n.get("method") == "notifications/message"]
+        check(len(logs) == 1 and (logs[0].get("params") or {}).get("level") == "warning",
+              f"ハーネスのログ通知が 1 件ではありません（{len(logs)} 件）")
 
         # 未知名でも JSON-RPC を壊さない
         unknown = send({"jsonrpc": "2.0", "id": 4, "method": "tools/call",

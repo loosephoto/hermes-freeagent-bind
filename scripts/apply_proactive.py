@@ -87,6 +87,9 @@ SNIPPET = (
 
 MARKER = "<!-- freeagent-bind: proactive-usage -->"
 MARKER_END = "<!-- /freeagent-bind: proactive-usage -->"
+# ハーネス判別の目印（server.py §8.6）。Hermes の clientInfo は MCP SDK 既定の "mcp" で区別できないため、
+# 設定の env: ブロック（子プロセスにそのまま渡る唯一の経路）で「Hermes から起動した」と明示する。
+HARNESS_MARKER_ENV = "FREEAGENT_HARNESS"
 
 
 def upsert_snippet(existing: str, snippet: str = SNIPPET) -> tuple[str, str]:
@@ -196,6 +199,35 @@ def _parse_flow_list(value: str) -> list[str]:
     if body.endswith("]"):
         body = body[:-1]
     return [part.strip().strip("\"'") for part in body.split(",") if part.strip()]
+
+
+def server_block(cfg: str, server: str) -> str:
+    """`mcp_servers.<server>` の節の本文（インデント 2 の次のサーバー名まで）を返す。"""
+    lines, inside = [], False
+    for line in cfg.splitlines():
+        if re.match(r"^  " + re.escape(server) + r":\s*$", line):
+            inside = True
+            continue
+        if inside:
+            if re.match(r"^  \S", line) or (line.strip() and not line.startswith(" ")):
+                break
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def own_server(cfg: str, servers: list[str]) -> str | None:
+    """このサーバー（freeagent-bind）の登録名。args に freeagent_bind を含む節を探す。"""
+    for name in servers:
+        if name == "freeagent-bind" or "freeagent_bind" in server_block(cfg, name):
+            return name
+    return None
+
+
+def configured_marker(cfg: str, server: str) -> str:
+    """設定済みの env.FREEAGENT_HARNESS（ハーネス判別の目印。server.py §8.6）。"""
+    m = re.search(r"^\s+" + re.escape(HARNESS_MARKER_ENV) + r":\s*['\"]?([^'\"\s]*)",
+                  server_block(cfg, server), re.M)
+    return m.group(1) if m else ""
 
 
 def configured_exclude(server: str) -> list[str]:
@@ -389,8 +421,19 @@ def main() -> int:
                 print(f"    {spec['why']}")
     print()
 
+    n_exclude = len(commands)   # 競合の除外だけの件数（目印のコマンドは数えない）
+    own = own_server(cfg, servers)
+    marker = configured_marker(cfg, own) if own else ""
+    if own and marker.lower() != "hermes":
+        commands.append(["hermes", "config", "set", f"mcp_servers.{own}.env.{HARNESS_MARKER_ENV}", "hermes"])
+        print(f"· {own}: ハーネス判別の目印 {HARNESS_MARKER_ENV}=hermes が未設定"
+              f"（現在: {marker or 'なし'}）。Hermes から起動したと判別できるよう設定に加えます")
+    elif own:
+        print(f"· {own}: ハーネス判別の目印 {HARNESS_MARKER_ENV}=hermes 設定済み")
+    print()
+
     if args.check:
-        print(f"照合できた競合: {len(commands)} 件 / 空振り・未確認: {broken} 件")
+        print(f"照合できた競合: {n_exclude} 件 / 空振り・未確認: {broken} 件")
         if broken:
             print("  設定済みの除外が空振りしています（実ツール名を確認して書き直すこと）")
         return 1 if broken else 0
@@ -418,13 +461,13 @@ def main() -> int:
         print()
 
     if not commands:
-        print("【2】適用できる設定はありません（競合が未登録か、パターンが実名に一致しません）。")
+        print("【2】適用できる設定はありません（競合が未登録かパターンが実名に一致せず、目印も設定済み）。")
         if broken:
             print("     ⚠ 空振りのパターンがあります（実ツール名を確認してください）:")
             print("       python scripts/apply_proactive.py --check")
         return 1 if broken else 0
 
-    print("【2】競合の汎用面を外す設定（実ツール名に一致したものだけ）")
+    print("【2】適用する設定（競合の汎用面の除外＝実ツール名に一致したものだけ／ハーネス判別の目印）")
     for cmd in commands:
         print("  " + " ".join(f"'{c}'" if " " in c else c for c in cmd))
 

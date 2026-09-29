@@ -1408,6 +1408,27 @@ class TestProactivePatternMatching(unittest.TestCase):
 
     def test_write_preserves_crlf(self):
         """利用者の SOUL.md が CRLF なら CRLF のまま書く（改行コードを勝手に変えない）。"""
+        self._crlf_body()
+
+    def test_marker_detection_in_config(self):
+        """ハーネス判別の目印（env.FREEAGENT_HARNESS）を自分の節からだけ読む。"""
+        cfg = ("mcp_servers:\n"
+               "  other:\n    command: x\n    env:\n      FREEAGENT_HARNESS: cursor\n"
+               "  freeagent-bind:\n    command: py\n    args:\n    - C:/x/src/freeagent_bind/server.py\n"
+               "    env:\n      OPENROUTER_API_KEY: sk-xxx\n"
+               "model: foo\n")
+        servers = self.mod.find_servers(cfg)
+        self.assertEqual(self.mod.own_server(cfg, servers), "freeagent-bind")
+        self.assertEqual(self.mod.configured_marker(cfg, "freeagent-bind"), "",
+                         "他の節の目印を自分のものと取り違えない")
+        cfg2 = cfg.replace("      OPENROUTER_API_KEY: sk-xxx\n",
+                           "      OPENROUTER_API_KEY: sk-xxx\n      FREEAGENT_HARNESS: hermes\n")
+        self.assertEqual(self.mod.configured_marker(cfg2, "freeagent-bind"), "hermes")
+        renamed = cfg.replace("  freeagent-bind:", "  fab:")
+        self.assertEqual(self.mod.own_server(renamed, self.mod.find_servers(renamed)), "fab",
+                         "登録名を変えていても args から自分を見つける")
+
+    def _crlf_body(self):
         import tempfile
         d = tempfile.mkdtemp()
         p = os.path.join(d, "SOUL.md")
@@ -1486,6 +1507,191 @@ class TestProactivePatternMatching(unittest.TestCase):
         matched2, empty2 = self.mod.match_report(["ask_*", "panel"], self.REAL)
         self.assertEqual(matched2, ["panel"])
         self.assertEqual(empty2, ["ask_*"])
+
+
+class TestHarnessDetection(unittest.TestCase):
+    """§8.6: Hermes 以外のハーネスで起動されたら（止めずに）警告する。"""
+
+    def setUp(self):
+        S._harness_reset()
+        self._env = unittest.mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop(S.HARNESS_MARKER_ENV, None)
+        os.environ.pop(S.HARNESS_WARN_ENV, None)
+
+    def tearDown(self):
+        self._env.stop()
+        S._harness_reset()
+
+    def _init(self, name="mcp", version="0.1.0"):
+        with unittest.mock.patch.object(sys, "stderr", new=__import__("io").StringIO()) as err:
+            res = S.harness_on_initialize({"protocolVersion": "2025-11-25",
+                                           "clientInfo": {"name": name, "version": version}})
+        return res, err.getvalue()
+
+    def test_detect_three_way(self):
+        d = S.detect_harness
+        # 実測: Hermes は MCP SDK 既定の clientInfo を送る → 目印が無ければ判別不能
+        self.assertEqual(d({"clientInfo": {"name": "mcp", "version": "0.1.0"}}, env={})["kind"], "unknown")
+        self.assertEqual(d({"clientInfo": {"name": "mcp"}}, env={"FREEAGENT_HARNESS": "hermes"})["kind"], "hermes")
+        self.assertEqual(d({"clientInfo": {"name": "mcp"}}, env={"FREEAGENT_HARNESS": "Hermes"})["source"], "env")
+        self.assertEqual(d({"clientInfo": {"name": "hermes-agent"}}, env={})["kind"], "hermes")
+        self.assertEqual(d({"clientInfo": {"name": "claude-code"}}, env={})["kind"], "other")
+        self.assertEqual(d({"clientInfo": {"name": "mcp"}}, env={"FREEAGENT_HARNESS": "cursor"})["kind"], "other")
+        for bad in (None, "x", {"clientInfo": "x"}, {"clientInfo": {"name": 5}}, {}):
+            self.assertEqual(d(bad, env={})["kind"], "unknown", repr(bad))
+
+    def test_initialize_declares_logging_and_echoes_protocol(self):
+        res, _ = self._init("claude-code")
+        self.assertIn("logging", res["capabilities"], "notifications/message を送るなら宣言が MUST")
+        self.assertEqual(res["protocolVersion"], "2025-11-25")
+
+    def test_other_warns_on_every_channel_once(self):
+        res, err = self._init("claude-code")
+        self.assertTrue(res["instructions"].startswith("【注意】"))
+        self.assertIn("Hermes Agent 以外", err)
+        note = S.harness_log_notification()
+        self.assertEqual(note["method"], "notifications/message")
+        self.assertEqual(note["params"]["level"], "warning")
+        self.assertIsNone(S.harness_log_notification(), "ログ通知は 1 回だけ")
+        first = S.handle_tool_call({"name": "freeagent_ask", "arguments": {"prompt": ""}})
+        self.assertTrue(first["content"][0]["text"].startswith("⚠️ Hermes Agent 以外"))
+        self.assertEqual(first["structuredContent"]["harness"]["kind"], "other")
+        second = S.handle_tool_call({"name": "freeagent_ask", "arguments": {"prompt": ""}})
+        self.assertNotIn("Hermes Agent 以外", second["content"][0]["text"], "content の警告は最初の 1 回だけ")
+        self.assertNotIn("harness", second["structuredContent"])
+        _, err2 = self._init("claude-code")
+        self.assertEqual(err2, "", "stderr も 1 プロセス 1 回")
+
+    def test_unknown_is_quiet(self):
+        res, err = self._init("mcp")
+        self.assertEqual(res["instructions"], S.PROACTIVE_INSTRUCTIONS)
+        self.assertIn(S.HARNESS_MARKER_ENV, err, "目印の入れ方だけは stderr に残す")
+        self.assertIsNone(S.harness_log_notification())
+        first = S.handle_tool_call({"name": "freeagent_ask", "arguments": {"prompt": ""}})
+        self.assertNotIn("Hermes Agent 以外", first["content"][0]["text"])
+        self.assertEqual(first["structuredContent"]["harness"]["kind"], "unknown")
+
+    def test_hermes_is_silent(self):
+        os.environ[S.HARNESS_MARKER_ENV] = "hermes"
+        res, err = self._init("mcp")
+        self.assertEqual((res["instructions"], err), (S.PROACTIVE_INSTRUCTIONS, ""))
+        self.assertIsNone(S.harness_log_notification())
+        first = S.handle_tool_call({"name": "freeagent_ask", "arguments": {"prompt": ""}})
+        self.assertNotIn("harness", first["structuredContent"])
+
+    def test_warn_off_suppresses_but_keeps_verdict(self):
+        os.environ[S.HARNESS_WARN_ENV] = "0"
+        res, err = self._init("claude-code")
+        self.assertEqual((res["instructions"], err), (S.PROACTIVE_INSTRUCTIONS, ""))
+        self.assertIsNone(S.harness_log_notification())
+        first = S.handle_tool_call({"name": "freeagent_ask", "arguments": {"prompt": ""}})
+        self.assertNotIn("Hermes Agent 以外", first["content"][0]["text"])
+        self.assertEqual(first["structuredContent"]["harness"]["kind"], "other")
+
+    def test_set_level_validates_and_gates_notification(self):
+        self.assertEqual(S.harness_set_level({"level": "loud"})["code"], -32602)
+        self.assertIsNone(S.harness_set_level({"level": "error"}))
+        self._init("claude-code")
+        self.assertIsNone(S.harness_log_notification(), "error 以上だけ欲しいクライアントに warning は送らない")
+
+    def test_no_initialize_no_side_effects(self):
+        out = S.handle_tool_call({"name": "freeagent_ask", "arguments": {"prompt": ""}})
+        self.assertNotIn("harness", out["structuredContent"])
+        self.assertIsNone(S.harness_status())
+
+    def test_stdio_dispatch_sends_log_notification_after_initialized(self):
+        lines = []
+        with unittest.mock.patch.object(S, "write_line", lines.append), \
+             unittest.mock.patch.object(sys, "stderr", new=__import__("io").StringIO()):
+            S._dispatch_message({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                 "params": {"protocolVersion": "2025-11-25",
+                                            "clientInfo": {"name": "claude-code"}}}, None)
+            S._dispatch_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, None)
+            S._dispatch_message({"jsonrpc": "2.0", "id": 2, "method": "logging/setLevel",
+                                 "params": {"level": "debug"}}, None)
+        msgs = [json.loads(x) for x in lines]
+        self.assertEqual(msgs[0]["id"], 1)
+        self.assertEqual(msgs[1]["method"], "notifications/message")
+        self.assertEqual(msgs[2], {"jsonrpc": "2.0", "id": 2, "result": {}})
+
+    def test_models_reports_harness(self):
+        self._init("claude-code")
+        with unittest.mock.patch.object(S, "provider_status", lambda: []), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: []), \
+             unittest.mock.patch.object(S, "cooling_refs", lambda: {}):
+            try:
+                data = S.tool_models({})
+            except Exception as exc:  # noqa: BLE001
+                self.skipTest(f"tool_models の依存を差し替えきれない: {exc}")
+        self.assertEqual(data["harness"]["kind"], "other")
+        self.assertIn("ハーネス: Hermes 以外", S.render("freeagent_models", data))
+
+
+class TestFallbackIndependence(unittest.TestCase):
+    """並列呼び出しのフォールバックが、他の枠・除外モデルと同じモデルで枠を埋めない。"""
+
+    def _patched(self, calls, fail=("p/a", "p/b")):
+        def call_once(provider, model, *a, **k):
+            ref = f"{provider}/{model}"
+            calls.append(ref)
+            if ref in fail:
+                raise S.HttpStatusError(503, "busy")
+            return {"text": f"answer from {ref}", "latency_s": 0.1, "truncated": False, "tokens": 1}
+        return [
+            unittest.mock.patch.object(S, "resolve_ref", lambda ref, free_only=True: tuple(ref.split("/", 1))),
+            unittest.mock.patch.object(S, "make_ref", lambda p, m: f"{p}/{m}"),
+            unittest.mock.patch.object(S, "_candidates",
+                                       lambda ref, free_only=True: [ref] + [r for r in ("p/b", "p/x", "p/y") if r != ref]),
+            unittest.mock.patch.object(S, "cooling_refs", lambda: {}),
+            unittest.mock.patch.object(S, "observe_call", lambda *a, **k: None),
+            unittest.mock.patch.object(S, "clear_provider_auth", lambda *a, **k: None),
+            unittest.mock.patch.object(S, "_call_once", call_once),
+        ]
+
+    def _run(self, refs, avoid=None, fail=("p/a",)):
+        calls = []
+        patches = self._patched(calls, fail)
+        for p in patches:
+            p.start()
+        try:
+            return S.ask_many(refs, "q", avoid=avoid), calls
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def test_fallback_skips_peer_slot_model(self):
+        (a, b), _ = self._run(["p/a", "p/b"], fail=("p/a",))
+        self.assertEqual(b["served_by"], "p/b")
+        self.assertNotEqual(a.get("served_by"), "p/b", "他の枠のモデルで埋めると独立 2 体が実質 1 体になる")
+        self.assertEqual(a["served_by"], "p/x")
+
+    def test_fallback_skips_avoided_models(self):
+        (a,), _ = self._run(["p/a"], avoid=["p/b", "p/x"], fail=("p/a",))
+        self.assertEqual(a["served_by"], "p/y", "検証者など avoid のモデルには落ちない")
+
+    def test_two_slots_never_share_one_fallback(self):
+        (a, b), _ = self._run(["p/a", "p/c"], fail=("p/a", "p/c"))
+        self.assertNotEqual(a.get("served_by"), b.get("served_by"))
+
+    def test_exhausted_by_avoidance_is_an_error_not_a_duplicate(self):
+        (a, b), _ = self._run(["p/a", "p/b"], avoid=["p/x", "p/y"], fail=("p/a",))
+        self.assertIn("error", a)
+        self.assertEqual(a.get("avoided_duplicates"), 3)
+        self.assertEqual(b["served_by"], "p/b")
+
+    def test_claims_are_atomic(self):
+        claims = S._ModelClaims(["p/a"], ["p/z"])
+        self.assertFalse(claims.take("p/a"))
+        self.assertFalse(claims.take("p/z"))
+        self.assertTrue(claims.take("p/x"))
+        self.assertFalse(claims.take("p/x"))
+
+    def test_parse_alternatives_drops_cut_last_line(self):
+        text = "代替: 独自メソッドで判別する。\n代替: 親プロセスのコマン"
+        self.assertEqual(S.parse_alternatives(text, truncated=True), ["独自メソッドで判別する。"])
+        self.assertEqual(len(S.parse_alternatives(text)), 2, "打ち切られていなければ全行を拾う")
+        self.assertEqual(S.parse_alternatives("代替", truncated=True), [])
 
 
 class TestVersionConsistency(unittest.TestCase):
