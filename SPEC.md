@@ -25,6 +25,7 @@
 | §6 | ツール実装（11 本） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
+| §8.5 / §8.6 | 失敗時の「次の一手」（`next_action`） / ハーネス判別（Hermes 以外で起動されたときの警告） |
 | §9 | JSON-RPC 2.0 / stdio |
 
 **依存は標準ライブラリのみ**。遅延 import するネイティブ拡張は、stdio 起動後に import すると
@@ -122,6 +123,12 @@
 - **空応答を成功として返さない**。思考トークンで予算を使い切るモデルがあり（実測: `max_tokens=220`
   で 3 体中 2 体が空）、空を回答として渡すとメイン LLM が無回答を回答と誤解する。予算を上げて
   （`min(max(max_tokens*3, 512), 2048)`）1 回だけ再試行し、なお空なら明示的なエラーにする。
+- **並列呼び出しの予備候補は重複させない**（`_ModelClaims`）。`ask_many` 1 回の中で、各枠の本来のモデルと
+  `avoid`（利用者の `exclude`、think の代替案では同じ呼び出しの検証者）を最初から「使用中」にし、フォールバックで
+  新たに取るモデルはロック内で 1 回だけ確保する。取れなければその候補を飛ばし、尽きたら
+  `avoided_duplicates` 付きのエラー（脱落）にする。同じモデルで 2 枠を埋めて「独立 2 体」に見せない
+  （実測: 代替案の提案者の枠を、同じ呼び出しの検証者と同じモデルが埋めた）。対象は panel / consult / 討論 /
+  grounded / think。`ask_map`（fanout / map）は枠ごとに依頼が違い独立性を主張しないので対象外。
 - **CoT 混入はマーカー方式**で検出する（改行数では判定しない。ラベル付き複数行出力を誤判定した
   実測がある）。用途は統計の減点のみで、回答を捨てる理由にはしない。
 
@@ -148,6 +155,35 @@
   使い切って空応答・切断になる（逆効果）。
 - `sources` を明示した場合は指定された有効ソースだけを検索する。無効な名前だけなら全ソースへフォールバックせず、利用可能な名前を返す。
 - 1 ソースの失敗で全体を落とさない（`errors` に集約し、成功分だけ返す）。
+
+### 6.1 締め切りつきの並列取得（§5.8）
+
+- `knowledge_lookup` は**ソースごとに専用スレッド**を立て、全体の締め切り `KB_DEADLINE`（既定 8 秒・
+  `FREEAGENT_KB_DEADLINE`・1〜120）まで待つ。旧実装は `run_parallel` で全ソース完了を待ち、並列数も
+  `min(ソース数, MAX_WORKERS=4)` だったため、6 ソースでは 2 つが待ち行列に入っていた（コードで確認）。
+  ソースはすべて別ホストなので、同時に引いてもホスト単位のリクエスト数は増えない。
+- 締め切りに間に合わなかったソースは `{"timed_out": true, "error": …}` の結果にし、`errors` と
+  トップレベルの `timed_out`（ソース名の配列）に載せる。**黙って消さない**。
+- 締め切り後も裏の取得は `KB_TIMEOUT` まで続く（daemon スレッド）。各ソースは `_kb_cached` を通るので、
+  完了すれば同じ問いの次回はキャッシュから即座に返る。締め切りは待ち時間の上限であって、取得の中止ではない。
+- `timings`（ソース → 所要秒。締め切り超えは `null`）と `deadline_s` を常に返す。表示は `✓ src (n 件・x.x 秒)` /
+  `⏱ src`。知識取得は状態ファイルを書かない（規約 21 の検査対象外にならない）。
+- 平常時の実測（2026-09-30 01:59〜02:0x）: 6 ソースとも 0.3〜4.5 秒、全体 1.9 秒。同時間帯に OpenAlex の
+  匿名検索が 429（`Anonymous search is temporarily rate-limited`）。候補の実測（J-STAGE 0.07〜0.44 秒・
+  CiNii Research 0.1〜0.3 秒・Stack Exchange 0.2〜0.4 秒・OpenAlex の arXiv 絞り込み 0.8〜2.5 秒ほか。
+  Semantic Scholar は匿名で 3/3 が 429、dblp はボット判定の HTML を HTTP 200 で返す）は追加の判断材料として
+  残し、追加は時間帯別の計測結果を見てから決める。
+
+### 6.2 時間帯別の計測（`scripts/measure_kb.py`）
+
+- 1 巡で全ソースを並列に 1 回ずつ引き、1 ソース 1 行を `FREEAGENT_KB_LATENCY_PATH`（既定
+  `FREEAGENT_STATE_DIR/kb_latency.jsonl`・最大 20,000 行・超えたら古い行から tmp + `os.replace` で捨てる）へ追記。
+  記録は `ts` / `hour`（日本時間）/ `source` / `elapsed_s` / `ok` / `items` / `error`（160 字）/ `mailto` /
+  `openalex_key` / `env_failure` だけで、**本文は残さない**。巡回ごとにキャッシュとホスト遮断の記憶を消す。
+- 全ソースが接続系の失敗なら `env_failure=true`（こちらのネットワーク障害）とし、`--report` の集計から外す。
+- `--schedule N` は Windows のタスク（`pythonw`＝窓を出さない）を 1 時間おきに登録し、残り回数を
+  `kb_latency.jsonl.schedule.json` で数えて、最後の 1 回でタスクを自分で消す（`/ED` `/ET` は HOURLY との
+  組み合わせで意味が曖昧なので使わない）。`schtasks` の出力はコンソールのコードページ（`oem`）で読む。
 
 ## 7. ツールの規約（§6–§8）
 
@@ -210,7 +246,7 @@
 | 仮説 | `kind=hypothesis` | ステップの `hypothesis_status`（初期 `open`） | 同じ番号で書き直しても `hypothesis_status` / `tested_by` は失わない |
 | 仮説の検証 | `tests_hypothesis` + `hypothesis_status` | 仮説側の `tested_by` / `hypothesis_status` | 対象は `kind=hypothesis` のみ。検証ステップ自身は `kind=test`（既定で推定） |
 | 見積り総数 | `total_thoughts` | ステップの `total_thoughts`、台帳メタ `total_history` | 省略時は台帳の値を引き継ぐ。**番号が見積りを超えたら番号まで引き上げ**、`total_auto_adjusted` と `notes` に出す |
-| 代替案 | `propose_alternatives` | ステップの `alternatives` | 検証者とも別のモデル（台帳の使用済みモデルを除外）。`THINK_ALT_SYSTEM` で「代替: …」を最大 3 行。全員が環境障害なら**書かない** |
+| 代替案 | `propose_alternatives` | ステップの `alternatives` | 検証者とも別のモデル（台帳の使用済みモデルを除外）。`THINK_ALT_SYSTEM` で「代替: …」を最大 3 行。フォールバックも検証者に落とさない（`avoid`）。`truncated`（上限で打ち切り）なら**最終行の案を捨てる**（文の途中で切れた案を完全な案として残さない。実測「代替: 親プロセスのコマン」）。既定の上限は 400 のまま（上げると proxy 経由で 10 秒の接続タイムアウトを超えやすい。§5）。全員が環境障害なら**書かない** |
 | 閲覧 | `view=true` + `session_id` | — | 何も書かない。サブも呼ばない（`verify` が付いていても） |
 
 - **推測で繋がない**: 参照先が無い操作はエラーで返し（`known_thoughts` / `known_branches` を添える）、
@@ -229,6 +265,27 @@
 - 未知メソッドは `-32601`、未知ツールは `isError: true` の結果として返す（JSON-RPC を壊さない）。
 - `initialize` の応答に **`instructions`**（`PROACTIVE_INSTRUCTIONS`）を載せる。ただし **Hermes は読まない**
   （ソース確認済み）ので、Hermes での自発利用は `description` と memory / `SOUL.md` の判断規則で作る。
+- `capabilities.logging` を宣言する（`notifications/message` を送るなら MUST。MCP 2025-11-25 Logging）。
+  `logging/setLevel` は `{}` を返し、不正なレベルは `-32602`。設定レベルが warning より上なら警告通知を送らない。
+
+### 8.1 ハーネス判別（§8.6）
+
+- **実測**: Hermes の `clientInfo` は MCP Python SDK 既定の `{"name": "mcp", "version": "0.1.0"}` で固有でない。
+  `HERMES_*` は子に渡らない（許可リスト方式。`tools/mcp_tool_config.py`）。設定の `env:` ブロックはそのまま渡る。
+  親プロセス名は Windows 11 で `wmic` が無く取れず、PowerShell / CIM は起動が秒単位で遅いので使わない。
+- 判定（`detect_harness`・文字列比較だけ）: `FREEAGENT_HARNESS` が `hermes`（大小無視）→ **hermes**、それ以外の値 →
+  **other**。目印が無ければ `clientInfo.name` に `hermes` を含む → hermes、`mcp` 以外の名前 → other、`mcp` か
+  名前なし → **unknown**。
+- 出し方（各 1 プロセス 1 回・`_HARNESS_LOCK` 内で判定）:
+  - other: `instructions` 先頭に【注意】 / stderr 1 行 / `notifications/initialized` 受信後に `notifications/message`
+    （level=warning・logger=`freeagent-bind.harness`） / **最初の `tools/call` だけ** content 先頭に `⚠️` 1 行と
+    `structuredContent.harness`
+  - unknown: stderr 1 行（目印の入れ方）と最初の結果の `structuredContent.harness` だけ
+  - hermes: 何も出さない
+- **動作は止めない**。`FREEAGENT_HARNESS_WARN=0` で警告を止める（判定は `structuredContent.harness` と
+  `freeagent_models` の `harness` に残す）。`initialize` 前の `tools/call` では何もしない。
+- `apply_proactive.py --apply` は自分の節（args に `freeagent_bind` を含む）の `env.FREEAGENT_HARNESS` が `hermes`
+  でなければ設定コマンドを加える（`--check` は表示だけ。exit コードには影響しない）。
 
 ## 9. 拡張の手順（新しいツールを足すとき）
 

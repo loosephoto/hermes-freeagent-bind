@@ -35,6 +35,7 @@
 | 並列で超高速になる | **ならない** | 速くなるのは**メインが待たずに走らせられる部分だけ**。1 体が数秒〜数十秒かかるので、往復する `freeagent_consult` は**分単位**です（実測: 4 体の `freeagent_panel` は 14〜20 秒、多段討議を含む 1 ターンは **3分52秒**、別の標本は 420 秒を超えても継続）。多くの場合、総時間はむしろ延びます |
 | 多数決を取れば正解が保証される | **保証されない** | 同系統の Free モデルは**同じ誤りを共有**しやすい。**投げ先も減ります**: 実測で `nous` はプロキシ停止で 0 モデル（到達不可）、HF の無料 3 件はクレジット枯渇で 402、NVIDIA は 82 件中 55 件が 404（廃止）。応答が返っても中身は玉石混交で、実測の 4 体には **6.7B のコーダーモデルが API 設計の問いに答えていました**。だから「独立意見は N 体・うち応答 M 体」と留保を付けて返します |
 | 合意度が高ければ正しい | **別物** | 合意度は**表層の一致**（言い回しの類似）であって、正しさの確率ではありません。**確信度の自己申告は当てになりません**（実測: 確信度 `confidence_mean` **90.5** に対し合意度 `agreement` **0.094** の回がありました＝自信満々でも言っていることがバラバラ） |
+| 知識検索がいつも速くなる | **ならない** | 締め切り（既定 8 秒）で**待ち時間に上限が付く**だけです。遅い時間帯のソースは `⏱` で結果から抜け、その回の出典は減ります（同じ問いの 2 回目は、裏で取れた分がキャッシュから返ります）。平常時は 6 ソースで全体 1.9 秒でした（実測） |
 | 出典が付くので幻覚が消える | **消えない** | `freeagent_lookup` / `freeagent_grounded` は LLM を介さず事実を取りますが、**解釈・推論は各モデルの出力**です。保証されるのは「取得した事実」までです。ただし `grounded` は**根拠の本文**を注入し、`agent` は回答中の `[n]` を根拠と照合するので、「根拠を使った回答か」は機械的に判定できます |
 | 常時 ON にすると他のツールが遅くなる | **ならない** | 固定費は起動と一覧で**約 0.17 秒**（実測: spawn → `tools/list` 完了まで **166 ms**・7 回の中央値 168 ms）、スキーマは **11 ツールで 12,985 文字**（うち `freeagent_think` が 3,431 文字。分解・改訂・分岐・仮説の引数と【常用】の指示で +1,384 文字）。実タスクの差はノイズ程度です |
 | 思考ノートを入れればメインが賢くなる | **ならない** | `freeagent_think` で分解・改訂・分岐・仮説を**考えるのはメイン自身**です。ツールは計画・分岐・仮説の状態を**覚える**だけで、知能は増えません。増えるのは「考えた道筋を忘れない（文脈圧縮・再起動をまたぐ）」ことと、頼んだときだけ付く**別モデルの反論・別案**です。ノートに書くだけならサブ呼び出し 0 回・**ほぼ 0 秒**、反論＋別案を頼むと 1 回 **約 24 秒**で、2 体中 1 体がタイムアウトで脱落しました（実測） |
@@ -59,7 +60,8 @@ LLM を介さず取る」「大量の要素へ同じ指示を並列に流す」�
 9. [知識バックエンド](#知識バックエンド)
 10. [つまずいたとき](#つまずいたとき)
 11. [環境変数](#環境変数)
-12. [既知の制約](#既知の制約) ・ [設計判断](#設計判断) ・ [検証](#検証)
+12. [Hermes 以外で使うとき](#hermes-以外で使うとき)
+13. [既知の制約](#既知の制約) ・ [設計判断](#設計判断) ・ [検証](#検証)
 
 ---
 
@@ -67,14 +69,19 @@ LLM を介さず取る」「大量の要素へ同じ指示を並列に流す」�
 
 **必要なもの**: Python 3.11+ と Hermes Agent。このサーバー自体の追加インストールは不要です（依存ゼロ）。
 
-### 1. 登録する（4 コマンド）
+### 1. 登録する（5 コマンド）
 
 ```bash
 hermes config set mcp_servers.freeagent-bind.command <python の絶対パス>
 hermes config set mcp_servers.freeagent-bind.args '["<ABS_PATH>/src/freeagent_bind/server.py"]'
 hermes config set mcp_servers.freeagent-bind.connect_timeout 45
 hermes config set mcp_servers.freeagent-bind.enabled true
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_HARNESS hermes   # Hermes から起動した目印
 ```
+
+最後の 1 行は、**起動したのが Hermes Agent だと判別するための目印**です。入れないと、起動のたびにログへ
+「ハーネスを判別できません」と 1 行出ます（動作は変わりません）。詳しくは [Hermes 以外で使うとき](#hermes-以外で使うとき)。
+`python scripts/apply_proactive.py --apply` でも入ります。
 
 `<python の絶対パス>` は `python -c "import sys; print(sys.executable)"` で分かります。
 `hermes mcp add` は**対話式**で、TTY が無い環境では `Cancelled.` になり設定が書かれません。
@@ -506,6 +513,11 @@ Free 21 件 / **実応答 11 件**。`:free` でも **403（モデル単位の�
 | `nvidia` | 未認証でも可 | `NVIDIA_API_KEY` | 無料クレジット枠。**一覧 82 件中 55 件は 404=EOL**（実測） |
 | `huggingface` | **未認証でも可** | `HF_TOKEN`（**Inference Providers の権限が必要**） | 料金・文脈長は**提供元ごと**（`providers[]`）。**137 モデル / Free 3 / 生存 1**（実測）。無料枠は**月次クレジット**（尽きると全モデルが 402） |
 
+**並列呼び出しの予備候補は重複させない**: 1 体が失敗すると予備の候補へ切り替えますが、panel / consult / 討論 /
+grounded / think の検証・代替案では、**同じ呼び出しの他の枠が使っているモデルと除外したモデルには切り替えません**
+（実測: 代替案の提案者の枠を、同じ呼び出しの検証者と同じモデルが埋め、「検証者とも別のモデル」が破れていた）。
+予備が尽きたらその枠は脱落として表示します（同じモデルで枠を埋めて「独立 2 体」に見せない）。
+
 ### 生存確認の 3 段
 
 一覧は実態と乖離します。各社の `/v1/models` は**呼べないモデルを含み**（NVIDIA は EOL が 55/82、HF は
@@ -548,10 +560,61 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 | `openalex` | 論文グラフ・被引用数 | 検索は `OPENALEX_API_KEY` を推奨（無いと匿名検索が止められうる） |
 | `github` | リポジトリ / Issue / コード | `GITHUB_TOKEN` / `GH_TOKEN`（コード検索は必須） |
 
-`freeagent_lookup` と `freeagent_grounded` は 6 ソースを**並列に**引いて、重複を除いた出典リスト
+`freeagent_lookup` と `freeagent_grounded` は 6 ソースを**同時に**引いて、重複を除いた出典リスト
 （`[1] タイトル URL`）を返します。**LLM を経由しないので幻覚が混入しません。** Wikipedia は検索結果と要約を 1 回の API 呼び出しで取得します。未知の `sources` だけが指定された場合は、誤って全ソースへ問い合わせず、有効なソース名を案内します。混在指定なら有効なソースだけを検索し、未知名も報告します。
 
 各出典には**本文**（Wikipedia の本文・arXiv/Crossref/OpenAlex のアブストラクト・GitHub の説明・Wikidata の説明）が付きます。`freeagent_grounded` はこれを番号つきでサブLLMへ注入してから答えさせ、回答中の `[n]` を検査します。`freeagent_agent` も自分で集めた根拠に通し番号を振り、回答が根拠を引用したかどうか（`cited_ok`）と、**根拠に無い番号**（`unsupported_citations`）を返します。「出典らしき番号を付けただけ」の回答はここで見分けられます。注入する本文量は `FREEAGENT_EVIDENCE_ITEM_CHARS` / `_TOTAL_CHARS` で調整できます（小型モデルは増やしすぎると空応答になります）。
+
+### 遅いソースで待たされない（締め切り）
+
+提供元によっては、時間帯によって応答が遅くなります。そこで取得には**全体の締め切り**（既定 **8 秒**・
+`FREEAGENT_KB_DEADLINE`）を設け、**間に合ったソースの分だけ**返します。
+
+実際の出力（2026-09-30 02:0x・`limit=2`・全体 1.89 秒。題名の行は一部省略）:
+
+```
+出典 10 件（wikipedia, wikidata, arxiv, crossref, openalex, github）
+  ✓ wikipedia (2 件・0.7 秒)
+  ✓ wikidata (2 件・1.9 秒)
+  ✓ arxiv (2 件・0.3 秒)
+  ✓ crossref (2 件・1.1 秒)
+  × openalex・0.3 秒: HTTP 429: {"error":"Rate limit exceeded","message":"Anonymous search is temporarily rate-l
+  ✓ github (2 件・0.5 秒)
+```
+
+締め切りを越えたソースがあると、見出しに `/ 締め切り 8.0 秒に間に合わず 1 件` が付き、そのソースの行が
+`⏱ openalex: 締め切りに間に合いませんでした（取得は継続・次回はキャッシュから）` になります（この回は全ソースが間に合いました）。
+
+- 間に合わなかったソースは `⏱` と `structuredContent.timed_out` に出ます（黙って消しません）。
+- 取得は裏で続けます。終われば 30 分キャッシュに入るので、**同じ問いの 2 回目は即座に**返ります。
+- ソースごとの所要秒は `structuredContent.timings` に入ります（どのソースが遅いかが分かります）。
+- 以前は全ソースの完了を待っていたうえ、同時に引けるのが 4 ソースまでで、6 ソースのうち 2 つは前の完了待ちでした
+  （コードで確認）。今は全ソースを同時に引きます（ソースごとに別のサーバーなので、1 サーバーあたりの回数は増えません）。
+
+**平常時の実測**（2026-09-30 01:59〜02:0x、各 1〜3 回）: 6 ソースとも 0.3〜4.5 秒、`freeagent_lookup` 全体で 1.9 秒。
+ただし同じ時間帯に OpenAlex が **HTTP 429**（キーなしの検索を一時制限中）を返しました。
+
+**速く・安定させる設定**（どちらも無料）:
+
+```bash
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_MAILTO 'you@example.com'   # Crossref / OpenAlex の優先窓口
+hermes config set mcp_servers.freeagent-bind.env.OPENALEX_API_KEY '<値>'              # OpenAlex の 429 を避ける
+```
+
+キーの入手先は [API キー](#api-キー) を参照してください。設定後は Hermes を再起動します。
+
+### どのソースがいつ遅いかを測る（`scripts/measure_kb.py`）
+
+```bash
+python scripts/measure_kb.py --schedule 24    # 1 時間おきに 24 回測る（Windows のタスク。終われば自動で削除）
+python scripts/measure_kb.py --report         # ソース別と、時間帯（日本時間）× ソースの p95・失敗数
+python scripts/measure_kb.py --unschedule     # 途中で止める
+python scripts/measure_kb.py                  # その場で 1 回だけ測る
+```
+
+記録するのは所要秒・成否・件数だけで、**本文は残しません**（`kb_latency.jsonl`・最大 2 万行）。
+こちらのネットワークが落ちていた回（全ソースが接続エラー）は集計から外します。Hermes の外で動くため、
+Hermes の設定にある `FREEAGENT_MAILTO` などは反映されません（記録に `mailto` の有無が残ります）。
 
 ---
 
@@ -578,6 +641,10 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 | 少し待っても選ばれない（自発しない） | 競合の汎用面が残っている・判断規則が毎ターンの場所に無い | `python scripts/apply_proactive.py --apply` → memory へ文面 → 再起動 → 測定 |
 | 除外したはずの競合がまだ出てくる | パターンが実ツール名に一致していない（例: `ask_*` は実名 `ask-all` に一致しない） | `python scripts/apply_proactive.py --check`（空振りなら exit 1）で照合し、一致したパターンだけを設定 |
 | 依頼した数より参加が少ない | 在庫に無い ref を指定した | content の `⚠️` に出る除外理由を確認（[出力の読み方](#出力の読み方)） |
+| `lookup` に `⏱ … 締め切りに間に合いませんでした` | そのソースが遅い時間帯 | 少し置いて同じ問いを再実行（裏で取れた分はキャッシュから即座に返る）。どのソースがいつ遅いかは `measure_kb.py --report` |
+| 1 体が「フォールバック先がすべて同じ呼び出しの他の枠で使用中か除外済み」で脱落 | 本来のモデルが失敗し、予備候補も他の枠・除外モデルしか無かった | 仕様どおり（同じモデルで 2 枠を埋めると独立した意見にならない）。`size` を減らすか少し待つ |
+| ログに「ハーネスを判別できません」 | 目印 `FREEAGENT_HARNESS` が未設定（Hermes は名乗らない） | `hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_HARNESS hermes` → 再起動 |
+| 結果の先頭に「⚠️ Hermes Agent 以外のクライアント…」 | Hermes 以外（Claude Code など）から起動された | [Hermes 以外で使うとき](#hermes-以外で使うとき)を参照。止めるなら `FREEAGENT_HARNESS_WARN=0` |
 
 ---
 
@@ -592,6 +659,10 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 | `FREEAGENT_DEFAULT_MODEL` | 空（自動選抜） | 既定モデル（`provider/model`） |
 | `FREEAGENT_MAX_WORKERS` | 4 | 並列度（1〜16） |
 | `FREEAGENT_MAX_CALLS_PER_RUN` | 40 | 1 呼び出しで許す最大推論回数 |
+| `FREEAGENT_KB_DEADLINE` | 8 | 知識取得全体の締め切り（秒・1〜120）。遅れたソースは `⏱` で脱落表示 |
+| `FREEAGENT_KB_LATENCY_PATH` | `kb_latency.jsonl` | `measure_kb.py` の記録先 |
+| `FREEAGENT_HARNESS` | 空 | 起動元の目印。Hermes から使うなら `hermes`（[Hermes 以外で使うとき](#hermes-以外で使うとき)） |
+| `FREEAGENT_HARNESS_WARN` | 1 | `0` で Hermes 以外のときの警告を止める（判定結果は `structuredContent.harness` に残る） |
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |
 | `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface` | 一覧に出すプロバイダと優先順 |
 | `FREEAGENT_AUTH_TTL` | 900 | 認証失敗を覚えて自動選抜から外す時間（秒） |
@@ -645,6 +716,41 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 | `FREEAGENT_TRACE_PATH` | `traces.jsonl`（トレース） |
 | `FREEAGENT_SESSIONS_PATH` | `sessions.json`（相談セッション） |
 | `FREEAGENT_THOUGHTS_PATH` | `thoughts.json`（思考台帳・TTL と上限つき。**知識は蓄積しない**） |
+
+---
+
+## Hermes 以外で使うとき
+
+このサーバーは **Hermes Agent 向け**です。ほかの MCP クライアント（Claude Code など）でも動きますが、次の 2 点は
+Hermes を前提にしています。
+
+- **推論の既定の接続先は `hermes proxy`**（`127.0.0.1:8645` の `nous` プロバイダ）。Hermes が無いと `nous` は使えません。
+  OpenRouter / NVIDIA / Hugging Face は、キーを入れればそのまま使えます（`FREEAGENT_BASE_URL` で接続先も変えられます）。
+- **自動的に使わせる設定**（SOUL.md の判断規則・`tools.exclude`・`apply_proactive.py`）は Hermes 専用です。
+
+そのため、起動時に**どのクライアントから起動されたか**を判定し、Hermes 以外なら**止めずに警告だけ**出します。
+
+### 判定のしかた
+
+| 判定 | 条件 | 表示 |
+|---|---|---|
+| **Hermes** | 目印 `FREEAGENT_HARNESS=hermes` がある（または将来 Hermes が `hermes` を名乗った場合） | 何も出さない |
+| **Hermes 以外** | クライアントの名乗り（`clientInfo.name`）が MCP SDK の既定値 `mcp` 以外（例: `claude-code`） | 下の 4 か所に警告 |
+| **判別不能** | 名乗りが `mcp` で、目印も無い | ログ（stderr）に目印の入れ方を 1 行と、最初の結果の `structuredContent.harness` だけ |
+
+**目印が要る理由（実測）**: Hermes が送る `clientInfo` は MCP Python SDK の既定値 `{"name": "mcp", "version": "0.1.0"}` で、
+同じ SDK を使う他のクライアントと区別できません。`HERMES_*` の環境変数も子プロセスには渡りません（Hermes は許可した
+変数しか渡さない）。設定の `env:` ブロックだけはそのまま渡るので、そこに目印を置きます。
+
+### Hermes 以外のときの警告
+
+1. `initialize` の `instructions` の先頭に注記（Hermes は読みませんが、他のクライアントは読みます）
+2. 標準エラー出力に 1 行（多くのクライアントがログファイルに残します）
+3. MCP のログ通知 `notifications/message`（level=warning）。画面に出すかはクライアント次第です
+4. **最初のツール結果だけ**、先頭に `⚠️` の 1 行と `structuredContent.harness`
+
+どれも 1 プロセスにつき 1 回です。止めるときは `FREEAGENT_HARNESS_WARN=0`（判定結果は `structuredContent.harness` と
+`freeagent_models` の「ハーネス:」行に残ります）。
 
 ---
 
@@ -767,6 +873,7 @@ python -m unittest discover -s tests         # オフライン回帰テスト
 python scripts/smoke_stdio.py                # 実クライアント経路（stdio）
 python scripts/check_offline.py              # バックエンド全滅でも例外漏れ・ハング・状態汚染なし
 python scripts/measure_adoption.py           # 自発利用率を state.db から測る
+python scripts/measure_kb.py --report         # 知識バックエンドの時間帯別の応答時間
 python scripts/apply_proactive.py            # 率先して使わせる設定（既定は表示のみ）
 python scripts/apply_proactive.py --check    # 除外パターンが実ツール名に一致するか（空振りなら exit 1）
 python scripts/apply_proactive.py --write-snippet "$LOCALAPPDATA/hermes/SOUL.md"   # 判断規則を入れる／最新に差し替え

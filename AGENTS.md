@@ -26,10 +26,11 @@ python scripts/smoke_stdio.py
 ```bash
 python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # TOOLS/HANDLERS の一致・スキーマ・版・content の規約
-python -m unittest discover -s tests         # オフライン回帰（166 件・ネットワーク不要）
+python -m unittest discover -s tests         # オフライン回帰（190 件・ネットワーク不要）
 python scripts/smoke_stdio.py                # 実クライアント経路（initialize/tools/list/tools/call）
 python scripts/check_offline.py              # バックエンド全滅: 例外漏れ・ハング・状態汚染が無いこと
 python scripts/measure_adoption.py           # 自発利用率の測定（state.db を読むだけ・副作用なし）
+python scripts/measure_kb.py --report         # 知識バックエンドの時間帯別の応答時間（記録を読むだけ）
 python scripts/apply_proactive.py            # 率先利用の設定（既定は表示のみ。--apply で適用）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存（プロキシが要る）
 env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py   # モデルの生存確認を定着（数分）
@@ -125,6 +126,28 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     `superseded_by` を付け、検証者・提案者には**現行の道筋**だけを渡す。今回の呼び出しで改訂・決着させる
     対象もプロンプト側で先に反映する（印は統合時＝検証の後に付くので、放置すると撤回済みの前提が
     「現行」として検証者に渡る。実装中のテストで検出）。`propose_alternatives` の到達不能も (c) と同じく書かない。
+
+25. **ハーネス判別は目印が主、推定は従**（§8.6）。Hermes の `clientInfo` は MCP SDK 既定の `mcp` で
+    **Hermes 固有でない**（実測）ので、`clientInfo` だけで「Hermes」と決めない。確実なのは設定の `env:` に置く
+    `FREEAGENT_HARNESS=hermes`（`env:` だけが子プロセスにそのまま渡る。`HERMES_*` は渡らない）。判別不能
+    （unknown）の Hermes 利用者を毎回の警告で煩わせない（stderr 1 行だけ）。Hermes 以外（other）でも
+    **動作は止めず警告だけ**、各チャネル 1 プロセス 1 回。判定はサブプロセスを使わない（起動が秒単位で遅くなる）。
+    `notifications/message` を送るので `capabilities.logging` の宣言を外さない（仕様上 MUST）。
+    スモークなどのクライアントは **`id` の一致する応答まで読み、途中の通知を飛ばす**（通知を応答として読むと
+    以降が 1 つずつずれる。実装中に `smoke_stdio.py` で発生）。
+
+26. **並列呼び出しの予備候補で枠を重複させない**（`_ModelClaims`）。フォールバックが同じ呼び出しの他の枠・
+    除外モデル・（think の代替案では）検証者と同じモデルに落ちると、「独立 N 体」の表示が実質 1 体になる（実測）。
+    予備が尽きたら脱落として返し、同じモデルで埋めない。`max_tokens` で打ち切られた応答の**最終行**は
+    文の途中で切れているので、完全な項目として拾わない（`parse_alternatives(truncated=True)`）。
+
+27. **知識取得は締め切りで待ち時間に上限を付け、遅れたソースは脱落として見せる**（§5.8）。全ソースの完了を
+    待つと、1 ソースの遅延（1 リクエスト最大 20 秒・Wikidata は最大 3 回直列）がそのまま全体の待ち時間になる。
+    並列数を LLM 用の `MAX_WORKERS` に揃えない（ソースは別ホストなので全部同時でよい）。締め切りは取得の
+    中止ではなく、裏の取得を `_kb_cached` に入れて次回を速くする。ソースの追加・差し替えは**時間帯別の実測**
+    （`measure_kb.py --report`）を根拠にする。1 時点の計測で「速い／遅い」と決めない（01:59 の計測では
+    遅延が再現しなかった）。HTTP 200 でも中身が JSON でない提供元がある（dblp はボット判定の HTML）ので、
+    候補は**状態コードではなく中身**で確かめる。
 
 ## ライセンス
 
