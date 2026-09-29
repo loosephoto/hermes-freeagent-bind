@@ -10,9 +10,11 @@
 目次
   §0 定数・設定        §1 ユーティリティ     §2 永続ストア（§2.1 クールダウン / §2.2 品質統計 /
                                              §2.3 トレース / §2.4 相談セッション /
-                                             §2.5 プロバイダ認証の記憶 / §2.6 思考台帳）
+                                             §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 /
+                                             §2.7 思考台帳の構造（分解・改訂・分岐・仮説））
   §3 プロバイダとモデル  §4 サブLLM呼び出し    §5 知識バックエンド
-  §6 ツール実装        §7 ツール定義         §8 表示（content）
+  §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案）
+  §7 ツール定義         §8 表示（content）
   §8.5 失敗時の「次の一手」（structuredContent.next_action）   §9 JSON-RPC / stdio
 
 設計方針（旧 hermes-memex の実測で裏づけられた規約を継承）
@@ -1117,7 +1119,7 @@ def thought_get(sid: str) -> dict | None:
 
 
 def thought_merge(sid: str, step: dict, *, question: str = "", verifier_models: list | None = None,
-                  assign_number: bool = False) -> dict:
+                  assign_number: bool = False, ops: dict | None = None) -> dict:
     """台帳へ 1 ステップを**1 つのロック内で**統合する（読み・採番・書きを分けない）。
 
     読みと書きを分けると、並列に呼ばれた 2 つの思考が同じ番号を採番して**片方が上書きで消える**
@@ -1137,8 +1139,11 @@ def thought_merge(sid: str, step: dict, *, question: str = "", verifier_models: 
         replaced = any(as_int(s.get("n"), 0, 0, 9999) == number for s in steps)
         if not replaced and len(steps) >= THOUGHT_MAX_STEPS:
             return {"session_id": target, "step": None, "steps_recorded": len(steps), "refused": True}
+        old = next((s for s in steps if as_int(s.get("n"), 0, 0, 9999) == number), None)
         steps = [s for s in steps if as_int(s.get("n"), 0, 0, 9999) != number] + [step]
         steps.sort(key=lambda s: as_int(s.get("n"), 0, 0, 9999))
+        # 他ステップ・台帳メタへの波及（改訂済みの印・仮説の状態・分岐の状態・計画）も**同じロック内**。
+        _thought_apply_ops(row, steps, step, old, ops or {})   # §2.7
         row.update({
             "steps": steps,
             "question": question or row.get("question") or "",
@@ -1157,6 +1162,75 @@ def thought_drop(sid: str) -> None:
     with _THOUGHTS_LOCK:
         _THOUGHTS.pop(sid, None)
     _thoughts_save()
+
+
+# ---------------------------------------------------------------- §2.7 思考台帳の構造（分解・改訂・分岐・仮説）
+#
+# 台帳を「思考の列」から**構造**へ上げる操作。`thought_merge` が**ロック内**で呼ぶ（読みと書きを
+# 分けると並列呼び出しで印が消える。規約 24b）。引数の検証は §6.10 の `_think_structure` が**先に**
+# 済ませる（検証に失敗した呼び出しでサブ呼び出しの予算を使わないため）。ここでは検証済みの操作を
+# 適用するだけで、対象が見つからなければ黙って何もしない（ステップは削除されないので実際には起きない）。
+#
+# - 改訂: 改訂された元ステップに `superseded_by` を付ける（消さない＝履歴は残す）。
+# - 仮説: `kind=hypothesis` のステップが状態（open/supported/refuted/inconclusive）を持つ。
+# - 分岐: 台帳メタ `branch_meta` に分岐元・状態（open/adopted/abandoned/merged）を持つ。
+# - 分解: 台帳メタ `plan`（サブ目標）。再送は計画の改訂で、達成済みの印は同じ文面の項目に引き継ぐ。
+# - 見積り総数: 変化したときだけ `total_history` に積む（動的調整の履歴）。
+
+THOUGHT_KINDS = ("step", "hypothesis", "test", "conclusion")
+HYPOTHESIS_STATES = ("open", "supported", "refuted", "inconclusive")
+BRANCH_STATES = ("open", "adopted", "abandoned", "merged")
+THOUGHT_PLAN_MAX = 12
+
+
+def _thought_apply_ops(row: dict, steps: list[dict], step: dict, old: dict | None, ops: dict) -> None:
+    n = as_int(step.get("n"), 0, 0, 9999)
+    by_n = {as_int(s.get("n"), 0, 0, 9999): s for s in steps}
+    # 同じ番号の再送（置き換え）でも、他ステップが付けた印は失わない。
+    if old:
+        if old.get("superseded_by") and not step.get("superseded_by"):
+            step["superseded_by"] = old["superseded_by"]
+        if old.get("kind") == "hypothesis" and step.get("kind") == "hypothesis":
+            for key in ("tested_by", "hypothesis_status", "status_at"):
+                if old.get(key):
+                    step[key] = old[key]
+    rev = as_int(ops.get("revises"), 0, 0, 9999)
+    if rev and rev != n and rev in by_n:
+        by_n[rev]["superseded_by"] = n
+    hyp = as_int(ops.get("tests_hypothesis"), 0, 0, 9999)
+    if hyp and hyp in by_n and by_n[hyp].get("kind") == "hypothesis":
+        target = by_n[hyp]
+        target["tested_by"] = [t for t in (target.get("tested_by") or []) if t != n] + [n]
+        if ops.get("hypothesis_status") in HYPOTHESIS_STATES:
+            target["hypothesis_status"] = ops["hypothesis_status"]
+            target["status_at"] = n
+    meta = row.get("branch_meta") if isinstance(row.get("branch_meta"), dict) else {}
+    bid = step.get("branch_id")
+    if bid and bid not in meta:
+        meta[bid] = {"from": step.get("branch_from_thought"), "status": "open",
+                     "opened_at": n, "resolved_at": None}
+    res = ops.get("resolve_branch")
+    if res and res in meta and ops.get("branch_status") in BRANCH_STATES:
+        meta[res]["status"] = ops["branch_status"]
+        meta[res]["resolved_at"] = None if ops["branch_status"] == "open" else n
+    row["branch_meta"] = meta
+    plan = [p for p in (row.get("plan") or []) if isinstance(p, dict)]
+    if ops.get("plan"):
+        done = {p.get("text"): p.get("done_at") for p in plan if p.get("done_at")}
+        plan = [{"id": i + 1, "text": text, "done_at": done.get(text)}
+                for i, text in enumerate(ops["plan"][:THOUGHT_PLAN_MAX])]
+        row["plan_revised_at"] = n
+    sub = as_int(step.get("subgoal"), 0, 0, THOUGHT_PLAN_MAX)
+    if sub and ops.get("subgoal_done"):
+        for item in plan:
+            if item.get("id") == sub:
+                item["done_at"] = n
+    row["plan"] = plan
+    total = as_int(ops.get("total"), 0, 0, 999)
+    history = [h for h in (row.get("total_history") or []) if isinstance(h, dict)]
+    if total and (not history or history[-1].get("total") != total):
+        history.append({"at": n, "total": total, "auto": bool(ops.get("total_auto"))})
+    row["total_history"] = history[-24:]
 
 
 # ================================================================ §3 プロバイダとモデル
@@ -3107,46 +3181,102 @@ def _think_step_label(step: dict) -> str:
     if step.get("branch_id"):
         tags.append(f"分岐 {step['branch_id']}")
     if step.get("is_revision"):
-        tags.append("修正")
+        tags.append(f"#{step['revises_thought']} の修正" if step.get("revises_thought") else "修正")
+    if step.get("kind") == "hypothesis":
+        tags.append(f"仮説・{step.get('hypothesis_status') or 'open'}")
+    elif step.get("kind") == "test" and step.get("tests_hypothesis"):
+        tags.append(f"仮説 #{step['tests_hypothesis']} の検証")
+    elif step.get("kind") == "conclusion":
+        tags.append("結論")
     return f"（{', '.join(tags)}）" if tags else ""
 
 
-def _think_prompt(question: str, steps: list[dict], step: dict) -> str:
-    """検証者へ渡す材料。**解析済みの項目だけ**を渡す（原文の CoT をそのまま転送しない）。"""
+def _think_prompt(question: str, steps: list[dict], step: dict, row: dict | None = None) -> str:
+    """検証者へ渡す材料。**解析済みの項目だけ**を渡す（原文の CoT をそのまま転送しない）。
+
+    渡すのは**現行の道筋**（改訂済み・棄却分岐を除く）だけ。古い思考を混ぜると、検証者が既に
+    撤回された前提を反証して予算を使う。改訂なら改訂前の文、仮説の検証なら対象の仮説を添える。
+    """
     parts: list[str] = []
+    n = as_int(step.get("n"), 0, 0, 9999)
+    rev = as_int(step.get("revises_thought"), 0, 0, 9999)
+    by_n = {as_int(s.get("n"), 0, 0, 9999): s for s in steps}
+    # 改訂の印（superseded_by）は統合時＝検証の後に付くので、今回の改訂対象もここで外す。
+    active = [s for s in _think_active(steps, row) if as_int(s.get("n"), 0, 0, 9999) not in (n, rev)]
     if question:
         parts.append(f"【問い】\n{truncate(question, 800)}")
-    if steps:
+    plan = [p for p in ((row or {}).get("plan") or []) if isinstance(p, dict)]
+    if plan:
+        parts.append("【計画（サブ目標）】\n" + "\n".join(
+            f"{p.get('id')}. {truncate(p.get('text') or '', 160)}" + ("（済）" if p.get("done_at") else "")
+            for p in plan))
+    if active:
         block = "\n".join(
             f"- #{s.get('n')}{_think_step_label(s)}: {truncate(s.get('text') or '', 400)}"
-            for s in steps[-6:])
-        parts.append(f"【これまでの思考】\n{block}")
-    parts.append(f"【検証対象の思考 #{step.get('n')}】\n{truncate(step.get('text') or '', 1200)}")
+            for s in active[-6:])
+        omitted = len([s for s in steps if as_int(s.get("n"), 0, 0, 9999) != n]) - len(active)
+        tail = f"\n（改訂・棄却で外した思考 {omitted} 件は省略）" if omitted > 0 else ""
+        parts.append(f"【これまでの思考（現行の道筋）】\n{block}{tail}")
+    rev_block = rev if rev in by_n else 0
+    if rev_block:
+        parts.append(f"【改訂前の思考 #{rev}】\n{truncate(by_n[rev].get('text') or '', 600)}")
+    hyp = as_int(step.get("tests_hypothesis"), 0, 0, 9999)
+    if hyp and hyp in by_n:
+        parts.append(f"【検証対象の仮説 #{hyp}】\n{truncate(by_n[hyp].get('text') or '', 600)}")
+    parts.append(f"【検証対象の思考 #{step.get('n')}{_think_step_label(step)}】\n"
+                 f"{truncate(step.get('text') or '', 1200)}")
     parts.append("上の形式（判定/反証/見落とし/確信度）だけで答えてください。")
     return "\n\n".join(parts)
 
 
-def _think_ledger_view(steps: list[dict], *, keep: int = 8) -> dict:
-    """台帳の要約（分岐・修正・最新の思考）。**全文は返さず末尾だけ**を載せる。"""
-    branches: dict[str, list[int]] = {}
+def _think_ledger_view(steps: list[dict], *, keep: int = 8, row: dict | None = None) -> dict:
+    """台帳の要約（計画・分岐・修正・仮説・最新の思考）。**全文は返さず末尾だけ**を載せる。"""
+    row = row or {}
+    meta = row.get("branch_meta") if isinstance(row.get("branch_meta"), dict) else {}
+    branches: dict[str, list[int]] = {bid: [] for bid in meta}
     for step in steps:
         if step.get("branch_id"):
             branches.setdefault(step["branch_id"], []).append(as_int(step.get("n"), 0, 0, 9999))
+    active = _think_active(steps, row)
+    plan = [p for p in (row.get("plan") or []) if isinstance(p, dict)]
     return {
         "steps_recorded": len(steps),
-        "branches": [{"branch_id": bid, "steps": ns} for bid, ns in branches.items()],
+        "branches": [{"branch_id": bid, "steps": ns,
+                      "from": (meta.get(bid) or {}).get("from"),
+                      "status": (meta.get(bid) or {}).get("status") or "open",
+                      "resolved_at": (meta.get(bid) or {}).get("resolved_at")}
+                     for bid, ns in branches.items()],
         "branch_points": sorted({as_int(s.get("branch_from_thought"), 0, 0, 9999)
                                  for s in steps if s.get("branch_from_thought")}),
         "revisions": [{"step": as_int(s.get("n"), 0, 0, 9999),
                        "revises": s.get("revises_thought")}
                       for s in steps if s.get("is_revision")],
+        # 改訂で置き換わった思考（消さずに印だけ付ける）と、現行の道筋（改訂済み・棄却分岐を除く）。
+        "superseded": [{"step": as_int(s.get("n"), 0, 0, 9999), "by": s.get("superseded_by")}
+                       for s in steps if s.get("superseded_by")],
+        "active_path": [as_int(s.get("n"), 0, 0, 9999) for s in active],
+        "plan": [{"id": p.get("id"), "text": truncate(p.get("text") or "", 200),
+                  "done": bool(p.get("done_at")), "done_at": p.get("done_at"),
+                  "steps": [as_int(s.get("n"), 0, 0, 9999) for s in steps
+                            if as_int(s.get("subgoal"), 0, 0, 999) == p.get("id")]} for p in plan],
+        "plan_progress": {"done": sum(1 for p in plan if p.get("done_at")), "total": len(plan)},
+        "hypotheses": [{"n": as_int(s.get("n"), 0, 0, 9999), "text": truncate(s.get("text") or "", 200),
+                        "status": s.get("hypothesis_status") or "open",
+                        "tested_by": s.get("tested_by") or [],
+                        "superseded_by": s.get("superseded_by"),
+                        "verdicts": ((s.get("verification") or {}).get("verdicts"))}
+                       for s in steps if s.get("kind") == "hypothesis"],
         "latest": [{"n": as_int(s.get("n"), 0, 0, 9999), "branch_id": s.get("branch_id"),
                     "is_revision": bool(s.get("is_revision")),
+                    "kind": s.get("kind") or "step",
+                    "superseded_by": s.get("superseded_by"),
+                    "hypothesis_status": s.get("hypothesis_status"),
+                    "tests_hypothesis": s.get("tests_hypothesis"),
+                    "subgoal": s.get("subgoal"),
                     "text": truncate(s.get("text") or "", 300)} for s in steps[-keep:]],
         # 直近に宣言された見積り総数（増減してよい・調整はメインが行う）。台帳に残して履歴化する。
-        "total_thoughts": next((as_int(s.get("total_thoughts"), 0, 0, 999)
-                                for s in reversed(steps)
-                                if as_int(s.get("total_thoughts"), 0, 0, 999)), None),
+        "total_thoughts": _think_latest_total(steps),
+        "total_history": [h for h in (row.get("total_history") or []) if isinstance(h, dict)],
     }
 
 
@@ -3168,12 +3298,29 @@ def _think_suggestions(data: dict, steps: list[dict], needed: bool) -> list[str]
         if verify["objections"]:
             out.append(f"未解決の反証が {len(verify['objections'])} 件あります。"
                        "結論の前に潰すか、未解決点として残してください。")
-    if len(data["ledger"]["branches"]) > 1:
-        out.append(f"分岐が {len(data['ledger']['branches'])} 本あります。統合ステップを推奨します。")
+    ledger = data["ledger"]
+    open_branches = [b["branch_id"] for b in ledger["branches"] if b.get("status", "open") == "open"]
+    if len(open_branches) > 1 or (open_branches and not needed):
+        out.append(f"未決着の分岐が {len(open_branches)} 本あります（{', '.join(open_branches)}）。"
+                   "統合ステップを積むか、resolve_branch と branch_status（adopted/abandoned/merged）で"
+                   "決着を記録してください。")
+    untested = [h["n"] for h in ledger.get("hypotheses") or []
+                if h.get("status") == "open" and not h.get("tested_by") and not h.get("superseded_by")]
+    if untested:
+        out.append(f"未検証の仮説があります（{', '.join(f'#{x}' for x in untested)}）。"
+                   "tests_hypothesis=#n と hypothesis_status で検証結果を記録するか、verify=true で"
+                   "独立モデルの反証を取ってください。")
+    plan = ledger.get("plan") or []
+    est = data.get("total_thoughts")
+    if plan and est and len(plan) > est:
+        out.append(f"計画は {len(plan)} 項目ですが見積り総数は {est} です。total_thoughts の見直しを推奨します。")
+    pending = [p["id"] for p in plan if not p.get("done")]
+    if pending and not needed:
+        out.append(f"計画の未達が {len(pending)} 項目あります（{', '.join(str(x) for x in pending)}）。"
+                   "結論にするなら未達の理由を残してください。")
     if needed and len(steps) >= THOUGHT_MAX_STEPS:
         out.append(f"思考数が上限（{THOUGHT_MAX_STEPS}）です。新しい session_id で台帳を分けてください。")
-    est = data.get("total_thoughts")
-    if needed and est and data["ledger"]["steps_recorded"] >= est:
+    if needed and est and ledger["steps_recorded"] >= est:
         out.append(f"見積り総数（{est}）に達しました。続けるなら total_thoughts を増やしてください"
                    "（据え置き・減らすのも可。総数はメインが動的に調整します）。")
     if not needed:
@@ -3184,19 +3331,26 @@ def _think_suggestions(data: dict, steps: list[dict], needed: bool) -> list[str]
 def tool_think(args: dict) -> dict:
     """メインの思考ステップを台帳に積み、任意で独立モデルに反証させる。
 
+    分解（`plan` / `subgoal`）・改訂（`revises_thought` → 元ステップに `superseded_by`）・
+    分岐（`branch_from_thought` / `branch_id` / `resolve_branch`）・仮説（`kind=hypothesis` /
+    `tests_hypothesis`）・見積り総数の動的調整（`total_thoughts`）を台帳の**構造**として持つ。
+    参照先の番号・分岐・仮説は**サブ呼び出しの前に**検証し、無ければ推測で繋がずエラーで返す。
+
     `verify=true` を付けたステップだけ、生成者とは別の Free モデルが「判定/反証/見落とし」を返す。
-    検証は**同意の収集ではなく反証探索**で、返るのは仮説（最終判断はメインが行う）。
-    バックエンドへ到達できなかった検証は**台帳に書かない**（検証されていない前提の上に次の思考を
-    積まないため。規約 21）。
+    `propose_alternatives=true` なら、さらに別のモデルが**この道筋とは異なる代替案**を返す（記録は
+    メインが選ぶ）。どちらも**同意の収集ではない**。バックエンドへ到達できなかった場合は**台帳に
+    書かない**（検証されていない前提の上に次の思考を積まないため。規約 21）。
     """
-    thought = as_str(args.get("thought"))
-    if not thought:
-        return {"error": "thought は必須です（空文字は不可）"}
     if not THOUGHTS_ENABLED:
         return {"error": "思考台帳は無効です（FREEAGENT_THOUGHTS=0 で停止中）", "enabled": False}
-
     sid_in = as_str(args.get("session_id"))
     stored = thought_get(sid_in) if sid_in else None
+    if as_flag(args.get("view")):
+        return _think_view(sid_in, stored)
+    thought = as_str(args.get("thought"))
+    if not thought:
+        return {"error": "thought は必須です（空文字は不可。台帳を読むだけなら view=true と session_id）"}
+
     steps = [s for s in ((stored or {}).get("steps") or []) if isinstance(s, dict)]
     notes: list[str] = []
     if sid_in and stored is None:
@@ -3211,16 +3365,41 @@ def tool_think(args: dict) -> dict:
                          "台帳を分けるか、FREEAGENT_THOUGHT_MAX_STEPS を上げてください",
                 "session_id": sid_in or None, "steps_recorded": len(steps)}
 
+    # 構造の検証は**サブ呼び出しの前**（参照先が無い呼び出しで検証者の予算を使わない）。
+    problem, st = _think_structure(args, steps, n, stored or {})
+    if problem:
+        problem.update({"session_id": sid_in or None, "steps_recorded": len(steps)})
+        return problem
+    notes.extend(st["notes"])
+
+    # 見積り総数の動的調整: 省略時は台帳の見積りを引き継ぎ、番号が見積りを超えたら引き上げる。
+    declared = as_int(args.get("total_thoughts"), 0, 0, 999)
+    total = declared or _think_latest_total(steps) or 0
+    total_auto = False
+    if total and n > total:
+        notes.append(f"思考 #{n} が見積り総数 {total} を超えたため、見積りを {n} へ引き上げました。")
+        total, total_auto = n, True
+
     step = {
         "n": n, "text": truncate(thought, _THOUGHT_CHARS),
-        "branch_id": as_str(args.get("branch_id")),
-        "is_revision": as_flag(args.get("is_revision")),
-        "revises_thought": as_int(args.get("revises_thought"), 0, 0, 9999) or None,
-        "branch_from_thought": as_int(args.get("branch_from_thought"), 0, 0, 9999) or None,
-        "total_thoughts": as_int(args.get("total_thoughts"), 0, 0, 999) or None,
+        "kind": st["kind"],
+        "branch_id": st["branch_id"],
+        "is_revision": st["is_revision"],
+        "revises_thought": st["revises"] or None,
+        "branch_from_thought": st["branch_from"] or None,
+        "tests_hypothesis": st["tests_hypothesis"] or None,
+        "result_status": st["hypothesis_status"] or None,
+        "subgoal": st["subgoal"] or None,
+        "subgoal_done": st["subgoal_done"],
+        "total_thoughts": total or None,
         "at": now_ts(), "verification": None,
     }
+    if st["kind"] == "hypothesis":
+        step["hypothesis_status"] = "open"
     used = [m for m in ((stored or {}).get("verifier_models") or []) if isinstance(m, str)]
+    question = as_str(args.get("question")) or (stored or {}).get("question") or ""
+    # 検証者へ渡す台帳には、今回の呼び出しで決まる計画・分岐の決着を先に反映して見せる。
+    preview = _think_preview_row(stored or {}, st)
 
     verification = None
     if as_flag(args.get("verify")):
@@ -3230,8 +3409,7 @@ def tool_think(args: dict) -> dict:
                                    exclude=(as_str_list(args.get("exclude")) or []) + used)
         if not refs:
             return _no_models()   # 状態を書かない（環境障害で台帳を汚さない）
-        question = as_str(args.get("question")) or (stored or {}).get("question") or ""
-        results = ask_many(refs, _think_prompt(question, steps, step), system=THINK_CRITIC_SYSTEM,
+        results = ask_many(refs, _think_prompt(question, steps, step, preview), system=THINK_CRITIC_SYSTEM,
                            max_tokens=as_int(args.get("max_tokens"), 400, 16, 2000), kind="think")
         rows: list[dict] = []
         for ref, res in zip(refs, results):
@@ -3275,12 +3453,25 @@ def tool_think(args: dict) -> dict:
         step["verification"] = verification
         used = (used + [r["model"] for r in rows])[:12]
 
-    # 台帳への統合は**ロック内**で行う（番号の採番も含む。並列呼び出しで片方が消えるのを防ぐ）。
-    # 検証プロンプトに載せた `#n` は採番前の見積りなので、並列時は 1 ずれることがある
-    # （返り値は統合後の確定番号を使う）。
-    merged = thought_merge(sid_in, step,
-                           question=as_str(args.get("question")) or (stored or {}).get("question") or "",
-                           verifier_models=used, assign_number=not explicit_number)
+    alternatives = None
+    if as_flag(args.get("propose_alternatives")):
+        alternatives = _think_alternatives(args, question, steps, step, preview, exclude=used)
+        if alternatives.get("error"):
+            alternatives.update({"session_id": sid_in or None})
+            return alternatives    # 状態を書かない（規約 21）
+        step["alternatives"] = alternatives
+        used = (used + list(alternatives.get("models") or []))[:12]
+
+    # 台帳への統合は**ロック内**で行う（番号の採番と、他ステップ・メタへの波及も含む。
+    # 並列呼び出しで片方が消えるのを防ぐ）。検証プロンプトに載せた `#n` は採番前の見積りなので、
+    # 並列時は 1 ずれることがある（返り値は統合後の確定番号を使う）。
+    ops = {"revises": st["revises"], "tests_hypothesis": st["tests_hypothesis"],
+           "hypothesis_status": st["hypothesis_status"],
+           "resolve_branch": st["resolve_branch"], "branch_status": st["branch_status"],
+           "plan": st["plan"], "subgoal_done": st["subgoal_done"],
+           "total": total, "total_auto": total_auto}
+    merged = thought_merge(sid_in, step, question=question, verifier_models=used,
+                           assign_number=not explicit_number, ops=ops)
     if merged.get("refused"):
         return {"error": f"思考数が上限（{THOUGHT_MAX_STEPS}）に達しています。新しい session_id で"
                          "台帳を分けるか、FREEAGENT_THOUGHT_MAX_STEPS を上げてください",
@@ -3296,24 +3487,244 @@ def tool_think(args: dict) -> dict:
 
     needed = as_flag(args.get("next_thought_needed", args.get("needs_more_thoughts", True)))
     data = {
-        "session_id": sid, "step": n, "text": step["text"],
+        "session_id": sid, "step": n, "text": step["text"], "kind": step.get("kind") or "step",
         "branch_id": step["branch_id"], "is_revision": step["is_revision"],
         "revises_thought": step["revises_thought"],
         "branch_from_thought": step["branch_from_thought"],
-        "total_thoughts": as_int(args.get("total_thoughts"), 0, 0, 999) or None,
+        "tests_hypothesis": step.get("tests_hypothesis"),
+        "hypothesis_status": step.get("result_status") or step.get("hypothesis_status"),
+        "subgoal": step.get("subgoal"),
+        "total_thoughts": total or None,
+        "total_auto_adjusted": total_auto,
         "next_thought_needed": needed,
-        "ledger": _think_ledger_view(steps_out),
+        "ledger": _think_ledger_view(steps_out, row=after),
         "verification": verification,
         "verified": bool(verification and verification["answered"]),
+        "alternatives": alternatives,
         "verifier_models": used,
         "notes": notes,
         "next_call": {"tool": "freeagent_think",
                       "args": {"session_id": sid, "thought": "<次の思考>",
-                               "thought_number": n + 1, "verify": bool(verification)}},
+                               "thought_number": n + 1, "verify": bool(verification),
+                               **({"total_thoughts": max(total, n + 1)} if total else {})}},
         "privacy_note": "台帳は思考の記録です。判断と責任はメインLLMに残ります。",
     }
     data["suggestions"] = _think_suggestions(data, steps_out, needed)
     return data
+
+
+# ---------------------------------------------------------------- §6.10 思考台帳の構造（検証・閲覧・代替案）
+#
+# §6.9 の `tool_think` が使う補助。参照の検証（`_think_structure`）は**推測で繋がない**:
+# 存在しない番号の改訂・分岐元・仮説、計画に無いサブ目標は、黙って直さずエラーで返す
+# （誤った番号のまま台帳に積むと、以後の「現行の道筋」が静かに壊れる）。自動で補うのは
+# 「branch_id を省略した新しい分岐への ID の割り当て」だけで、その場合も `notes` に必ず出す。
+
+# 代替案の提案者（`propose_alternatives=true`）。検証者（THINK_CRITIC_SYSTEM）が「この思考は正しいか」を
+# 突くのに対し、提案者は「**別の道筋は無いか**」を出す。メインと別モデルなので多様性は構造的に担保される。
+THINK_ALT_SYSTEM = (
+    "あなたは代替案の提案者です。与えられた思考の道筋とは**異なる**仮説・解法・道筋を挙げてください。"
+    "出力は次の形式の行だけです（最大3行）。\n"
+    "代替: <1〜2文。どこが今の道筋と違うかが分かるように>\n"
+    "今の道筋の言い換えや賛成は書かない。無ければ「代替: なし」の1行だけ。"
+    "前置き・思考過程・挨拶・Markdown の見出しは書かない。"
+)
+_LABEL_ALT = re.compile(
+    r"^(?:(?:[-*・•]|\d+[.)．、])\s*)?(?:\*\*)?(?:代替案?|対立仮説|alternative)\s*\d*(?:\*\*)?\s*[:：]\s*(.+)",
+    re.I)
+_BULLET = re.compile(r"^(?:[-*・•]|\d+[.)．、])\s+(.+)")
+
+
+def parse_alternatives(text, limit: int = 3) -> list[str]:
+    """提案者の「代替: …」行を取り出す。ラベルが 1 つも無ければ箇条書きだけを拾う（推測で埋めない）。"""
+    lines = [ln.strip() for ln in (text if isinstance(text, str) else "").splitlines() if ln.strip()]
+    labeled = [m.group(1) for m in (_LABEL_ALT.match(ln) for ln in lines) if m]
+    picked = labeled or [m.group(1) for m in (_BULLET.match(ln) for ln in lines) if m]
+    out: list[str] = []
+    for value in picked:
+        value = value.strip().strip("* ")
+        if value and not _is_no_answer(value):
+            out.append(truncate(value, 300))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _think_latest_total(steps: list[dict]) -> int | None:
+    return next((as_int(s.get("total_thoughts"), 0, 0, 999) for s in reversed(steps)
+                 if as_int(s.get("total_thoughts"), 0, 0, 999)), None)
+
+
+def _think_active(steps: list[dict], row: dict | None) -> list[dict]:
+    """現行の道筋: 改訂で置き換わった思考と、棄却（abandoned）された分岐の思考を除いたもの。"""
+    meta = (row or {}).get("branch_meta")
+    meta = meta if isinstance(meta, dict) else {}
+    dropped = {bid for bid, m in meta.items() if isinstance(m, dict) and m.get("status") == "abandoned"}
+    return [s for s in steps if not s.get("superseded_by") and s.get("branch_id") not in dropped]
+
+
+def _think_preview_row(row: dict, st: dict) -> dict:
+    """今回の呼び出しで決まる計画・分岐の決着を反映した台帳メタの写し（検証者に見せる用。書かない）。"""
+    out = json.loads(json.dumps({k: row.get(k) for k in ("plan", "branch_meta")}))
+    if st.get("plan"):
+        out["plan"] = [{"id": i + 1, "text": t, "done_at": None} for i, t in enumerate(st["plan"])]
+    meta = out.get("branch_meta") if isinstance(out.get("branch_meta"), dict) else {}
+    if st.get("resolve_branch") and st["resolve_branch"] in meta:
+        meta[st["resolve_branch"]]["status"] = st["branch_status"]
+    out["branch_meta"] = meta
+    return out
+
+
+def _think_structure(args: dict, steps: list[dict], n: int, row: dict) -> tuple[dict | None, dict]:
+    """構造引数を検証・正規化する。問題があれば `({"error": ...}, {})` を返す（台帳は書かない）。"""
+    notes: list[str] = []
+    by_n = {as_int(s.get("n"), 0, 0, 9999): s for s in steps}
+    known = sorted(k for k in by_n if k != n)
+    meta = row.get("branch_meta") if isinstance(row.get("branch_meta"), dict) else {}
+
+    def fail(msg: str) -> tuple[dict, dict]:
+        return {"error": msg, "known_thoughts": known, "known_branches": sorted(meta)}, {}
+
+    kind_raw = as_str(args.get("kind")).strip().lower()
+    if kind_raw and kind_raw not in THOUGHT_KINDS:
+        return fail(f"kind は {' / '.join(THOUGHT_KINDS)} のいずれかです（受け取った値: {truncate(kind_raw, 40)}）")
+    tests = as_int(args.get("tests_hypothesis"), 0, 0, 9999)
+    kind = kind_raw or ("test" if tests else "step")
+
+    # 改訂: 元ステップは消さず、統合時に `superseded_by` を付ける（§2.7）。
+    revises = as_int(args.get("revises_thought"), 0, 0, 9999)
+    is_revision = as_flag(args.get("is_revision")) or bool(revises)
+    if is_revision and not revises:
+        return fail("is_revision=true には revises_thought（改訂する思考の番号）が必要です")
+    if revises and revises not in known:
+        return fail(f"revises_thought=#{revises} は台帳にありません（自分自身は改訂できません）")
+    if revises and by_n[revises].get("superseded_by") not in (None, n):
+        notes.append(f"#{revises} は既に #{by_n[revises]['superseded_by']} で改訂済みです（改訂を重ねます）。")
+
+    # 分岐: 新しい分岐には分岐元が要る。既存の分岐は分岐元を引き継ぐ。
+    bid = as_str(args.get("branch_id")).strip()[:40]
+    bfrom = as_int(args.get("branch_from_thought"), 0, 0, 9999)
+    if bfrom and bfrom not in known:
+        return fail(f"branch_from_thought=#{bfrom} は台帳にありません")
+    if bid and bid in meta:
+        origin = as_int((meta[bid] or {}).get("from"), 0, 0, 9999)
+        if bfrom and origin and bfrom != origin:
+            notes.append(f"分岐 {bid} の分岐元は #{origin} のままです（branch_from_thought=#{bfrom} は使いません）。")
+        bfrom = origin or bfrom
+        state = (meta[bid] or {}).get("status") or "open"
+        if state != "open":
+            notes.append(f"分岐 {bid} は {state} で決着済みです（状態は変えずに記録しました。"
+                         "再開は resolve_branch と branch_status=open）。")
+    elif bid and not bfrom and not any(s.get("branch_id") == bid for s in steps):
+        return fail(f"新しい分岐 {bid} には branch_from_thought（分岐元の思考番号）が必要です")
+    elif bfrom and not bid:
+        k = len(meta) + 1
+        while f"b{k}" in meta:
+            k += 1
+        bid = f"b{k}"
+        notes.append(f"branch_id が省略されたため、#{bfrom} からの分岐に {bid} を割り当てました。")
+
+    # 分岐の決着（採用・棄却・統合）。棄却した分岐は「現行の道筋」から外れる。
+    resolve = as_str(args.get("resolve_branch")).strip()[:40]
+    bstatus = as_str(args.get("branch_status")).strip().lower()
+    if bstatus and bstatus not in BRANCH_STATES:
+        return fail(f"branch_status は {' / '.join(BRANCH_STATES)} のいずれかです")
+    if bstatus and not resolve:
+        return fail("branch_status には resolve_branch（決着させる分岐の ID）が必要です")
+    if resolve and not bstatus:
+        return fail("resolve_branch には branch_status（adopted / abandoned / merged / open）が必要です")
+    if resolve and resolve not in meta and resolve != bid:
+        return fail(f"分岐 {truncate(resolve, 40)} は台帳にありません")
+
+    # 仮説の検証: 対象は kind=hypothesis のステップに限る。
+    hstatus = as_str(args.get("hypothesis_status")).strip().lower()
+    if hstatus and hstatus not in HYPOTHESIS_STATES:
+        return fail(f"hypothesis_status は {' / '.join(HYPOTHESIS_STATES)} のいずれかです")
+    if hstatus and not tests:
+        return fail("hypothesis_status には tests_hypothesis（検証する仮説の番号）が必要です")
+    if tests and tests not in known:
+        return fail(f"tests_hypothesis=#{tests} は台帳にありません")
+    if tests and by_n[tests].get("kind") != "hypothesis":
+        return fail(f"#{tests} は仮説（kind=hypothesis）として記録されていません")
+    if tests and kind == "hypothesis":
+        return fail("仮説の検証ステップは kind=test です（仮説そのものは kind=hypothesis で別に積みます）")
+
+    # 分解: 計画（サブ目標）は再送で改訂できる。上限超過は切り捨てずエラー。
+    plan = [truncate(p, 200) for p in as_str_list(args.get("plan"))]
+    if len(plan) > THOUGHT_PLAN_MAX:
+        return fail(f"plan は {THOUGHT_PLAN_MAX} 項目までです（{len(plan)} 項目）。粒度を上げて分けてください")
+    plan_now = plan or [p for p in (row.get("plan") or []) if isinstance(p, dict)]
+    sub = as_int(args.get("subgoal"), 0, 0, 999)
+    if sub and not 1 <= sub <= len(plan_now):
+        return fail(f"subgoal={sub} は計画にありません（計画 {len(plan_now)} 項目。先に plan で分解してください）")
+    sub_done = as_flag(args.get("subgoal_done"))
+    if sub_done and not sub:
+        return fail("subgoal_done には subgoal（達成したサブ目標の番号）が必要です")
+
+    return None, {"kind": kind, "is_revision": is_revision, "revises": revises,
+                  "branch_id": bid, "branch_from": bfrom,
+                  "resolve_branch": resolve, "branch_status": bstatus,
+                  "tests_hypothesis": tests, "hypothesis_status": hstatus,
+                  "plan": plan, "subgoal": sub, "subgoal_done": sub_done, "notes": notes}
+
+
+def _think_view(sid: str, stored: dict | None) -> dict:
+    """台帳を**書かずに**読む（文脈圧縮・再起動の後に、積んだ思考へ戻るため）。"""
+    if not sid:
+        return {"error": "view=true には session_id が必要です"}
+    if stored is None:
+        return {"error": f"セッション {truncate(sid, 40)} は見つかりません（期限切れ／未知）",
+                "session_id": sid}
+    steps = [s for s in (stored.get("steps") or []) if isinstance(s, dict)]
+    last = max([as_int(s.get("n"), 0, 0, 9999) for s in steps] + [0])
+    total = _think_latest_total(steps)
+    data = {
+        "session_id": sid, "view": True, "step": last or None, "question": stored.get("question") or "",
+        "total_thoughts": total, "next_thought_needed": True,
+        "ledger": _think_ledger_view(steps, keep=THOUGHT_MAX_STEPS, row=stored),
+        "verification": None, "verified": False, "alternatives": None,
+        "verifier_models": [m for m in (stored.get("verifier_models") or []) if isinstance(m, str)],
+        "notes": [],
+        "next_call": {"tool": "freeagent_think",
+                      "args": {"session_id": sid, "thought": "<次の思考>", "thought_number": last + 1}},
+    }
+    data["suggestions"] = _think_suggestions(data, steps, True)
+    return data
+
+
+def _think_alternatives(args: dict, question: str, steps: list[dict], step: dict, row: dict,
+                        *, exclude: list[str]) -> dict:
+    """生成者・検証者とは別のモデルに**代替案**を出させる。不通なら error を返す（呼び出し側は書かない）。"""
+    refs, info = select_models(as_int(args.get("size"), 2, 1, 4), None,
+                               prefer=as_str_list(args.get("prefer")) or None,
+                               exclude=(as_str_list(args.get("exclude")) or []) + list(exclude))
+    if not refs:
+        return _no_models()
+    prompt = _think_prompt(question, steps, step, row).rsplit("\n\n", 1)[0] + (
+        "\n\n上の道筋とは異なる代替の仮説・解法・道筋を「代替: …」の形式で最大3行だけ挙げてください。")
+    results = ask_many(refs, prompt, system=THINK_ALT_SYSTEM,
+                       max_tokens=as_int(args.get("max_tokens"), 400, 16, 2000), kind="think")
+    rows: list[dict] = []
+    for ref, res in zip(refs, results):
+        if res.get("error"):
+            rows.append({"model": ref, "error": res["error"]})
+            continue
+        rows.append({"model": ref, "served_by": res.get("served_by"),
+                     "items": parse_alternatives(res.get("text")), "text": truncate(res.get("text") or "", 600)})
+    answered = [r for r in rows if not r.get("error")]
+    failed = [r for r in rows if r.get("error")]
+    if not answered and failed and all(is_env_failure(r.get("error") or "") for r in failed):
+        return {"error": "代替案の提案者に到達できませんでした（バックエンド不通: "
+                         f"{truncate(failed[0].get('error') or '', 120)}）。この思考は台帳に記録していません。",
+                "failures": [{"model": r["model"], "error": truncate(r.get("error") or "", 160)} for r in failed]}
+    return {
+        "models": refs, "selection": info, "answered": len(answered), "failed": len(failed),
+        "items": [{"model": r["model"], "text": item} for r in answered for item in r["items"]],
+        "empty": [r["model"] for r in answered if not r["items"]],
+        "answers": rows,
+        "failed_rows": [{"model": r["model"], "error": truncate(r.get("error") or "", 160)} for r in failed],
+        "note": "代替案は独立モデルの提案（仮説）です。検証済みではなく、採否はメインが決めます。",
+    }
 
 
 # ================================================================ §7 ツール定義
@@ -3506,41 +3917,60 @@ TOOLS: list[dict] = [
     {
         "name": "freeagent_think",
         "description": (
-            "【使う条件】(a) 複雑な問題を**扱いやすいステップに分解**して1件ずつ積みたい "
-            "(b) 理解が深まるにつれて**前の思考を修正・洗練**させたい (c) **別の道筋へ分岐**させたい "
-            "(d) 仮説を**生成者以外の独立モデルに反証させたい**（verify=true）。"
-            "【差分】思考の台帳（分岐・修正・思考数の調整つき）。`verify=true` のときだけ、生成者とは"
-            "別の Free モデルが「判定（妥当/要修正/根拠不足）・最強の反証・見落とし」を返す。"
+            "【使う条件】(a) 複雑な問題を**サブ目標に分解**して（plan）1件ずつ積みたい "
+            "(b) 理解が深まるにつれて**過去の思考を改訂**したい（revises_thought。元は改訂済みとして残る） "
+            "(c) **代替案へ分岐**して探索し、採用・棄却を記録したい（branch_* / resolve_branch） "
+            "(d) 思考数の見積りを**動的に増減**したい (e) **仮説を立てて検証**したい（kind=hypothesis → "
+            "tests_hypothesis）／生成者以外の独立モデルに反証（verify）や代替案（propose_alternatives）を出させたい。"
+            "【差分】構造つきの思考台帳（計画の進捗・現行の道筋・分岐の決着・仮説の状態）。参照先の番号が"
+            "無ければ推測で繋がずエラー。verify / propose_alternatives のときだけ別の Free モデルを呼ぶ。"
+            "view=true で書かずに台帳全体を読める（文脈圧縮後の復帰）。"
             "【使わない条件】単発の問いは panel / consult が速い。思考の記録だけなら思考メモ帳系の軽量ツールで足りる。"
-            "【注意】返る検証は反証の仮説であり、合意は正しさの保証ではありません。判断はメインが行います。"
+            "【注意】返る検証・代替案は仮説であり、合意は正しさの保証ではありません。判断はメインが行います。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "thought": {"type": "string", "description": "今回の思考ステップ（必須）"},
+                "thought": {"type": "string", "description": "今回の思考ステップ（view=true 以外は必須）"},
                 "session_id": {"type": "string",
                                "description": "継続する台帳のID（返り値の next_call に同梱。省略で新規）"},
+                "view": {"type": "boolean", "description": "台帳を読むだけ（書かない・session_id 必須）"},
                 "question": {"type": "string", "description": "解こうとしている問い（検証者へ渡す文脈）"},
+                "kind": {"type": "string", "enum": list(THOUGHT_KINDS),
+                         "description": "思考の種類（既定 step。tests_hypothesis 指定時は test）"},
+                "plan": {"type": "array", "items": {"type": "string"},
+                         "description": f"サブ目標への分解（最大 {THOUGHT_PLAN_MAX}。再送で計画を改訂）"},
+                "subgoal": {"type": "integer", "description": "この思考が扱うサブ目標の番号（plan の 1 始まり）"},
+                "subgoal_done": {"type": "boolean", "description": "subgoal を達成済みにする"},
                 "thought_number": {"type": "integer", "description": "思考番号（省略時は末尾+1）"},
                 "total_thoughts": {"type": "integer",
-                                   "description": "現時点の見積り総数（増減してよい・調整はメインが行う）"},
+                                   "description": "見積り総数（増減してよい。省略時は台帳の値を引き継ぎ、"
+                                                  "番号が超えたら自動で引き上げる）"},
                 "next_thought_needed": {"type": "boolean",
                                         "description": "続けるか（省略時 true）。false で結論フェーズ"},
                 "needs_more_thoughts": {"type": "boolean", "description": "next_thought_needed の別名"},
-                "is_revision": {"type": "boolean", "description": "前の思考を修正する"},
-                "revises_thought": {"type": "integer", "description": "修正対象の思考番号"},
-                "branch_from_thought": {"type": "integer", "description": "分岐元の思考番号"},
-                "branch_id": {"type": "string", "description": "分岐の識別子（例: b1）"},
+                "is_revision": {"type": "boolean", "description": "前の思考を改訂する（revises_thought 必須）"},
+                "revises_thought": {"type": "integer", "description": "改訂対象の思考番号"},
+                "branch_from_thought": {"type": "integer", "description": "分岐元の思考番号（新しい分岐で必須）"},
+                "branch_id": {"type": "string", "description": "分岐の識別子（例: b1。省略時は自動割当）"},
+                "resolve_branch": {"type": "string", "description": "決着させる分岐の ID"},
+                "branch_status": {"type": "string", "enum": list(BRANCH_STATES),
+                                  "description": "分岐の決着（abandoned は現行の道筋から外れる）"},
+                "tests_hypothesis": {"type": "integer", "description": "検証する仮説（kind=hypothesis）の番号"},
+                "hypothesis_status": {"type": "string", "enum": list(HYPOTHESIS_STATES),
+                                      "description": "検証の結果（仮説の状態を更新する）"},
                 "verify": {"type": "boolean",
                            "description": "独立モデルに反証させる（既定 false＝台帳のみで高速）"},
+                "propose_alternatives": {"type": "boolean",
+                                         "description": "別モデルに代替の仮説・道筋を出させる（既定 false）"},
                 "models": {"type": "array", "items": {"type": "string"},
                            "description": "検証者を明示（provider/model）"},
-                "size": {"type": "integer", "description": "検証者の数（既定 2・最大 4）"},
+                "size": {"type": "integer", "description": "検証者・提案者の数（既定 2・最大 4）"},
                 "prefer": {"type": "array", "items": {"type": "string"}},
                 "exclude": {"type": "array", "items": {"type": "string"}},
-                "max_tokens": {"type": "integer", "description": "検証者の上限トークン（既定 400）"},
+                "max_tokens": {"type": "integer", "description": "検証者・提案者の上限トークン（既定 400）"},
             },
-            "required": ["thought"],
+            "required": [],
         },
     },
     {
@@ -3838,10 +4268,44 @@ def _render_body(name: str, data: dict) -> str:
                 f" / 分岐 {len(branches)} / 修正 {len(ledger.get('revisions') or [])}）")
         if data.get("total_thoughts"):
             head += f" / 見積り総数 {data['total_thoughts']}"
+            if data.get("total_auto_adjusted"):
+                head += "（自動で引き上げ）"
+        if data.get("view"):
+            head = "【台帳の閲覧（記録なし）】" + head
         lines = [head]
-        for row in (ledger.get("latest") or [])[-5:]:
+        plan = ledger.get("plan") or []
+        if plan:
+            prog = ledger.get("plan_progress") or {}
+            lines.append(f"計画: {prog.get('done', 0)}/{prog.get('total', len(plan))} 達成")
+            for item in plan:
+                mark = "✅" if item.get("done") else "□"
+                refs = "".join(f" #{x}" for x in (item.get("steps") or []))
+                lines.append(f"  {mark} {item.get('id')}. {truncate(item.get('text') or '', 100)}"
+                             + (f"（{refs.strip()}）" if refs else ""))
+        state_ja = {"open": "未決着", "adopted": "採用", "abandoned": "棄却", "merged": "統合"}
+        if branches:
+            lines.append("分岐: " + " / ".join(
+                f"{b.get('branch_id')}"
+                + (f"（#{b['from']} から・" if b.get("from") else "（")
+                + f"{state_ja.get(b.get('status') or 'open', b.get('status'))}）"
+                for b in branches))
+        hyps = ledger.get("hypotheses") or []
+        if hyps:
+            hyp_ja = {"open": "未検証", "supported": "支持", "refuted": "反証", "inconclusive": "保留"}
+            lines.append("仮説: " + " / ".join(
+                f"#{h.get('n')} {hyp_ja.get(h.get('status') or 'open', h.get('status'))}"
+                + ("（改訂済み）" if h.get("superseded_by") else "") for h in hyps))
+        for row in (ledger.get("latest") or [])[-(12 if data.get("view") else 5):]:
             tag = f" [{row['branch_id']}]" if row.get("branch_id") else ""
             tag += " [修正]" if row.get("is_revision") else ""
+            if row.get("kind") == "hypothesis":
+                tag += " [仮説]"
+            elif row.get("kind") == "test" and row.get("tests_hypothesis"):
+                tag += f" [#{row['tests_hypothesis']} の検証]"
+            elif row.get("kind") == "conclusion":
+                tag += " [結論]"
+            if row.get("superseded_by"):
+                tag += f" [#{row['superseded_by']} で改訂済み]"
             lines.append(f"  • #{row.get('n')}{tag}: {truncate(row.get('text') or '', 140)}")
         verify = data.get("verification")
         if verify:
@@ -3862,11 +4326,19 @@ def _render_body(name: str, data: dict) -> str:
                     lines.append(f"      見落とし: {truncate(row['oversight'], 140)}")
             if verify.get("failed_rows"):
                 lines.append(f"  ⚠️ 検証に失敗 {len(verify['failed_rows'])} 体（脱落は隠していません）")
-        else:
+        elif not data.get("view"):
             lines.append("検証なし（台帳のみ。verify=true で独立モデルの反証が付きます）")
+        alt = data.get("alternatives")
+        if alt:
+            lines.append(f"代替案（独立 {alt.get('answered')}/{len(alt.get('models') or [])} 体・"
+                         f"{len(alt.get('items') or [])} 件）:")
+            for item in (alt.get("items") or [])[:8]:
+                lines.append(f"  ◇ {item.get('model')}: {truncate(item.get('text') or '', 160)}")
+            for row in (alt.get("failed_rows") or []):
+                lines.append(f"  ✗ {row.get('model')}: {truncate(row.get('error') or '', 100)}")
         for note in (data.get("notes") or []):
             lines.append(f"⚠️ {note}")
-        lines.append("ℹ️ 検証は独立モデルによる反証の探索で、合意は正しさの保証ではありません。")
+        lines.append("ℹ️ 検証・代替案は独立モデルによる反証・提案で、合意は正しさの保証ではありません。")
         return "\n".join(lines)
 
     if name == "freeagent_agent":

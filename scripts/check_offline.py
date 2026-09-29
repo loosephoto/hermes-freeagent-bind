@@ -53,6 +53,8 @@ CASES: list[tuple[str, dict]] = [
     # 思考台帳は verify を付けて呼ぶ（環境障害では**書かない**契約を検証する。台帳のみなら
     # ネットワークに触れないので、この検査は「検証に到達できないとき」の経路を突く）。
     ("freeagent_think", {"thought": "前提を分解する", "verify": True}),
+    # 代替案（propose_alternatives）も同じ契約: 提案者に到達できなければ台帳に書かない。
+    ("freeagent_think", {"thought": "仮説を立てる", "kind": "hypothesis", "propose_alternatives": True}),
     ("freeagent_agent", {"task": "調べる", "size": 1, "max_steps": 1}),
     ("freeagent_delegate", {"task": "調べる"}),
     ("freeagent_unknown_tool_xyz", {}),   # 未知ツール＝無効化されている場合の経路

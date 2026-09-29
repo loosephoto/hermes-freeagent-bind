@@ -26,7 +26,7 @@ python scripts/smoke_stdio.py
 ```bash
 python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # TOOLS/HANDLERS の一致・スキーマ・版・content の規約
-python -m unittest discover -s tests         # オフライン回帰（118 件・ネットワーク不要）
+python -m unittest discover -s tests         # オフライン回帰（159 件・ネットワーク不要）
 python scripts/smoke_stdio.py                # 実クライアント経路（initialize/tools/list/tools/call）
 python scripts/check_offline.py              # バックエンド全滅: 例外漏れ・ハング・状態汚染が無いこと
 python scripts/measure_adoption.py           # 自発利用率の測定（state.db を読むだけ・副作用なし）
@@ -117,6 +117,11 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     （429 など）は記録し、`failed_rows` と `answered: 0` で隠さず返す。`check_offline.py` が
     「`verify=true` で呼んでも状態ディレクトリにファイルが増えない」ことで検証する。
     (d) 次の一手の助言は `structuredContent.suggestions` に置き、`content` には書かない（規約 3）。
+    (e) **構造（計画・改訂・分岐・仮説）の参照は推測で繋がない**。存在しない番号・分岐・仮説・サブ目標は
+    **サブ呼び出しの前に**エラーで返し、台帳を書かない（`_think_structure`）。改訂は消さずに
+    `superseded_by` を付け、検証者・提案者には**現行の道筋**だけを渡す。今回の呼び出しで改訂・決着させる
+    対象もプロンプト側で先に反映する（印は統合時＝検証の後に付くので、放置すると撤回済みの前提が
+    「現行」として検証者に渡る。実装中のテストで検出）。`propose_alternatives` の到達不能も (c) と同じく書かない。
 
 ## ライセンス
 

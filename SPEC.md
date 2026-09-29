@@ -38,7 +38,7 @@
 | `model_stats.json` | モデル別の成功・空応答・CoT 混入・切断・エラー観測（種類別） | 消えると品質順が初期化＝死んだモデルを選び直す |
 | `traces.jsonl` | 1 行 1 呼び出しのメタデータ（**本文は残さない**。`answer_sha1` のみ） | 消えてよい |
 | `sessions.json` | 進行中の相談（問い・ラウンド・メインの回答） | 消えると往復が切れる（TTL 1 時間） |
-| `thoughts.json` | 進行中の思考台帳（思考・分岐・修正・検証結果） | 消えると思考の連鎖が切れる（TTL 2 時間・台帳 32 件・1 台帳 24 思考） |
+| `thoughts.json` | 進行中の思考台帳（思考・計画・分岐の状態・改訂の印・仮説の状態・見積りの履歴・検証結果・代替案） | 消えると思考の連鎖が切れる（TTL 2 時間・台帳 32 件・1 台帳 24 思考） |
 | `provider_auth.json` | 認証で失敗したプロバイダ（15 分・自動選抜から外す） | 消えてよい（次の 403 で再記録） |
 
 いずれも **tmp へ書いて `os.replace` で原子置換**し、`threading.Lock` で保護する。原子置換は
@@ -193,8 +193,33 @@
 - 上限は `THOUGHT_MAX_STEPS`（既定 24）。**黙って捨てずエラーで返す**。同じ番号の再送は置き換える。
 - **思考の総数（`total_thoughts`）は見積り**で、進めるうちに増減してよい（動的調整）。台帳は直近の見積りを
   保持し、記録数がその値に達したら `suggestions` で増減を促す（調整するのはメインで、台帳は判断しない）。
-- 表示（`content`）は人間向けの事実だけ（思考の末尾・分岐・修正・判定の内訳・反証）。次の一手の助言は
-  `structuredContent.suggestions` に置く（`content` に LLM 向け指示を書かない）。
+- 表示（`content`）は人間向けの事実だけ（思考の末尾・計画の進捗・分岐の状態・仮説の状態・判定の内訳・反証・
+  代替案）。次の一手の助言は `structuredContent.suggestions` に置く（`content` に LLM 向け指示を書かない）。
+
+### 7.5.1 構造（§2.7 / §6.10）
+
+台帳は思考の列に加えて**構造**を持つ。適用は `thought_merge` のロック内（`_thought_apply_ops`）、引数の検証は
+**サブ呼び出しの前**（`_think_structure`）に行う。
+
+| 構造 | 引数 | 保存先 | 規則 |
+|---|---|---|---|
+| 分解 | `plan[]` / `subgoal` / `subgoal_done` | 台帳メタ `plan`（`id` / `text` / `done_at`） | 最大 `THOUGHT_PLAN_MAX`=12（超過はエラー）。再送は計画の改訂で、**同じ文面の項目は達成済みを引き継ぐ**。`subgoal` は計画の範囲内のみ |
+| 改訂 | `revises_thought`（`is_revision` 単独はエラー） | 元ステップの `superseded_by` | 元は**消さない**。対象は既存かつ自分以外。改訂の改訂は `notes` に出して許す |
+| 分岐 | `branch_from_thought` / `branch_id` | 台帳メタ `branch_meta`（`from` / `status` / `opened_at` / `resolved_at`） | 新しい分岐は分岐元が必須。既存の分岐は分岐元を引き継ぐ（食い違う指定は `notes`）。`branch_id` 省略時のみ `b<k>` を自動割当（`notes` に出す） |
+| 決着 | `resolve_branch` + `branch_status` | `branch_meta[bid].status` | 片方だけはエラー。`abandoned` の分岐は `active_path` から外れる。決着済みの分岐への追記は状態を変えず `notes` |
+| 仮説 | `kind=hypothesis` | ステップの `hypothesis_status`（初期 `open`） | 同じ番号で書き直しても `hypothesis_status` / `tested_by` は失わない |
+| 仮説の検証 | `tests_hypothesis` + `hypothesis_status` | 仮説側の `tested_by` / `hypothesis_status` | 対象は `kind=hypothesis` のみ。検証ステップ自身は `kind=test`（既定で推定） |
+| 見積り総数 | `total_thoughts` | ステップの `total_thoughts`、台帳メタ `total_history` | 省略時は台帳の値を引き継ぐ。**番号が見積りを超えたら番号まで引き上げ**、`total_auto_adjusted` と `notes` に出す |
+| 代替案 | `propose_alternatives` | ステップの `alternatives` | 検証者とも別のモデル（台帳の使用済みモデルを除外）。`THINK_ALT_SYSTEM` で「代替: …」を最大 3 行。全員が環境障害なら**書かない** |
+| 閲覧 | `view=true` + `session_id` | — | 何も書かない。サブも呼ばない（`verify` が付いていても） |
+
+- **推測で繋がない**: 参照先が無い操作はエラーで返し（`known_thoughts` / `known_branches` を添える）、
+  台帳を書かない。誤った番号のまま積むと以後の `active_path` が静かに壊れる。
+- 検証者・提案者のプロンプトは**現行の道筋**（`superseded_by` 無し・`abandoned` 分岐以外）だけを載せ、
+  改訂なら改訂前の文、仮説の検証なら対象の仮説を添える。印は統合時＝検証の後に付くため、**今回の
+  呼び出しで改訂する元の思考・決着させる分岐も**プロンプト側で先に反映する（`_think_preview_row`）。
+- 並列呼び出しで `branch_id` を省略した新しい分岐が同時に来ると、自動割当が同じ ID になり得る
+  （割当はロック外）。明示の `branch_id` を推奨する。
 
 ## 8. プロトコル（§9）
 
