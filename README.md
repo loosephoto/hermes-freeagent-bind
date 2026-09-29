@@ -380,7 +380,7 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 | `github` | リポジトリ / Issue / コード | `GITHUB_TOKEN` / `GH_TOKEN`（コード検索は必須） |
 
 `freeagent_lookup` と `freeagent_grounded` は 6 ソースを**並列に**引いて、重複を除いた出典リスト
-（`[1] タイトル URL`）を返します。**LLM を経由しないので幻覚が混入しません。**
+（`[1] タイトル URL`）を返します。**LLM を経由しないので幻覚が混入しません。** Wikipedia は検索結果と要約を 1 回の API 呼び出しで取得します。未知の `sources` だけが指定された場合は、誤って全ソースへ問い合わせず、有効なソース名を案内します。混在指定なら有効なソースだけを検索し、未知名も報告します。
 
 ---
 
@@ -395,7 +395,7 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 | `⚠ nous … 到達不可 WinError 10061` | ローカルプロキシが停止 | `hermes proxy start` |
 | どの候補でも `401` で失敗 | キー未設定・無効 | 該当キーを設定（[API キー](#api-キー)） |
 | HF が全モデル `403` | トークンに Inference Providers 権限が無い | fine-grained トークンで権限を有効化して差し替え |
-| HF が全モデル `402` | 月次クレジット枯渇 | 他プロバイダを使う（翌月に回復） |
+| HF が全モデル `402` | 月次クレジット枯渇 | 別プロバイダへ fallback。該当モデルは短時間クールダウン後に再試行（翌月に回復） |
 | HF の一部だけ `403`（`:together` 等） | 提供元/CDN のブロック（実測: Cloudflare 1010） | `model:提供元` で別経路（例 `:novita`） |
 | NVIDIA が `404` / `410` | モデルが未有効 / 廃止（82 件中 55 件） | `probe` で生存確認し、生きているものだけ使う |
 | OpenAlex だけ `503` / `429` | 匿名検索が提供元側で停止 | `OPENALEX_API_KEY` を設定（他の 5 ソースは影響なし） |
@@ -509,7 +509,17 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 - **protocolVersion はクライアント提示値をそのまま返す**。固定すると新しめのクライアントが
   `tools/list` を取り消し、「60 秒タイムアウト」に見える。
 - **stdout へは必ず UTF-8 バイト列**で書く。日本語 Windows では cp932 に落ちて応答が黙って捨てられる。
-- **どのツールも例外を外へ漏らさない**。失敗は `structuredContent.error` で返す。
+- **どのツールも例外を外へ漏らさない**。handler だけでなく `render` / `error_advice` の失敗も `structuredContent.error` に変換する。
+- **品質統計は観測ごとに永続化**し、成功・失敗カウンタを同じ半減期で減衰する（既定 14 日）。60 日超の古い履歴を prune し、並行保存では snapshot を複製してから原子的に置き換える。
+- **知識検索キャッシュは同じ問い合わせを single-flight** でまとめ、エラー結果は保存しない。API 回復後の呼び出しは再取得できる。
+- **接続・読み取りタイムアウトを分離**する（既定 10 / 180 秒）。接続不能や timeout では同じ不通先への fallback を続けない。
+- **stdio は不正な JSON 値や batch でも停止しない**。JSON-RPC batch の応答は 1 行の response array として返す。
+- 討論ラベルは句読点付き「なし」を空として扱い、同じ行の結論へ次ラベルを混ぜない。`deep` 討論は討論後の立場で合意度を算出し、初回回答の確認事項を保持する。
+- セッション ID は短時間の並行呼び出しでも衝突しない乱数成分を含む。
+- Wikipedia の言語コードはホスト名への埋め込み前に検証し、不正値では外部接続しない。
+- クールダウン中の明示モデルが使えないときも代替候補を試す（認証失敗中のプロバイダは自動 fallback から除外）。HTTP 402（クレジット枯渇）はプロバイダ全体を停止せず、そのモデルだけを短時間クールダウンして別候補へ進む。
+- `freeagent_panel` の回答数（`answered`）と独立した実モデル数（`independent_sources`）を分けて報告する。fallback によって同じ実モデルが複数枠を埋めても、合意度・確信度・コンセンサスでは 1 票として数える。
+- `freeagent_map` は暗黙選択時に品質統計・クールダウンを考慮してモデルを選ぶ。`reduce` は文字列 `"false"` を真と誤認しない。
 - **空応答を成功として返さない**。思考トークンで予算を使い切るモデルがあり（実測: `max_tokens=220`
   で 3 体中 2 体が空）、空を回答として渡すとメイン LLM が無回答を回答と誤解する。予算を上げて
   1 回だけ再試行し、それでも空なら明示的なエラーにする。

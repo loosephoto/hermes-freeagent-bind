@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import copy
 import datetime
 import email.utils
 import json
@@ -308,6 +309,15 @@ def agreement_of(texts: list[str]) -> float:
             total += similarity(vals[i], vals[j])
             pairs += 1
     return round(total / pairs, 3) if pairs else 0.0
+
+
+def independent_answers(rows: list[dict]) -> list[dict]:
+    """fallback で同じ実モデルが複数回現れた場合、合意度計算では 1 回だけ数える。"""
+    selected = {}
+    for row in rows:
+        source = as_str(row.get("served_by")) or as_str(row.get("model"))
+        selected.setdefault(source, row)
+    return list(selected.values())
 
 
 def truncate(text: str, limit: int) -> str:
@@ -590,6 +600,34 @@ def _decay(row: dict, factor: float) -> None:
     for k in _KIND_KEYS:
         row[k] = as_float(row.get(k), 0.0) * factor
     row["lat_ms"] = as_float(row.get("lat_ms"), 0.0) * factor
+    errors = row.get("err")
+    if isinstance(errors, dict):
+        row["err"] = {key: as_float(value, 0.0) * factor for key, value in errors.items()}
+
+
+def _decay_model(entry: dict, now: float) -> None:
+    """モデル別の観測を半減期で減衰し、古い履歴が品質順位を固定しないようにする。"""
+    previous = as_float(entry.get("updated_at"), now)
+    elapsed = max(0.0, now - previous)
+    if elapsed:
+        factor = 0.5 ** (elapsed / (_STATS_HALFLIFE_DAYS * 86400.0))
+        for row in (entry.get("kinds") or {}).values():
+            if isinstance(row, dict):
+                _decay(row, factor)
+    entry["updated_at"] = now
+
+
+def _stats_prune(models: dict, now: float) -> dict:
+    alive = {ref: row for ref, row in models.items()
+             if isinstance(row, dict)
+             and now - as_float(row.get("updated_at"), now) <= STATS_STALE_DAYS * 86400}
+    if len(alive) > STATS_MAX_REFS:
+        ordered = sorted(alive, key=lambda ref: as_float(alive[ref].get("updated_at"), 0.0), reverse=True)
+        alive = {ref: alive[ref] for ref in ordered[:STATS_MAX_REFS]}
+    return alive
+
+
+_STATS_WRITE_LOCK = threading.Lock()
 
 
 def _ensure_stats_loaded() -> None:
@@ -608,15 +646,18 @@ def _ensure_stats_loaded() -> None:
 def _stats_save() -> bool:
     if not STATS_ENABLED:
         return False
-    with _STATS_LOCK:
-        payload = {"version": 1, "models": _STATS["models"]}
-    return _atomic_write(stats_path(), json.dumps(payload, ensure_ascii=False))
+    now = now_ts()
+    with _STATS_WRITE_LOCK:
+        with _STATS_LOCK:
+            _STATS["models"] = _stats_prune(_STATS["models"], now)
+            payload = {"version": 1, "models": copy.deepcopy(_STATS["models"])}
+        return _atomic_write(stats_path(), json.dumps(payload, ensure_ascii=False))
 
 
 def classify_error(err: str) -> str:
     """エラー文字列を分類する（集計の粒度を揃えるため、ここで語彙を固定する）。"""
     t = (err or "").lower()
-    if "429" in t or "rate" in t or "quota" in t:
+    if any(part.strip(".,:;()[]") == "429" for part in t.split()) or "rate limit" in t or "rate_limit" in t or "rate-limit" in t or "too many requests" in t or "quota" in t:
         return "rate_limited"
     if "timeout" in t or "timed out" in t:
         return "timeout"
@@ -661,14 +702,16 @@ def note_observation(ref: str, kind: str, *, error: str = "", leak: bool = False
     if not STATS_ENABLED:
         return
     _ensure_stats_loaded()
+    now = now_ts()
     with _STATS_LOCK:
-        entry = _STATS["models"].setdefault(ref, {"kinds": {}})
+        entry = _STATS["models"].setdefault(ref, {"kinds": {}, "updated_at": now})
+        _decay_model(entry, now)
         row = entry["kinds"].setdefault(kind, _empty_kind())
         row["n"] = as_float(row.get("n"), 0.0) + 1.0
         if error:
             cls = classify_error(error)
             err = row.setdefault("err", {})
-            err[cls] = int(err.get(cls) or 0) + 1
+            err[cls] = as_float(err.get(cls), 0.0) + 1.0
         else:
             if leak:
                 row["leak"] = as_float(row.get("leak"), 0.0) + 1.0
@@ -680,6 +723,9 @@ def note_observation(ref: str, kind: str, *, error: str = "", leak: bool = False
                 row["ok"] = as_float(row.get("ok"), 0.0) + 1.0
         if lat_ms:
             row["lat_ms"] = as_float(row.get("lat_ms"), 0.0) + lat_ms
+
+
+    _stats_save()
 
 
 def _kind_quality(row: dict) -> tuple[float, float]:
@@ -694,7 +740,7 @@ def _kind_quality(row: dict) -> tuple[float, float]:
     score = (ok + 0.5 * trunc + 0.3 * leak) / n
     score *= (1.0 - min(1.0, empty / n))
     err = row.get("err") or {}
-    err_total = sum(int(v) for v in err.values()) if isinstance(err, dict) else 0
+    err_total = sum(as_float(v, 0.0) for v in err.values()) if isinstance(err, dict) else 0.0
     score *= max(0.0, 1.0 - err_total / n)
     return round(max(0.0, min(1.0, score)), 4), n
 
@@ -958,7 +1004,7 @@ def _sessions_save() -> bool:
 
 
 def new_session_id() -> str:
-    return f"s{int(now_ts()) % 100000000:08d}{os.getpid() % 1000:03d}"
+    return f"s{int(now_ts()) % 100000000:08d}{os.getpid() % 1000:03d}{os.urandom(8).hex()}"
 
 
 def session_get(sid: str) -> dict | None:
@@ -1013,8 +1059,16 @@ def split_ref(ref: str) -> tuple[str, str]:
 
 
 def _urlopen(req: urllib.request.Request, timeout: float):
-    """(connect, read) のタイムアウトを必ず与える。遮断されたホストで分単位に固まらないため。"""
-    return urllib.request.urlopen(req, timeout=timeout)
+    """接続には短い上限を、接続後の応答読取には呼び出し別の上限を設定する。"""
+    response = urllib.request.urlopen(req, timeout=CONNECT_TIMEOUT)
+    # urllib の timeout は接続時にも socket に残るため、レスポンスを受け取ったら
+    # 本文読取のために read timeout へ切り替える（HTTPS/HTTP 標準実装の socket）。
+    try:
+        sock = response.fp.raw._sock
+        sock.settimeout(timeout)
+    except (AttributeError, OSError):
+        pass
+    return response
 
 
 def provider_http(path: str, provider: str = "nous", payload: dict | None = None,
@@ -1254,11 +1308,14 @@ def _call_once(provider: str, model: str, prompt: str, system: str,
         data = provider_http("/chat/completions", provider=provider, payload=payload, timeout=timeout)
     except urllib.error.HTTPError as exc:
         body = ""
+        retry_after = exc.headers.get("Retry-After") if exc.headers else None
         try:
             body = exc.read().decode("utf-8", "replace")
         except Exception:
             pass
-        raise HttpStatusError(int(exc.code), body, exc.headers.get("Retry-After") if exc.headers else None)
+        finally:
+            exc.close()
+        raise HttpStatusError(int(exc.code), body, retry_after)
     latency = now_ts() - started
     text = _extract_text(data)
     finish = ""
@@ -1273,15 +1330,16 @@ def _call_once(provider: str, model: str, prompt: str, system: str,
 
 
 def _candidates(ref: str, free_only: bool = True) -> list[str]:
-    """冷却中なら代替を並べる（同じ ref を先頭に残し、他の Free モデルを後ろに足す）。"""
+    """指定先が冷却中でも、冷却外かつ認証可能な Free 代替モデルを並べる。"""
     cooling = cooling_refs()
     out = [ref] if ref and ref not in cooling else []
-    if not out:
-        return []
     if len(out) >= _MAX_ATTEMPTS:
         return out[:_MAX_ATTEMPTS]
+    blocked = {name for name in PROVIDER_ORDER if provider_auth_blocked(name)}
     for other in free_model_refs(free_only=free_only):
         if other == ref or other in cooling or other in out:
+            continue
+        if other.split("/", 1)[0] in blocked:
             continue
         out.append(other)
         if len(out) >= _MAX_ATTEMPTS:
@@ -1380,8 +1438,15 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
             elif exc.status in (404, 410):
                 note_unavailable(cand, exc.status)
                 skipped.append(cand)
-            elif exc.status in (401, 403, 402):
-                # キー不備・権限なし。原因を残し、**認証の署名があるときだけ**プロバイダ単位で覚える。
+            elif exc.status == 402:
+                # クレジット枯渇はプロバイダ全体の認証障害ではないが、同一モデルへの
+                # 連続要求を避けるため短時間だけモデル単位で休ませる。
+                note_cooldown(cand, _COOLDOWN_DEFAULT_S, "HTTP 402 (credit depleted)")
+                skipped.append(cand)
+                last_error = _auth_hint(c_provider, exc.status, exc.body)
+                _debug("credit_exhausted", {"ref": cand})
+            elif exc.status in (401, 403):
+                # 原因を残し、**認証の署名があるときだけ**プロバイダ単位で覚える。
                 # 提供元都合の 403（モデル単位の制限・CDN のエラー）でプロバイダ全体を止めないため。
                 last_error = _auth_hint(c_provider, exc.status, exc.body)
                 if _is_auth_error(exc.status, exc.body):
@@ -1392,6 +1457,8 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
             continue
         except Exception as exc:  # 接続不可・タイムアウト・JSON 壊れ
             last_error = f"{type(exc).__name__}: {exc}"
+            if is_env_failure(last_error):
+                break  # 環境障害では別モデルも同じ経路で失敗するため再試行を打ち切る
             continue
 
         text = result["text"]
@@ -1487,6 +1554,7 @@ def ask_map(pairs: list[tuple[str, str]], *, system: str = "", max_tokens: int =
 
 _KB_CACHE: dict[str, dict] = {}
 _KB_CACHE_LOCK = threading.Lock()
+_KB_INFLIGHT: dict[str, threading.Event] = {}
 _KB_BLOCKED: dict[str, float] = {}
 _KB_BLOCK_LOCK = threading.Lock()
 _KB_BLOCK_S = 600.0
@@ -1524,14 +1592,17 @@ def kb_http(url: str, *, accept: str = "application/json", extra_headers: dict |
             return int(resp.status), resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         body = ""
+        retry_after = exc.headers.get("Retry-After") if exc.headers else None
+        status = int(exc.code)
         try:
             body = exc.read().decode("utf-8", "replace")[:300]
         except Exception:
             pass
-        if exc.code in (403, 429, 503):
-            _kb_block(host, _parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None,
-                                               None) if exc.code == 429 else _KB_BLOCK_S)
-        return int(exc.code), body
+        finally:
+            exc.close()
+        if status in (403, 429, 503):
+            _kb_block(host, _parse_retry_after(retry_after, None) if status == 429 else _KB_BLOCK_S)
+        return status, body
     except Exception as exc:
         _kb_block(host, 120.0)  # 接続不可・タイムアウトも短くブロックする
         return 0, f"{type(exc).__name__}: {exc}"
@@ -1548,17 +1619,34 @@ def kb_json(url: str, *, extra_headers: dict | None = None) -> tuple[dict | None
 
 
 def _kb_cached(key: str, producer):
-    with _KB_CACHE_LOCK:
-        hit = _KB_CACHE.get(key)
-        if hit and now_ts() - as_float(hit.get("at"), 0.0) < KB_TTL:
-            return hit.get("value")
-    value = producer()
-    with _KB_CACHE_LOCK:
-        _KB_CACHE[key] = {"at": now_ts(), "value": value}
-        if len(_KB_CACHE) > 512:  # 単純な上限（古い順に捨てる）
-            for old in sorted(_KB_CACHE, key=lambda k: as_float(_KB_CACHE[k].get("at"), 0.0))[:128]:
-                _KB_CACHE.pop(old, None)
-    return value
+    while True:
+        with _KB_CACHE_LOCK:
+            hit = _KB_CACHE.get(key)
+            if hit and now_ts() - as_float(hit.get("at"), 0.0) < KB_TTL:
+                return copy.deepcopy(hit.get("value"))
+            event = _KB_INFLIGHT.get(key)
+            if event is None:
+                event = threading.Event()
+                _KB_INFLIGHT[key] = event
+                owner = True
+            else:
+                owner = False
+        if owner:
+            break
+        event.wait()
+    try:
+        value = producer()
+        if not (isinstance(value, dict) and value.get("error")):
+            with _KB_CACHE_LOCK:
+                _KB_CACHE[key] = {"at": now_ts(), "value": copy.deepcopy(value)}
+                if len(_KB_CACHE) > 512:
+                    for old in sorted(_KB_CACHE, key=lambda k: as_float(_KB_CACHE[k].get("at"), 0.0))[:128]:
+                        _KB_CACHE.pop(old, None)
+        return copy.deepcopy(value)
+    finally:
+        with _KB_CACHE_LOCK:
+            _KB_INFLIGHT.pop(key, None)
+            event.set()
 
 
 def _cite(source: str, title: str, url: str, **extra) -> dict:
@@ -1573,29 +1661,34 @@ def _cite(source: str, title: str, url: str, **extra) -> dict:
 
 def kb_wikipedia(query: str, lang: str = "ja", limit: int = 3) -> dict:
     """本文の要約＋検索結果。出典 URL 付き（LLM 不使用）。"""
-    lang = as_str(lang, "ja")[:8]
+    lang = as_str(lang, "ja").lower()
+    if not re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", lang):
+        return {"source": "wikipedia", "lang": lang, "items": [], "citations": [],
+                "error": "lang は有効な Wikipedia 言語コードで指定してください"}
     limit = as_int(limit, 3, 1, 8)
 
     def produce() -> dict:
         base = f"https://{lang}.wikipedia.org"
-        q = urllib.parse.urlencode({"action": "query", "format": "json", "list": "search",
-                                    "srsearch": query, "srlimit": limit, "srprop": "snippet"})
+        q = urllib.parse.urlencode({
+            "action": "query", "format": "json", "generator": "search",
+            "gsrsearch": query, "gsrlimit": limit, "prop": "extracts",
+            "exintro": 1, "explaintext": 1, "exchars": 1200,
+        })
         data, err = kb_json(f"{base}/w/api.php?{q}")
         if err:
             return {"source": "wikipedia", "error": err}
-        hits = ((data or {}).get("query") or {}).get("search") or []
+        pages = ((data or {}).get("query") or {}).get("pages") or {}
+        hits = sorted((page for page in pages.values() if isinstance(page, dict)),
+                      key=lambda page: as_int(page.get("index"), 999999, 0, 999999))
         items, cites = [], []
         for hit in hits[:limit]:
-            title = hit.get("title") or ""
+            title = as_str(hit.get("title"))
+            if not title:
+                continue
             page_url = f"{base}/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
-            snippet = re.sub(r"<[^>]+>", "", hit.get("snippet") or "")
-            summary = ""
-            s_data, s_err = kb_json(f"{base}/api/rest_v1/page/summary/{urllib.parse.quote(title)}")
-            if not s_err and isinstance(s_data, dict):
-                summary = s_data.get("extract") or ""
-                page_url = ((s_data.get("content_urls") or {}).get("desktop") or {}).get("page") or page_url
+            summary = re.sub(r"<[^>]+>", "", as_str(hit.get("extract")))
             items.append({"title": title, "url": page_url, "summary": truncate(summary, 1200),
-                          "snippet": truncate(snippet, 300)})
+                          "snippet": truncate(summary, 300)})
             cites.append(_cite("wikipedia", title, page_url, lang=lang))
         return {"source": "wikipedia", "lang": lang, "items": items, "citations": cites,
                 "error": "" if items else "該当なし"}
@@ -1902,8 +1995,14 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
     query = as_str(query)
     if not query:
         return {"error": "query は必須です", "query": query}
-    picked = [s for s in as_str_list(sources) if s in KB_BACKENDS] or list(KB_BACKENDS)
-    unknown = [s for s in as_str_list(sources) if s not in KB_BACKENDS]
+    requested = as_str_list(sources)
+    picked = [s for s in requested if s in KB_BACKENDS] if requested else list(KB_BACKENDS)
+    unknown = [s for s in requested if s not in KB_BACKENDS]
+    if requested and not picked:
+        message = "有効な sources がありません。利用可能: " + ", ".join(KB_BACKENDS)
+        return {"query": query, "sources": [], "unknown_sources": unknown,
+                "results": {}, "citations": [], "citation_count": 0,
+                "errors": {"sources": message}, "error": message, "llm_used": False}
     limit = as_int(limit, 3, 1, 10)
     opts = {"lang": as_str(lang, "ja"), "kind": as_str(kind, "repo")}
     results = run_parallel(
@@ -1955,7 +2054,8 @@ AGENT_SYSTEM = (
     "JSON 以外の文字（前置き・コードフェンス）を書かない。根拠が足りなければツールを使う。"
 )
 
-_LABEL_CONCLUSION = re.compile(r"(?:結論|まとめ|conclusion)\s*[:：]\s*(.+)", re.I)
+_LABEL_CONCLUSION = re.compile(
+    r"(?:結論|まとめ|conclusion)\s*[:：]\s*(.+?)(?=\s+(?:確信度|自信|confidence|メインに確認したい点|確認したい点|質問|questions?)\s*[:：]|$)", re.I)
 _LABEL_CONFIDENCE = re.compile(r"(?:確信度|自信|confidence)\s*[:：]?\s*([0-9]{1,3}(?:\.[0-9]+)?|0?\.[0-9]+)", re.I)
 _LABEL_QUESTION = re.compile(r"(?:メインに確認したい点|確認したい点|質問|questions?)\s*[:：]\s*(.+)", re.I)
 _NO_ANSWER = ("なし", "無し", "ありません", "none", "-", "n/a", "特になし")
@@ -1970,23 +2070,22 @@ def parse_labeled(text: str) -> dict:
             continue
         m = _LABEL_CONCLUSION.search(line)
         if m and not out["conclusion"]:
-            out["conclusion"] = truncate(m.group(1).strip().strip("*"), 600)
+            out["conclusion"] = truncate(m.group(1).strip().strip("* "), 600)
             out["labels_found"] += 1
-        # **同じ行に別のラベルが続くことがある**（実測: 「結論: … 確信度: 88」）ので continue しない。
-        # 1 行 1 ラベルと決め打つと確信度を取りこぼし、確信度が None のまま返る。
         m = _LABEL_CONFIDENCE.search(line)
         if m and out["confidence"] is None:
             raw = m.group(1)
             val = as_float(raw, -1.0)
-            if val <= 1.0:
+            if "." in raw and val <= 1.0:
                 val *= 100.0
             if 0 <= val <= 100:
                 out["confidence"] = int(val)
                 out["labels_found"] += 1
         m = _LABEL_QUESTION.search(line)
         if m and not out["question"]:
-            value = m.group(1).strip().strip("*")
-            out["question"] = "" if value.lower() in _NO_ANSWER else truncate(value, 400)
+            value = m.group(1).strip().strip("* ")
+            empty_value = value.lower().rstrip(" .。!?！？;；").strip()
+            out["question"] = "" if empty_value in _NO_ANSWER else truncate(value, 400)
             out["labels_found"] += 1
     return out
 
@@ -2265,13 +2364,14 @@ def tool_panel(args: dict) -> dict:
             "cot_leak": res.get("cot_leak"), "truncated": res.get("truncated"),
         })
     good = [a for a in answers if not a.get("error")]
-    conf = [a["confidence"] for a in good if isinstance(a.get("confidence"), int)]
+    independent = independent_answers(good)
+    conf = [a["confidence"] for a in independent if isinstance(a.get("confidence"), int)]
     data = {
         "question": question, "models": refs, "selection": info,
-        "answered": len(good), "failed": len(answers) - len(good),
-        "agreement": agreement_of([a["conclusion"] for a in good]),
+        "answered": len(good), "independent_sources": len(independent), "failed": len(answers) - len(good),
+        "agreement": agreement_of([a["conclusion"] for a in independent]),
         "confidence_mean": round(sum(conf) / len(conf), 1) if conf else None,
-        "consensus": _consensus_groups(good),
+        "consensus": _consensus_groups(independent),
         "disagreements": [a["model"] for a in good if a.get("question")],
         "open_questions": [{"model": a["model"], "question": a["question"]}
                            for a in good if a.get("question")],
@@ -2361,7 +2461,11 @@ def tool_map(args: dict) -> dict:
     if not instruction:
         return {"error": "instruction は必須です（各要素へ適用する指示）"}
     items = items[:64]
-    model = as_str(args.get("model")) or default_model()
+    model = as_str(args.get("model"))
+    selection = {"requested": True, "models": [model]} if model else {}
+    if not model:
+        selected, selection = select_models(1)
+        model = selected[0] if selected else ""
     if not model:
         return _no_models()
     max_tokens = as_int(args.get("max_tokens"), 500, 16, 4000)
@@ -2374,8 +2478,9 @@ def tool_map(args: dict) -> dict:
                      "output": truncate(res.get("text") or "", 1500) if not res.get("error") else "",
                      "error": res.get("error") or ""})
     ok = sum(1 for r in rows if not r["error"])
-    data = {"model": model, "count": len(rows), "ok": ok, "failed": len(rows) - ok, "results": rows}
-    if args.get("reduce"):
+    data = {"model": model, "count": len(rows), "ok": ok, "failed": len(rows) - ok, "results": rows,
+            "selection": selection}
+    if as_flag(args.get("reduce")):
         joined = "\n".join(f"- {r['output']}" for r in rows if r["output"])
         if joined.strip():
             reduce_prompt = (f"次の {len(rows)} 件の出力を統合してください。"
@@ -2469,8 +2574,8 @@ def tool_consult(args: dict) -> dict:
             labels = {}
             for part in (res["text"] or "").splitlines():
                 if ":" in part or "：" in part:
-                    key, _, value = re.split(r"[:：]", part, maxsplit=1)[0], None, part
-                    labels[part.split(":")[0].split("：")[0].strip()] = value
+                    key, value = re.split(r"[:：]", part, maxsplit=1)
+                    labels[key.strip()] = value.strip()
             debate_rows.append({"model": ref, "served_by": res.get("served_by"),
                                 "text": truncate(res["text"], 1500),
                                 "position": truncate(labels.get("立場") or "", 300),
@@ -2499,13 +2604,42 @@ def tool_consult(args: dict) -> dict:
                 "strongest_objection": row.get("strongest_objection"),
                 "unresolved": row.get("unresolved"),
             } for row in debate_rows if not row.get("error")],
-            "unresolved_dissent": any(row.get("unresolved") for row in debate_rows
-                                      if not row.get("error")),
+            "unresolved_dissent": any(
+                (row.get("unresolved") or "").lower().rstrip(" .。!?！？;；").strip() not in _NO_ANSWER
+                and bool(row.get("unresolved")) for row in debate_rows if not row.get("error")),
         }
 
-    last = [row for row in rounds[-1]["answers"] if not row.get("error")]
-    open_questions = [{"model": row["model"], "question": row["question"]}
-                      for row in last if row.get("question")]
+    if depth == "deep":
+        debate_by_model = {row.get("model"): row for row in debate_rows}
+        last = []
+        for initial in round_rows:
+            if initial.get("error"):
+                last.append(initial)
+                continue
+            debated = debate_by_model.get(initial.get("model"), {})
+            if debated.get("error"):
+                last.append({**initial, "error": debated["error"]})
+                continue
+            last.append({
+                "model": initial["model"], "served_by": debated.get("served_by"),
+                "conclusion": debated.get("position") or initial.get("conclusion") or "",
+                "confidence": initial.get("confidence"), "question": initial.get("question") or "",
+                "answer": debated.get("text") or initial.get("text") or "",
+                "text": debated.get("text") or initial.get("text") or "",
+            })
+    else:
+        last = [row for row in rounds[-1]["answers"] if not row.get("error")]
+    question_rows = last
+    last = [row for row in last if not row.get("error")]
+    open_questions = []
+    seen_questions = set()
+    for row in question_rows:
+        question_text = (row.get("question") or "").strip()
+        normalized = norm_text(question_text)
+        if question_text and normalized not in seen_questions:
+            seen_questions.add(normalized)
+            open_questions.append({"model": row["model"], "question": question_text})
+    open_questions_for_main = list(dict.fromkeys(q["question"] for q in open_questions))
     sid = sid or new_session_id()
     session_put(sid, {
         "question": question, "models": refs, "rounds": rounds,
@@ -2527,7 +2661,7 @@ def tool_consult(args: dict) -> dict:
         "consensus": last,
         "failed": [{"model": row.get("model"), "error": truncate(row.get("error") or "", 160)}
                    for row in rounds[-1]["answers"] if row.get("error")],
-        "open_questions_for_main": [q["question"] for q in open_questions],
+        "open_questions_for_main": open_questions_for_main,
         "debate_summary": debate_summary,
         "next_call": ({"tool": "freeagent_consult",
                        "args": {"session_id": sid, "main_reply": "<メインの回答>",
@@ -3045,7 +3179,8 @@ def _render_body(name: str, data: dict) -> str:
     if name == "freeagent_panel":
         conf_mean = data.get("confidence_mean")
         conf_note = f"（確信度平均 {conf_mean}）" if isinstance(conf_mean, (int, float)) else ""
-        lines = [f"参加 {data.get('answered')}/{len(data.get('models') or [])} 体"
+        lines = [f"回答 {data.get('answered')}/{len(data.get('models') or [])} 体"
+                 f" / 独立した実モデル {data.get('independent_sources', data.get('answered'))} 体"
                  f" / 合意度 {data.get('agreement')}{conf_note}"]
         for group in (data.get("consensus") or [])[:5]:
             lines.append(f"  • {', '.join(group['models'])}: {truncate(group['excerpt'], 160)}")
@@ -3271,6 +3406,8 @@ def respond(msg_id, result=None, error=None) -> None:
 
 
 def handle_tool_call(params: dict) -> dict:
+    if not isinstance(params, dict):
+        params = {}
     name = params.get("name")
     args = params.get("arguments") or {}
     if not isinstance(args, dict):
@@ -3289,13 +3426,79 @@ def handle_tool_call(params: dict) -> dict:
         data = {"error": f"internal error: handler returned {type(data).__name__}"}
     is_error = bool(data.get("error"))
     if is_error:
-        # 失敗してもターンは続く。**次の一手**を機械可読で返す（content には書かない）。
-        data.setdefault("next_action", error_advice(data))
-    text = render(name, data)
+        try:
+            data.setdefault("next_action", error_advice(data))
+        except Exception:
+            data["next_action"] = {"kind": "error", "advice": "structuredContent.error を確認してください"}
+    try:
+        text = render(name, data)
+    except Exception as exc:
+        data = {"error": f"internal render error: {type(exc).__name__}: {exc}",
+                "next_action": {"kind": "error", "advice": "structuredContent.error を確認してください"}}
+        is_error = True
+        text = "表示の生成に失敗しました。structuredContent.error を確認してください。"
     if is_error:
         text = "⚠️ 実行は失敗しました。structuredContent.error を確認してください。\n" + text
     return {"content": [{"type": "text", "text": text}],
             "structuredContent": data, "isError": is_error}
+
+
+def _dispatch_batch(items: list) -> None:
+    """JSON-RPC batch を 1 行の response array として返す。通知には応答しない。"""
+    replies = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("method"), str):
+            replies.append({"jsonrpc": "2.0", "id": None,
+                            "error": {"code": -32600, "message": "invalid request"}})
+            continue
+        method, msg_id = item["method"], item.get("id")
+        params = item.get("params") or {}
+        if method in ("notifications/initialized", "initialized") or msg_id is None:
+            continue
+        if method == "initialize":
+            offered = params.get("protocolVersion", "") if isinstance(params, dict) else ""
+            result = {"protocolVersion": negotiate_protocol(offered),
+                      "capabilities": {"tools": {"listChanged": False}},
+                      "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                      "instructions": PROACTIVE_INSTRUCTIONS}
+            replies.append({"jsonrpc": "2.0", "id": msg_id, "result": result})
+        elif method == "tools/list":
+            replies.append({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
+        elif method == "tools/call":
+            result = handle_tool_call(params)
+            replies.append({"jsonrpc": "2.0", "id": msg_id, "result": result})
+        elif method == "ping":
+            replies.append({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+        else:
+            replies.append({"jsonrpc": "2.0", "id": msg_id,
+                            "error": {"code": -32601, "message": f"method not found: {method}"}})
+    if replies:
+        with WRITE_LOCK:
+            write_line(json.dumps(replies, ensure_ascii=False))
+
+
+def _dispatch_message(msg: dict, pool: ThreadPoolExecutor) -> None:
+    method = msg.get("method")
+    msg_id = msg.get("id")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        offered = params.get("protocolVersion", "") if isinstance(params, dict) else ""
+        respond(msg_id, {
+            "protocolVersion": negotiate_protocol(offered),
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "instructions": PROACTIVE_INSTRUCTIONS,
+        })
+    elif method in ("notifications/initialized", "initialized"):
+        return
+    elif method == "tools/list":
+        respond(msg_id, {"tools": TOOLS})
+    elif method == "tools/call":
+        pool.submit(lambda i=msg_id, p=params: respond(i, handle_tool_call(p)))
+    elif method == "ping":
+        respond(msg_id, {})
+    elif msg_id is not None:
+        respond(msg_id, error={"code": -32601, "message": f"method not found: {method}"})
 
 
 def serve() -> None:
@@ -3313,29 +3516,17 @@ def serve() -> None:
         try:
             msg = json.loads(raw)
         except Exception:
+            respond(None, error={"code": -32700, "message": "parse error"})
             continue
         _debug("in", msg)
-        method = msg.get("method")
-        msg_id = msg.get("id")
-        if method == "initialize":
-            offered = ((msg.get("params") or {}).get("protocolVersion") or "")
-            respond(msg_id, {
-                "protocolVersion": negotiate_protocol(offered),
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                # 他クライアント向け（Hermes は読まない。§0 の実測メモを参照）。
-                "instructions": PROACTIVE_INSTRUCTIONS,
-            })
-        elif method in ("notifications/initialized", "initialized"):
-            continue
-        elif method == "tools/list":
-            respond(msg_id, {"tools": TOOLS})
-        elif method == "tools/call":
-            pool.submit(lambda i=msg_id, p=msg.get("params") or {}: respond(i, handle_tool_call(p)))
-        elif method == "ping":
-            respond(msg_id, {})
-        elif msg_id is not None:
-            respond(msg_id, error={"code": -32601, "message": f"method not found: {method}"})
+        if isinstance(msg, list):
+            if not msg:
+                respond(None, error={"code": -32600, "message": "invalid request"})
+            _dispatch_batch(msg)
+        elif isinstance(msg, dict):
+            _dispatch_message(msg, pool)
+        else:
+            respond(None, error={"code": -32600, "message": "invalid request"})
 
 
 def main() -> None:
