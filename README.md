@@ -144,7 +144,7 @@ freeagent_think で、この設計案を 1 ステップずつ分解して。
 | **出典つきの知識だけ**取る（LLM を経由しない） | `freeagent_lookup` | `query` `sources` `limit` `lang` `github_kind` |
 | 多数の要素へ同じ指示 ＋ 必要なら統合 | `freeagent_map` | `items` `instruction` `model` `reduce` `reduce_model` |
 | メイン ↔ サブの**往復相談**（`debate_depth="deep"` で 3 段討論） | `freeagent_consult` | `question` `session_id` `main_reply` `mode` `debate_depth` |
-| **思考を1ステップずつ積む**（分解・修正・分岐）＋必要なときだけ**独立モデルに反証させる** | `freeagent_think` | `thought` `session_id` `verify` `is_revision` `revises_thought` `branch_id` `branch_from_thought` `thought_number` `total_thoughts` `next_thought_needed` |
+| **思考を1ステップずつ積む**（分解・修正・分岐・**思考数の動的調整**）＋必要なときだけ**独立モデルに反証させる** | `freeagent_think` | `thought` `session_id` `verify` `is_revision` `revises_thought` `branch_id` `branch_from_thought` `thought_number` `total_thoughts` `next_thought_needed` |
 | サブが**自分で知識ツールを呼ぶ**調査ループ（読み取り専用） | `freeagent_agent` | `task` `models` `size` `max_steps` `main_reply` |
 | Hermes 本体を別プロセスで起動（**既定では無効**・opt-in） | `freeagent_delegate` | `task` `timeout` |
 
@@ -219,6 +219,9 @@ freeagent_think で、この設計案を 1 ステップずつ分解して。
   `verify` を付けないステップは「検証なし（台帳のみ）」と表示されます（判定なし＝検証済みではない）。
 - 検証に**到達できなかった**とき（バックエンド不通）は、その思考を**台帳に書きません**。検証されていない
   前提の上に次の思考が積まれるのを防ぐためで、`next_action.kind=unavailable_backend` が返ります。
+- **思考の総数（`total_thoughts`）は見積り**です。進めるうちに増減してかまいません（動的調整）。台帳は
+  直近の見積りを保持し、記録数がその値に達したら「増やす／据え置く／減らす」を `suggestions` で促します
+  （調整するのはメインで、台帳は判断しません）。出力の `見積り総数 N` がその値です。
 
 ---
 
@@ -603,6 +606,8 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 - **除外パターンはライブの実ツール名に照合する**。`fnmatchcase` の照合で、流布している `ask_*` は実名
   （`ask-all` 等）に一致しない。`cache/mcp_schema_cache.json` は**不完全**（実測 18 件 < ライブ 21 件）で、
   実在するツールを「存在しない」と誤判定するため、照合は `hermes mcp test` を優先する。
+- **思考の総数は見積りとして台帳に保存**し、動的に増減できる。記録数が見積りに達したら増減を助言する
+  （総数の調整はメインが行い、台帳は判断しない）。
 - **原子置換の書きかけを掃除する**。`os.replace` の前に `<name>.<pid>.<tid>.tmp` の古い残骸を消す
   （実測: 途中で落ちた書きかけが残り、再起動のたびに増えた。60 秒より古いものだけを対象にする）。
 
