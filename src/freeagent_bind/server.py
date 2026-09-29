@@ -149,8 +149,11 @@ PROACTIVE_INSTRUCTIONS = (
     "Free モデルをサブ LLM として並列に走らせるサーバー。1 ターンで複数の freeagent_* を"
     "並列に呼んでよい。独立した複数視点が要るとき（設計判断・リスク抽出・意見が割れそうな問い）は "
     "freeagent_panel / freeagent_consult、出典が要るときは freeagent_lookup / freeagent_grounded、"
-    "大量要素の一括処理は freeagent_map、複雑な問題の分解と**各ステップの独立検証**は freeagent_think を"
-    "使う。delegate_task は同一モデルの分身で多様性が無い。"
+    "大量要素の一括処理は freeagent_map。**2 段以上の推論が要る問題では、考え始める前に freeagent_think を"
+    "開き、plan で分解・revises_thought で改訂・branch_from_thought で分岐・total_thoughts で見積り調整・"
+    "kind=hypothesis と tests_hypothesis で仮説の生成と検証を積みながら進める**（要所だけ verify / "
+    "propose_alternatives で別モデルに反証・別案を出させる。1 問 1 答の質問には使わない）。"
+    "delegate_task は同一モデルの分身で多様性が無い。"
     "**このサーバーが無効・不通のときは、存在しないツールを探さず通常の手段で回答を完遂し、"
     "実際に応答した独立ソースの件数を回答に明記する**（1 件しか取れていないのに「複数視点で検討した」"
     "と書かない）。"
@@ -3312,6 +3315,15 @@ def _think_suggestions(data: dict, steps: list[dict], needed: bool) -> list[str]
                    "独立モデルの反証を取ってください。")
     plan = ledger.get("plan") or []
     est = data.get("total_thoughts")
+    # 構造を使っていない台帳への促し（常用の規則を台帳側でも補強する。数値から生成・判断はメイン）。
+    if needed and ledger["steps_recorded"] == 1 and not plan:
+        out.append("計画がありません。複数段の問題なら plan でステップ（サブ目標）に分解してください"
+                   "（1 問 1 答で済むなら不要です）。")
+    if (needed and ledger["steps_recorded"] == 3 and not ledger.get("hypotheses")
+            and not ledger["branches"] and not ledger.get("revisions")):
+        out.append(f"{ledger['steps_recorded']} ステップ積みましたが、仮説・分岐・改訂がありません。"
+                   "前提や原因は kind=hypothesis で立てて検証し、別案は branch_from_thought で分岐して"
+                   "比べ、考えが変わった前のステップは revises_thought で改訂してください。")
     if plan and est and len(plan) > est:
         out.append(f"計画は {len(plan)} 項目ですが見積り総数は {est} です。total_thoughts の見直しを推奨します。")
     pending = [p["id"] for p in plan if not p.get("done")]
@@ -3917,6 +3929,8 @@ TOOLS: list[dict] = [
     {
         "name": "freeagent_think",
         "description": (
+            "【常用】2 段以上の推論が要る問題（設計・調査・デバッグ・比較検討・計画）では、考え始める前に"
+            "これを開き、分解・改訂・分岐・見積りの調整・仮説の検証を台帳に積みながら進める。"
             "【使う条件】(a) 複雑な問題を**サブ目標に分解**して（plan）1件ずつ積みたい "
             "(b) 理解が深まるにつれて**過去の思考を改訂**したい（revises_thought。元は改訂済みとして残る） "
             "(c) **代替案へ分岐**して探索し、採用・棄却を記録したい（branch_* / resolve_branch） "
@@ -4040,9 +4054,9 @@ _EXTRA_DESC: dict[str, str] = {
                        "`deliberation` の ask_* を N 回並べる代わりにこれを使う。",
     "freeagent_consult": "【競合より優先】`deliberation`（単発の意見集約）にはラウンド・合意度の推移・"
                          "少数意見の保持が無い。往復して前提を更新したいならこれ。",
-    "freeagent_think": "【競合より優先】思考を記録するだけのツールは**ホスト LLM の思考メモ帳**で、"
-                       "検証者がいない（書いた本人が正しいか確かめる手段が無い）。"
-                       "各ステップを**生成者とは別のモデルに反証させる**ならこれ。",
+    "freeagent_think": "【競合より優先】思考を記録するだけのツール（sequential-thinking 系）は番号を積むだけで、"
+                       "計画の進捗・改訂済みの印・分岐の決着・仮説の状態を持たず、検証者もいない。"
+                       "分解・改訂・分岐・仮説を**構造として**残し、要所だけ別モデルに反証・別案を出させるならこれ。",
     "freeagent_grounded": "【競合より優先】`web_search` は単一視点で根拠が本文に埋もれる。"
                           "出典本文つき・番号つきで複数モデルに答えさせたいならこれ。",
     "freeagent_lookup": "【競合より優先】`web_search` より学術ソース（arXiv / Crossref / OpenAlex）と"

@@ -714,6 +714,25 @@ class TestThinkStructure(unittest.TestCase):
         self.assertIn("閲覧", S.render("freeagent_think", data))
         self.assertIn("session_id", S.tool_think({"view": True})["error"])
 
+    def test_structure_nudges_when_unused(self):
+        """常用の補強: 計画なしの 1 ステップ目、構造なしの 3 ステップ目にだけ促す（毎回は出さない）。"""
+        first = S.tool_think({"thought": "a"})
+        self.assertTrue(any("plan で" in s for s in first["suggestions"]))
+        sid = first["session_id"]
+        S.tool_think({"thought": "b", "session_id": sid})
+        third = S.tool_think({"thought": "c", "session_id": sid})
+        self.assertTrue(any("仮説・分岐・改訂がありません" in s for s in third["suggestions"]))
+        fourth = S.tool_think({"thought": "d", "session_id": sid})
+        self.assertFalse(any("仮説・分岐・改訂がありません" in s for s in fourth["suggestions"]))
+        planned = S.tool_think({"thought": "x", "plan": ["p"]})
+        self.assertFalse(any("plan で" in s for s in planned["suggestions"]))
+
+    def test_description_marks_think_as_standing_practice(self):
+        desc = next(t["description"] for t in S.TOOLS if t["name"] == "freeagent_think")
+        self.assertTrue(desc.startswith("【常用】"))
+        for key in ("plan", "revises_thought", "branch_", "hypothesis", "total_thoughts"):
+            self.assertIn(key, desc + S.PROACTIVE_INSTRUCTIONS)
+
     def test_render_structure_has_no_instructions(self):
         sid = S.tool_think({"thought": "a", "plan": ["x"], "kind": "hypothesis"})["session_id"]
         data = S.tool_think({"thought": "b", "session_id": sid, "branch_from_thought": 1,
@@ -1349,6 +1368,59 @@ class TestProactivePatternMatching(unittest.TestCase):
 
     def test_glob_matches_real_names(self):
         self.assertEqual(len(self.mod.pattern_hits("ask-*", self.REAL)), 6)
+
+    def test_snippet_covers_all_thinking_features(self):
+        """判断規則の単一の出典に、分解・改訂・分岐・見積り・仮説の常用と無効時の振る舞いが入っている。"""
+        for key in ("freeagent_think", "plan", "revises_thought", "branch_from_thought",
+                    "resolve_branch", "total_thoughts", "kind=hypothesis", "tests_hypothesis",
+                    "view=true", "無効・不通"):
+            self.assertIn(key, self.mod.SNIPPET)
+
+    def test_upsert_snippet_adds_updates_and_is_idempotent(self):
+        user = "# 私の SOUL\n好みの口調\n"
+        added, action = self.mod.upsert_snippet(user, "v1")
+        self.assertEqual(action, "added")
+        self.assertTrue(added.startswith(user), "利用者の記述を書き換えてはいけない")
+        updated, action = self.mod.upsert_snippet(added, "v2")
+        self.assertEqual(action, "updated")
+        self.assertIn("v2", updated)
+        self.assertNotIn("v1", updated)
+        self.assertEqual(updated.count(self.mod.MARKER), 1, "差し替えでブロックが増殖してはいけない")
+        again, action = self.mod.upsert_snippet(updated, "v2")
+        self.assertEqual((again, action), (updated, "unchanged"))
+
+    def test_upsert_replaces_legacy_block_without_end_marker(self):
+        legacy = f"前文\n\n{self.mod.MARKER}\n古い規則\n後文\n"
+        new, action = self.mod.upsert_snippet(legacy, "新しい規則")
+        self.assertEqual(action, "updated")
+        self.assertNotIn("古い規則", new)
+        self.assertIn("前文", new)
+        self.assertIn("後文", new, "旧形式の差し替えで後ろの記述を消してはいけない")
+
+    def test_remove_snippet_restores_user_text(self):
+        user = "# 私の SOUL\n好みの口調\n"
+        added, _ = self.mod.upsert_snippet(user, "規則")
+        removed, found = self.mod.remove_snippet(added)
+        self.assertTrue(found)
+        self.assertNotIn(self.mod.MARKER, removed)
+        self.assertEqual(removed.rstrip("\n"), user.rstrip("\n"))
+        self.assertEqual(self.mod.remove_snippet(user), (user, False))
+
+    def test_write_preserves_crlf(self):
+        """利用者の SOUL.md が CRLF なら CRLF のまま書く（改行コードを勝手に変えない）。"""
+        import tempfile
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "SOUL.md")
+        with open(p, "wb") as fh:
+            fh.write("一行目\r\n二行目\r\n".encode("utf-8"))
+        text, nl = self.mod._read_text(p)
+        self.assertEqual(nl, "\r\n")
+        body, _ = self.mod.upsert_snippet(text, "規則")
+        self.mod._write_text(p, body, nl)
+        with open(p, "rb") as fh:
+            raw = fh.read()
+        self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"), "LF だけの行が混ざってはいけない")
+        self.assertTrue(raw.startswith("一行目\r\n二行目\r\n".encode("utf-8")))
 
     def test_stale_underscore_pattern_matches_nothing(self):
         # `ask_*`（アンダースコア）は空振り。実名はハイフン区切り。

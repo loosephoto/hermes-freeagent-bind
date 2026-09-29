@@ -30,6 +30,8 @@
     python scripts/apply_proactive.py --snippet        # 貼る文面だけ出す
     python scripts/apply_proactive.py --apply          # 設定を適用（Hermes の再起動が必要）
     python scripts/apply_proactive.py --apply --yes    # 確認なしで適用
+    python scripts/apply_proactive.py --write-snippet "$HERMES_HOME/SOUL.md"   # 判断規則を入れる／最新に差し替え
+    python scripts/apply_proactive.py --remove-snippet "$HERMES_HOME/SOUL.md"  # MCP を外したら規則も外す
 
 終了コード: 0=正常 / 1=**設定済みの除外が空振り**（または適用対象が無い） / 2=設定が読めない。
 """
@@ -65,19 +67,89 @@ COMPETING = {
 }
 
 SNIPPET = (
-    "複数視点が要るときは freeagent-bind を優先（有効なら）: 設計判断・リスク抽出・意見が割れそうな問いは "
-    "mcp__freeagent_bind__freeagent_panel（往復して前提を更新するなら freeagent_consult）、"
+    "freeagent-bind が有効な間は、**2 段以上の推論が要る問題（設計・調査・デバッグ・比較検討・計画）では、"
+    "考え始める前に mcp__freeagent_bind__freeagent_think で思考ノートを開き、次を常用する**: "
+    "(1) plan でステップ（サブ目標）に分解し、subgoal / subgoal_done で進捗を付ける "
+    "(2) 理解が変わったら revises_thought で過去のステップを改訂する（消さずに改訂済みとして残る） "
+    "(3) 代替案は branch_from_thought で分岐して探索し、resolve_branch + branch_status で採用・棄却を記録する "
+    "(4) total_thoughts は見積りとして進めながら増減する "
+    "(5) 原因・前提は kind=hypothesis で仮説として立て、tests_hypothesis + hypothesis_status で検証結果を記録する。"
+    "要所だけ verify=true（別モデルの反証）/ propose_alternatives=true（別モデルの別案）を付ける"
+    "（全ステップに付けない。1 回 20 秒前後かかる）。文脈が圧縮されたら view=true と session_id で読み戻す。"
+    "1 問 1 答で済む質問・単純な事実確認・雑談では使わない。"
+    "複数視点が要るときは mcp__freeagent_bind__freeagent_panel（往復して前提を更新するなら freeagent_consult）、"
     "出典が要るなら freeagent_lookup / freeagent_grounded。delegate_task は同一モデルの分身で多様性ゼロ、"
     "deliberation の ask-* は単発集約。"
     "**freeagent-bind が無効・不通のときは、存在しないツールを探さず delegate_task / web_search / "
     "web_extract で回答を完遂し、実際に応答した独立ソースの件数を明記する**"
     "（1 件で「複数視点で検討した」と書かない）。"
-    "**複雑な問題を分解して考えを積むときは freeagent_think**（思考メモ帳系ツールの代替。"
-    "1 ステップずつ分解・前の思考の修正・分岐・思考数の動的調整ができ、要所だけ verify=true で"
-    "生成者とは別の Free モデルに反証させる）。"
 )
 
 MARKER = "<!-- freeagent-bind: proactive-usage -->"
+MARKER_END = "<!-- /freeagent-bind: proactive-usage -->"
+
+
+def upsert_snippet(existing: str, snippet: str = SNIPPET) -> tuple[str, str]:
+    """判断規則のブロックを入れる／**差し替える**。返り値は (新しい本文, "added"/"updated"/"unchanged")。
+
+    旧版は「マーカーがあれば何もしない」仕様だったため、文面を更新しても既存の SOUL.md は**古い規則の
+    まま**残る（分解・改訂・分岐・仮説を常用させる規則に替えたときに、コードを読んで判明）。終端マーカーの無い
+    旧形式（マーカー行＋文面 1 行）も差し替える。ブロック外の利用者の記述には触れない。
+    """
+    block = f"{MARKER}\n{snippet}\n{MARKER_END}"
+    body, found = _strip_block(existing)
+    if not found:
+        sep = "" if not existing or existing.endswith("\n") else "\n"
+        return f"{existing}{sep}\n{block}\n", "added"
+    new = _insert_at(existing, block)
+    return new, ("unchanged" if new == existing else "updated")
+
+
+def remove_snippet(existing: str) -> tuple[str, bool]:
+    """判断規則のブロックを取り除く（MCP を無効にしたとき、規則だけが残って空振りするのを防ぐ）。"""
+    body, found = _strip_block(existing)
+    return body, found
+
+
+def _block_span(lines: list[str]) -> tuple[int, int] | None:
+    for i, line in enumerate(lines):
+        if line.strip() == MARKER:
+            for j in range(i + 1, len(lines)):
+                if lines[j].strip() == MARKER_END:
+                    return i, j + 1
+            # 旧形式: 終端マーカーが無い＝マーカー行と直後の 1 行（文面）だけ
+            return i, min(i + 2, len(lines))
+    return None
+
+
+def _strip_block(existing: str) -> tuple[str, bool]:
+    lines = existing.split("\n")
+    span = _block_span(lines)
+    if span is None:
+        return existing, False
+    start, end = span
+    if start > 0 and not lines[start - 1].strip():
+        start -= 1          # 追記時に入れた空行も一緒に外す
+    return "\n".join(lines[:start] + lines[end:]), True
+
+
+def _insert_at(existing: str, block: str) -> str:
+    lines = existing.split("\n")
+    start, end = _block_span(lines)
+    return "\n".join(lines[:start] + block.split("\n") + lines[end:])
+
+
+def _read_text(path: str) -> tuple[str, str]:
+    """(本文（改行は \\n に正規化）, 元の改行コード) を返す。利用者のファイルの改行コードを変えないため。"""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    newline = "\r\n" if b"\r\n" in raw else "\n"
+    return raw.decode("utf-8", errors="replace").replace("\r\n", "\n"), newline
+
+
+def _write_text(path: str, body: str, newline: str) -> None:
+    with open(path, "w", encoding="utf-8", newline=newline) as fh:
+        fh.write(body)
 
 
 def hermes_home() -> str:
@@ -243,11 +315,26 @@ def main() -> int:
     ap.add_argument("--snippet", action="store_true", help="貼る文面だけを出す")
     ap.add_argument("--check", action="store_true", help="照合結果だけを出す（設定は書かない）")
     ap.add_argument("--write-snippet", default=None,
-                    help="文面を指定ファイルへ追記する（既に入っていれば何もしない）")
+                    help="文面を指定ファイルへ書く（既にあれば最新の文面に差し替える）")
+    ap.add_argument("--remove-snippet", default=None,
+                    help="指定ファイルから文面を取り除く（freeagent-bind を無効にしたとき用）")
     args = ap.parse_args()
 
     if args.snippet:
         print(SNIPPET)
+        return 0
+
+    if args.remove_snippet:
+        path = args.remove_snippet
+        if not os.path.exists(path):
+            print(f"· {path}: ファイルがありません（何もしません）")
+            return 0
+        body, found = remove_snippet(_read_text(path)[0])
+        if not found:
+            print(f"· {path}: 文面は入っていません（何もしません）")
+            return 0
+        _write_text(path, body, _read_text(path)[1])
+        print(f"✓ {path} から文面を取り除きました（Hermes の再起動で反映）")
         return 0
 
     cfg = read_config()
@@ -319,16 +406,15 @@ def main() -> int:
 
     if args.write_snippet:
         path = args.write_snippet
-        existing = ""
+        existing, newline = "", "\n"
         if os.path.exists(path):
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                existing = fh.read()
-        if MARKER in existing:
-            print(f"· {path}: 既に入っています（何もしません）")
+            existing, newline = _read_text(path)
+        body, action = upsert_snippet(existing)
+        if action == "unchanged":
+            print(f"· {path}: 最新の文面が入っています（何もしません）")
         else:
-            with open(path, "a", encoding="utf-8", newline="\n") as fh:
-                fh.write(f"\n{MARKER}\n{SNIPPET}\n")
-            print(f"✓ {path} に文面を追記しました")
+            _write_text(path, body, newline)
+            print(f"✓ {path} の文面を{'追記' if action == 'added' else '最新に差し替え'}しました")
         print()
 
     if not commands:

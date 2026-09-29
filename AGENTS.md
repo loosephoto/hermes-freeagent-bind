@@ -26,7 +26,7 @@ python scripts/smoke_stdio.py
 ```bash
 python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # TOOLS/HANDLERS の一致・スキーマ・版・content の規約
-python -m unittest discover -s tests         # オフライン回帰（159 件・ネットワーク不要）
+python -m unittest discover -s tests         # オフライン回帰（166 件・ネットワーク不要）
 python scripts/smoke_stdio.py                # 実クライアント経路（initialize/tools/list/tools/call）
 python scripts/check_offline.py              # バックエンド全滅: 例外漏れ・ハング・状態汚染が無いこと
 python scripts/measure_adoption.py           # 自発利用率の測定（state.db を読むだけ・副作用なし）
@@ -106,6 +106,9 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     実在する `panel` / `consensus` / `consensus-step` が欠けており、キャッシュで照合すると「存在しない」と
     誤判定する）ので、照合は `hermes mcp test <server>` のライブ一覧で行う。`apply_proactive.py --check` が
     設定済みの除外の空振りを exit 1 で検出する。
+    **SOUL.md の判断規則はマーカーで囲んだブロックとして差し替える**（`--write-snippet` は最新の文面へ
+    差し替え、`--remove-snippet` で外す）。「入っていれば何もしない」にすると、文面を更新しても古い規則が
+    残り続ける。ブロック外の利用者の記述と**元の改行コード**（CRLF / LF）は変えない。
 
 24. **思考台帳（`freeagent_think`）の検証は opt-in、採番はロック内、環境障害では書かない**。
     (a) `verify=true` のときだけサブLLMを呼ぶ（既定は台帳のみ＝サブ呼び出し 0 回。全ステップに検証を

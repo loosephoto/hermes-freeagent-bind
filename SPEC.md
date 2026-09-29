@@ -271,6 +271,17 @@
   `apply_proactive.py` は照合結果を表示し、設定済みの除外が空振りなら exit 1 にする。
 - 測定は回答本文ではなく **`state.db` の `messages.tool_calls`** で行う（`scripts/measure_adoption.py`）。
   遅延カタログ経由の呼び出しは `tool_call` として記録され、実名は `arguments.calls[].name` に入る。
+- **思考台帳の常用**: 判断規則（`SNIPPET`）・`freeagent_think` の description 先頭【常用】・
+  `PROACTIVE_INSTRUCTIONS` の 3 箇所で「2 段以上の推論が要る問題では、考え始める前に `freeagent_think` を開き、
+  plan で分解・revises_thought で改訂・branch_from_thought で分岐・total_thoughts で見積り調整・
+  kind=hypothesis と tests_hypothesis で仮説の生成と検証を積む」を指示する。1 問 1 答・単純な事実確認・雑談は
+  対象外（全問で開くと 1 ターンが無駄に伸びる）。台帳側でも補強する: 計画なしの 1 ステップ目と、仮説・分岐・
+  改訂が 1 つも無い 3 ステップ目に**だけ** `suggestions` で促す（毎ステップ出すと雑音になる）。
+- **「有効な間だけ」効かせる**: 判断規則は `<!-- freeagent-bind: proactive-usage -->` 〜
+  `<!-- /freeagent-bind: proactive-usage -->` のブロックで SOUL.md に置く。`--write-snippet` は**既存の
+  ブロックを最新の文面に差し替え**（旧形式＝終端マーカー無しも可。ブロック外は触らない。改行コードは元の
+  ファイルに合わせる）、`--remove-snippet` はブロックだけを外す（MCP を外したときに規則が空振りし続けない）。
+  規則自体にも「無効・不通なら存在しないツールを探さず代替で完遂」を含める。
 
 ## 12. 検証
 
