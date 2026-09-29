@@ -70,7 +70,7 @@ def main() -> int:
 
         listing = send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         tools = ((listing or {}).get("result") or {}).get("tools") or []
-        check(len(tools) == 10, f"tools/list が 10 件ではありません（{len(tools)} 件）")
+        check(len(tools) == 11, f"tools/list が 11 件ではありません（{len(tools)} 件）")
         check(all(t.get("name", "").startswith("freeagent_") for t in tools),
               "tools/list に名前空間外のツールが混ざっています")
 

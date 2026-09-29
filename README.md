@@ -3,7 +3,7 @@
 **Hermes Agent の Free モデルを「サブ LLM」として並列に走らせ、外部知識で根拠づける MCP サーバー。**
 
 メインの LLM が判断するための材料 —— **複数モデルの意見と一致・不一致**、**出典つきの知識**、**大量要素の
-並列処理結果** —— を、無料枠だけで組み立てます。ツールは 10 個（`freeagent_*`）です。
+並列処理結果** —— を、無料枠だけで組み立てます。ツールは 11 個（`freeagent_*`）です。
 
 - **実行時依存ゼロ**（Python 3.11+ の標準ライブラリのみ。`pip install` 不要）
 - **モデルは 4 プロバイダ横断**（Nous / OpenRouter / NVIDIA NIM / Hugging Face）で、生きている Free を自動選抜
@@ -36,7 +36,8 @@
 | 多数決を取れば正解が保証される | **保証されない** | 同系統の Free モデルは**同じ誤りを共有**しやすい。**投げ先も減ります**: 実測で `nous` はプロキシ停止で 0 モデル（到達不可）、HF の無料 3 件はクレジット枯渇で 402、NVIDIA は 82 件中 55 件が 404（廃止）。応答が返っても中身は玉石混交で、実測の 4 体には **6.7B のコーダーモデルが API 設計の問いに答えていました**。だから「独立意見は N 体・うち応答 M 体」と留保を付けて返します |
 | 合意度が高ければ正しい | **別物** | 合意度は**表層の一致**（言い回しの類似）であって、正しさの確率ではありません。**確信度の自己申告は当てになりません**（実測: 確信度 `confidence_mean` **90.5** に対し合意度 `agreement` **0.094** の回がありました＝自信満々でも言っていることがバラバラ） |
 | 出典が付くので幻覚が消える | **消えない** | `freeagent_lookup` / `freeagent_grounded` は LLM を介さず事実を取りますが、**解釈・推論は各モデルの出力**です。保証されるのは「取得した事実」までです。ただし `grounded` は**根拠の本文**を注入し、`agent` は回答中の `[n]` を根拠と照合するので、「根拠を使った回答か」は機械的に判定できます |
-| 常時 ON にすると他のツールが遅くなる | **ならない** | 固定費は起動と一覧で**約 0.17 秒**（実測: spawn → `tools/list` 完了まで **170 ms**）、スキーマは **10 ツールで 9,451 文字**。実タスクの差はノイズ程度です |
+| 常時 ON にすると他のツールが遅くなる | **ならない** | 固定費は起動と一覧で**約 0.16 秒**（実測: spawn → `tools/list` 完了まで **158 ms**）、スキーマは **11 ツールで 11,617 文字**（うち `freeagent_think` が 2,063 文字）。実タスクの差はノイズ程度です |
+| 思考台帳を入れればメインが賢くなる | **ならない** | `freeagent_think` の思考は**メイン自身が書きます**（知能は増えない）。増えるのは「積んだ思考を忘れない（文脈圧縮・再起動をまたぐ）」ことと、`verify=true` のときだけ付く**生成者とは別モデルの反証**です。既定は台帳のみ＝サブ呼び出し 0 回で、1 ステップは **0.0 秒**（実測）です |
 | OFF にすれば速くなる | **ならない** | 浮くのは上の分だけ。相談が要る場面では代替手段（`delegate_task` / `deliberation` を N 回）の方が遅いことがあります |
 
 **では何に向くのか**: 「メイン 1 体では見落とす観点を、独立した数体に当てて洗い出す」「出典つきの事実を
@@ -98,7 +99,7 @@ hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_MAILTO   'you@example
 
 ```bash
 hermes proxy start              # nous プロバイダ（ローカルプロキシ）を使うなら
-hermes mcp test freeagent-bind  # → Connected / 10 tools なら成功
+hermes mcp test freeagent-bind  # → Connected / 11 tools なら成功
 ```
 
 **MCP はホットリロードしません。** 設定やキーを変えたら Hermes を再起動してください。
@@ -120,6 +121,12 @@ freeagent_map で、以下のタイトル 30 件を 1 件ずつ 1 行に要約�
 最後に reduce で全体の傾向を 3 行にまとめて。
 ```
 
+```
+freeagent_think で、この設計案を 1 ステップずつ分解して。
+3 ステップ目は verify=true にして、独立したモデルに反証させて。
+「要修正」が出たら、その指摘を潰す修正ステップ（is_revision=true）を積んで。
+```
+
 ---
 
 ## どのツールを使うか
@@ -137,11 +144,13 @@ freeagent_map で、以下のタイトル 30 件を 1 件ずつ 1 行に要約�
 | **出典つきの知識だけ**取る（LLM を経由しない） | `freeagent_lookup` | `query` `sources` `limit` `lang` `github_kind` |
 | 多数の要素へ同じ指示 ＋ 必要なら統合 | `freeagent_map` | `items` `instruction` `model` `reduce` `reduce_model` |
 | メイン ↔ サブの**往復相談**（`debate_depth="deep"` で 3 段討論） | `freeagent_consult` | `question` `session_id` `main_reply` `mode` `debate_depth` |
+| **思考を1ステップずつ積む**（分解・修正・分岐）＋必要なときだけ**独立モデルに反証させる** | `freeagent_think` | `thought` `session_id` `verify` `is_revision` `revises_thought` `branch_id` `branch_from_thought` `thought_number` `total_thoughts` `next_thought_needed` |
 | サブが**自分で知識ツールを呼ぶ**調査ループ（読み取り専用） | `freeagent_agent` | `task` `models` `size` `max_steps` `main_reply` |
 | Hermes 本体を別プロセスで起動（**既定では無効**・opt-in） | `freeagent_delegate` | `task` `timeout` |
 
 **迷ったら**: 意見の食い違いを見たい → `freeagent_panel` / 事実が欲しい → `freeagent_lookup` /
-件数が多い → `freeagent_map` / 1 回だけ聞きたい → `freeagent_ask`。
+件数が多い → `freeagent_map` / 1 回だけ聞きたい → `freeagent_ask` / **問題が複雑で、積んだ思考を
+忘れずに進めたい（＋要所だけ独立検証したい）** → `freeagent_think`。
 
 `freeagent_models` で得た ref（`provider/model` の形）は、そのまま他のツールの `models` に渡せます。
 `model:提供元`（例 `inclusionAI/Ling-3.0-flash-Fin:novita`）の形で経路を固定することもできます。
@@ -191,6 +200,25 @@ freeagent_map で、以下のタイトル 30 件を 1 件ずつ 1 行に要約�
 **不通のときは状態を一切書きません。** 接続不可・タイムアウトは「モデルの成績」ではないので、統計・
 トレース・クールダウンのどれにも記録しません（プロキシが落ちていた数分でモデルの評価が下がり、
 復旧後も選抜が歪むのを避けるため）。この契約は `python scripts/check_offline.py` が機械的に検証します。
+
+### `freeagent_think` の出力（思考台帳）
+
+```
+思考 #3（記録 3 件 / 分岐 1 / 修正 1） / 見積り総数 5
+  • #2 [b1]: 代替案の検討…
+  • #3 [修正]: 指摘を潰す修正…
+検証（独立 2/2 体）: 妥当 1 / 要修正 1 / 根拠不足 0 / 確信度平均 67.0
+  ◦ nous/upstage/solar-pro4:free: 要修正
+      反証: 「opt-in にする」は機能のオプション化を指すだけで、…
+      見落とし: 独立検証が何を検証するのかという前提が欠けている
+```
+
+- `検証（独立 N/M 体）` は**生成者とは別モデルの反証**です。`M` は選抜した検証者、`N` は実際に応答した数。
+  **脱落（`✗`）は隠しません**（`verification.failed_rows` にも残ります）。
+- `妥当 / 要修正 / 根拠不足` は**検証者の判定**で、合意は正しさの保証ではありません。
+  `verify` を付けないステップは「検証なし（台帳のみ）」と表示されます（判定なし＝検証済みではない）。
+- 検証に**到達できなかった**とき（バックエンド不通）は、その思考を**台帳に書きません**。検証されていない
+  前提の上に次の思考が積まれるのを防ぐためで、`next_action.kind=unavailable_backend` が返ります。
 
 ---
 
@@ -430,6 +458,10 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 | `FREEAGENT_PROBE_WORKERS` | 8 | 生存確認の並列度（1〜8） |
 | `FREEAGENT_SESSIONS` | 1 | 相談セッションを永続化する |
 | `FREEAGENT_SESSION_TTL` | 3600 | 相談セッションの寿命（秒） |
+| `FREEAGENT_THOUGHTS` | 1 | 思考台帳（`freeagent_think`）を永続化する |
+| `FREEAGENT_THOUGHT_TTL` / `_MAX` | 7200 / 32 | 台帳の寿命（秒）・保持する台帳の数 |
+| `FREEAGENT_THOUGHT_MAX_STEPS` | 24 | 1 台帳あたりの思考数上限（超過は黙って捨てずエラー） |
+| `FREEAGENT_THOUGHT_CHARS` | 2000 | 1 思考あたりに保存する文字数（超過は切り詰め） |
 | `FREEAGENT_ALLOW_AGENT` | 0 | `freeagent_delegate`（Hermes 本体の起動）を許可 |
 | `FREEAGENT_ARXIV_INTERVAL` | 3.0 | arXiv の最小呼び出し間隔（秒） |
 | `FREEAGENT_EVIDENCE_ITEM_CHARS` / `_TOTAL_CHARS` | 360 / 3200 | 根拠本文をサブLLMへ注入する 1 件あたり・全体の上限（0 で本文を入れない） |
@@ -470,7 +502,8 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 | `FREEAGENT_AUTH_PATH` | `provider_auth.json`（プロバイダ単位の認証失敗・`FREEAGENT_AUTH_TTL` 秒） |
 | `FREEAGENT_STATS_PATH` | `model_stats.json`（品質統計） |
 | `FREEAGENT_TRACE_PATH` | `traces.jsonl`（トレース） |
-| `FREEAGENT_SESSIONS_PATH` | `consult_sessions.json`（相談セッション） |
+| `FREEAGENT_SESSIONS_PATH` | `sessions.json`（相談セッション） |
+| `FREEAGENT_THOUGHTS_PATH` | `thoughts.json`（思考台帳・TTL と上限つき。**知識は蓄積しない**） |
 
 ---
 
@@ -478,6 +511,18 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 
 > 「どのくらい賢く／速くなるのか」の現実的な期待値は [期待しないこと（実測に基づく）](#期待しないこと実測に基づく) にまとめています。
 
+- **サブLLM 呼び出しの実効上限は約 10 秒**（`nous` ローカルプロキシで実測）。設計は
+  (connect 10 秒 / read 180 秒) ですが、`urllib` の `timeout` は「接続〜**応答ヘッダの受信**」までに
+  適用され、プロキシは上流の生成が終わるまで本文を返しません（実測: **TTFB 6.13 秒 = total 6.13 秒**）。
+  つまり **10 秒を超える生成は `TimeoutError` になる**（実測: 1200 トークンを要求した呼び出しが
+  **10.0 秒**で timeout。180 秒の read 上限は効いていない）。しかも `is_env_failure` がこれを
+  環境障害として扱うため、統計にも残らず、`freeagent_think(verify=true)` では**台帳に書かない**側へ
+  倒れます。回避は `max_tokens` を小さく保つ・検証者を 1〜2 体にする・
+  `FREEAGENT_CONNECT_TIMEOUT` を上げる（上げるほど**遮断ホストへの fail fast が鈍る**）のいずれかです
+  （**実測**: `FREEAGENT_CONNECT_TIMEOUT=60` で **40.5 秒かかる生成が成功**。既定 10 では同じ呼び出しが
+  10.0 秒で timeout）。
+  **他プロバイダは未検証**（ヘッダを早く返す実装ならこの上限は掛かりません）。根本対策は HTTP 層を
+  `http.client` に替えて「接続は短く・送信と読取は長く」を実装することです（未着手）。
 - **arXiv の HTTP 406**: 同一リクエストでも Python クライアントに確率的に 406 を返す（curl では
   常に 200）。レート・問いの内容には依存しない。スロットル + 最大 3 回の再試行で緩和しているが、
   落ちることはある（その場合 `results.arxiv.error` に出る）。

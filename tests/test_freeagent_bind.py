@@ -214,6 +214,297 @@ class TestSessions(unittest.TestCase):
         self.assertEqual(list(alive), ["fresh"])
 
 
+class TestThoughtLedgerStore(unittest.TestCase):
+    """§2.6 思考台帳の永続ストア（相談セッションと同じ規律で扱う）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="fa-think-store-")
+        self._old = os.environ.get("FREEAGENT_THOUGHTS_PATH")
+        os.environ["FREEAGENT_THOUGHTS_PATH"] = os.path.join(self.tmp, "thoughts.json")
+        S._THOUGHTS.clear()
+        S._THOUGHTS_LOADED = False
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("FREEAGENT_THOUGHTS_PATH", None)
+        else:
+            os.environ["FREEAGENT_THOUGHTS_PATH"] = self._old
+        S._THOUGHTS.clear()
+        S._THOUGHTS_LOADED = False
+
+    def test_merge_get_drop(self):
+        out = S.thought_merge("", {"n": 1, "text": "t"}, question="q")
+        sid = out["session_id"]
+        self.assertFalse(out["refused"])
+        self.assertEqual(S.thought_get(sid)["question"], "q")
+        S.thought_drop(sid)
+        self.assertIsNone(S.thought_get(sid))
+
+    def test_get_returns_copy(self):
+        sid = S.thought_merge("", {"n": 1, "text": "t"})["session_id"]
+        row = S.thought_get(sid)
+        row["steps"][0]["text"] = "書き換え"
+        self.assertEqual(S.thought_get(sid)["steps"][0]["text"], "t",
+                         "呼び出し側の書き換えが保存値へ波及してはいけない")
+
+    def test_expired_is_gone(self):
+        sid = S.thought_merge("", {"n": 1, "text": "t"})["session_id"]
+        with S._THOUGHTS_LOCK:
+            S._THOUGHTS[sid]["updated_at"] = S.now_ts() - S.THOUGHT_TTL_S - 10
+        self.assertIsNone(S.thought_get(sid), "TTL 切れの台帳を復活させてはいけない")
+
+    def test_persisted_and_reloaded(self):
+        sid = S.thought_merge("", {"n": 1, "text": "永続"})["session_id"]
+        S._THOUGHTS.clear()
+        S._THOUGHTS_LOADED = False
+        self.assertEqual(S.thought_get(sid)["steps"][0]["text"], "永続")
+
+    def test_unknown_sid_is_not_revived(self):
+        out = S.thought_merge("t-does-not-exist", {"n": 1, "text": "t"})
+        self.assertNotEqual(out["session_id"], "t-does-not-exist",
+                            "未知の ID へ書き戻して古い台帳を復活させてはいけない")
+
+    def test_assign_number_inside_lock(self):
+        """並列呼び出しでも番号が衝突して片方が消えないこと（規約 14）。"""
+        from concurrent.futures import ThreadPoolExecutor
+        sid = S.thought_merge("", {"n": 1, "text": "start"})["session_id"]
+
+        def add(i):
+            return S.thought_merge(sid, {"text": f"t{i}"}, assign_number=True)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(add, range(4)))
+        steps = S.thought_get(sid)["steps"]
+        self.assertEqual(len(steps), 5, f"並列追加でステップが失われている: {steps}")
+        self.assertEqual([s["n"] for s in steps], [1, 2, 3, 4, 5])
+
+    def test_prune_keeps_newest(self):
+        now = S.now_ts()
+        rows = {f"old{i}": {"updated_at": now - S.THOUGHT_TTL_S - 1} for i in range(5)}
+        rows["fresh"] = {"updated_at": now}
+        self.assertEqual(list(S._thoughts_prune(rows, now)), ["fresh"])
+
+
+class TestParseVerdict(unittest.TestCase):
+    def test_labels(self):
+        parsed = S.parse_verdict("判定: 要修正\n反証: 前提が未検証です\n見落とし: コスト\n確信度: 70")
+        self.assertEqual(parsed["verdict"], "要修正")
+        self.assertEqual(parsed["objection"], "前提が未検証です")
+        self.assertEqual(parsed["oversight"], "コスト")
+        self.assertEqual(parsed["confidence"], 70)
+        self.assertEqual(parsed["labels_found"], 4)
+
+    def test_same_line_multiple_labels(self):
+        # 1 行 1 ラベルと決め打たない（規約 11）。
+        parsed = S.parse_verdict("判定: 妥当 確信度: 55")
+        self.assertEqual(parsed["verdict"], "妥当")
+        self.assertEqual(parsed["confidence"], 55)
+
+    def test_english_and_verdict_variants(self):
+        self.assertEqual(S.parse_verdict("判定: 根拠不足")["verdict"], "根拠不足")
+        self.assertEqual(S.parse_verdict("verdict: needs revision")["verdict"], "要修正")
+        self.assertEqual(S.parse_verdict("判定: ok")["verdict"], "妥当")
+
+    def test_none_is_not_counted_as_objection(self):
+        parsed = S.parse_verdict("判定: 妥当\n反証: なし\n見落とし: 無し")
+        self.assertEqual(parsed["objection"], "")
+        self.assertEqual(parsed["oversight"], "")
+
+    def test_missing_labels_stay_empty(self):
+        parsed = S.parse_verdict("ただの自由文です")
+        self.assertEqual(parsed["verdict"], "")
+        self.assertIsNone(parsed["confidence"])
+        self.assertEqual(parsed["labels_found"], 0)
+
+    def test_junk_does_not_crash(self):
+        for junk in [None, "", 123, [], {}]:
+            self.assertEqual(S.parse_verdict(junk)["labels_found"], 0, f"junk={junk!r}")
+
+
+class TestThinkTool(unittest.TestCase):
+    """`freeagent_think`（§6.9）。検証は opt-in、環境障害では台帳に書かない。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="fa-think-")
+        self._old = os.environ.get("FREEAGENT_THOUGHTS_PATH")
+        os.environ["FREEAGENT_THOUGHTS_PATH"] = os.path.join(self.tmp, "thoughts.json")
+        S._THOUGHTS.clear()
+        S._THOUGHTS_LOADED = False
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("FREEAGENT_THOUGHTS_PATH", None)
+        else:
+            os.environ["FREEAGENT_THOUGHTS_PATH"] = self._old
+        S._THOUGHTS.clear()
+        S._THOUGHTS_LOADED = False
+
+    def _ledger_file(self) -> str:
+        return os.path.join(self.tmp, "thoughts.json")
+
+    def test_thought_is_required(self):
+        res = S.handle_tool_call({"name": "freeagent_think", "arguments": {}})
+        self.assertTrue(res["isError"])
+        self.assertIn("thought", res["content"][0]["text"])
+
+    def test_ledger_only_makes_no_model_calls(self):
+        # verify を付けない＝サブ呼び出しゼロ。呼ばれたら失敗させて契約を固定する。
+        with unittest.mock.patch.object(S, "ask_many",
+                                        side_effect=AssertionError("verify なしでモデルを呼んではいけない")):
+            data = S.tool_think({"thought": "まず前提を分解する", "question": "A と B どちらか"})
+        self.assertIsNone(data.get("error"))
+        self.assertEqual(data["ledger"]["steps_recorded"], 1)
+        self.assertFalse(data["verified"])
+        self.assertIsNone(data["verification"])
+        self.assertTrue(os.path.exists(self._ledger_file()), "台帳が永続化されていない")
+
+    def test_resume_by_session_id(self):
+        sid = S.tool_think({"thought": "1つ目"})["session_id"]
+        S._THOUGHTS.clear()
+        S._THOUGHTS_LOADED = False          # プロセス再起動を模す
+        again = S.tool_think({"thought": "2つ目", "session_id": sid})
+        self.assertEqual(again["session_id"], sid)
+        self.assertEqual(again["step"], 2)
+        self.assertEqual(again["ledger"]["steps_recorded"], 2)
+
+    def test_unknown_session_starts_new_ledger(self):
+        data = S.tool_think({"thought": "x", "session_id": "t-deadbeef"})
+        self.assertNotEqual(data["session_id"], "t-deadbeef")
+        self.assertTrue(any("見つかりません" in n for n in data["notes"]))
+
+    def test_branch_and_revision_tracking(self):
+        first = S.tool_think({"thought": "案A", "question": "q"})
+        sid = first["session_id"]
+        S.tool_think({"thought": "案B", "session_id": sid, "branch_id": "b1",
+                      "branch_from_thought": 1})
+        third = S.tool_think({"thought": "案Aを修正", "session_id": sid, "is_revision": True,
+                              "revises_thought": 1})
+        self.assertEqual([b["branch_id"] for b in third["ledger"]["branches"]], ["b1"])
+        self.assertEqual(third["ledger"]["branch_points"], [1])
+        self.assertEqual(third["ledger"]["revisions"], [{"step": 3, "revises": 1}])
+
+    def test_same_number_overwrites(self):
+        sid = S.tool_think({"thought": "v1", "thought_number": 1})["session_id"]
+        data = S.tool_think({"thought": "v2", "session_id": sid, "thought_number": 1})
+        self.assertEqual(data["ledger"]["steps_recorded"], 1)
+        self.assertEqual(data["text"], "v2")
+        self.assertTrue(any("置き換え" in n for n in data["notes"]))
+
+    def test_verify_attaches_independent_refutation(self):
+        rows = [
+            {"text": "判定: 要修正\n反証: 前提が未検証です\n見落とし: 運用コスト\n確信度: 70",
+             "served_by": "p/m1", "model": "m1", "cot_leak": False, "truncated": False},
+            {"text": "判定: 妥当\n反証: なし\n見落とし: なし\n確信度: 80",
+             "served_by": "p/m2", "model": "m2", "cot_leak": False, "truncated": False},
+        ]
+        with unittest.mock.patch.object(S, "select_models",
+                                        return_value=(["p/m1", "p/m2"], {"notes": []})), \
+                unittest.mock.patch.object(S, "ask_many", return_value=rows):
+            data = S.tool_think({"thought": "仮説X", "verify": True})
+        verify = data["verification"]
+        self.assertTrue(data["verified"])
+        self.assertEqual(verify["answered"], 2)
+        self.assertEqual(verify["verdicts"]["要修正"], 1)
+        self.assertEqual(verify["verdicts"]["妥当"], 1)
+        self.assertEqual(len(verify["objections"]), 1, "「なし」を反証として数えてはいけない")
+        self.assertEqual(len(verify["oversights"]), 1)
+        self.assertEqual(verify["confidence_mean"], 75.0)
+        self.assertIn("p/m1", data["verifier_models"])
+        self.assertTrue(any("要修正" in s for s in data["suggestions"]))
+
+    def test_verifier_models_are_rotated(self):
+        """2 回目の検証では 1 回目に使った検証者を選抜から外す（同じモデルに固定しない）。"""
+        seen: list[list[str]] = []
+
+        def fake_select(size, requested=None, *, prefer=None, exclude=None, free_only=True):
+            seen.append(list(exclude or []))
+            return [f"p/m{len(seen)}"], {"notes": []}
+
+        row = [{"text": "判定: 妥当\n反証: なし\n見落とし: なし\n確信度: 60",
+                "served_by": "p/m1", "model": "p/m1"}]
+        with unittest.mock.patch.object(S, "select_models", side_effect=fake_select), \
+                unittest.mock.patch.object(S, "ask_many", return_value=row):
+            first = S.tool_think({"thought": "a", "verify": True})
+            S.tool_think({"thought": "b", "session_id": first["session_id"], "verify": True})
+        self.assertEqual(seen[0], [])
+        self.assertIn("p/m1", seen[1], "1 回目の検証者を 2 回目の選抜で除外していない")
+
+    def test_verify_env_failure_writes_nothing(self):
+        """規約 21: バックエンド不通では台帳に書かない（検証されていない前提を積まない）。"""
+        rows = [{"error": "URLError: <urlopen error [WinError 10061] 接続を拒否されました>",
+                 "ref": "p/m1"}]
+        with unittest.mock.patch.object(S, "select_models",
+                                        return_value=(["p/m1"], {"notes": []})), \
+                unittest.mock.patch.object(S, "ask_many", return_value=rows):
+            res = S.handle_tool_call({"name": "freeagent_think",
+                                      "arguments": {"thought": "仮説", "verify": True}})
+        self.assertTrue(res["isError"])
+        self.assertIn("記録していません", res["structuredContent"]["error"])
+        self.assertEqual(res["structuredContent"]["next_action"]["kind"], "unavailable_backend")
+        self.assertFalse(os.path.exists(self._ledger_file()),
+                         "環境障害では状態ディレクトリにファイルを作ってはいけない")
+
+    def test_verify_model_failure_is_recorded_not_hidden(self):
+        """モデル側の失敗（429 など）は環境障害ではないので記録し、脱落として残す。"""
+        rows = [{"error": "HTTP 429: rate limited", "ref": "p/m1"}]
+        with unittest.mock.patch.object(S, "select_models",
+                                        return_value=(["p/m1"], {"notes": []})), \
+                unittest.mock.patch.object(S, "ask_many", return_value=rows):
+            data = S.tool_think({"thought": "仮説", "verify": True})
+        self.assertIsNone(data.get("error"))
+        self.assertFalse(data["verified"])
+        self.assertEqual(data["verification"]["failed"], 1)
+        self.assertEqual(len(data["verification"]["failed_rows"]), 1)
+        self.assertTrue(any("独立した検証が得られていません" in s for s in data["suggestions"]))
+        self.assertTrue(os.path.exists(self._ledger_file()))
+
+    def test_step_limit_refuses_and_says_so(self):
+        sid = S.tool_think({"thought": "1つ目"})["session_id"]
+        with unittest.mock.patch.object(S, "THOUGHT_MAX_STEPS", 1):
+            res = S.handle_tool_call({"name": "freeagent_think",
+                                      "arguments": {"thought": "2つ目", "session_id": sid}})
+        self.assertTrue(res["isError"])
+        self.assertIn("上限", res["structuredContent"]["error"])
+        self.assertEqual(len(S.thought_get(sid)["steps"]), 1, "上限超過で台帳を書き換えてはいけない")
+
+    def test_next_thought_needed_defaults_true(self):
+        self.assertTrue(S.tool_think({"thought": "a"})["next_thought_needed"])
+        data = S.tool_think({"thought": "b", "next_thought_needed": False})
+        self.assertFalse(data["next_thought_needed"])
+        self.assertTrue(any("結論" in s for s in data["suggestions"]))
+
+    def test_total_thoughts_is_stored_and_adjustable(self):
+        """思考の総数を動的に調整できる（宣言 → 台帳に残る → 増減が反映される）。"""
+        first = S.tool_think({"thought": "a", "total_thoughts": 2})
+        sid = first["session_id"]
+        self.assertEqual(first["total_thoughts"], 2)
+        self.assertEqual(first["ledger"]["total_thoughts"], 2)
+        second = S.tool_think({"thought": "b", "session_id": sid, "total_thoughts": 2})
+        # 見積り総数（2）に達したので、続けるなら増やすよう促す（数値から生成）
+        self.assertTrue(any("見積り総数" in s and "増やして" in s for s in second["suggestions"]))
+        # 総数を増やして継続できる（積んだ思考は失われない）
+        third = S.tool_think({"thought": "c", "session_id": sid, "total_thoughts": 5})
+        self.assertEqual(third["ledger"]["total_thoughts"], 5)
+        self.assertEqual(third["ledger"]["steps_recorded"], 3)
+        # 減らすのも許容する（据え置き・減も動的調整のうち）
+        fourth = S.tool_think({"thought": "d", "session_id": sid, "total_thoughts": 3})
+        self.assertEqual(fourth["ledger"]["total_thoughts"], 3)
+
+    def test_render_never_breaks(self):
+        self.assertIsInstance(S.render("freeagent_think", {}), str)
+        text = S.render("freeagent_think", {
+            "step": 2, "ledger": {"steps_recorded": 2, "branches": [], "revisions": [],
+                                  "latest": [{"n": 1, "text": "x"}]},
+            "verification": {"models": ["p/m"], "answered": 1, "failed": 0,
+                             "verdicts": {"妥当": 1, "要修正": 0, "根拠不足": 0},
+                             "confidence_mean": 60.0,
+                             "answers": [{"model": "p/m", "verdict": "妥当", "objection": "根拠が薄い"}]}})
+        self.assertIn("思考 #2", text)
+        self.assertIn("反証: 根拠が薄い", text)
+        for banned in ("要約せず", "引用してください", "回答時は", "LLMへ", "モデルに対して"):
+            self.assertNotIn(banned, text, "content は人間が読むチャネル（指示文を混ぜない）")
+
+
 class TestCooldownAndStats(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="fa-cd-")
@@ -261,7 +552,7 @@ class TestToolRegistry(unittest.TestCase):
         names = [t["name"] for t in S.TOOLS]
         self.assertEqual(len(names), len(set(names)), "ツール名が重複している")
         self.assertEqual(set(names), set(S.HANDLERS), "TOOLS と HANDLERS が一致していない")
-        self.assertEqual(len(names), 10)
+        self.assertEqual(len(names), 11)
 
     def test_descriptions_carry_required_markers(self):
         for tool in S.TOOLS:

@@ -72,6 +72,9 @@ SNIPPET = (
     "**freeagent-bind が無効・不通のときは、存在しないツールを探さず delegate_task / web_search / "
     "web_extract で回答を完遂し、実際に応答した独立ソースの件数を明記する**"
     "（1 件で「複数視点で検討した」と書かない）。"
+    "**複雑な問題を分解して考えを積むときは freeagent_think**（旧 sequential-thinking の代替。"
+    "1 ステップずつ分解・前の思考の修正・分岐・思考数の動的調整ができ、要所だけ verify=true で"
+    "生成者とは別の Free モデルに反証させる）。"
 )
 
 MARKER = "<!-- freeagent-bind: proactive-usage -->"

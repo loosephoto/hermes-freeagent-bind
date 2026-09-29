@@ -50,6 +50,9 @@ CASES: list[tuple[str, dict]] = [
     ("freeagent_grounded", {"question": "1+1 は？", "size": 2}),
     ("freeagent_map", {"items": ["a", "b"], "instruction": "1 行に要約"}),
     ("freeagent_consult", {"question": "1+1 は？", "size": 2}),
+    # 思考台帳は verify を付けて呼ぶ（環境障害では**書かない**契約を検証する。台帳のみなら
+    # ネットワークに触れないので、この検査は「検証に到達できないとき」の経路を突く）。
+    ("freeagent_think", {"thought": "前提を分解する", "verify": True}),
     ("freeagent_agent", {"task": "調べる", "size": 1, "max_steps": 1}),
     ("freeagent_delegate", {"task": "調べる"}),
     ("freeagent_unknown_tool_xyz", {}),   # 未知ツール＝無効化されている場合の経路
