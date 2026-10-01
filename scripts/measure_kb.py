@@ -87,6 +87,10 @@ def measure_round(index: int | None = None, sources: list[str] | None = None,
     def one(src: str) -> None:
         # 日本語の問いは日本語版を持つソースだけ（Wikipedia / Wikidata）。論文系は英語で引く
         query = ja if src in ("wikipedia", "wikidata") else en
+        if src == "ror":
+            names = ["CERN", "University of Tokyo", "Massachusetts Institute of Technology",
+                     "University of Oxford", "CNRS", "Kyoto University"]
+            query = names[(now.hour if index is None else index) % len(names)]
         start = time.monotonic()
         try:
             res = S.KB_BACKENDS[src](query, 3, {"lang": "ja", "kind": "repo", "datacite_kind": datacite_kind})
@@ -254,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rounds", type=int, default=1)
     ap.add_argument("--interval", type=float, default=600.0)
     ap.add_argument("--report", action="store_true")
-    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help="計測対象（既定は対応9ソース）")
+    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help="計測対象（既定は対応11ソース）")
     ap.add_argument("--datacite-kind", choices=("all", "arxiv", "dataset"), default="all")
     ap.add_argument("--schedule", type=int, metavar="HOURS")
     ap.add_argument("--unschedule", action="store_true")

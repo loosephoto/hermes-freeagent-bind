@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hermes-freeagent-bind"
 version = "0.4.0"
-description = "Hermes Agent の Free モデルをサブLLMとして並列に走らせ、外部知識（既定6ソース・DataCite/OpenAIRE/Europe PMCの任意追加）で根拠づける MCP サーバー"
+description = "Hermes Agent の Free モデルをサブLLMとして並列に走らせ、外部知識（既定6ソース・DataCite/OpenAIRE/Europe PMC/Zenodo/RORの任意追加）で根拠づける MCP サーバー"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

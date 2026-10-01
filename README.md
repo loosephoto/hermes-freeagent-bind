@@ -406,11 +406,11 @@ Nous ローカルプロキシで確認されている制約です（他プロバ
 検索拡張時のローカル実測（2026-10-01、同一Python、各5回の中央値。
 起動〜initialize〜tools/list〜終了を含むため、起動単体の保証値ではありません）:
 
-| 測定 | 変更前HEAD | 検索拡張後 |
+| 測定 | 第1/第2段階HEAD（1e26ed2） | 第3段階追加後 |
 |---|---:|---:|
 | ツール数 | 11 | 11 |
-| ツール一覧JSON文字数（ensure_ascii=false・compact） | 12,414 | 12,981 |
-| stdioプロセス往復・終了 | 0.2167秒 | 0.2078秒 |
+| ツール一覧JSON文字数（ensure_ascii=false・compact） | 12,981 | 13,116 |
+| stdioプロセス往復・終了 | 0.2018秒 | 0.1932秒 |
 
 検索APIの追加は推論モデルの能力を増やしません。ツールスキーマの増加もメインLLMの入力負担になります。
 
@@ -476,9 +476,11 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `datacite`（明示指定） | DOIメタデータ・抄録、研究データ | `datacite_kind`: `all` / `arxiv` / `dataset`。各語を引用したAND検索＋関連度順 |
 | `openaire`（明示指定） | Graph V3の論文書誌・抄録・掲載先 | 匿名API。60.1秒間隔で制御。抄録欠落あり、OpenAIREのクレジットを表示 |
 | `europepmc`（明示指定） | 医学・生命科学系の抄録・書誌 | `core`検索。全文は取得せず、プレプリント種別・ライセンスを保持 |
+| `zenodo`（明示指定） | 研究データ・ソフトウェア・論文等の公開メタデータ | 説明・注記を取得。全文/ファイルは取得しない。メタデータCC0とファイル条件を分離 |
+| `ror`（明示指定） | 研究機関の候補・種別・国・都市・設立年 | v2の構造化情報。論文検索ではなく機関情報の補完。機関を自動同定しない |
 
 `sources` を省略すると**従来の6ソースのみ**、指定すると指定したソースだけを検索します。
-追加3ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
+追加5ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
 `limit` は**各ソースの上限**です。全体の結果は重複除去などで減るので、合計件数を保証する値ではありません。
 本文という場合も、取得できた説明・導入部・アブストラクトを指します。原典の全文とは限りません。
 
@@ -486,7 +488,8 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 
 - **第1段階：DataCite** — 「arXiv論文をDataCiteから探して」「その研究に使えるデータセットを探して」。
 - **第2段階：OpenAIRE / Europe PMC** — 「OpenAIREでも論文を探して」「生命科学の根拠をEurope PMCから探して」。
-- **第3段階は保留** — J-STAGE（商用承認・クレジット・保存条件）、Stack Exchange（回答本文とライセンスの検証）、CiNii（appid登録）、CORE（組込み条件の確認）。まだ対応ソースではありません。
+- **第3段階：Zenodo / ROR** — 「Zenodoでグラフェンの研究データを探して」「RORでCERNの機関候補を探して」。公開メタデータだけを使います。
+- **元の候補4APIは保留** — J-STAGE（用途/商用承認・主コンテンツ・保存条件）、Stack Exchange（AI開発/テスト向け自動取得の事前書面許諾）、CiNii（appid登録・用途承認・抄録権利）、CORE（検索/API組込みの相談）。既定offだけでは利用許諾にならないため、まだ登録しません。
 
 ツールへ渡す引数の例（端末コマンドではありません）:
 
@@ -497,6 +500,10 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 {"query":"graphene","sources":["datacite"],"datacite_kind":"dataset","limit":2}
 // 分野横断検索と生命科学検索
 {"query":"CRISPR gene editing","sources":["openaire","europepmc"],"limit":2}
+// 公開研究成果のメタデータ（ファイルは取得しません）
+{"query":"graphene","sources":["zenodo"],"limit":2}
+// 研究機関の候補（論文抄録ではありません）
+{"query":"CERN","sources":["ror"],"limit":2}
 // 自然語arXiv検索の失敗・遅延時にのみ、DataCiteの追加利用を明示許可
 {"query":"language model hallucination","sources":["arxiv"],"fallback":true,"limit":2}
 ```
@@ -512,6 +519,12 @@ DataCiteへの直接指定は自然語の各語をAND検索します。arXivと�
 成功した代替は `arxiv → datacite（代替）` と実取得元を表示し、`results.arxiv.fallback.primary_error`に元の失敗を残します。
 両方が失敗した場合は `fallback_attempt.error` に代替の失敗も残します。
 
+Zenodoの`summary_kind=metadata_description`は説明・注記の抜粋で、ファイル本文ではありません。
+`license=CC0-1.0`はメタデータ、`file_license`/`access_right`は別のファイル条件です。メール欄は返さず、引用符付き/アドレスリテラルを含む説明等のメール表記も省略します。
+未対応の`@`表記が残ればその値を返しません。script/style等の非本文とHTMLコメントは除外し、除外だけの結果には本文番号を付けません。
+RORの`summary_kind=structured_metadata`は、種別・国・都市・状態・設立年の実属性を整形したものです。
+論文の抄録を作る処理ではなく、`established`を出版年にしないため`year`は空です。候補の順位を本人同定・機関同定の確定と解釈しません。
+
 本文が無い結果は、既存・追加ソースを問わず `metadata_only=true`。書誌探索には表示しますが、groundedの本文根拠には注入しません。
 agentでも本文根拠の引用番号を振らず、書誌は`bibliography`に分離します。
 DOI・URLの両方を別名として照合して引用を統合し、より長い本文と`providers`（配信元一覧）を残します。
@@ -525,7 +538,25 @@ agentの番号登録・返却でもDOIを優先し、同じURLの異なる版を
 agentは後のステップで未注入の出典を読ませた場合だけ、その番号を有効にします。
 **同じ論文の別配信元は独立した裏付けではありません**。版の異なるDOIは勝手に統合しません。
 
-実stdio経路での出力（2026-10-01、`CRISPR gene editing`・各2件、題名の行は省略）:
+第3段階の実stdio出力（2026-10-01、`CERN`・各2件。下記は実取得の表示）:
+
+```text
+出典 4 件（zenodo, ror）
+  ✓ zenodo (2 件・2.3 秒)
+      データ提供: Zenodo（メタデータCC0・ファイル条件は別） https://zenodo.org/
+      LISA promotional material — https://zenodo.org/records/13998413
+      2023 CERN openlab Annual Report — https://zenodo.org/records/14289083
+  ✓ ror (2 件・0.9 秒)
+      データ提供: ROR（CC0・研究機関候補） https://ror.org/
+      European Organization for Nuclear Research — https://ror.org/01ggx4157
+      Research Infrastructure for Experiments at CERN — https://ror.org/01t0a1151
+```
+
+この回は取得4件のうち3件に根拠テキストがあり、締切脱落はありませんでした。
+機関候補が2件出ても、両者を同じ機関と決める結果ではありません。
+Zenodoも説明のない結果には、ファイルを読んだかのような本文を補いません。
+
+実stdio経路での第1/第2段階の出力（2026-10-01、`CRISPR gene editing`・各2件、題名の行は省略）:
 
 ```text
 出典 6 件（datacite, openaire, europepmc）
@@ -538,12 +569,14 @@ agentは後のステップで未注入の出典を読ませた場合だけ、そ
 この回は取得6件中5件に本文があり、締切脱落・代替切替は発生しませんでした。
 データセット検索も実stdioで2件・1.59秒、本文2件を確認しました。
 後の再検証ではEurope PMCが6.21秒まで変動しましたが、8秒の締切内で取得できました。
+第3段階の実stdio検証（同日、`CERN`、各2件）ではZenodoが2.33秒、RORが0.87秒、取得4件中3件に根拠テキストがありました。
+これは第1/第2段階の速度とは異なる問いのスポット計測です。
 **代替APIにも速度のムラがあります。一時点の成功は24時間の安定性の保証ではありません**。
 
 | 症状 | 理由・対処 |
 |---|---|
 | 追加ソースが検索されない | `sources`に明示指定してください。既定6ソースは変えていません |
-| 「ローカルのアクセス間隔制御」 | 同じホストの予算待ちです。DataCiteは0.61秒、Europe PMCは1秒、OpenAIREは60.1秒間隔。待機せずエラーを返すため表示された秒数後に再試行 |
+| 「ローカルのアクセス間隔制御」 | 同じホストの予算待ちです。DataCiteは0.61秒、Europe PMCは1秒、OpenAIREは60.1秒、Zenodoは2.01秒、RORは6.1秒間隔。待機せずエラーを返すため表示された秒数後に再試行 |
 | OpenAIREを別プロセスでも使う | 間隔制御はプロセス内のみ。同一IPの別MCP/CLIを含め提供元の枠を共有するため、並行実行を避ける。今回のOpenAIRE認証枠の拡張は未実装 |
 | 書誌はあるがgroundedの根拠がない | 抄録無しの追加ソースは本文を生成で補いません。別ソースを明示指定 |
 | arXivの代替が起動しない | `fallback=true`、自然語検索、締切内、障害/遅延という条件を確認 |
@@ -553,6 +586,8 @@ agentは後のステップで未注入の出典を読ませた場合だけ、そ
 ```bash
 python scripts/probe_knowledge_stdio.py
 python scripts/probe_knowledge_stdio.py --sources datacite --datacite-kind dataset --query graphene
+python scripts/probe_knowledge_stdio.py --sources zenodo ror --query CERN
+python scripts/measure_kb.py --sources zenodo ror
 python scripts/measure_kb.py --sources datacite openaire europepmc
 python scripts/measure_kb.py --sources datacite --datacite-kind dataset
 python scripts/measure_kb.py --report
@@ -563,7 +598,12 @@ python scripts/measure_kb.py --report
 
 利用条件・仕様: [DataCite](https://support.datacite.org/docs/rest-api) /
 [OpenAIRE](https://graph.openaire.eu/docs/apis/terms) /
-[Europe PMC](https://europepmc.org/RestfulWebService)。リンク先全文の利用条件はメタデータの条件とは別です。
+[Europe PMC](https://europepmc.org/RestfulWebService) /
+[Zenodo](https://about.zenodo.org/terms/)（非軍事用途のみ・ファイル条件は別） /
+[ROR](https://ror.org/terms/)（IDs/metadataはCC0）。リンク先全文の利用条件はメタデータの条件とは別です。
+元候補の保留根拠: [J-STAGE](https://www.jstage.jst.go.jp/static/pages/WebAPI/-char/ja) /
+[Stack Exchange AUP](https://stackoverflow.com/legal/acceptable-use-policy) /
+[CiNii登録](https://support.nii.ac.jp/ja/cinii/api/developer) / [CORE](https://core.ac.uk/terms)。
 
 ### 遅いソースは締め切りで区切る
 

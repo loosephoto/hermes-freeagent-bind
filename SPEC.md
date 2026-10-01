@@ -147,6 +147,8 @@
 | datacite | `api.datacite.org/dois` | 不要、mailto任意 | モード間でホスト予算共有。抄録・登録反映の欠落あり |
 | openaire | `api.openaire.eu/graph/v3/research-products` | 今回は匿名のみ | 公式60/h、メタデータCC-BY表示、本文欠落あり |
 | europepmc | `www.ebi.ac.uk/europepmc/webservices/rest/search` | 不要 | core検索、全文利用条件は別、生命科学系 |
+| zenodo | `zenodo.org/api/records/` | 公開検索は匿名 | 説明メタデータCC0（メール除外）、非軍事用途、ファイル条件は別 |
+| ror | `api.ror.org/v2/organizations` | 今回は匿名 | 機関属性CC0、検索候補であって機関同定の確定ではない |
 
 - 結果は**必ず `citation`（source / title / url / year / summary）に正規化**する。表示も注入もこの形だけを使う。
 - 取得はメモリ TTL キャッシュ + ホスト単位の遮断記憶。**同一キーは single-flight** で同時取得を 1 回にまとめ、エラー応答はキャッシュしない（回復後の再取得を妨げない）。キャッシュ値は複製して返し、呼び出し側の変更が共有状態に伝播しない。**LLM を介さない**（＝幻覚が入らない経路）。
@@ -158,7 +160,7 @@
 - 注入する本文は 1 件あたり `FREEAGENT_EVIDENCE_ITEM_CHARS`（既定 360）、全体で
   `FREEAGENT_EVIDENCE_TOTAL_CHARS`（既定 3200）に収める。入れすぎると小型 Free モデルが予算を
   使い切って空応答・切断になる（逆効果）。
-- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加3種は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。
+- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加5種は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。
 - `fallback=true`のJSON真偽値だけが、自然語arXiv検索をDataCiteへ追加送信する明示許可。文字列`"true"`等は許可にしない。
 - 1 ソースの失敗で全体を落とさない（`errors` に集約し、成功分だけ返す）。
 
@@ -178,7 +180,7 @@
   匿名検索が 429（`Anonymous search is temporarily rate-limited`）。候補の実測（J-STAGE 0.07〜0.44 秒・
   CiNii Research 0.1〜0.3 秒・Stack Exchange 0.2〜0.4 秒・OpenAlex の arXiv 絞り込み 0.8〜2.5 秒ほか。
   Semantic Scholar は匿名で 3/3 が 429、dblp はボット判定の HTML を HTTP 200 で返す）は追加の判断材料として
-  残し、追加は時間帯別の計測結果を見てから決める。新規3種は当面明示指定のみ（§6.3）。
+  残し、追加は時間帯別の計測結果を見てから決める。新規5種は当面明示指定のみ（§6.3/§6.4）。
 
 ### 6.2 時間帯別の計測（`scripts/measure_kb.py`）
 
@@ -186,7 +188,7 @@
   `FREEAGENT_STATE_DIR/kb_latency.jsonl`・最大 20,000 行・超えたら古い行から tmp + `os.replace` で捨てる）へ追記。
   記録は `ts` / `hour`（日本時間）/ `source` / `elapsed_s` / `ok` / `items` / `error`（160 字）/ `mailto` /
   `openalex_key` / `env_failure` に加え `datacite_kind` / `summaries`（本文がある件数）を記録し、**タイトル・本文は残さない**。
-  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応9ソースを測る。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
+  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応11ソースを測る。RORだけは機関名の6問を巡回し、論文キーワードの空振りと混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
 - 全ソースが接続系の失敗なら `env_failure=true`（こちらのネットワーク障害）とし、`--report` の集計から外す。
 - `--schedule N` は Windows のタスク（`pythonw`＝窓を出さない）を 1 時間おきに登録し、残り回数を
   `kb_latency.jsonl.schedule.json` で数えて、最後の 1 回でタスクを自分で消す（`/ED` `/ET` は HOURLY との
@@ -225,7 +227,27 @@
   `validate_lookup`で引用値・HTTP(S) URL・実取得元・代替許可も検査する。OpenAIREのdescriptions/instances.urlsは配列型を検証し、
   辞書キーや文字列各文字を本文/URLにしない。新規ソースの全引用URLも共通境界で検査する。
   `--sources`・`--datacite-kind`・`--fallback`で経路を選べる。MCP再起動前でも新しい子プロセスの実装を検証できる。
-- 第3段階（J-STAGE / Stack Exchange / CiNii / CORE）は利用条件や回答取得の検証が未完了なので登録しない。
+### 6.4 第3段階の公開メタデータ（§5.14/§5.15）
+
+- `zenodo`と`ror`は`SOURCES`/`KB_BACKENDS`へ追加するが`DEFAULT_SOURCES`は変更しない。lookup/grounded/agentは既存経路で明示選択できる。
+- Zenodoは公開`/api/records/`の`q`（自然語各語を引用してAND）・`sort=bestmatch`・`size<=10`。
+  `hits.hits`を正規化し、`description`と`notes`のテキストを根拠として使う。`summary_kind=metadata_description`。
+  HTMLParserでscript/style/template/noscript/headとコメントを本文から除外し、文字参照を復元する。
+  メール欄をコピーせず、引用符付きローカル部・アドレスリテラル等を含むメールらしい文字列を削除する。残る`@`は値全体を省略する。
+  省略の代替ラベルを本文として注入せず、実テキストがなければmetadata_onlyとする。ファイル/全文/制限付きコンテンツは取得しない。
+  説明メタデータの`license=CC0-1.0`と`file_license`/`access_right`を分離し、版のDOIを使う（concept DOIで潰さない）。
+- RORはv2の`query`で機関候補を探す。`ror_display`の名称とROR IDのCrockford文字集合・末尾数字・公式MOD 97-10チェックサムを確認し、提供された種別・国・都市・状態・設立年だけを整形する。
+  `summary_kind=structured_metadata`は構造化属性の根拠で論文抄録ではない。設立年は`established`、出版年`year`は空。
+  複数候補を返し、順位から同定しない（`search_candidates=true`）。属性がなければ`metadata_only=true`で本文番号は付けない。
+- 共通のコピー付きsingle-flight/失敗非キャッシュ/HTTP遮断記憶/8秒gatherを使い、各ソース1リクエストだけ。
+  Zenodo 2.01秒（公式検索30/min）、ROR 6.1秒（将来の匿名50/5minを考慮）のプロセス内ホスト予算。
+  ROR client ID登録は現時点で一時停止・識別有無の制限は未導入。登録必須と断定せず、利用条件の変更を再確認する。
+- 引用統合の`provider_metadata`は`file_license`/`access_right`/`summary_kind`も保持し、長い別ソース本文を選んでもライセンスを混同しない。
+  stdio probeは根拠種別・CC0メタデータ・ROR年・Zenodoファイル条件のキーを検査する。
+- 元候補は保留: J-STAGE（商用承認・主コンテンツ・24時間保存等）、Stack Exchange（現行AUPのAI開発/テスト向け自動取得に事前書面許諾）、
+  CiNii（登録appid・用途承認・抄録権利）、CORE（検索/API組込み相談）。匿名200/CCライセンス/既定offは許諾の代わりにしない。
+- 条件: ROR IDs/metadata CC0 https://ror.org/terms/ 、Zenodo非軍事用途/メタデータCC0（メール例外） https://about.zenodo.org/terms/ https://about.zenodo.org/policies/ 。
+  原典ファイルの条件は別。ソース間の登録範囲・検索順位・内容の同等性や24時間の応答安定性は保証しない。
 
 ## 7. ツールの規約（§6–§8）
 

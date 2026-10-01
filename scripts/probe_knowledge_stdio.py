@@ -2,6 +2,7 @@
 
 python scripts/probe_knowledge_stdio.py
 python scripts/probe_knowledge_stdio.py --sources datacite --datacite-kind dataset --query graphene
+python scripts/probe_knowledge_stdio.py --sources zenodo ror --query CERN
 
 各指定ソースの有効応答・出典・両チャネルを検査。失敗はexit 1（成功を捏造しない）。
 OpenAIREは匿名60/h。同一IP上の他プロセスも含め、連続実行には60秒以上の間隔を空ける。
@@ -63,6 +64,14 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
             raise ValueError("new citation year field is missing")
         if "year" in cite and (type(cite["year"]) not in (str, int)):
             raise ValueError("citation year type is invalid")
+        if cite["source"] in ("zenodo", "ror"):
+            expected_kind = "metadata_description" if cite["source"] == "zenodo" else "structured_metadata"
+            if cite.get("summary_kind") != expected_kind or cite.get("license") != "CC0-1.0":
+                raise ValueError("open metadata evidence/license mismatch")
+            if "year" not in cite or (cite["source"] == "ror" and cite["year"] != ""):
+                raise ValueError("ROR establishment must not be a publication year")
+            if cite["source"] == "zenodo" and not {"file_license", "access_right"}.issubset(cite):
+                raise ValueError("Zenodo file conditions are missing")
         S._kb_http_url(cite["url"])
         if not set(cite.get("providers") or [cite["source"]]).issubset(served):
             raise ValueError("merged citation provider mismatch")

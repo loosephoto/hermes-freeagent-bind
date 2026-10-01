@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """hermes-freeagent-bind — Hermes Agent の Free モデルをサブLLMとして並列に走らせ、
-外部知識（既定6ソース＋DataCite / OpenAIRE / Europe PMC）で根拠づける MCP サーバー。
+外部知識（既定6ソース＋DataCite / OpenAIRE / Europe PMC / Zenodo / ROR）で根拠づける MCP サーバー。
 
 これは **モノリス**（単一ファイル）として書く。理由: 配布物が 1 つの stdio スクリプトで完結し、
 遅延 import や相対 import の取り回しでクライアント側の起動が壊れる事故が無い（実測: stdio 起動後に
@@ -13,7 +13,7 @@
                                              §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 /
                                              §2.7 思考台帳の構造（分解・改訂・分岐・仮説））
   §3 プロバイダとモデル  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
-                    §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13 引用統合）
+                    §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR）
   §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号）
   §7 ツール定義         §8 表示（content）
   §8.5 失敗時の「次の一手」（structuredContent.next_action）
@@ -2750,7 +2750,8 @@ def _kb_merge_citations(citations: list[dict]) -> list[dict]:
                     metadata.extend(copy.deepcopy(row["provider_metadata"]))
                 else:
                     metadata.append({k: copy.deepcopy(row[k]) for k in
-                        ("source", "url", "doi", "license", "licenses", "publication_types", "resource_type", "repository", "attribution")
+                        ("source", "url", "doi", "license", "licenses", "publication_types", "resource_type", "repository", "attribution",
+                         "file_license", "access_right", "summary_kind")
                         if k in row})
             cite["provider_metadata"] = metadata
             credits = [c for r in rows for c in ((r.get("attributions") or []) +
@@ -2759,6 +2760,181 @@ def _kb_merge_citations(citations: list[dict]) -> list[dict]:
                 cite["attributions"] = list(dict.fromkeys(credits))
         merged.append(cite)
     return merged
+
+
+# ---------------------------------------------------------------- §5.14 Zenodo（公開メタデータのみ・ファイルを取得しない）
+
+
+def _kb_object(value, field: str) -> dict:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} はオブジェクトではありません")
+    return value
+
+
+def _open_metadata_text(value, limit: int = 600) -> str:
+    """非本文HTMLとメールを除外する。除外だけの値は空で返す。"""
+    from html.parser import HTMLParser
+    class Reader(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts, self.hidden = [], []
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style", "template", "noscript", "head"):
+                self.hidden.append(tag)
+            elif not self.hidden:
+                self.parts.append(" ")
+        def handle_endtag(self, tag):
+            if tag in self.hidden:
+                self.hidden = self.hidden[:self.hidden.index(tag)]
+            elif not self.hidden:
+                self.parts.append(" ")
+        def handle_data(self, data):
+            if not self.hidden:
+                self.parts.append(data)
+    reader = Reader()
+    reader.feed(as_str(value))
+    reader.close()
+    text = " ".join("".join(reader.parts).split())
+    text = re.sub(r'(?:"[^"]*"|[^ @<>]+) *@ *[^ <>]+', " ", text)
+    if "@" in text:
+        return ""
+    return truncate(" ".join(text.split()), limit)
+
+
+def kb_zenodo(query: str, limit: int = 3) -> dict:
+    """Zenodoの説明/注記はメタデータ。ファイルライセンスとは分離し全文・ファイルは取得しない。"""
+    query = as_str(query)
+    limit = as_int(limit, 3, 1, 10)
+    if not query:
+        return {"source": "zenodo", "error": "query は必須です"}
+    def produce():
+        params = {"q": _literal_search(query), "size": limit, "sort": "bestmatch"}
+        data, err = _kb_new_json("https://zenodo.org/api/records/?" + urllib.parse.urlencode(params), 2.01)
+        if err:
+            return {"source": "zenodo", "error": err}
+        hits = _kb_object(data, "Zenodo応答").get("hits")
+        rows = _kb_object(hits, "hits").get("hits")
+        if not isinstance(rows, list):
+            raise ValueError("Zenodo hits.hits は配列ではありません")
+        items, cites = [], []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                raise ValueError("Zenodo record はオブジェクトではありません")
+            meta = _kb_object(row.get("metadata"), "metadata")
+            title = _open_metadata_text(meta.get("title"), 300)
+            if not title:
+                continue
+            doi = as_str(row.get("doi")) or as_str(meta.get("doi"))
+            links = _kb_object(row.get("links"), "links")
+            link = as_str(links.get("self_html")) or ("https://doi.org/" + doi if doi else "")
+            if not link:
+                continue
+            description = " ".join(as_str(meta.get(k)) for k in ("description", "notes"))
+            summary = _open_metadata_text(description)
+            year = as_str(meta.get("publication_date"))[:4]
+            authors = [_open_metadata_text(a.get("name"), 100) for a in _kb_array(meta.get("creators"), "creators")
+                       if isinstance(a, dict)]
+            resource_type = as_str(_kb_object(meta.get("resource_type"), "resource_type").get("type"))
+            file_license = as_str(_kb_object(meta.get("license"), "license").get("id"))
+            item = {"title": title, "url": link, "doi": doi, "year": year, "summary": summary,
+                    "authors": [a for a in authors if a][:8], "resource_type": resource_type,
+                    "access_right": as_str(meta.get("access_right")), "file_license": file_license,
+                    "license": "CC0-1.0", "summary_kind": "metadata_description", "metadata_only": not bool(summary)}
+            cite = _cite("zenodo", title, link, doi=doi, attribution="データ提供: Zenodo（メタデータCC0・ファイル条件は別） https://zenodo.org/")
+            cite.update({k: v for k, v in item.items() if k != "authors"})
+            items.append(item)
+            cites.append(cite)
+        return {"source": "zenodo", "items": items, "citations": cites,
+                "attribution": "データ提供: Zenodo（メタデータCC0・ファイル条件は別） https://zenodo.org/",
+                "error": "" if items else "該当なし"}
+    return _kb_new_cached(f"zenodo:{query}:{limit}", "zenodo", produce)
+
+
+# ---------------------------------------------------------------- §5.15 ROR v2（研究機関の構造化メタデータ・機関同定を確定しない）
+
+
+def _ror_id_valid(value: str) -> bool:
+    """Crockford Base32 + ROR公式のMOD 97-10。誤ったIDは修復しない。"""
+    match = re.fullmatch(r"https://ror[.]org/0([0-9a-hjkmnp-tv-z]{6})([0-9]{2})", value)
+    if not match:
+        return False
+    alphabet = "0123456789abcdefghjkmnpqrstvwxyz"
+    number = 0
+    for char in match.group(1):
+        number = number * 32 + alphabet.index(char)
+    return int(match.group(2)) == 98 - ((number * 100) % 97)
+
+
+def kb_ror(query: str, limit: int = 3) -> dict:
+    """論文検索ではなく機関候補検索。登録された属性だけを根拠文にする。"""
+    query = as_str(query)
+    limit = as_int(limit, 3, 1, 10)
+    if not query:
+        return {"source": "ror", "error": "query は必須です"}
+    def produce():
+        data, err = _kb_new_json("https://api.ror.org/v2/organizations?" + urllib.parse.urlencode({"query": query}), 6.1)
+        if err:
+            return {"source": "ror", "error": err}
+        rows = _kb_object(data, "ROR応答").get("items")
+        if not isinstance(rows, list):
+            raise ValueError("ROR items は配列ではありません")
+        items, cites = [], []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                raise ValueError("ROR record はオブジェクトではありません")
+            names = _kb_array(row.get("names"), "names")
+            if any(not isinstance(n, dict) for n in names):
+                raise ValueError("ROR names の要素はオブジェクトではありません")
+            title = next((_open_metadata_text(n.get("value"), 300) for n in names
+                          if "ror_display" in _kb_array(n.get("types"), "names.types")), "")
+            link = as_str(row.get("id"))
+            if not title or not _ror_id_valid(link):
+                raise ValueError("ROR の表示名またはIDの形式が不正です")
+            types = [as_str(v) for v in _kb_array(row.get("types"), "types") if as_str(v)]
+            locations = [_kb_object(l, "location") for l in _kb_array(row.get("locations"), "locations")]
+            countries, cities = [], []
+            for location in locations:
+                geo = _kb_object(location.get("geonames_details"), "geonames_details")
+                countries.append(as_str(geo.get("country_name")))
+                cities.append(as_str(geo.get("name")))
+            countries = list(dict.fromkeys(c for c in countries if c))
+            cities = list(dict.fromkeys(c for c in cities if c))
+            established = row.get("established")
+            if type(established) is not int or not 1 <= established <= 9999:
+                established = None
+            status = as_str(row.get("status"))
+            facts = []
+            for label, value in (("機関種別", ", ".join(types)), ("国", ", ".join(countries)),
+                                 ("都市", ", ".join(cities)), ("状態", status)):
+                if value:
+                    facts.append(label + ": " + value)
+            if established is not None:
+                facts.append("設立年（出版年ではない）: " + str(established))
+            summary = _open_metadata_text("; ".join(facts))
+            sites = [as_str(_kb_object(v, "link").get("value")) for v in _kb_array(row.get("links"), "links")
+                     if _kb_object(v, "link").get("type") == "website"]
+            for site in sites:
+                _kb_http_url(site)
+            item = {"title": title, "url": link, "year": "", "summary": summary,
+                    "name_variants": [_open_metadata_text(n.get("value"), 300) for n in names],
+                    "organization_types": types, "countries": countries, "cities": cities,
+                    "established": established, "status": status, "websites": sites,
+                    "license": "CC0-1.0", "summary_kind": "structured_metadata", "metadata_only": not bool(summary)}
+            cite = _cite("ror", title, link, attribution="データ提供: ROR（CC0・研究機関候補） https://ror.org/")
+            cite.update({k: v for k, v in item.items() if k not in ("name_variants", "websites")})
+            items.append(item)
+            cites.append(cite)
+        return {"source": "ror", "items": items, "citations": cites, "search_candidates": True,
+                "attribution": "データ提供: ROR（CC0・研究機関候補） https://ror.org/",
+                "error": "" if items else "該当なし"}
+    return _kb_new_cached(f"ror:{query}:{limit}", "ror", produce)
+
+
+SOURCES = (*SOURCES, "zenodo", "ror")
+KB_BACKENDS.update({"zenodo": lambda q, limit, opts: kb_zenodo(q, limit),
+                    "ror": lambda q, limit, opts: kb_ror(q, limit)})
 
 
 # ================================================================ §6 ツール実装
@@ -2788,7 +2964,7 @@ AGENT_SYSTEM_FINAL = (
 AGENT_SYSTEM = (
     "あなたは調査補佐です。次のいずれか**1つだけ**を JSON で出力してください。\n"
     '  ツールを使う: {"tool": "lookup", "query": "<検索語>", "sources": ["arxiv","crossref",...]}\n'
-    '  使える source: wikipedia, wikidata, arxiv, crossref, openalex, github, datacite, openaire, europepmc\n'
+    '  使える source: wikipedia, wikidata, arxiv, crossref, openalex, github, datacite, openaire, europepmc, zenodo, ror\n'
     '  追加sourceは明示指定のみ。datacite_kind: all / arxiv / dataset。fallback: trueでarXivのDataCite代替を許可。\n'
     '  回答する:     {"answer": "<回答。使った根拠の番号 [n] を本文に書く>"}\n'
     "ツール結果は [1] [2] … の番号つきで返ります。回答では使った根拠の番号を本文に書き、"
@@ -4397,7 +4573,7 @@ TOOLS: list[dict] = [
         "description": (
             "【使う条件】出典URLが要る／判断の前に知識を補強したい／LLM を介さず一次情報に当たりたい。"
             "【差分】LLM を使わないので幻覚が無い。arXiv・Crossref・OpenAlex（論文）／Wikipedia・Wikidata"
-            "（百科・構造化）／GitHub（コード）を並列に引く。追加の datacite / openaire / europepmc は"
+            "（百科・構造化）／GitHub（コード）を並列に引く。追加の datacite / openaire / europepmc / zenodo / ror は"
             "sources で明示指定する。DataCite は自然語の各語を AND 検索、datacite_kind=dataset で研究データ。"
             "fallback=true のときだけ自然語 arXiv検索の失敗/遅延を DataCite で代替する（取得元を明示）。"
             "【使わない条件】単一の事実だけなら web_search が速い。"
@@ -4407,7 +4583,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "query": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / europepmc"},
+                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / europepmc / zenodo / ror"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
                 "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語（既定 ja）"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須）"},
@@ -4431,7 +4607,8 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "question": {"type": "string"},
-                "sources": {"type": "array", "items": {"type": "string"}},
+                "sources": {"type": "array", "items": {"type": "string"},
+                            "description": "既定6種。明示追加: datacite / openaire / europepmc / zenodo / ror。RORは機関属性、Zenodoは説明メタデータで全文ではない"},
                 "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
                 "limit": {"type": "integer"},
