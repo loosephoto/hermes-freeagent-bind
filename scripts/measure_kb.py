@@ -10,6 +10,8 @@
     python scripts/measure_kb.py                  # 1 巡測って追記
     python scripts/measure_kb.py --rounds 6 --interval 600   # 10 分おきに 6 巡（1 時間）
     python scripts/measure_kb.py --report         # 時間帯（日本時間の時）× ソースで集計
+    python scripts/measure_kb.py --sources datacite openaire europepmc
+    python scripts/measure_kb.py --sources datacite --datacite-kind dataset
     python scripts/measure_kb.py --schedule 24    # Windows のタスクで 1 時間おきに 24 回（終われば自動で削除）
     python scripts/measure_kb.py --unschedule     # タスクを消す
 
@@ -70,12 +72,14 @@ def _say(text: str) -> None:
         print(text)
 
 
-def measure_round(index: int | None = None) -> list[dict]:
+def measure_round(index: int | None = None, sources: list[str] | None = None,
+                  datacite_kind: str = "all") -> list[dict]:
     """全ソースを並列に 1 回ずつ引き、1 ソース 1 行の記録を返す（書き込みはしない）。"""
     with S._KB_CACHE_LOCK:
         S._KB_CACHE.clear()
     with S._KB_BLOCK_LOCK:
         S._KB_BLOCKED.clear()
+    picked = list(dict.fromkeys(s for s in sources if s in S.KB_BACKENDS)) if sources is not None else list(S.KB_BACKENDS)
     now = datetime.datetime.now(JST)
     en, ja = QUERIES[(now.hour if index is None else index) % len(QUERIES)]
     rows: dict[str, dict] = {}
@@ -85,7 +89,7 @@ def measure_round(index: int | None = None) -> list[dict]:
         query = ja if src in ("wikipedia", "wikidata") else en
         start = time.monotonic()
         try:
-            res = S.KB_BACKENDS[src](query, 3, {"lang": "ja", "kind": "repo"})
+            res = S.KB_BACKENDS[src](query, 3, {"lang": "ja", "kind": "repo", "datacite_kind": datacite_kind})
         except Exception as exc:  # noqa: BLE001
             res = {"error": f"{type(exc).__name__}: {exc}"}
         elapsed = round(time.monotonic() - start, 3)
@@ -94,14 +98,17 @@ def measure_round(index: int | None = None) -> list[dict]:
                      "elapsed_s": elapsed, "ok": not err,
                      "items": len((res or {}).get("items") or []) if isinstance(res, dict) else 0,
                      "error": err[:160], "mailto": bool(S.KB_MAILTO),
-                     "openalex_key": bool(getattr(S, "OPENALEX_API_KEY", ""))}
+                     "openalex_key": bool(getattr(S, "OPENALEX_API_KEY", "")),
+                     "datacite_kind": datacite_kind if src == "datacite" else "",
+                     "summaries": sum(bool(c.get("summary")) for c in (res.get("citations") or [])
+                                      if isinstance(c, dict)) if isinstance(res, dict) else 0}
 
-    threads = [threading.Thread(target=one, args=(src,), daemon=True) for src in S.KB_BACKENDS]
+    threads = [threading.Thread(target=one, args=(src,), daemon=True) for src in picked]
     for t in threads:
         t.start()
     for t in threads:
         t.join(S.KB_TIMEOUT * 4)   # Wikidata は最大 3 回直列＋余裕
-    out = [rows[src] for src in S.KB_BACKENDS if src in rows]
+    out = [rows[src] for src in picked if src in rows]
     # 全滅かつ接続系の失敗なら「こちらのネットワーク障害」。ソースの成績と混ぜない（規約 21 の考え方）
     env_down = bool(out) and all((not r["ok"]) and any(k in r["error"] for k in _ENV_ERRORS) for r in out)
     for r in out:
@@ -247,6 +254,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rounds", type=int, default=1)
     ap.add_argument("--interval", type=float, default=600.0)
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help="計測対象（既定は対応9ソース）")
+    ap.add_argument("--datacite-kind", choices=("all", "arxiv", "dataset"), default="all")
     ap.add_argument("--schedule", type=int, metavar="HOURS")
     ap.add_argument("--unschedule", action="store_true")
     ap.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)  # タスクからの起動
@@ -262,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     for i in range(max(1, args.rounds)):
         if i:
             time.sleep(max(1.0, args.interval))
-        rows = measure_round()
+        rows = measure_round(sources=args.sources, datacite_kind=args.datacite_kind)
         append(rows)
         _say(" / ".join(f"{r['source']} {r['elapsed_s']:.2f}s{'' if r['ok'] else '✗'}" for r in rows))
     return 0

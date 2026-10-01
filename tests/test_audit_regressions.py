@@ -200,13 +200,14 @@ class TestAuditRegressions(unittest.TestCase):
         self.assertIn("T" * 50, tight)
         self.assertNotIn("T" * 60, tight)
 
-    def test_evidence_block_keeps_header_only_when_summary_is_missing(self):
+    def test_evidence_block_excludes_headers_without_body_evidence(self):
         block = S._evidence_block([{"title": "A", "url": "u1", "year": 2020},
                                    {"title": "B", "url": "u2"}])
-        self.assertEqual(block.splitlines(), ["[1] A (2020) u1", "[2] B u2"])
+        self.assertEqual(block, "")
 
     def test_evidence_block_honours_external_numbering(self):
-        block = S._evidence_block([{"title": "A", "url": "u1"}, {"title": "B", "url": "u2"}],
+        block = S._evidence_block([{"title": "A", "url": "u1", "summary": "Body A"},
+                                   {"title": "B", "url": "u2", "summary": "Body B"}],
                                   numbers=[3, 4])
         self.assertIn("[3] A u1", block)
         self.assertIn("[4] B u2", block)

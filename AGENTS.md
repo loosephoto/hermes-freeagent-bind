@@ -2,7 +2,7 @@
 
 Hermes Agent の **Free モデルをサブ LLM として並列に走らせる** MCP サーバー（Python 3.11+ / 実行時依存ゼロ /
 単一ファイルのモノリス）。メイン LLM の知識補助として **arXiv / Crossref / OpenAlex / Wikipedia /
-Wikidata / GitHub** を引く。
+Wikidata / GitHub** を既定で引き、**DataCite / OpenAIRE / Europe PMC** は明示指定で追加する。
 
 - 全体像は `README.md`、**実装の契約は `SPEC.md`**（変更時は両方を同一変更内で更新する）。
 - 本体は `src/freeagent_bind/server.py` の 1 ファイルで、**§0〜§9 の区画**に分かれている。
@@ -26,8 +26,9 @@ python scripts/smoke_stdio.py
 ```bash
 python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # TOOLS/HANDLERS の一致・スキーマ・版・content の規約
-python -m unittest discover -s tests         # オフライン回帰（190 件・ネットワーク不要）
+python -m unittest discover -s tests         # オフライン回帰（件数は実行結果を参照・ネットワーク不要）
 python scripts/smoke_stdio.py                # 実クライアント経路（initialize/tools/list/tools/call）
+python scripts/probe_knowledge_stdio.py      # 新規知識ソースの実API・stdio（ネットワークあり）
 python scripts/check_offline.py              # バックエンド全滅: 例外漏れ・ハング・状態汚染が無いこと
 python scripts/measure_adoption.py           # 自発利用率の測定（state.db を読むだけ・副作用なし）
 python scripts/measure_kb.py --report         # 知識バックエンドの時間帯別の応答時間（記録を読むだけ）
@@ -148,6 +149,14 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     （`measure_kb.py --report`）を根拠にする。1 時点の計測で「速い／遅い」と決めない（01:59 の計測では
     遅延が再現しなかった）。HTTP 200 でも中身が JSON でない提供元がある（dblp はボット判定の HTML）ので、
     候補は**状態コードではなく中身**で確かめる。
+
+28. **追加ソースは明示指定、arXiv代替は明示許可だけ**（§5.9〜§5.13）。既定6ソースを維持し、
+    `fallback=true`のJSON真偽値だけがDataCiteへ追加送信できる。検索式・版指定を弱めて代替しない。
+    同じ締切を主系/代替に共有し、期限後に新たな代替を開始しない。主系の失敗と実取得元を残す。
+    抄録欠落は`metadata_only`として本文根拠にせず、同じDOIの配信元を独立した裏付けに数えない。
+    DOI/URLの対応は全入力を先に確認し、曖昧な書誌の版帰属を入力順で決めない。本文選択とは別に別名を保持する。
+    本文予算で注入しなかった番号も引用成功に数えない（§6.11）。取得候補registryと注入済み番号を分離する。
+    ホスト予算はモード間で共有するがプロセス間共有ではないため、複数MCP/CLIによる同一IPの連打に注意する。
 
 ## ライセンス
 

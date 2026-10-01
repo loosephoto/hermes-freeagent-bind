@@ -816,9 +816,11 @@ class TestToolRegistry(unittest.TestCase):
 
 
 class TestKnowledgeBackendRegistry(unittest.TestCase):
-    def test_six_backends(self):
-        self.assertEqual(set(S.KB_BACKENDS),
+    def test_default_six_and_opt_in_backends(self):
+        self.assertEqual(set(S.DEFAULT_SOURCES),
                          {"wikipedia", "wikidata", "arxiv", "crossref", "openalex", "github"})
+        self.assertEqual(set(S.KB_BACKENDS), set(S.DEFAULT_SOURCES) | {"datacite", "openaire", "europepmc"})
+        self.assertEqual(set(S.SOURCES), set(S.KB_BACKENDS))
 
     def test_arxiv_uses_https(self):
         """http は 301 の先で 406 になる（実測）。ソース上 https であることを固定する。"""
@@ -831,8 +833,8 @@ class TestKnowledgeBackendRegistry(unittest.TestCase):
         self.assertGreaterEqual(S._ARXIV_MIN_INTERVAL, 1.0)
 
     def test_evidence_block_numbering(self):
-        block = S._evidence_block([{"title": "A", "url": "u1", "year": 2020},
-                                   {"title": "B", "url": "u2"}])
+        block = S._evidence_block([{"title": "A", "url": "u1", "year": 2020, "summary": "Body A"},
+                                   {"title": "B", "url": "u2", "summary": "Body B"}])
         self.assertIn("[1] A (2020) u1", block)
         self.assertIn("[2] B u2", block)
 

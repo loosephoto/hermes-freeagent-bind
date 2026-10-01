@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 11 個のツール。モデルは Nous / OpenRouter / NVIDIA NIM / Hugging Face、検索は 6 ソースに対応します。
+- 11 個のツール。モデルは Nous / OpenRouter / NVIDIA NIM / Hugging Face、検索は **9 ソース（既定6＋明示指定3）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 > **まず試すなら**：「出典つきで調べて」は知識検索、「この設計の弱点を別の AI にも聞いて」は相談です。
@@ -329,8 +329,8 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | `agreement` | 結論の言い回しが似ている度合い。正答率ではありません |
 | `confidence_mean` | モデル自身が申告した確信度の平均。精度の測定値ではありません |
 | `served_by` / `fell_back` | 実際に答えたモデル / 代替モデルに切り替わったか |
-| `cited_ok` | 有効な出典番号を少なくとも 1 つ引用したか。**文章が出典に裏付けられているかは検査していません** |
-| `unsupported_citations` | agent が返す、集めた根拠にない引用番号。grounded はこの一覧を返しません |
+| `cited_ok` | 本文を実際に注入した出典番号を少なくとも1つ引用したか。**文章が出典に裏付けられているかは検査していません** |
+| `unsupported_citations` | agent / grounded が返す、本文を実際に注入していない引用番号（予算切れも含む） |
 | `✗` / `×` | モデルや検索ソースの失敗。成功分だけで判断できるか確認してください |
 | `⏱` / `timed_out` | 知識取得の締め切りに間に合わなかったソース |
 | `truncated` | トークン上限で回答が打ち切られた可能性。完全な回答として扱わないでください |
@@ -403,6 +403,17 @@ Nous ローカルプロキシで確認されている制約です（他プロバ
 反論＋別案を付けた回は約 24 秒で、提案者 2 体のうち 1 体がタイムアウトしました。
 速度の保証や、現在のモデル全体の性能評価ではありません。
 
+検索拡張時のローカル実測（2026-10-01、同一Python、各5回の中央値。
+起動〜initialize〜tools/list〜終了を含むため、起動単体の保証値ではありません）:
+
+| 測定 | 変更前HEAD | 検索拡張後 |
+|---|---:|---:|
+| ツール数 | 11 | 11 |
+| ツール一覧JSON文字数（ensure_ascii=false・compact） | 12,414 | 12,981 |
+| stdioプロセス往復・終了 | 0.2167秒 | 0.2078秒 |
+
+検索APIの追加は推論モデルの能力を増やしません。ツールスキーマの増加もメインLLMの入力負担になります。
+
 ## API キーと推論バックエンド
 
 使う提供元だけ設定します。**キーがあること、モデル一覧が見えること、実際に推論できることは別です。**
@@ -415,7 +426,7 @@ Nous ローカルプロキシで確認されている制約です（他プロバ
 | `HF_TOKEN` | Hugging Face の推論。未設定なら一覧のみ | [Access Tokens](https://huggingface.co/settings/tokens)。Inference Providers の権限と残りクレジットを確認 |
 | `OPENALEX_API_KEY` | OpenAlex 検索。匿名検索が止められる場合があるので推奨 | [API 設定](https://openalex.org/settings/api)。キーがあっても利用上限はあります |
 | `GITHUB_TOKEN` / `GH_TOKEN` | GitHub の検索。コード検索は必須 | [Tokens](https://github.com/settings/tokens)。リポジトリ・Issue は未認証でも利用可能ですが枠が小さくなります |
-| `FREEAGENT_MAILTO` | Crossref / OpenAlex 用の連絡先。キーではありません | 自分のメールアドレス。未設定でも他ソースの利用は可能 |
+| `FREEAGENT_MAILTO` | Crossref / OpenAlex / DataCite 用の連絡先。キーではありません | 自分のメールアドレス。未設定でも他ソースの利用は可能 |
 
 **このサーバーは `.env` を自動で読みません。** Hermes の MCP `env` へ渡してください。
 最近の Hermes は [環境変数参照](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference#environment-variable-references)
@@ -462,14 +473,101 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `crossref` | DOI・論文のメタデータ・公開されているアブストラクト | アブストラクトがない論文もあります |
 | `openalex` | 論文のメタデータ・被引用数・アブストラクト | 匿名検索の制限あり。API キーを推奨 |
 | `github` | リポジトリ / Issue / コードの検索結果 | コード検索はトークン必須 |
+| `datacite`（明示指定） | DOIメタデータ・抄録、研究データ | `datacite_kind`: `all` / `arxiv` / `dataset`。各語を引用したAND検索＋関連度順 |
+| `openaire`（明示指定） | Graph V3の論文書誌・抄録・掲載先 | 匿名API。60.1秒間隔で制御。抄録欠落あり、OpenAIREのクレジットを表示 |
+| `europepmc`（明示指定） | 医学・生命科学系の抄録・書誌 | `core`検索。全文は取得せず、プレプリント種別・ライセンスを保持 |
 
-`sources` を省略すると全ソース、指定するとそのソースだけを検索します。未知の名前は報告します。
+`sources` を省略すると**従来の6ソースのみ**、指定すると指定したソースだけを検索します。
+追加3ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
 `limit` は**各ソースの上限**です。全体の結果は重複除去などで減るので、合計件数を保証する値ではありません。
 本文という場合も、取得できた説明・導入部・アブストラクトを指します。原典の全文とは限りません。
 
+### 段階的に追加した検索を使う
+
+- **第1段階：DataCite** — 「arXiv論文をDataCiteから探して」「その研究に使えるデータセットを探して」。
+- **第2段階：OpenAIRE / Europe PMC** — 「OpenAIREでも論文を探して」「生命科学の根拠をEurope PMCから探して」。
+- **第3段階は保留** — J-STAGE（商用承認・クレジット・保存条件）、Stack Exchange（回答本文とライセンスの検証）、CiNii（appid登録）、CORE（組込み条件の確認）。まだ対応ソースではありません。
+
+ツールへ渡す引数の例（端末コマンドではありません）:
+
+```jsonc
+// DataCite経由でarXivのメタデータを取得
+{"query":"language model hallucination","sources":["datacite"],"datacite_kind":"arxiv","limit":2}
+// 研究データを検索（Dataset型でも品質を保証しません）
+{"query":"graphene","sources":["datacite"],"datacite_kind":"dataset","limit":2}
+// 分野横断検索と生命科学検索
+{"query":"CRISPR gene editing","sources":["openaire","europepmc"],"limit":2}
+// 自然語arXiv検索の失敗・遅延時にのみ、DataCiteの追加利用を明示許可
+{"query":"language model hallucination","sources":["arxiv"],"fallback":true,"limit":2}
+```
+
+`fallback` は既定 `false`。`true`（JSON真偽値）の場合のみ、arXivの429・5xx・接続障害等なら直ちに、
+応答待ちが既定2秒続けばDataCiteのarXiv限定検索を開始します。**全体8秒の締切は延長しません**。
+締切を過ぎてから新たな代替取得は開始しません。元のarXiv取得は裏で継続し、成功すればそのキャッシュを温めます。
+
+自然語の簡易検索だけが代替対象です。`ti:` / `cat:`等の検索式、引用符・括弧・AND/OR/NOT、新旧形式のarXiv IDや版指定は
+意味を勝手に変えず代替対象外にします。「該当なし」も障害と混同しません。
+DataCiteへの直接指定は自然語の各語をAND検索します。arXivと検索順位・更新反映・特定版の内容が同等とは保証しません。
+
+成功した代替は `arxiv → datacite（代替）` と実取得元を表示し、`results.arxiv.fallback.primary_error`に元の失敗を残します。
+両方が失敗した場合は `fallback_attempt.error` に代替の失敗も残します。
+
+本文が無い結果は、既存・追加ソースを問わず `metadata_only=true`。書誌探索には表示しますが、groundedの本文根拠には注入しません。
+agentでも本文根拠の引用番号を振らず、書誌は`bibliography`に分離します。
+DOI・URLの両方を別名として照合して引用を統合し、より長い本文と`providers`（配信元一覧）を残します。
+選択した本文の取得元は`summary_source`、各提供元のライセンス・種別は`provider_metadata`、クレジットは`attributions`へ保持します。
+URL別名の連鎖全体とDOI対応を先に調べ、曖昧な書誌を入力順で特定版へ割り当てません。
+agentの番号登録・返却でもDOIを優先し、同じURLの異なる版を落としません。
+本文の選択とは別に`doi`と`aliases`を保持するので、結果を再統合しても識別子が失われません。
+
+本文予算で読ませられなかった出典は、取得できていても引用成功とは認定しません。
+`injected_citations`が注入済み番号、groundedの`evidence_citation_count`が実際の本文根拠数です。
+agentは後のステップで未注入の出典を読ませた場合だけ、その番号を有効にします。
+**同じ論文の別配信元は独立した裏付けではありません**。版の異なるDOIは勝手に統合しません。
+
+実stdio経路での出力（2026-10-01、`CRISPR gene editing`・各2件、題名の行は省略）:
+
+```text
+出典 6 件（datacite, openaire, europepmc）
+  ✓ datacite (2 件・1.4 秒)
+  ✓ openaire (2 件・1.8 秒)
+      データ提供: OpenAIRE（CC-BY） https://graph.openaire.eu/
+  ✓ europepmc (2 件・3.0 秒)
+```
+
+この回は取得6件中5件に本文があり、締切脱落・代替切替は発生しませんでした。
+データセット検索も実stdioで2件・1.59秒、本文2件を確認しました。
+後の再検証ではEurope PMCが6.21秒まで変動しましたが、8秒の締切内で取得できました。
+**代替APIにも速度のムラがあります。一時点の成功は24時間の安定性の保証ではありません**。
+
+| 症状 | 理由・対処 |
+|---|---|
+| 追加ソースが検索されない | `sources`に明示指定してください。既定6ソースは変えていません |
+| 「ローカルのアクセス間隔制御」 | 同じホストの予算待ちです。DataCiteは0.61秒、Europe PMCは1秒、OpenAIREは60.1秒間隔。待機せずエラーを返すため表示された秒数後に再試行 |
+| OpenAIREを別プロセスでも使う | 間隔制御はプロセス内のみ。同一IPの別MCP/CLIを含め提供元の枠を共有するため、並行実行を避ける。今回のOpenAIRE認証枠の拡張は未実装 |
+| 書誌はあるがgroundedの根拠がない | 抄録無しの追加ソースは本文を生成で補いません。別ソースを明示指定 |
+| arXivの代替が起動しない | `fallback=true`、自然語検索、締切内、障害/遅延という条件を確認 |
+
+動作確認と時間帯別計測:
+
+```bash
+python scripts/probe_knowledge_stdio.py
+python scripts/probe_knowledge_stdio.py --sources datacite --datacite-kind dataset --query graphene
+python scripts/measure_kb.py --sources datacite openaire europepmc
+python scripts/measure_kb.py --sources datacite --datacite-kind dataset
+python scripts/measure_kb.py --report
+```
+
+計測はタイトル・本文を保存せず、時間・成否・件数・本文がある件数・モードだけを追記します。
+既存の時刻別計測も続けられます。OpenAIREを含む別プロセスの連続実行は60秒以上空けてください。
+
+利用条件・仕様: [DataCite](https://support.datacite.org/docs/rest-api) /
+[OpenAIRE](https://graph.openaire.eu/docs/apis/terms) /
+[Europe PMC](https://europepmc.org/RestfulWebService)。リンク先全文の利用条件はメタデータの条件とは別です。
+
 ### 遅いソースは締め切りで区切る
 
-既定では全ソースを同時に引き、**8 秒以内に間に合った分**を返します。
+選択したソースを同時に引き、**8 秒以内に間に合った分**を返します。
 遅れたソースは `⏱` / `timed_out` に残します。取得は裏で続き、**成功した結果だけ**が
 同じサーバープロセス内の 30 分キャッシュに入ります。再起動するとキャッシュは消えます。
 2 回目でも、取得が未完了・失敗・条件が違う場合は速くなるとは限りません。

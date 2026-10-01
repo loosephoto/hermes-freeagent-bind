@@ -21,8 +21,8 @@
 | §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳） |
 | §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
-| §5 | 知識バックエンド 6 種（arXiv / Crossref / OpenAlex / Wikipedia / Wikidata / GitHub） |
-| §6 | ツール実装（11 本） |
+| §5 | 知識バックエンド9種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13引用統合） |
+| §6 | ツール実装（11本、§6.11 本文の注入番号・引用認定） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
 | §8.5 / §8.6 | 失敗時の「次の一手」（`next_action`） / ハーネス判別（Hermes 以外で起動されたときの警告） |
@@ -142,8 +142,11 @@
 | wikidata | `www.wikidata.org/w/api.php` | 不要 | ラベル欠落（`label` は `title` ではない） |
 | arxiv | `https://export.arxiv.org/api/query` | 不要 | **http は 301 の先で 406**。連続アクセスで 406 → **3 秒間隔で直列化** |
 | crossref | `api.crossref.org/works` | 不要 | `mailto` 未設定だと polite pool に入れない |
-| openalex | `api.openalex.org/works` | **検索は API キー必須** | 匿名検索は提供元が制限中（実測 `503 Anonymous search is paused` / `429 Rate limit exceeded`） |
+| openalex | `api.openalex.org/works` | **常用では無料APIキーを推奨（匿名基本利用も可）** | 匿名検索は提供元が制限中（実測 `503 Anonymous search is paused` / `429 Rate limit exceeded`） |
 | github | `api.github.com/search/*` | トークン推奨（コード検索は必須） | 未認証は 10 リクエスト/分 |
+| datacite | `api.datacite.org/dois` | 不要、mailto任意 | モード間でホスト予算共有。抄録・登録反映の欠落あり |
+| openaire | `api.openaire.eu/graph/v3/research-products` | 今回は匿名のみ | 公式60/h、メタデータCC-BY表示、本文欠落あり |
+| europepmc | `www.ebi.ac.uk/europepmc/webservices/rest/search` | 不要 | core検索、全文利用条件は別、生命科学系 |
 
 - 結果は**必ず `citation`（source / title / url / year / summary）に正規化**する。表示も注入もこの形だけを使う。
 - 取得はメモリ TTL キャッシュ + ホスト単位の遮断記憶。**同一キーは single-flight** で同時取得を 1 回にまとめ、エラー応答はキャッシュしない（回復後の再取得を妨げない）。キャッシュ値は複製して返し、呼び出し側の変更が共有状態に伝播しない。**LLM を介さない**（＝幻覚が入らない経路）。
@@ -155,7 +158,8 @@
 - 注入する本文は 1 件あたり `FREEAGENT_EVIDENCE_ITEM_CHARS`（既定 360）、全体で
   `FREEAGENT_EVIDENCE_TOTAL_CHARS`（既定 3200）に収める。入れすぎると小型 Free モデルが予算を
   使い切って空応答・切断になる（逆効果）。
-- `sources` を明示した場合は指定された有効ソースだけを検索する。無効な名前だけなら全ソースへフォールバックせず、利用可能な名前を返す。
+- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加3種は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。
+- `fallback=true`のJSON真偽値だけが、自然語arXiv検索をDataCiteへ追加送信する明示許可。文字列`"true"`等は許可にしない。
 - 1 ソースの失敗で全体を落とさない（`errors` に集約し、成功分だけ返す）。
 
 ### 6.1 締め切りつきの並列取得（§5.8）
@@ -174,18 +178,54 @@
   匿名検索が 429（`Anonymous search is temporarily rate-limited`）。候補の実測（J-STAGE 0.07〜0.44 秒・
   CiNii Research 0.1〜0.3 秒・Stack Exchange 0.2〜0.4 秒・OpenAlex の arXiv 絞り込み 0.8〜2.5 秒ほか。
   Semantic Scholar は匿名で 3/3 が 429、dblp はボット判定の HTML を HTTP 200 で返す）は追加の判断材料として
-  残し、追加は時間帯別の計測結果を見てから決める。
+  残し、追加は時間帯別の計測結果を見てから決める。新規3種は当面明示指定のみ（§6.3）。
 
 ### 6.2 時間帯別の計測（`scripts/measure_kb.py`）
 
 - 1 巡で全ソースを並列に 1 回ずつ引き、1 ソース 1 行を `FREEAGENT_KB_LATENCY_PATH`（既定
   `FREEAGENT_STATE_DIR/kb_latency.jsonl`・最大 20,000 行・超えたら古い行から tmp + `os.replace` で捨てる）へ追記。
   記録は `ts` / `hour`（日本時間）/ `source` / `elapsed_s` / `ok` / `items` / `error`（160 字）/ `mailto` /
-  `openalex_key` / `env_failure` だけで、**本文は残さない**。巡回ごとにキャッシュとホスト遮断の記憶を消す。
+  `openalex_key` / `env_failure` に加え `datacite_kind` / `summaries`（本文がある件数）を記録し、**タイトル・本文は残さない**。
+  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応9ソースを測る。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
 - 全ソースが接続系の失敗なら `env_failure=true`（こちらのネットワーク障害）とし、`--report` の集計から外す。
 - `--schedule N` は Windows のタスク（`pythonw`＝窓を出さない）を 1 時間おきに登録し、残り回数を
   `kb_latency.jsonl.schedule.json` で数えて、最後の 1 回でタスクを自分で消す（`/ED` `/ET` は HOURLY との
   組み合わせで意味が曖昧なので使わない）。`schtasks` の出力はコンソールのコードページ（`oem`）で読む。
+
+### 6.3 任意ソースと代替の契約（§5.9〜§5.13）
+
+- DataCiteは`datacite_kind=all/arxiv/dataset`。自然語の各語をJSON引用符でエスケープしAND結合、`sort=relevance`を指定。
+  arxivは`client-id=arxiv.content`（旧資料の型がTextでも落とさない）、datasetは`resource-type-id=dataset`。
+  Abstract種別の実本文だけを採用。キャッシュキーはモード・検索語・件数。年/本文の欠落もキーとして返す。
+- Europe PMCは`resultType=core`・JSON・`pageSize`。実抄録、元source/id、プレプリント種別・原文ライセンスを保持。
+  OpenAIREはGraph V3の`search`・publication限定。DOI/instance URL/idをURLへ正規化、descriptionsを本文にする。
+  メタデータのOpenAIRE CC-BYクレジットと原文licenseを区別。今回は匿名のみで認証枠の拡張は未実装。
+- 新規3種は`_kb_new_cached`→既存single-flight/cache。上流の不正型・解析例外はsource付きerror。
+  空/不正配列を成功扱いせず、失敗はキャッシュしない。本文が無い正常書誌は`metadata_only=true`。
+  lookupには表示するが、既存ソースを含め本文なしの引用は`_kb_has_evidence`でgrounded/evidence注入・agent番号登録から除外する。
+  agentの書誌は`bibliography`に分離する。生成で本文を埋めない。
+- `_kb_rate_acquire`はホスト単位にLock内で採番。待機・未来の予約をせず、アクセスできない場合はローカルHTTP429相当を返す。
+  DataCite0.61秒、Europe PMC1秒、OpenAIRE60.1秒。DataCiteのモードは同じ予算。
+  メモリ内・1プロセスの制御であり、他プロセス/IP上の他アプリとは共有しない。提供元のRetry-After/遮断記憶も従来通り。
+- 明示許可代替は`_kb_source_result`。arXivの429/5xx/接続系/遮断なら直ちに、応答待ちなら`KB_HEDGE_DELAY`（既定2秒）後にDataCiteへ。
+  設定は`FREEAGENT_KB_HEDGE_DELAY`（非有限は2へ、0.05〜30秒）。全体締切は延長しない。
+  `_kb_gather`が同じ`deadline_at`を渡し、呼び出し元と代替worker内の取得開始直前の両方で期限を確認する。
+  スレッド開始がスケジューリングで遅れた場合も新規代替を抑止する。既存取得は裏で継続。
+  colon/引用符/括弧/AND・OR・NOT/新旧形式のarXiv ID等は互換不可として代替しない。「該当なし」や即時認証/不正要求も代替しない。
+- 代替で`sources`（要求先）は変えない。`results.arxiv.source`と`citations[].source`は実取得元datacite。
+  `fallback.requested_source/served_by/primary_error`で切替と主系の状態を明示。代替失敗は`fallback_attempt.error`にも残す。
+- 引用はDOI（case-insensitive、版suffixは保持）とURL完全一致の両別名でグループ化する。DOI欠落側もURLで統合し、
+  全入力のDOI/URL別名を連結成分として先に索引化し、URL-onlyの連鎖で複数DOIに到達する曖昧性も判定する。
+  未知同士は共通URLで未知グループとして統合できるが、明示DOIの異なる版同士はURL一致だけで統合しない。
+  複数DOIに結びつく曖昧なURL-only引用は入力順によらず割り当てない。本文選択と独立に確定DOIと`aliases`を保持し再統合できる。
+  長い本文を残し`providers`に取得元一覧、`summary_source`に選択本文の取得元、`provider_metadata`に提供元別license/種別、
+  `attributions`に全クレジットを保持。本文がない統合引用のmetadata_onlyを再計算する。
+  キャッシュの辞書を変更せずコピーする。配信元数を独立した事実の証明にしない。本文の意味的同一性は未検証。
+- `probe_knowledge_stdio.py`は実APIをstdio経由で検査。モデル推論は行わず、両チャネル・入力スキーマ・各ソースの結果・引用形を検証。
+  `validate_lookup`で引用値・HTTP(S) URL・実取得元・代替許可も検査する。OpenAIREのdescriptions/instances.urlsは配列型を検証し、
+  辞書キーや文字列各文字を本文/URLにしない。新規ソースの全引用URLも共通境界で検査する。
+  `--sources`・`--datacite-kind`・`--fallback`で経路を選べる。MCP再起動前でも新しい子プロセスの実装を検証できる。
+- 第3段階（J-STAGE / Stack Exchange / CiNii / CORE）は利用条件や回答取得の検証が未完了なので登録しない。
 
 ## 7. ツールの規約（§6–§8）
 
@@ -205,11 +245,20 @@
 - サブエージェント（`freeagent_agent`）は根拠に**通し番号**を振り、ツール結果を番号つきの本文で注入する。
   回答中の `[n]` は番号と照合し、根拠に無い番号は `unsupported_citations`、有効な引用がない回答は
   `cited_ok: false` として返す。`freeagent_grounded` の `cited_ok` も有効な番号の有無だけであり、
-  **本文と根拠の意味的な整合性は検証しない**。grounded は `unsupported_citations` を返さず、
-  有効番号と無効番号が混在しても有効番号があれば `cited_ok: true` になる。
+  **本文と根拠の意味的な整合性は検証しない**。groundedも`unsupported_citations`を返し、
+  有効番号と無効番号が混在しても、本文注入済みの有効番号があれば`cited_ok: true`になる。
 - サブエージェント（`freeagent_agent`）は**最終ステップでツールを封じ、回答を要求する**。封じないと
   全ステップを調査に使い、回答が永久に出ない（実測）。到達しなかった場合は推測で埋めず、
   `steps_exhausted` と収集済みの根拠を返す。
+
+### 7.1 本文予算と引用認定（§6.11）
+
+- `_evidence_window`は実際に本文を注入した`numbers`とテキストを同時に作る。本文予算がない項目には見出しも番号も注入しない。
+- groundedは`injected_citations`に対して引用を照合し、`not_injected_citations`と`evidence_citation_count`を返す。予算0なら推論を呼ばない。
+- agentは取得本文候補のregistryと注入済み番号の集合を分離し、未注入候補は次のlookup時に同じ番号で再注入できる。
+  認定は注入済み集合だけ。番号登録とagent結果集約は`_kb_citation_key`（provider＋DOI優先、DOIなし時だけURL）を共用し版を落とさない。
+  返すregistryを先頭8件に切らず、返却番号と出典配列の対応を保つ。
+- `_cited_numbers(..., allowed=...)`で存在するだけの出典や予算切れ番号を成功にしない。書誌は別の`bibliography`に置く。
 
 ## 7.5 思考台帳（`freeagent_think`・§2.6 / §6.9）
 

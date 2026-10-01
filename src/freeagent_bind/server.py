@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """hermes-freeagent-bind — Hermes Agent の Free モデルをサブLLMとして並列に走らせ、
-外部知識（arXiv / Crossref / OpenAlex / Wikipedia / Wikidata / GitHub）で根拠づける MCP サーバー。
+外部知識（既定6ソース＋DataCite / OpenAIRE / Europe PMC）で根拠づける MCP サーバー。
 
 これは **モノリス**（単一ファイル）として書く。理由: 配布物が 1 つの stdio スクリプトで完結し、
 遅延 import や相対 import の取り回しでクライアント側の起動が壊れる事故が無い（実測: stdio 起動後に
@@ -12,8 +12,9 @@
                                              §2.3 トレース / §2.4 相談セッション /
                                              §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 /
                                              §2.7 思考台帳の構造（分解・改訂・分岐・仮説））
-  §3 プロバイダとモデル  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切りつきの並列取得）
-  §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案）
+  §3 プロバイダとモデル  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
+                    §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13 引用統合）
+  §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号）
   §7 ツール定義         §8 表示（content）
   §8.5 失敗時の「次の一手」（structuredContent.next_action）
   §8.6 ハーネス判別（Hermes 以外で起動されたときの警告）   §9 JSON-RPC / stdio
@@ -2284,6 +2285,7 @@ def _kb_gather(picked: list[str], query: str, limit: int, opts: dict,
                deadline: float | None = None) -> tuple[dict, dict]:
     """(ソース → 結果, ソース → 所要秒) を返す。締め切りを過ぎたソースは timed_out の結果にする。"""
     deadline = KB_DEADLINE if deadline is None else deadline
+    opts = {**opts, "deadline_at": time.monotonic() + deadline}
     done: dict[str, dict] = {}
     spent: dict[str, float] = {}
     lock = threading.Lock()
@@ -2293,7 +2295,7 @@ def _kb_gather(picked: list[str], query: str, limit: int, opts: dict,
     def work(src: str) -> None:
         start = time.monotonic()
         try:
-            res = KB_BACKENDS[src](query, limit, opts)
+            res = _kb_source_result(src, query, limit, opts)
         except Exception as exc:  # 例外を外へ漏らさない（規約 1）
             res = {"error": f"{type(exc).__name__}: {exc}"}
         with lock:
@@ -2323,7 +2325,7 @@ def _kb_gather(picked: list[str], query: str, limit: int, opts: dict,
 
 def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int = 3,
                      lang: str = "ja", kind: str = "repo", max_workers: int | None = None,
-                     deadline: float | None = None) -> dict:
+                     deadline: float | None = None, datacite_kind: str = "all", fallback: bool = False) -> dict:
     """指定ソースを**並列に**引いて、出典つきでまとめる。LLM を使わないので幻覚が入らない。
 
     全体の締め切り（`KB_DEADLINE`）までに届いた分だけ返す（§5.8）。`max_workers` は互換のため
@@ -2333,7 +2335,7 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
     if not query:
         return {"error": "query は必須です", "query": query}
     requested = as_str_list(sources)
-    picked = [s for s in requested if s in KB_BACKENDS] if requested else list(KB_BACKENDS)
+    picked = list(dict.fromkeys(s for s in requested if s in KB_BACKENDS)) if requested else [s for s in DEFAULT_SOURCES if s in KB_BACKENDS]
     unknown = [s for s in requested if s not in KB_BACKENDS]
     if requested and not picked:
         message = "有効な sources がありません。利用可能: " + ", ".join(KB_BACKENDS)
@@ -2341,7 +2343,8 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
                 "results": {}, "citations": [], "citation_count": 0,
                 "errors": {"sources": message}, "error": message, "llm_used": False}
     limit = as_int(limit, 3, 1, 10)
-    opts = {"lang": as_str(lang, "ja"), "kind": as_str(kind, "repo")}
+    opts = {"lang": as_str(lang, "ja"), "kind": as_str(kind, "repo"),
+            "datacite_kind": as_str(datacite_kind, "all"), "fallback": fallback is True}
     by_source, timings = _kb_gather(picked, query, limit, opts, deadline)
     citations: list[dict] = []
     errors = {}
@@ -2351,6 +2354,7 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
         if res.get("error"):
             errors[src] = res["error"]
         citations.extend(res.get("citations") or [])
+    citations = _kb_merge_citations(citations)
     late = [src for src, res in by_source.items() if isinstance(res, dict) and res.get("timed_out")]
     out = {"query": query, "sources": picked, "unknown_sources": unknown,
            "results": by_source, "citations": citations, "citation_count": len(citations),
@@ -2359,6 +2363,402 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
     if late:
         out["timed_out"] = late
     return out
+
+
+# ---------------------------------------------------------------- §5.9 DataCite（任意ソース・研究データ・arXiv代替）
+
+
+def _literal_search(query: str) -> str:
+    """自然語の各語を引用して AND 結合する。提供元の演算子として解釈させない。"""
+    return " AND ".join(json.dumps(word, ensure_ascii=False) for word in query.split())
+
+
+def _kb_new_cached(key: str, source: str, producer) -> dict:
+    """新規ソースの破損した上流データも、直接呼び出し時に例外を漏らさない。"""
+    def safe():
+        try:
+            result = producer()
+            for cite in result.get("citations") or []:
+                _kb_http_url(cite.get("url"))
+            return result
+        except Exception as exc:
+            return {"source": source, "error": f"応答解析失敗: {type(exc).__name__}: {exc}"}
+    return _kb_cached(key, safe)
+
+
+def kb_datacite(query: str, limit: int = 5, kind: str = "all") -> dict:
+    """公開 DOI メタデータ。all / arxiv / dataset。版・arXiv検索式の互換は保証しない。"""
+    query = as_str(query)
+    kind = as_str(kind, "all")
+    limit = as_int(limit, 5, 1, 20)
+    if not query or kind not in ("all", "arxiv", "dataset"):
+        return {"source": "datacite", "error": "query と有効な datacite_kind（all / arxiv / dataset）が必要です"}
+
+    def produce() -> dict:
+        params = {"query": _literal_search(query), "sort": "relevance", "page[size]": limit}
+        if kind == "arxiv":
+            params["client-id"] = "arxiv.content"
+        elif kind == "dataset":
+            params["resource-type-id"] = "dataset"
+        if KB_MAILTO:
+            params["mailto"] = KB_MAILTO
+        data, err = _kb_new_json("https://api.datacite.org/dois?" + urllib.parse.urlencode(params), 0.61)
+        if err:
+            return {"source": "datacite", "error": err}
+        rows = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return {"source": "datacite", "error": "DataCite の応答形式が不正です"}
+        items, cites = [], []
+        for record in rows[:limit]:
+            row = record.get("attributes") if isinstance(record, dict) else None
+            if not isinstance(row, dict):
+                continue
+            title = next((as_str(t.get("title")) for t in (row.get("titles") or [])
+                          if isinstance(t, dict) and as_str(t.get("title"))), "")
+            doi = as_str(row.get("doi"))
+            link = as_str(row.get("url")) or (f"https://doi.org/{doi}" if doi else "")
+            if not title or not link:
+                continue
+            descriptions = [d for d in (row.get("descriptions") or []) if isinstance(d, dict)]
+            abstract = next((as_str(d.get("description")) for d in descriptions
+                             if d.get("descriptionType") == "Abstract" and as_str(d.get("description"))), "")
+            summary = _plain_text(abstract, 600)
+            authors = [as_str(a.get("name")) for a in (row.get("creators") or []) if isinstance(a, dict)]
+            year = row.get("publicationYear")
+            item = {"title": truncate(title, 300), "url": link, "doi": doi, "year": year,
+                    "authors": [a for a in authors if a][:8], "summary": summary,
+                    "type": (row.get("types") or {}).get("resourceTypeGeneral"),
+                    "metadata_only": not bool(summary)}
+            items.append(item)
+            cite = _cite("datacite", title, link, year=year, doi=doi,
+                         repository="arxiv" if kind == "arxiv" else "", metadata_only=not bool(summary))
+            cite["summary"] = summary
+            cite["year"] = year or ""
+            cite["resource_type"] = item.get("type") or ""
+            cites.append(cite)
+        return {"source": "datacite", "datacite_kind": kind, "items": items, "citations": cites,
+                "error": "" if items else "該当なし"}
+
+    return _kb_new_cached(f"datacite:{kind}:{query}:{limit}", "datacite", produce)
+
+
+DEFAULT_SOURCES = SOURCES
+SOURCES = (*DEFAULT_SOURCES, "datacite")
+KB_BACKENDS["datacite"] = lambda q, limit, opts: kb_datacite(q, limit, opts.get("datacite_kind", "all"))
+
+
+# ---------------------------------------------------------------- §5.10 明示許可した arXiv の代替取得（同じ締め切り内）
+
+KB_HEDGE_DELAY = max(0.05, min(30.0, as_float(os.environ.get("FREEAGENT_KB_HEDGE_DELAY"), 2.0)))
+
+
+def _kb_source_result(src: str, query: str, limit: int, opts: dict) -> dict:
+    """主系と代替は別ホスト。遅延時も主系をキャンセルせず、そのキャッシュを温める。"""
+    primary_fn = KB_BACKENDS[src]
+    allowed = (src == "arxiv" and opts.get("fallback") is True and "datacite" in KB_BACKENDS
+               and not re.search(r'[:"()\[\]]|\b(?:AND|OR|NOT)\b|\b\d{4}\.\d{4,5}(?:v\d+)?\b'
+                                 r'|\b[A-Za-z][A-Za-z.-]*/\d{7}(?:v\d+)?\b', query))
+    if not allowed:
+        return primary_fn(query, limit, opts)
+    done = {}
+    lock = threading.Lock()
+    changed = threading.Event()
+
+    def invoke(key, fn, options):
+        try:
+            if key == "alternate" and time.monotonic() >= options.get("deadline_at", float("inf")):
+                res = {"error": "締め切り後の代替取得は開始しません", "timed_out": True}
+            else:
+                res = fn(query, limit, options)
+            if not isinstance(res, dict):
+                res = {"error": "不正な結果"}
+        except Exception as exc:
+            res = {"error": f"{type(exc).__name__}: {exc}"}
+        with lock:
+            done[key] = res
+            changed.set()
+
+    def retryable(res):
+        err = as_str(res.get("error"))
+        return bool(err and (is_env_failure(err) or err.startswith("blocked:")
+                    or re.search(r"HTTP (?:429|5\d\d)\b", err)))
+
+    threading.Thread(target=invoke, args=("primary", primary_fn, opts), daemon=True).start()
+    end = opts.get("deadline_at", time.monotonic() + KB_DEADLINE)
+    changed.wait(min(KB_HEDGE_DELAY, max(0.0, end - time.monotonic())))
+    with lock:
+        primary = done.get("primary")
+    if primary is not None and not retryable(primary):
+        return primary
+    if time.monotonic() >= end:
+        return primary if primary is not None else {"error": "締め切りに間に合いませんでした",
+                                                   "timed_out": True, "items": [], "citations": []}
+    alternate_opts = {**opts, "datacite_kind": "arxiv", "fallback": False}
+    threading.Thread(target=invoke, args=("alternate", KB_BACKENDS["datacite"], alternate_opts), daemon=True).start()
+    while True:
+        with lock:
+            primary = done.get("primary")
+            alternate = done.get("alternate")
+            changed.clear()
+        if primary is not None and not primary.get("error"):
+            return primary
+        if alternate is not None and not alternate.get("error") and alternate.get("items"):
+            return {**alternate, "fallback": {"requested_source": src, "served_by": "datacite",
+                    "primary_error": (primary or {}).get("error") or "主系が応答待ち（遅延時の代替）"}}
+        if primary is not None and alternate is not None:
+            return {**primary, "fallback_attempt": {"source": "datacite", "error": alternate.get("error") or "該当なし"}}
+        changed.wait()
+
+
+# ---------------------------------------------------------------- §5.11 新規ソースのホスト別予算（メモリのみ・待たずに返す）
+
+_KB_RATE_NEXT: dict[str, float] = {}
+_KB_RATE_LOCK = threading.Lock()
+
+
+def _kb_rate_acquire(host: str, interval: float) -> float:
+    """HTTP実行の枠を原子的に取る。足りなければ待機秒を返し、枠を予約しない。"""
+    with _KB_RATE_LOCK:
+        now = time.monotonic()
+        wait = _KB_RATE_NEXT.get(host, 0.0) - now
+        if wait > 0:
+            return wait
+        _KB_RATE_NEXT[host] = now + interval
+        return 0.0
+
+
+def _kb_new_json(url: str, interval: float) -> tuple[dict | None, str]:
+    host = urllib.parse.urlsplit(url).netloc
+    if _kb_is_blocked(host):
+        return None, f"blocked: {host} は一時停止中です"
+    wait = _kb_rate_acquire(host, interval)
+    if wait:
+        return None, f"HTTP 429: ローカルのアクセス間隔制御（あと {wait:.1f} 秒）。同一ホストの枠を共有します"
+    return kb_json(url)
+
+
+# ---------------------------------------------------------------- §5.12 Europe PMC / OpenAIRE Graph V3（明示指定のみ）
+
+
+def _kb_array(value, field: str) -> list:
+    """上流配列を辞書キーや文字列として走査しない（欠落/Noneだけは空配列）。"""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{field} は配列ではありません")
+    return value
+
+
+def _kb_http_url(value: str) -> str:
+    if not isinstance(value, str) or re.search(r"\s", value):
+        raise ValueError("出典URLはHTTP(S)の文字列が必要です")
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("出典URLの形式が不正です")
+    return value
+
+
+def _kb_paper_result(source: str, items: list[dict], **extra) -> dict:
+    cites = []
+    for item in items:
+        summary = item.get("summary") or ""
+        cite = _cite(source, item["title"], item["url"], year=item.get("year") or "",
+                     doi=item.get("doi") or "", metadata_only=not bool(summary))
+        cite["summary"] = summary
+        cite["year"] = item.get("year") or ""
+        for field in ("publication_types", "repository", "license", "licenses"):
+            if item.get(field):
+                cite[field] = item[field]
+        if extra.get("attribution"):
+            cite["attribution"] = extra["attribution"]
+        cites.append(cite)
+    return {"source": source, "items": items, "citations": cites,
+            "error": "" if items else "該当なし", **extra}
+
+
+def kb_europepmc(query: str, limit: int = 5) -> dict:
+    """生命科学系の抄録。全文は取得しない。プレプリント・原文ライセンスを保持する。"""
+    query = as_str(query)
+    limit = as_int(limit, 5, 1, 20)
+    if not query:
+        return {"source": "europepmc", "error": "query は必須です"}
+    def produce():
+        params = {"query": _literal_search(query), "format": "json", "resultType": "core", "pageSize": limit}
+        data, err = _kb_new_json("https://www.ebi.ac.uk/europepmc/webservices/rest/search?"
+                                + urllib.parse.urlencode(params), 1.0)
+        if err:
+            return {"source": "europepmc", "error": err}
+        rows = (data.get("resultList") or {}).get("result") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return {"source": "europepmc", "error": "Europe PMC の応答形式が不正です"}
+        items = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict) or not as_str(row.get("title")):
+                continue
+            record_id, origin = as_str(row.get("id")), as_str(row.get("source"))
+            if not record_id or not origin:
+                continue
+            summary = _plain_text(as_str(row.get("abstractText")), 600)
+            authors = [as_str(a.get("fullName")) for a in ((row.get("authorList") or {}).get("author") or [])
+                       if isinstance(a, dict)]
+            items.append({"title": truncate(row["title"], 300), "summary": summary,
+                          "url": "https://europepmc.org/article/" + urllib.parse.quote(origin, safe="")
+                                 + "/" + urllib.parse.quote(record_id, safe=""),
+                          "doi": as_str(row.get("doi")), "year": as_str(row.get("pubYear")),
+                          "id": record_id, "repository": origin, "authors": [a for a in authors if a][:8],
+                          "publication_types": (row.get("pubTypeList") or {}).get("pubType") or [],
+                          "is_oa": row.get("isOpenAccess") == "Y", "license": as_str(row.get("license")),
+                          "cited_by": row.get("citedByCount"), "metadata_only": not bool(summary)})
+        return _kb_paper_result("europepmc", items)
+    return _kb_new_cached(f"europepmc:{query}:{limit}", "europepmc", produce)
+
+
+def kb_openaire(query: str, limit: int = 5) -> dict:
+    """Graph V3の論文メタデータ。匿名枠60/hをプロセス内60.1秒間隔で守る。"""
+    query = as_str(query)
+    limit = as_int(limit, 5, 1, 20)
+    if not query:
+        return {"source": "openaire", "error": "query は必須です"}
+    def produce():
+        params = {"search": query, "type": "publication", "pageSize": limit}
+        data, err = _kb_new_json("https://api.openaire.eu/graph/v3/research-products?"
+                                + urllib.parse.urlencode(params), 60.1)
+        if err:
+            return {"source": "openaire", "error": err}
+        rows = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return {"source": "openaire", "error": "OpenAIRE の応答形式が不正です"}
+        items = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict) or not as_str(row.get("mainTitle")):
+                continue
+            doi = next((as_str(p.get("value")) for p in (row.get("pids") or [])
+                        if isinstance(p, dict) and p.get("scheme") == "doi"), "")
+            instances = _kb_array(row.get("instances"), "instances")
+            if any(not isinstance(i, dict) for i in instances):
+                raise ValueError("instances の要素がオブジェクトではありません")
+            urls = [_kb_http_url(u) for i in instances
+                    for u in _kb_array(i.get("urls"), "instances.urls")]
+            record_id = as_str(row.get("id"))
+            link = f"https://doi.org/{doi}" if doi else (urls[0] if urls else
+                   "https://api.openaire.eu/graph/v3/research-products/" + urllib.parse.quote(record_id, safe=""))
+            if not doi and not urls and not record_id:
+                continue
+            descriptions = _kb_array(row.get("descriptions"), "descriptions")
+            if any(not isinstance(d, str) for d in descriptions):
+                raise ValueError("descriptions の要素が文字列ではありません")
+            summary = _plain_text(" ".join(d for d in descriptions if isinstance(d, str)), 600)
+            authors = [as_str(a.get("fullName")) for a in (row.get("authors") or []) if isinstance(a, dict)]
+            items.append({"title": truncate(row["mainTitle"], 300), "summary": summary, "url": link,
+                          "doi": doi, "id": record_id, "year": as_str(row.get("publicationDate"))[:4],
+                          "authors": [a for a in authors if a][:8],
+                          "licenses": list(dict.fromkeys(as_str(i.get("license")) for i in instances if as_str(i.get("license")))),
+                          "cited_by": (((row.get("indicators") or {}).get("citationImpact") or {}).get("citationCount")),
+                          "metadata_only": not bool(summary)})
+        return _kb_paper_result("openaire", items,
+                               attribution="データ提供: OpenAIRE（CC-BY） https://graph.openaire.eu/")
+    return _kb_new_cached(f"openaire:{query}:{limit}", "openaire", produce)
+
+
+SOURCES = (*SOURCES, "openaire", "europepmc")
+KB_BACKENDS.update({"openaire": lambda q, limit, opts: kb_openaire(q, limit),
+                    "europepmc": lambda q, limit, opts: kb_europepmc(q, limit)})
+
+
+# ---------------------------------------------------------------- §5.13 同一識別子の引用統合（独立した裏付けには数えない）
+
+
+def _kb_has_evidence(cite: dict) -> bool:
+    return isinstance(cite, dict) and not cite.get("metadata_only") and bool(as_str(cite.get("summary")))
+
+
+def _kb_citation_aliases(cite: dict) -> tuple[set[str], set[str]]:
+    stored = cite.get("aliases") if isinstance(cite.get("aliases"), dict) else {}
+    raw_dois = [cite.get("doi")] + (stored.get("dois") if isinstance(stored.get("dois"), list) else [])
+    raw_urls = [cite.get("url")] + (stored.get("urls") if isinstance(stored.get("urls"), list) else [])
+    dois = {re.sub(r"^https?://(?:dx\.)?doi\.org/", "", as_str(d).lower()) for d in raw_dois if as_str(d)}
+    urls = {as_str(u) for u in raw_urls if as_str(u)}
+    return dois, urls
+
+
+def _kb_citation_key(cite: dict) -> tuple:
+    """agentも明示DOIの異なる版をURL一致だけで潰さない。"""
+    dois, _ = _kb_citation_aliases(cite)
+    source = as_str(cite.get("source"))
+    return (source, "doi", tuple(sorted(dois))) if dois else (source, "url", as_str(cite.get("url")))
+
+
+def _kb_merge_citations(citations: list[dict]) -> list[dict]:
+    """全入力のDOI/URL別名を先に索引化し、曖昧なURL-only引用を版に割り当てない。"""
+    prepared = [(n, copy.deepcopy(c), *_kb_citation_aliases(c))
+                for n, c in enumerate(citations) if isinstance(c, dict)]
+    # 別名の連鎖も含め、到達するDOIを成分全体から求める（直接対応だけでは順序依存になる）。
+    parent = {}
+    def find(node):
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+    for _, _, dois, urls in prepared:
+        nodes = [("doi", d) for d in dois] + [("url", u) for u in urls]
+        if nodes:
+            root = find(nodes[0])
+            for node in nodes[1:]:
+                parent[find(node)] = root
+    component_dois = {}
+    for _, _, dois, _ in prepared:
+        for doi in dois:
+            component_dois.setdefault(find(("doi", doi)), set()).add(doi)
+    url_dois = {u: component_dois.get(find(("url", u)), set())
+                for _, _, _, urls in prepared for u in urls}
+    groups = []
+    for number, cite, dois, urls in prepared:
+        claims = set().union(*(url_dois.get(u, set()) for u in urls))
+        join_urls = {u for u in urls if len(url_dois.get(u, set())) <= 1}
+        if not dois and len(claims) > 1:
+            join_urls = set()
+        matches = [g for g in groups if (dois and dois & g["dois"]) or
+                   (not dois and not g["dois"] and urls & g["urls"]) or
+                   (join_urls & g["join_urls"] and (not dois or not g["dois"] or g["dois"] == dois))]
+        if len(dois | set().union(*(g["dois"] for g in matches))) > 1:
+            matches = []
+        group = {"dois": set(dois), "urls": set(urls), "join_urls": set(join_urls), "rows": [(number, cite)]}
+        for match in matches:
+            group["dois"].update(match["dois"])
+            group["urls"].update(match["urls"])
+            group["join_urls"].update(match["join_urls"])
+            group["rows"].extend(match["rows"])
+            groups.remove(match)
+        groups.append(group)
+    merged = []
+    for group in sorted(groups, key=lambda g: min(n for n, _ in g["rows"])):
+        rows = [r for _, r in sorted(group["rows"], key=lambda p: p[0])]
+        selected = max(rows, key=lambda r: len(as_str(r.get("summary"))) if not r.get("metadata_only") else 0)
+        cite = copy.deepcopy(selected)
+        cite["aliases"] = {"dois": sorted(group["dois"]), "urls": sorted(group["urls"])}
+        if not as_str(cite.get("doi")) and len(group["dois"]) == 1:
+            cite["doi"] = next((r["doi"] for r in rows if as_str(r.get("doi"))), next(iter(group["dois"])))
+        cite["metadata_only"] = not bool(as_str(cite.get("summary"))) or bool(cite.get("metadata_only"))
+        if len(rows) > 1:
+            providers = [p for r in rows for p in (r.get("providers") or [r.get("source")]) if p]
+            cite["providers"] = list(dict.fromkeys(providers))
+            cite["summary_source"] = cite.get("source") if not cite["metadata_only"] else ""
+            metadata = []
+            for row in rows:
+                if isinstance(row.get("provider_metadata"), list):
+                    metadata.extend(copy.deepcopy(row["provider_metadata"]))
+                else:
+                    metadata.append({k: copy.deepcopy(row[k]) for k in
+                        ("source", "url", "doi", "license", "licenses", "publication_types", "resource_type", "repository", "attribution")
+                        if k in row})
+            cite["provider_metadata"] = metadata
+            credits = [c for r in rows for c in ((r.get("attributions") or []) +
+                       ([r["attribution"]] if r.get("attribution") else []))]
+            if credits:
+                cite["attributions"] = list(dict.fromkeys(credits))
+        merged.append(cite)
+    return merged
 
 
 # ================================================================ §6 ツール実装
@@ -2388,7 +2788,8 @@ AGENT_SYSTEM_FINAL = (
 AGENT_SYSTEM = (
     "あなたは調査補佐です。次のいずれか**1つだけ**を JSON で出力してください。\n"
     '  ツールを使う: {"tool": "lookup", "query": "<検索語>", "sources": ["arxiv","crossref",...]}\n'
-    '  使える source: wikipedia, wikidata, arxiv, crossref, openalex, github\n'
+    '  使える source: wikipedia, wikidata, arxiv, crossref, openalex, github, datacite, openaire, europepmc\n'
+    '  追加sourceは明示指定のみ。datacite_kind: all / arxiv / dataset。fallback: trueでarXivのDataCite代替を許可。\n'
     '  回答する:     {"answer": "<回答。使った根拠の番号 [n] を本文に書く>"}\n'
     "ツール結果は [1] [2] … の番号つきで返ります。回答では使った根拠の番号を本文に書き、"
     "根拠に無い事実は書かない（書けない点は「根拠に無い」と明記する）。"
@@ -2801,7 +3202,8 @@ def tool_lookup(args: dict) -> dict:
                             as_str_list(args.get("sources")) or None,
                             limit=as_int(args.get("limit"), 3, 1, 10),
                             lang=as_str(args.get("lang"), "ja"),
-                            kind=as_str(args.get("github_kind"), "repo"))
+                            kind=as_str(args.get("github_kind"), "repo"),
+                            datacite_kind=as_str(args.get("datacite_kind"), "all"), fallback=args.get("fallback") is True)
 
 
 # 根拠としてサブLLMへ注入する本文の量。**入れないと幻覚は減らない**（実測: 以前はタイトルと URL
@@ -2811,35 +3213,45 @@ _EVIDENCE_ITEM_CHARS = max(0, min(2000, _env_int("FREEAGENT_EVIDENCE_ITEM_CHARS"
 _EVIDENCE_TOTAL_CHARS = max(0, min(20000, _env_int("FREEAGENT_EVIDENCE_TOTAL_CHARS", 3200)))
 
 
-def _evidence_block(citations: list[dict], *, item_chars: int | None = None,
-                    total_chars: int | None = None,
-                    numbers: list[int] | None = None) -> str:
-    """根拠を **番号 + 本文（要約）** で並べる。番号は回答中の `[n]` と対応する。
+# ---------------------------------------------------------------- §6.11 本文を実際に注入した引用番号だけを認定する
 
-    本文は 1 件あたり `_EVIDENCE_ITEM_CHARS`、全体で `_EVIDENCE_TOTAL_CHARS` に収める。
-    見出し行の形式（`[1] タイトル (年) URL`）は変えない（引用番号の対応を崩さないため）。
-    `numbers` を渡すとその番号で表示する。サブエージェントの調査ループでは、ステップをまたいで
-    同じ根拠に同じ番号を保つ必要がある（回答中の `[n]` と対応させるため）。
-    """
-    per_item = _EVIDENCE_ITEM_CHARS if item_chars is None else item_chars
-    budget = _EVIDENCE_TOTAL_CHARS if total_chars is None else total_chars
-    lines: list[str] = []
+
+def _evidence_window(citations: list[dict], *, item_chars: int | None = None,
+                     total_chars: int | None = None, numbers: list[int] | None = None) -> dict:
+    """本文予算に入った番号を返す。本文を渡せない項目は番号付き見出しも作らない。"""
+    per_item = as_int(_EVIDENCE_ITEM_CHARS if item_chars is None else item_chars, _EVIDENCE_ITEM_CHARS, 0, 2000)
+    budget = as_int(_EVIDENCE_TOTAL_CHARS if total_chars is None else total_chars, _EVIDENCE_TOTAL_CHARS, 0, 20000)
     labels = numbers if numbers and len(numbers) == len(citations) else list(range(1, len(citations) + 1))
+    lines, injected = [], []
     for i, c in zip(labels, citations):
-        bits = [f"[{i}] {c.get('title') or '(無題)'}"]
-        if c.get("year"):
-            bits.append(f"({c['year']})")
-        bits.append(c.get("url") or "")
-        lines.append(" ".join(str(b) for b in bits if b))
-        body = " ".join(str(c.get("summary") or "").split())
-        if not body or budget <= 0:
+        if not _kb_has_evidence(c):
             continue
+        body = " ".join(as_str(c.get("summary")).split())
         take = min(per_item, budget, len(body))
         if take <= 0:
             continue
+        bits = [f"[{i}] {c.get('title') or '(無題)'}"]
+        if c.get("year"):
+            bits.append(f"({c['year']})")
+        if c.get("publication_types"):
+            bits.append("種別: " + ", ".join(as_str_list(c["publication_types"])))
+        if c.get("resource_type"):
+            bits.append("種別: " + as_str(c["resource_type"]))
+        bits.append(c.get("url") or "")
+        credits = (c.get("attributions") or []) + ([c["attribution"]] if c.get("attribution") else [])
+        bits.extend(dict.fromkeys(credits))
+        lines.append(" ".join(str(b) for b in bits if b))
         lines.append("    " + truncate(body, take))
         budget -= take
-    return "\n".join(lines)
+        injected.append(i)
+    return {"text": "\n".join(lines), "numbers": injected,
+            "omitted": [i for i in labels if i not in injected]}
+
+
+def _evidence_block(citations: list[dict], *, item_chars: int | None = None,
+                    total_chars: int | None = None, numbers: list[int] | None = None) -> str:
+    """従来の文字列インターフェース。番号の認定は_evidence_windowのnumbersを使う。"""
+    return _evidence_window(citations, item_chars=item_chars, total_chars=total_chars, numbers=numbers)["text"]
 
 
 def tool_grounded(args: dict) -> dict:
@@ -2850,11 +3262,15 @@ def tool_grounded(args: dict) -> dict:
     sources = as_str_list(args.get("sources")) or None
     kb = knowledge_lookup(question, sources, limit=as_int(args.get("limit"), 3, 1, 10),
                           lang=as_str(args.get("lang"), "ja"),
-                          kind=as_str(args.get("github_kind"), "repo"))
-    citations = kb.get("citations") or []
+                          kind=as_str(args.get("github_kind"), "repo"),
+                          datacite_kind=as_str(args.get("datacite_kind"), "all"), fallback=args.get("fallback") is True)
+    citations = [c for c in (kb.get("citations") or []) if _kb_has_evidence(c)]
     if not citations:
         return {"error": "根拠が 0 件でした。query を変えるか sources を広げてください",
                 "lookup": {"sources": kb.get("sources"), "errors": kb.get("errors")}}
+    window = _evidence_window(citations)
+    if not window["numbers"]:
+        return {"error": "本文根拠を注入できませんでした。根拠の取得・本文予算を確認してください"}
     refs, info = _select_or_error(args, default_size=2)
     if not refs:
         return _no_models()
@@ -2862,7 +3278,7 @@ def tool_grounded(args: dict) -> dict:
         "次の【根拠】だけを情報源として質問に答えてください。\n"
         "根拠に無い事実は書かない。書けない場合は「根拠に無い」と明示する。\n"
         "本文中で根拠を示すときは [番号] を付ける。\n\n"
-        f"【根拠】\n{_evidence_block(citations)}\n\n【質問】\n{question}"
+        f"【根拠】\n{window['text']}\n\n【質問】\n{question}"
     )
     results = ask_many(refs, prompt, max_tokens=as_int(args.get("max_tokens"), 700, 16, 4000),
                        kind="grounded", avoid=as_str_list(args.get("exclude")) or None)
@@ -2871,16 +3287,18 @@ def tool_grounded(args: dict) -> dict:
         if res.get("error"):
             answers.append({"model": ref, "error": res["error"]})
             continue
-        cited = sorted({int(n) for n in re.findall(r"\[(\d{1,2})\]", res["text"] or "")
-                        if 1 <= int(n) <= len(citations)})
+        cited, unsupported = _cited_numbers(res["text"] or "", len(citations), allowed=window["numbers"])
         answers.append({"model": ref, "served_by": res.get("served_by"),
                         "answer": truncate(res["text"], 2000),
-                        "cited": cited, "cited_ok": bool(cited),
+                        "cited": cited, "cited_ok": bool(cited), "unsupported_citations": unsupported,
                         "truncated": res.get("truncated"), "cot_leak": res.get("cot_leak")})
     good = [a for a in answers if not a.get("error")]
     return {
         "question": question, "citations": citations, "citation_count": len(citations),
         "sources_used": kb.get("sources"), "source_errors": kb.get("errors"),
+        "injected_citations": window["numbers"], "not_injected_citations": window["omitted"],
+        "evidence_citation_count": len(window["numbers"]),
+        "unsupported_citations": sorted({n for row in good for n in row.get("unsupported_citations", [])}),
         "models": refs, "selection": info, "answers": answers,
         "agreement": agreement_of([a.get("answer") or "" for a in good]),
         "answers_with_citations": sum(1 for a in good if a.get("cited_ok")),
@@ -3117,14 +3535,18 @@ def _agent_tool_call(parsed: dict) -> dict:
     if tool == "lookup" or tool in KB_BACKENDS:
         sources = as_str_list(parsed.get("sources")) or ([tool] if tool in KB_BACKENDS else None)
         out = knowledge_lookup(query, sources, limit=as_int(parsed.get("limit"), 2, 1, 5),
-                               kind=as_str(parsed.get("kind"), "repo"))
-        cites = out.get("citations") or []
+                               kind=as_str(parsed.get("kind"), "repo"),
+                               datacite_kind=as_str(parsed.get("datacite_kind"), "all"), fallback=parsed.get("fallback") is True)
+        all_cites = out.get("citations") or []
+        cites = [c for c in all_cites if _kb_has_evidence(c)]
+        bibliography = [c for c in all_cites if not _kb_has_evidence(c)]
         brief = []
         for src, res in (out.get("results") or {}).items():
             for item in (res.get("items") or [])[:2]:
-                brief.append(f"{src}: {item.get('title') or item.get('label') or ''} "
+                label = "書誌のみ（本文根拠なし）" if item.get("metadata_only") else src
+                brief.append(f"{label}: {item.get('title') or item.get('label') or ''} "
                              f"— {truncate(item.get('summary') or item.get('description') or '', 300)}")
-        return {"hits": len(cites), "brief": brief, "citations": cites[:6],
+        return {"hits": len(cites), "brief": brief, "citations": cites[:6], "bibliography": bibliography,
                 "errors": out.get("errors") or {}}
     return {"hits": 0, "brief": [f"未知のツール: {tool}（使えるのは lookup / {', '.join(KB_BACKENDS)}）"],
             "citations": []}
@@ -3143,7 +3565,7 @@ def _parse_agent_reply(text: str) -> dict:
 
 
 
-def _cited_numbers(answer: str, total: int) -> tuple[list[int], list[int]]:
+def _cited_numbers(answer: str, total: int, allowed: list[int] | None = None) -> tuple[list[int], list[int]]:
     """回答中の `[n]` を根拠の番号と突き合わせる。返り値は (根拠にある番号, 無い番号)。
 
     引用を検査しないと、サブエージェントが根拠を読まずに記憶で答えて `[1]` を飾りで付けた場合に"
@@ -3152,11 +3574,12 @@ def _cited_numbers(answer: str, total: int) -> tuple[list[int], list[int]]:
     """
     cited: set[int] = set()
     unsupported: set[int] = set()
+    accepted = set(range(1, total + 1)) if allowed is None else set(allowed) & set(range(1, total + 1))
     for raw in re.findall(r"\[(\d{1,2})\]", answer or ""):
         number = as_int(raw, -1, 0, 99)
         if number <= 0:
             continue
-        if number <= total:
+        if number in accepted:
             cited.add(number)
         else:
             # 根拠が 0 件でも [1] と書けば「存在しない出典」なので unsupported に入れる。
@@ -3182,16 +3605,22 @@ def tool_agent(args: dict) -> dict:
     def run_one(ref: str) -> dict:
         history = base
         trace: list[dict] = []
-        registry: list[dict] = []      # 番号を振った根拠（回答中の [n] と対応させる）
+        registry: list[dict] = []      # 番号を振った本文根拠（回答中の [n] と対応させる）
+        bibliography: list[dict] = []  # 書誌探索は番号のregistryと分離する
         numbers: dict[tuple, int] = {}
         evidence: list[str] = []
+        injected: set[int] = set()
 
         def register(new_cites: list[dict]) -> list[tuple[int, dict]]:
             """新しい根拠に通し番号を振る（同じ URL には同じ番号を保つ）。"""
             added: list[tuple[int, dict]] = []
             for cite in new_cites or []:
-                key = (cite.get("source"), cite.get("url"))
-                if not cite.get("url") or key in numbers:
+                key = _kb_citation_key(cite)
+                if not _kb_has_evidence(cite) or not cite.get("url"):
+                    continue
+                if key in numbers:
+                    if numbers[key] not in injected:
+                        added.append((numbers[key], registry[numbers[key] - 1]))
                     continue
                 numbers[key] = len(registry) + 1
                 registry.append(cite)
@@ -3210,30 +3639,35 @@ def tool_agent(args: dict) -> dict:
             if parsed.get("tool") and not final_step:
                 got = _agent_tool_call(parsed)
                 added = register(got.get("citations") or [])
+                bibliography.extend(got.get("bibliography") or [])
                 trace.append({"tool": parsed.get("tool"), "args": parsed, "hits": got["hits"],
                               "new_citations": len(added)})
                 evidence.extend(got["brief"][:6])
                 # **番号つきの本文**を注入する。番号を保たないと回答中の [n] を検査できない。
-                block = _evidence_block([c for _, c in added], item_chars=300, total_chars=1200,
-                                        numbers=[n for n, _ in added]) if added else ""
+                window = _evidence_window([c for _, c in added], item_chars=300, total_chars=1200,
+                                          numbers=[n for n, _ in added])
+                injected.update(window["numbers"])
                 history += (f"\n\n【ツール結果 {parsed.get('tool')}】\n"
-                            + (block or "\n".join(got["brief"][:6])))
+                            + (window["text"] or "本文根拠を注入できませんでした（書誌のみ・本文予算不足等）"))
                 continue
             answer = as_str(parsed.get("answer"))
             if answer:
-                cited, unsupported = _cited_numbers(answer, len(registry))
+                cited, unsupported = _cited_numbers(answer, len(registry), allowed=list(injected))
                 return {"model": ref, "served_by": res.get("served_by"), "steps": step + 1,
                         "answer": truncate(answer, 1500), "trace": trace,
-                        "citations": registry[:8], "cited": cited, "cited_ok": bool(cited),
+                        "citations": registry, "bibliography": bibliography, "injected_citations": sorted(injected),
+                        "cited": cited, "cited_ok": bool(cited),
                         "unsupported_citations": unsupported}
             # 最終ステップでツールを求められた場合は実行しない（予算切れ）。推測で埋めず、
             # **集めた根拠だけを返して「回答に到達しなかった」と明示する**。
             return {"model": ref, "served_by": res.get("served_by"), "steps": step + 1,
                     "answer": "", "steps_exhausted": True, "trace": trace,
-                    "evidence": evidence[:8], "citations": registry[:8],
+                    "evidence": evidence[:8], "citations": registry, "bibliography": bibliography,
+                    "injected_citations": sorted(injected),
                     "cited": [], "cited_ok": False}
         return {"model": ref, "steps": max_steps, "trace": trace, "answer": "",
-                "steps_exhausted": True, "evidence": evidence[:8], "citations": registry[:8],
+                "steps_exhausted": True, "evidence": evidence[:8], "citations": registry, "bibliography": bibliography,
+                    "injected_citations": sorted(injected),
                 "cited": [], "cited_ok": False}
 
     results = run_parallel(refs, run_one, max_workers=min(len(refs), MAX_WORKERS))
@@ -3241,7 +3675,7 @@ def tool_agent(args: dict) -> dict:
     citations, seen = [], set()
     for row in good:
         for cite in row.get("citations") or []:
-            key = (cite.get("source"), cite.get("url"))
+            key = _kb_citation_key(cite)
             if key not in seen:
                 seen.add(key)
                 citations.append(cite)
@@ -3963,7 +4397,9 @@ TOOLS: list[dict] = [
         "description": (
             "【使う条件】出典URLが要る／判断の前に知識を補強したい／LLM を介さず一次情報に当たりたい。"
             "【差分】LLM を使わないので幻覚が無い。arXiv・Crossref・OpenAlex（論文）／Wikipedia・Wikidata"
-            "（百科・構造化）／GitHub（コード）を並列に引く。"
+            "（百科・構造化）／GitHub（コード）を並列に引く。追加の datacite / openaire / europepmc は"
+            "sources で明示指定する。DataCite は自然語の各語を AND 検索、datacite_kind=dataset で研究データ。"
+            "fallback=true のときだけ自然語 arXiv検索の失敗/遅延を DataCite で代替する（取得元を明示）。"
             "【使わない条件】単一の事実だけなら web_search が速い。"
         ),
         "inputSchema": {
@@ -3971,10 +4407,13 @@ TOOLS: list[dict] = [
             "properties": {
                 "query": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "wikipedia / wikidata / arxiv / crossref / openalex / github"},
+                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / europepmc"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
                 "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語（既定 ja）"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須）"},
+                "fallback": {"type": "boolean", "description": "既定 false。自然語 arXiv検索の失敗/遅延時に DataCite を許可"},
+                "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"],
+                                  "description": "DataCite の対象（既定 all）。自然語の各語を AND 検索"},
             },
             "required": ["query"],
         },
@@ -3993,6 +4432,8 @@ TOOLS: list[dict] = [
             "properties": {
                 "question": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"}},
+                "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
+                "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
                 "limit": {"type": "integer"},
                 "lang": {"type": "string"},
                 "models": {"type": "array", "items": {"type": "string"}},
@@ -4351,15 +4792,23 @@ def _render_body(name: str, data: dict) -> str:
                 continue
             if not items:
                 lines.append(f"  × {src}{secs(src)}: {(res.get('error') or '該当なし')[:90]}")
+                if res.get("fallback_attempt"):
+                    lines.append(f"      代替 datacite も失敗: {truncate(res['fallback_attempt'].get('error') or '', 90)}")
                 continue
-            lines.append(f"  ✓ {src} ({len(items)} 件{secs(src)})")
+            acquisition = (res.get("fallback") or {}).get("served_by")
+            label = f"{src} → {acquisition}（代替）" if acquisition else src
+            lines.append(f"  ✓ {label} ({len(items)} 件{secs(src)})")
+            if acquisition:
+                lines.append(f"      主系: {truncate(res['fallback'].get('primary_error') or '', 100)}")
+            if res.get("attribution"):
+                lines.append(f"      {res['attribution']}")
             for item in items[:2]:
                 title = item.get("title") or item.get("label") or ""
                 lines.append(f"      {truncate(title, 90)} — {item.get('url', '')}")
         return "\n".join(lines)
 
     if name == "freeagent_grounded":
-        lines = [f"根拠 {data.get('citation_count')} 件 / 引用付き回答 "
+        lines = [f"根拠 {data.get('evidence_citation_count', data.get('citation_count'))} 件 / 引用付き回答 "
                  f"{data.get('answers_with_citations')}/{data.get('answered')} 体"
                  f" / 合意度 {data.get('agreement')}"]
         for row in (data.get("answers") or []):
@@ -4370,6 +4819,10 @@ def _render_body(name: str, data: dict) -> str:
         lines.append("出典:")
         for i, cite in enumerate(data.get("citations") or [], 1):
             lines.append(f"  [{i}] [{cite.get('source')}] {truncate(cite.get('title') or '', 80)} {cite.get('url')}")
+        credits = [c for cite in (data.get("citations") or []) for c in
+                   ((cite.get("attributions") or []) + ([cite["attribution"]] if cite.get("attribution") else []))]
+        if credits:
+            lines[1:1] = list(dict.fromkeys(credits))
         return "\n".join(lines[:40])
 
     if name == "freeagent_map":
