@@ -12,7 +12,7 @@
                                              §2.3 トレース / §2.4 相談セッション /
                                              §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 /
                                              §2.7 思考台帳の構造（分解・改訂・分岐・仮説））
-  §3 プロバイダとモデル  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
+  §3 プロバイダとモデル（§3.1 Free-tier provider guards）  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
                     §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR /
                     §5.16 DOAJ・npm・crates.io）
   §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号）
@@ -142,6 +142,42 @@ PROVIDER_SPECS: dict[str, dict] = {
         "key_env": "HF_TOKEN", "free_kind": "hf_providers", "always_ready": False,
         "note": "Hugging Face Inference Providers（router。一覧は未認証でも取得可・推論はトークン必須）",
     },
+    # GroqのFree-plan表に掲載されたチャットモデルだけを許可する。
+    # Free契約かどうかはAPIから確認できないため、利用者の明示確認を必須にする。
+    "groq": {
+        "base_url": os.environ.get("FREEAGENT_GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+        "key": os.environ.get("GROQ_API_KEY", ""),
+        "key_env": "GROQ_API_KEY", "free_kind": "allowlist", "always_ready": False,
+        "free_model_ids": ("openai/gpt-oss-120b", "openai/gpt-oss-20b",
+                            "qwen/qwen3.8-27b"),
+        "required_env_flags": ("FREEAGENT_GROQ_FREE_TIER",), "catalog_requires_ready": True,
+        "note": "Groq Free tier確認が必須（FREEAGENT_GROQ_FREE_TIER=1）。Free対象モデルだけ許可。Developer tierは有料です",
+    },
+    "cloudflare": {
+        "base_url": ("https://api.cloudflare.com/client/v4/accounts/"
+                     + os.environ.get("CLOUDFLARE_ACCOUNT_ID", "") + "/ai"),
+        "key": os.environ.get("CLOUDFLARE_API_TOKEN", ""),
+        "key_env": "CLOUDFLARE_API_TOKEN", "free_kind": "allowlist", "always_ready": False,
+        "free_model_ids": ("@cf/openai/gpt-oss-20b", "@cf/zai-org/glm-4.7-flash"),
+        "required_env_values": ("CLOUDFLARE_ACCOUNT_ID",),
+        "required_env_patterns": {"CLOUDFLARE_ACCOUNT_ID": r"[0-9a-fA-F]{32}"},
+        "required_env_flags": ("FREEAGENT_CLOUDFLARE_FREE_PLAN",), "catalog_requires_ready": True,
+        "models_path": "/models/search?format=openrouter&hide_experimental=true&per_page=100",
+        "chat_path": "/v1/chat/completions", "catalog_format": "cloudflare_openrouter",
+        "note": "Workers Free plan確認が必須（FREEAGENT_CLOUDFLARE_FREE_PLAN=1）。Neuronsは10,000/日を全用途で共有。有料専用モデルは許可しません",
+    },
+    # GeminiのFree対象は、公式pricing表で入力・出力がFreeのモデルだけを絞る。
+    # Unpaid Servicesはプロンプト/応答を製品改善や人手レビューに使うため、 tierとデータ用途の二重明示確認を要求。
+    "gemini": {
+        "base_url": os.environ.get("FREEAGENT_GEMINI_BASE_URL",
+                                  "https://generativelanguage.googleapis.com/v1beta/openai"),
+        "key": os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", ""),
+        "key_env": "GEMINI_API_KEY", "free_kind": "allowlist", "always_ready": False,
+        "free_model_ids": ("gemini-3.8-flash", "gemini-3.7-flash"),
+        "required_env_flags": ("FREEAGENT_GEMINI_FREE_TIER", "FREEAGENT_GEMINI_UNPAID_DATA_ACK"),
+        "catalog_requires_ready": True,
+        "note": "Gemini Free tierと非機密データ利用の両確認が必須。Unpaid prompts/outputs may be reviewed and used to improve Google products; OpenAI compatibility is Beta",
+    },
 }
 # MCP の `initialize` 応答に載せる `instructions`。**Hermes はこれを読まない**（実測: 旧実装で
 # 自発率が上がらず、現行版のソース `tools/mcp_tool_*.py` にも参照が無いことを確認）。それでも
@@ -163,7 +199,7 @@ PROACTIVE_INSTRUCTIONS = (
 )
 
 PROVIDER_ORDER = [n.strip() for n in os.environ.get(
-    "FREEAGENT_PROVIDER_ORDER", "nous,openrouter,nvidia,huggingface").split(",")
+    "FREEAGENT_PROVIDER_ORDER", "nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini").split(",")
     if n.strip() in PROVIDER_SPECS] or ["nous"]
 
 # 知識バックエンドの識別用 User-Agent。MediaWiki / OpenAlex / Crossref は連絡先入りの UA を求める。
@@ -1242,8 +1278,7 @@ def _thought_apply_ops(row: dict, steps: list[dict], step: dict, old: dict | Non
 # ================================================================ §3 プロバイダとモデル
 
 def provider_ready(name: str) -> bool:
-    spec = PROVIDER_SPECS.get(name) or {}
-    return bool(spec.get("always_ready")) or bool(spec.get("key"))
+    return not _provider_missing_settings(PROVIDER_SPECS.get(name) or {})
 
 
 def make_ref(provider: str, model: str) -> str:
@@ -1291,6 +1326,7 @@ def _is_hf(provider: str) -> bool:
     return (PROVIDER_SPECS.get(provider) or {}).get("free_kind") == "hf_providers"
 
 
+
 def _free_providers(row: dict) -> list[str]:
     """HF の一覧で**無料で使える提供元**を列挙する（`is_free` か、価格が全部 0 のもの）。
 
@@ -1321,6 +1357,8 @@ def _is_free(provider: str, row: dict) -> bool:
     kind = (PROVIDER_SPECS.get(provider) or {}).get("free_kind")
     if kind == "credit":
         return True
+    if kind == "allowlist":
+        return provider_model_allowed(provider, as_str(row.get("id")))
     if _is_hf(provider):
         return bool(_free_providers(row))
     if str(row.get("id") or "").endswith(":free"):
@@ -1350,6 +1388,9 @@ def _context_length(provider: str, raw: dict):
 
 def fetch_provider_models(provider: str, ttl: float = 600.0) -> list[dict]:
     """モデル一覧。Free モデルは入れ替わるので**固定しない**（毎回ここから解決する）。"""
+    spec = PROVIDER_SPECS.get(provider) or {}
+    if spec.get("catalog_requires_ready") and not provider_ready(provider):
+        return []
     with _MODELS_LOCK:
         cached = _MODELS_CACHE.get(provider)
         if cached and now_ts() - as_float(cached.get("at"), 0.0) < ttl:
@@ -1357,8 +1398,10 @@ def fetch_provider_models(provider: str, ttl: float = 600.0) -> list[dict]:
     rows: list[dict] = []
     error = ""
     try:
-        data = provider_http("/models", provider=provider, timeout=min(30.0, READ_TIMEOUT))
-        for raw in (data.get("data") or []):
+        data = provider_http(spec.get("models_path") or "/models", provider=provider,
+                             timeout=min(30.0, READ_TIMEOUT))
+        raw_rows = _provider_catalog_rows(provider, data)
+        for raw in raw_rows:
             if not isinstance(raw, dict) or not raw.get("id"):
                 continue
             rows.append({
@@ -1378,6 +1421,55 @@ def fetch_provider_models(provider: str, ttl: float = 600.0) -> list[dict]:
     return rows
 
 
+# ================================================================ §3.1 Free-tier provider guards
+# This subsection owns the extra activation, model-ID allowlist, and Cloudflare catalog contracts.
+def _provider_missing_settings(spec: dict) -> list[str]:
+    """List missing key/plan/privacy confirmations without exposing their values."""
+    missing = []
+    if not spec.get("always_ready") and not spec.get("key"):
+        missing.append(spec.get("key_env") or "API key")
+    missing.extend(name for name in spec.get("required_env_values") or ()
+                   if not os.environ.get(name, "").strip())
+    missing.extend(name for name, pattern in (spec.get("required_env_patterns") or {}).items()
+                   if not re.fullmatch(pattern, os.environ.get(name, "")))
+    accepted = {"1", "true", "yes", "on"}
+    missing.extend(name for name in spec.get("required_env_flags") or ()
+                   if os.environ.get(name, "").strip().lower() not in accepted)
+    return list(dict.fromkeys(missing))
+
+
+def provider_model_allowed(provider: str, model: str) -> bool:
+    """Reject paid/unknown IDs even when explicitly selected by the caller."""
+    allowed = (PROVIDER_SPECS.get(provider) or {}).get("free_model_ids")
+    return allowed is None or as_str(model) in allowed
+
+
+def _provider_catalog_rows(provider: str, data) -> list:
+    """Normalize documented provider model-list envelopes; reject malformed catalogs."""
+    spec = PROVIDER_SPECS.get(provider) or {}
+    if spec.get("catalog_format") == "cloudflare_openrouter":
+        if not isinstance(data, dict) or ("success" in data and data.get("success") is not True):
+            raise ValueError("Cloudflare model catalog response is not successful")
+        result = data.get("result")
+        if isinstance(result, dict):
+            rows = result.get("data")
+        elif isinstance(result, list):
+            rows = result
+        elif isinstance(data.get("data"), list):
+            rows = data["data"]  # documented marketplace-format response
+        else:
+            raise ValueError("Cloudflare marketplace model catalog has no data array")
+        if not isinstance(rows, list):
+            raise ValueError("Cloudflare marketplace model catalog data is not an array")
+        return rows
+    rows = data.get("data") if isinstance(data, dict) else None
+    if rows is None:
+        return []
+    if not isinstance(rows, list):
+        raise ValueError(f"{provider} model list is not an array")
+    return rows
+
+
 def all_models(ttl: float = 600.0) -> list[dict]:
     out: list[dict] = []
     for provider in PROVIDER_ORDER:
@@ -1389,6 +1481,7 @@ def provider_status() -> list[dict]:
     rows = []
     for provider in PROVIDER_ORDER:
         models = fetch_provider_models(provider)
+        spec = PROVIDER_SPECS.get(provider) or {}
         with _MODELS_LOCK:
             error = (_MODELS_CACHE.get(provider) or {}).get("error") or ""
         rows.append({
@@ -1396,8 +1489,10 @@ def provider_status() -> list[dict]:
             "ready": provider_ready(provider),
             "models": len(models),
             "free": sum(1 for m in models if m.get("free")),
-            "key_env": (PROVIDER_SPECS.get(provider) or {}).get("key_env"),
-            "note": (PROVIDER_SPECS.get(provider) or {}).get("note"),
+            "key_env": spec.get("key_env"),
+            "note": spec.get("note"),
+            "requires_activation": bool(spec.get("catalog_requires_ready")),
+            "missing_settings": _provider_missing_settings(spec),
             "error": error,
         })
     return rows
@@ -1506,7 +1601,8 @@ def _call_once(provider: str, model: str, prompt: str, system: str,
         payload["temperature"] = temperature
     started = now_ts()
     try:
-        data = provider_http("/chat/completions", provider=provider, payload=payload, timeout=timeout)
+        chat_path = (PROVIDER_SPECS.get(provider) or {}).get("chat_path") or "/chat/completions"
+        data = provider_http(chat_path, provider=provider, payload=payload, timeout=timeout)
     except urllib.error.HTTPError as exc:
         body = ""
         retry_after = exc.headers.get("Retry-After") if exc.headers else None
@@ -1574,6 +1670,18 @@ def _auth_hint(provider: str, status: int, body: str) -> str:
     """
     tail = truncate((body or "").replace("\n", " "), 160)
     if status == 402:
+        if provider == "cloudflare":
+            return ("HTTP 402（cloudflare）: Workers AIのFree割当/アカウント制限の可能性があります。"
+                    "Workers Freeでは日次枠超過後に処理が停止し、Workers Paidでは超過分が課金されます。"
+                    f"契約状態を確認してください / 応答: {tail}")
+        if provider == "groq":
+            return ("HTTP 402（groq）: Free tierの状態またはアカウント利用制限を確認してください。"
+                    "Developer tierは従量課金です。"
+                    f" / 応答: {tail}")
+        if provider == "gemini":
+            return ("HTTP 402（gemini）: Free tierのプロジェクト割当またはBilling設定を確認してください。"
+                    "Billing有効時は課金が発生する場合があります。"
+                    f" / 応答: {tail}")
         # クレジット枯渇。キーや権限の問題ではないので取り違えさせない（実測: HF の月次無料枠は
         # 生存確認やパネルを繰り返すと尽き、全モデルが 402 になる）。翌月に回復するため
         # **プロバイダ記憶（15 分）には入れない**。
@@ -1594,6 +1702,12 @@ def _auth_hint(provider: str, status: int, body: str) -> str:
                 "（Cloudflare のブロックや提供元の障害）。`model:提供元` で別の提供元を試してください"
                 f" / 応答: {tail}")
     hints = {
+        "groq": ("GROQ_API_KEY が未設定か無効です" if status == 401 else
+                 "Free対象モデル一覧とアカウントのモデル権限を確認してください"),
+        "cloudflare": ("CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID と Workers AI Read 権限を確認してください" if status == 401 else
+                       "Freeプラン・モデル利用権限を確認してください。Workers Paidへのアップグレードで超過利用が課金されます"),
+        "gemini": ("GEMINI_API_KEY（または GOOGLE_API_KEY）とFree tierプロジェクトを確認してください" if status == 401 else
+                   "Freeモデルの利用可否・プロジェクト割当・地域制限を確認してください"),
         "openrouter": ("OPENROUTER_API_KEY が未設定か無効です" if status == 401 else
                        "キーは有効ですが、このモデルを使う権限・プランがありません"
                        "（`:free` でも提供元側の制限で 403 になるものがあります）"),
@@ -1617,6 +1731,14 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
     provider, model = resolve_ref(ref, free_only=free_only)
     if not model:
         return {"error": "モデルが解決できませんでした（Free モデルが 0 件の可能性）",
+                "ref": ref, "kind": kind}
+    spec = PROVIDER_SPECS.get(provider) or {}
+    if spec.get("free_model_ids") is not None and not provider_model_allowed(provider, model):
+        return {"error": f"{provider}/{model} はこのFree-tier設定で許可されていないモデルです",
+                "ref": ref, "kind": kind}
+    if spec.get("catalog_requires_ready") and not provider_ready(provider):
+        missing = _provider_missing_settings(spec)
+        return {"error": f"{provider} は未設定/未確認です。必要なenv設定: {', '.join(missing)}",
                 "ref": ref, "kind": kind}
     ref = make_ref(provider, model)
     cooling = cooling_refs()
@@ -4626,7 +4748,7 @@ TOOLS: list[dict] = [
         "description": (
             "【使う条件】使えるモデルを**検索**したい（どのプロバイダにどんな Free モデルがあるか）／"
             "品質統計やクールダウンを確認したいとき。"
-            "【差分】`query`（ID の部分一致）と `provider`（nous / openrouter / nvidia / huggingface）で絞り込む。"
+            "【差分】`query`（ID の部分一致）と `provider`（nous / openrouter / nvidia / huggingface / groq / cloudflare / gemini）で絞り込む。"
             "返る `ref` は他ツールの `models` 引数にそのまま渡せる（HF は `:提供元` を付けて経路を固定できる）。"
             "【使わない条件】通常は不要（panel/consult 等が自動で選ぶ）。"
         ),
@@ -4636,7 +4758,7 @@ TOOLS: list[dict] = [
                 "query": {"type": "string", "description": "モデル ID の部分一致（例: qwen / llama / :free）"},
                 "q": {"type": "string", "description": "query の別名"},
                 "provider": {"type": "string",
-                             "description": "nous / openrouter / nvidia / huggingface のいずれか"},
+                             "description": "nous / openrouter / nvidia / huggingface / groq / cloudflare / gemini のいずれか"},
                 "limit": {"type": "integer", "description": "表示件数（既定 40・最大 200）"},
                 "offset": {"type": "integer", "description": "読み飛ばす件数（ページ送り）"},
                 "free_only": {"type": "boolean", "description": "有料モデルを除き、Free だけを対象にする"},
@@ -5003,7 +5125,13 @@ def _render_body(name: str, data: dict) -> str:
                 mark = "⚠"
             else:
                 mark = "—"
-            note = f"  [{row['key_env']} 未設定 → 検索のみ]" if not row.get("ready") and row.get("key_env") else ""
+            if not row.get("ready") and row.get("requires_activation"):
+                missing = ", ".join(row.get("missing_settings") or []) or "設定確認"
+                note = f"  [無効: {missing}]"
+            elif not row.get("ready") and row.get("key_env"):
+                note = f"  [{row['key_env']} 未設定 → 検索のみ]"
+            else:
+                note = ""
             lines.append(f"  {mark} {row['provider']:11} {row['models']:4} モデル / Free {row['free']:3}{note}")
             if row.get("error"):
                 lines.append(f"      到達不可: {row['error'][:100]}")
@@ -5450,7 +5578,7 @@ def harness_message(info: dict) -> str:
              "動作しています。"]
     if _harness_backend_is_default():
         parts.append("既定の推論先 hermes proxy（127.0.0.1:8645）が無いと nous プロバイダは使えません"
-                     "（FREEAGENT_BASE_URL で変更可。OpenRouter / NVIDIA / Hugging Face はキーがあれば使えます）。")
+                     "（FREEAGENT_BASE_URL で変更可。OpenRouter / NVIDIA / Hugging Face / Groq / Cloudflare / Gemini はキーと必要なFree-tier確認があれば使えます）。")
     parts.append("自発利用の設定（SOUL.md・tools.exclude・apply_proactive.py）は Hermes 専用です。")
     parts.append(f"この警告は {HARNESS_WARN_ENV}=0 で止められます。")
     return "".join(parts)

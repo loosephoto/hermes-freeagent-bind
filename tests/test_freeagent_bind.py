@@ -908,12 +908,14 @@ class TestMeasuredRegressions(unittest.TestCase):
 
 
 class TestMultiProvider(unittest.TestCase):
-    """OpenRouter / NVIDIA NIM / Hugging Face を同じ「検索→利用」に乗せるための契約。"""
+    """推論プロバイダを同じ「検索→利用」に乗せるための契約。"""
 
-    def test_registry_has_four_providers(self):
-        for name in ("nous", "openrouter", "nvidia", "huggingface"):
+    def test_registry_has_seven_providers(self):
+        expected = ("nous", "openrouter", "nvidia", "huggingface", "groq", "cloudflare", "gemini")
+        for name in expected:
             self.assertIn(name, S.PROVIDER_SPECS)
             self.assertIn(name, S.PROVIDER_ORDER, "PROVIDER_ORDER に無いと一覧に出ない")
+        self.assertEqual(len(S.PROVIDER_SPECS), len(expected))
         self.assertEqual(S.PROVIDER_ORDER[0], "nous")
 
     def test_hf_free_detection(self):

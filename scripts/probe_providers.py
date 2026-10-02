@@ -1,4 +1,4 @@
-"""3 プロバイダ（OpenRouter / NVIDIA NIM / Hugging Face）の実推論を検証する（鍵は環境変数から）。"""
+"""外部推論プロバイダの実推論を検証する（APIキーとFree-tier確認は環境変数から）。"""
 import os
 import sys
 
@@ -14,15 +14,15 @@ for _stream in (sys.stdout, sys.stderr):
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 from freeagent_bind import server as S
 
-print("=== ready 判定（鍵が入っているか） ===")
+print("=== ready 判定（キー・Free-tier確認が揃っているか） ===")
 for r in S.provider_status():
     print(f"  {'✓' if r['ready'] else '—'} {r['provider']:12} models={r['models']:4} free={r['free']:4} err={r['error'][:50]}")
 
 print("\n=== 各プロバイダの Free モデルで実推論 ===")
 prompt = "「並列」を英単語1つで答えよ。記号も説明も書くな。"
-for provider in ("openrouter", "nvidia", "huggingface"):
+for provider in ("openrouter", "nvidia", "huggingface", "groq", "cloudflare", "gemini"):
     if not S.provider_ready(provider):
-        print(f"  {provider}: 鍵が無いのでスキップ")
+        print(f"  {provider}: API key/Free-tier確認が無いのでスキップ")
         continue
     rows = [m for m in S.fetch_provider_models(provider) if m.get("free")]
     if not rows:
@@ -42,7 +42,7 @@ for provider in ("openrouter", "nvidia", "huggingface"):
         if res.get("fallback"):
             print(f"      （要求 {ref} から代替へ回った）")
 
-print("\n=== プロバイダ横断の並列（4 プロバイダから選抜） ===")
+print("\n=== プロバイダ横断の並列（利用可能な Free 候補を選抜） ===")
 refs, info = S.select_models(4)
 print("  選抜:", refs, "| notes:", info.get("notes"))
 if refs:

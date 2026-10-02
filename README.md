@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face の 4 プロバイダ、検索は **14 ソース（既定6＋明示指定8）** に対応します。
+- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API の 7 プロバイダ、検索は **14 ソース（既定6＋明示指定8）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 > **まず試すなら**：「出典つきで調べて」は知識検索、「この設計の弱点を別の AI にも聞いて」は相談です。
@@ -403,14 +403,14 @@ Nous ローカルプロキシで確認されている制約です（他プロバ
 反論＋別案を付けた回は約 24 秒で、提案者 2 体のうち 1 体がタイムアウトしました。
 速度の保証や、現在のモデル全体の性能評価ではありません。
 
-検索拡張時のローカル実測（2026-10-02、同一Python、各7回の中央値。
+バックエンド拡張時のローカル実測（2026-10-02、同一Python、各7回の中央値。
 起動〜initialize〜tools/list〜終了を含むため、起動単体の保証値ではありません）:
 
-| 測定 | 第3段階HEAD（28f89d1） | 第4段階追加後 |
-|---|---:|---:|
-| ツール数 | 11 | 11 |
-| ツール一覧JSON文字数（ensure_ascii=false・compact） | 13,116 | 13,220 |
-| stdioプロセス往復・終了 | 0.2216秒 | 0.2267秒 |
+| 測定 | 第3段階HEAD（28f89d1） | 第4段階追加後 | 推論プロバイダ追加後 |
+|---|---:|---:|---:|
+| ツール数 | 11 | 11 | 11 |
+| ツール一覧JSON文字数（ensure_ascii=false・compact） | 13,116 | 13,220 | 13,278 |
+| stdioプロセス往復・終了（7回中央値） | 0.2216秒 | 0.2267秒 | 0.2181秒 |
 
 検索APIの追加は推論モデルの能力を増やしません。ツールスキーマの増加もメインLLMの入力負担になります。
 
@@ -422,7 +422,7 @@ Nous ローカルプロキシで確認されている制約です（他プロバ
 ### 推論バックエンド（サブ LLM）の接続
 
 別の AI に答えさせる機能（`ask` / `panel` / `consult` / `grounded` / `agent` / `map` / `fanout`、
-`think` の `verify` / `propose_alternatives`）で使います。**4 プロバイダのうち、使うものを 1 つ以上**用意します。
+`think` の `verify` / `propose_alternatives`）で使います。**7 プロバイダのうち、使うものを 1 つ以上**用意します。
 
 | プロバイダ | 必要なもの | 入手先・注意点 |
 |---|---|---|
@@ -430,8 +430,12 @@ Nous ローカルプロキシで確認されている制約です（他プロバ
 | **OpenRouter** | `OPENROUTER_API_KEY` | [API Keys](https://openrouter.ai/settings/keys)。`:free` モデルでもキーは必須。レート制限・モデル単位の拒否があります |
 | **NVIDIA NIM** | `NVIDIA_API_KEY` | [NVIDIA Build](https://build.nvidia.com)。一覧に未有効・廃止モデルが混じるため生存確認を推奨 |
 | **Hugging Face** | `HF_TOKEN` | [Access Tokens](https://huggingface.co/settings/tokens)。**Make calls to Inference Providers** 権限と月次クレジット残が必要 |
+| **Groq** | `GROQ_API_KEY` と `FREEAGENT_GROQ_FREE_TIER=1` | [API Keys](https://console.groq.com/keys)。Free tier契約を利用者が確認した場合だけ有効。Free対象モデルIDを限定し、Developer tierは従量課金なのでプラン変更時は確認変数を解除してください |
+| **Cloudflare Workers AI** | `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`、`FREEAGENT_CLOUDFLARE_FREE_PLAN=1` | [API Tokens](https://dash.cloudflare.com/profile/api-tokens)。Workers **Free** planの利用者向け。10,000 Neurons/日の共有枠を超えるとFreeでは停止しますが、Workers Paidでは超過分が課金されます。CloudflareはCustomer Contentをモデル学習・サービス改善に使わないとしています（別途ストレージ連携時は保存の可能性あり）。Paid planなら確認変数を設定しないでください |
+| **Gemini Developer API** | `GEMINI_API_KEY`（別名 `GOOGLE_API_KEY`）と2つの確認変数 | [Google AI Studio API key](https://aistudio.google.com/apikey)。Free/unpaid tierの入力・出力は製品改善や人手レビューに使われる場合があります。**機密・個人情報は送らず**、Free tierとデータ用途を確認した場合だけ有効にしてください |
 
-- 未設定のプロバイダは「モデル一覧の取得のみ」になり、推論はできません。
+- Groq / Cloudflare / Gemini は、確認変数がそろうまでモデル一覧取得も推論も行いません。これは契約プランをAPIから検証する仕組みではなく、利用者の明示確認です。プランやBilling設定を変更したら、確認変数を解除して再確認してください。
+- これら3社はコード側のFreeモデル許可リストに含まれるIDだけを呼び出し、明示指定でも有料・未許可モデルを拒否します。Free枠・モデルの提供条件は変更されるため、最新の提供元ページも確認してください。
 - 全プロバイダ未設定でも、知識検索と思考ノート（サブを呼ばない範囲）は使えます。
 
 ### 知識検索（検索ソース）のキー
@@ -458,6 +462,15 @@ wikipedia / wikidata / arxiv / doaj / npm / crates / europepmc / openaire / zeno
 hermes config set mcp_servers.freeagent-bind.env.OPENROUTER_API_KEY '${OPENROUTER_API_KEY}'
 hermes config set mcp_servers.freeagent-bind.env.NVIDIA_API_KEY '${NVIDIA_API_KEY}'
 hermes config set mcp_servers.freeagent-bind.env.HF_TOKEN '${HF_TOKEN}'
+# 以下は任意。キーだけでは有効化されず、プラン/データ条件の確認後に確認変数を設定します。
+hermes config set mcp_servers.freeagent-bind.env.GROQ_API_KEY '${GROQ_API_KEY}'
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_GROQ_FREE_TIER '1'
+hermes config set mcp_servers.freeagent-bind.env.CLOUDFLARE_API_TOKEN '${CLOUDFLARE_API_TOKEN}'
+hermes config set mcp_servers.freeagent-bind.env.CLOUDFLARE_ACCOUNT_ID '${CLOUDFLARE_ACCOUNT_ID}'
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_CLOUDFLARE_FREE_PLAN '1'
+hermes config set mcp_servers.freeagent-bind.env.GEMINI_API_KEY '${GEMINI_API_KEY}'
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_GEMINI_FREE_TIER '1'
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_GEMINI_UNPAID_DATA_ACK '1'
 hermes config set mcp_servers.freeagent-bind.env.OPENALEX_API_KEY '${OPENALEX_API_KEY}'
 hermes config set mcp_servers.freeagent-bind.env.GITHUB_TOKEN '${GITHUB_TOKEN}'
 hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_MAILTO 'you@example.com'
@@ -748,7 +761,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_HARNESS` | 空 | 起動元の目印。Hermes から使うなら `hermes`（[Hermes 以外で使うとき](#hermes-以外で使うとき)） |
 | `FREEAGENT_HARNESS_WARN` | 1 | `0` で Hermes 以外のときの警告を止める（判定結果は `structuredContent.harness` に残る） |
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |
-| `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface` | 一覧に出すプロバイダと優先順 |
+| `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini` | 一覧に出すプロバイダと優先順。オプション3社は契約確認変数が無い間は通信しない |
 | `FREEAGENT_AUTH_TTL` | 900 | 認証失敗を覚えて自動選抜から外す時間（秒） |
 | `FREEAGENT_PROBE_TIMEOUT` | 25.0 | 生存確認 1 件の読み取りタイムアウト（秒） |
 | `FREEAGENT_PROBE_WORKERS` | 8 | 生存確認の並列度（1〜8） |
@@ -776,6 +789,13 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `OPENROUTER_API_KEY` | 空 | OpenRouter の推論。無料 `:free` SKU でも必須（一覧は未認証でも取れる） |
 | `NVIDIA_API_KEY` | 空 | NVIDIA NIM の推論（一覧は未認証でも取れる。生存確認が必須） |
 | `HF_TOKEN`（別名 `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN`） | 空 | Hugging Face の推論。**Inference Providers 権限**が必要 |
+| `GROQ_API_KEY` | 空 | Groqの推論。Freeモデルallowlistは3 IDに固定。`FREEAGENT_GROQ_FREE_TIER=1`でFree tierを明示確認 |
+| `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` | 空 | Workers AIの推論とモデル検索。Workers AI Read権限が必要。Free plan確認は`FREEAGENT_CLOUDFLARE_FREE_PLAN=1` |
+| `GEMINI_API_KEY`（別名 `GOOGLE_API_KEY`） | 空 | Gemini Developer API。Free対象の2モデルのみ。Free tier確認とデータ利用同意を個別に設定 |
+| `FREEAGENT_GROQ_FREE_TIER` | 未設定（無効） | GroqアカウントがFree tierであることを明示確認。Developer tierは従量課金 |
+| `FREEAGENT_CLOUDFLARE_FREE_PLAN` | 未設定（無効） | Workers Free planであることを明示確認。Workers Paidでは日次割当超過分が課金される |
+| `FREEAGENT_GEMINI_FREE_TIER` | 未設定（無効） | GeminiプロジェクトのFree/unpaid tierを明示確認 |
+| `FREEAGENT_GEMINI_UNPAID_DATA_ACK` | 未設定（無効） | Gemini Free tierの入力・出力がGoogleの製品改善や人手レビューに使われる可能性を理解した確認 |
 | `FREEAGENT_API_KEY` | `proxy-attaches-real-credentials` | `nous` プロキシ用のダミー（実資格情報はプロキシが付与） |
 
 **知識検索（検索ソース）のキー・連絡先**
@@ -794,6 +814,8 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter の接続先 |
 | `FREEAGENT_NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | NVIDIA NIM の接続先 |
 | `FREEAGENT_HF_BASE_URL` | `https://router.huggingface.co/v1` | HF Inference Providers の接続先 |
+| `FREEAGENT_GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Groqの接続先（通常は変更不要） |
+| `FREEAGENT_GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` | Gemini APIのOpenAI互換接続先（Beta） |
 
 **蓄積ストアのパス上書き**（既定は `FREEAGENT_STATE_DIR` 配下。**作業状態・統計が消えない場所**に置く）
 

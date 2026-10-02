@@ -85,7 +85,11 @@ def main() -> int:
         "FREEAGENT_PROBE_TIMEOUT": "3",
     })
     for name in ("OPENROUTER_API_KEY", "NVIDIA_API_KEY", "HF_TOKEN",
-                 "HUGGINGFACE_API_KEY", "HUGGINGFACEHUB_API_TOKEN"):
+                 "HUGGINGFACE_API_KEY", "HUGGINGFACEHUB_API_TOKEN", "GROQ_API_KEY",
+                 "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "GEMINI_API_KEY",
+                 "GOOGLE_API_KEY", "FREEAGENT_GROQ_FREE_TIER",
+                 "FREEAGENT_CLOUDFLARE_FREE_PLAN", "FREEAGENT_GEMINI_FREE_TIER",
+                 "FREEAGENT_GEMINI_UNPAID_DATA_ACK"):
         env.pop(name, None)
 
     cmd = [sys.executable, os.path.join(ROOT, "src", "freeagent_bind", "server.py")]

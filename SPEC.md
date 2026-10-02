@@ -63,7 +63,7 @@
 
 ## 4. モデル解決と選抜
 
-### 4.1 プロバイダ（4 つ）
+### 4.1 プロバイダ（7 つ）
 
 | プロバイダ | base_url | Free 判定 | 一覧の取得 | 実測（2026-09 時点） |
 |---|---|---|---|---|
@@ -71,10 +71,24 @@
 | `openrouter` | `openrouter.ai/api/v1` | `:free` または pricing が全部 0 | **未認証可** | 458 モデル / Free 21 / 生存 11 |
 | `nvidia` | `integrate.api.nvidia.com/v1` | `free_kind="credit"`（全件が無料枠） | **未認証可** | 82 モデル / **55 件が 404=EOL** / 生存 15 |
 | `huggingface` | `router.huggingface.co/v1` | **提供元単位**（`providers[].is_free` または pricing 0） | **未認証可** | 137 モデル / Free 3 / 生存 1（`:together` は Cloudflare Error 1010 で要再確認） |
+| `groq` | `api.groq.com/openai/v1` | Free plan確認 + 3 ID許可リスト | API key必須 (`/models`) | 未実測（資格情報なし）。Free limitsは組織/モデル別 |
+| `cloudflare` | `api.cloudflare.com/client/v4/accounts/{id}/ai` | Workers Free確認 + 2 ID許可リスト | API token必須。`/models/search?format=openrouter` | 未実測（資格情報なし）。Free割当 10,000 Neurons/日 |
+| `gemini` | `generativelanguage.googleapis.com/v1beta/openai` | Unpaid確認・データ利用確認 + 2 ID許可リスト | API key必須 (`/models`) | 未実測（資格情報なし）。OpenAI互換はBeta |
+
+### 4.1.1 追加プロバイダの Free / 課金防護
+
+- Groq / Cloudflare / Gemini はAPIからアカウントの課金tierを確実に判定できないため、必要なAPI資格情報に加えて専用の確認envを必須にする。確認envは文字列 `1` / `true` / `yes` / `on` のいずれかのみ有効。値は利用者の申告であり、実際の契約をAPI検証するものではない。プラン/Billing設定を変更したら確認envを外す。
+- 3社はモデル一覧のpricingが0でもFreeとはみなさず、`free_model_ids` の完全一致だけをFreeにする。`call_model` の明示model指定も同じ許可リストで拒否し、catalogに出た有料/未知モデルへ直接HTTPしない。
+- Groqは `GROQ_API_KEY` と `FREEAGENT_GROQ_FREE_TIER=1` が揃った時だけ一覧/推論を有効化。許可IDは `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `qwen/qwen3.8-27b`。Free planの上限はモデル・組織ごとに変わるためアカウントのLimitsを確認し、Developer planは従量課金であることを警告する。
+- Cloudflareは `CLOUDFLARE_API_TOKEN`、32桁hexの`CLOUDFLARE_ACCOUNT_ID`、Workers AI Read権限、`FREEAGENT_CLOUDFLARE_FREE_PLAN=1` が揃った時のみ利用。チャットは `/v1/chat/completions`、モデル一覧はアカウントREST APIの`format=openrouter`を使う（互換APIの`/models`ではない）。Free許可IDは `@cf/openai/gpt-oss-20b` と `@cf/zai-org/glm-4.7-flash`。Workers Freeは10,000 Neurons/日超過後に処理停止、Workers Paidは超過分を課金するため、Free plan確認を外さない。CloudflareはCustomer Contentをモデル学習/サービス改善に使わないと明記する（ストレージサービス連携時は保存される可能性）。
+- Geminiは `GEMINI_API_KEY`（別名 `GOOGLE_API_KEY`）、`FREEAGENT_GEMINI_FREE_TIER=1`、`FREEAGENT_GEMINI_UNPAID_DATA_ACK=1` が全て揃った時のみ利用。許可IDは `gemini-3.8-flash` と `gemini-3.7-flash`。Free/unpaid tierでは入力・出力がGoogle製品改善に利用され、人手レビューされる場合があるため、機密・個人情報を送らない。
+- これらのallowlistはFree提供条件の保守対象。提供元仕様/モデル提供条件を定期確認し、実アカウントが無い状態では認証付き一覧・推論成功を主張しない。
+- 根拠: [Groq rate limits](https://console.groq.com/docs/rate-limits) / [billing](https://console.groq.com/docs/billing-faqs); [Cloudflare model search](https://developers.cloudflare.com/api/resources/ai/subresources/models/methods/list/) / [pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) / [OpenAI compatibility](https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/) / [data usage](https://developers.cloudflare.com/workers-ai/platform/data-usage/); [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) / [OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai) / [terms](https://ai.google.dev/gemini-api/terms).
 
 - **HF はトップレベルに料金と文脈長を持たない**。`providers[]` の各要素が `pricing` / `context_length` /
   `is_free` / `status` を持つので、`status == "live"` かつ無料の提供元があるときだけ Free と判定する
   （停止中の提供元を数えると「無料で使える」と嘘をつく）。文脈長は提供元の最大値。
+
 
 ### 4.2 一覧は実態と乖離する（`probe`）
 
