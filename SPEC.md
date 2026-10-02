@@ -21,7 +21,7 @@
 | §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳） |
 | §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
-| §5 | 知識バックエンド9種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13引用統合） |
+| §5 | 知識バックエンド14種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io） |
 | §6 | ツール実装（11本、§6.11 本文の注入番号・引用認定） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
@@ -149,6 +149,9 @@
 | europepmc | `www.ebi.ac.uk/europepmc/webservices/rest/search` | 不要 | core検索、全文利用条件は別、生命科学系 |
 | zenodo | `zenodo.org/api/records/` | 公開検索は匿名 | 説明メタデータCC0（メール除外）、非軍事用途、ファイル条件は別 |
 | ror | `api.ror.org/v2/organizations` | 今回は匿名 | 機関属性CC0、検索候補であって機関同定の確定ではない |
+| doaj | `doaj.org/api/search/articles/` | 不要（キーは発行者向け） | 記事メタデータCC0、全ルート2req/s、OA記事限定 |
+| npm | `registry.npmjs.org/-/v1/search` | 不要 | 公式公開API。説明は登録者の自己申告（審査結果ではない） |
+| crates | `crates.io/api/v1/crates` | 不要、識別UA必須 | Crawler Policy: 1req/s上限。説明は登録者の自己申告 |
 
 - 結果は**必ず `citation`（source / title / url / year / summary）に正規化**する。表示も注入もこの形だけを使う。
 - 取得はメモリ TTL キャッシュ + ホスト単位の遮断記憶。**同一キーは single-flight** で同時取得を 1 回にまとめ、エラー応答はキャッシュしない（回復後の再取得を妨げない）。キャッシュ値は複製して返し、呼び出し側の変更が共有状態に伝播しない。**LLM を介さない**（＝幻覚が入らない経路）。
@@ -160,7 +163,7 @@
 - 注入する本文は 1 件あたり `FREEAGENT_EVIDENCE_ITEM_CHARS`（既定 360）、全体で
   `FREEAGENT_EVIDENCE_TOTAL_CHARS`（既定 3200）に収める。入れすぎると小型 Free モデルが予算を
   使い切って空応答・切断になる（逆効果）。
-- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加5種は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。
+- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加8種（datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。
 - `fallback=true`のJSON真偽値だけが、自然語arXiv検索をDataCiteへ追加送信する明示許可。文字列`"true"`等は許可にしない。
 - 1 ソースの失敗で全体を落とさない（`errors` に集約し、成功分だけ返す）。
 
@@ -248,6 +251,27 @@
   CiNii（登録appid・用途承認・抄録権利）、CORE（検索/API組込み相談）。匿名200/CCライセンス/既定offは許諾の代わりにしない。
 - 条件: ROR IDs/metadata CC0 https://ror.org/terms/ 、Zenodo非軍事用途/メタデータCC0（メール例外） https://about.zenodo.org/terms/ https://about.zenodo.org/policies/ 。
   原典ファイルの条件は別。ソース間の登録範囲・検索順位・内容の同等性や24時間の応答安定性は保証しない。
+
+### 6.5 第4段階 DOAJ / npm / crates.io（§5.16）
+
+- 3種とも`SOURCES`/`KB_BACKENDS`へ追加するが`DEFAULT_SOURCES`は変更しない（明示指定のみ）。
+- **DOAJ**は`/api/search/articles/{query}`のパス埋め込み検索。`_literal_search`で各語を引用してAND結合し、
+  パスへは`urllib.parse.quote(…, safe="")`でエスケープする。DOIがあれば`https://doi.org/`を正規URLにする
+  （既存の引用統合がDOI別名で束ねられる）。抄録は実テキストだけを本文根拠にし、欠落は`metadata_only`。
+  記事メタデータはCC0（https://doaj.org/terms/ ）。公式レートは全ルート2req/s → プロセス内予算0.51秒。
+- **npm / crates**はパッケージレジストリ検索で、**説明文は登録者の自己申告**（審査・品質評価ではない）。
+  `summary_kind=registry_description`で論文抄録と区別する。npmはOpen Source Termsが「公式Public APIによる
+  複製」を明示許可（1.0秒間隔に自制）。crates.ioはCrawler Policyが1req/s＋識別UAを要求（1.01秒間隔、
+  UAは`KB_USER_AGENT`で連絡先入り）。`downloads`はint型のみ採用し、文字列等は黙って落とす。
+- 採用根拠（2026-10-02実測）: DOAJ 0.38〜0.45秒・npm 0.31〜0.58秒・crates 0.75〜0.78秒、いずれも抄録/説明つき。
+  DOAJはOpenAlex匿名検索の503/429時の科学系キーワード検索の受け皿、npm/cratesはGitHub未認証10req/minの
+  パッケージ系クエリの分流先になる。
+- 見送りの記録: PyPI / deps.devはキーワード検索APIが無い（名前直引きのみ）。PubMed / bioRxivはEurope PMCが
+  索引済みで重複。PLOSは10req/min＋5秒待機推奨が8秒締切と不整合。HALは検索APIは公開だがOAI条項の
+  非商用制限があり条件曖昧→保留群。Semantic Scholarは匿名が429頻発（実測3/3→再測でも429）でキー運用のみ
+  将来候補。OpenCitationsはキーワード検索が無くDOI引用数の補完用途のみ。
+- `measure_kb.py`はnpm/cratesにパッケージ系の問い（json schema validator等）を巡回させ、論文キーワードの
+  空振りと障害を混同しない（RORの機関名巡回と同じ考え方）。
 
 ## 7. ツールの規約（§6–§8）
 

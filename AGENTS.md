@@ -166,6 +166,13 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     既定6を維持し追加5は明示のみ。ROR6.1秒、Zenodo2.01秒のプロセス内間隔を他アプリ/IP全体の保証にしない。
     API規約が参照するAUP/bot/AI利用制限も実プローブ前に確認し、許諾未確認候補は登録しない。既定offは許諾ではない。
 
+30. **第4段階は検索できる公認APIだけ**（§5.16）。DOAJ（記事メタデータCC0・2req/s公認）/ npm（公式Public APIで
+    複製を明示許可）/ crates.io（Crawler Policy: 1req/s＋識別UA）を明示指定ソースとして追加。既定6は不変。
+    パッケージの説明文は**登録者の自己申告**であり審査結果ではない（`summary_kind=registry_description`で
+    論文抄録と区別し、品質・安全性の根拠として提示しない）。キーワード検索APIが無いもの（PyPI / deps.dev）、
+    既存ソースと重複するもの（PubMed / bioRxiv ⊂ Europe PMC）、レートが8秒締切と不整合なもの（PLOS 10req/min）、
+    条件曖昧なもの（HAL 非商用条項）は登録しない。DOAJはパス埋め込み検索なので検索語を必ずURLエスケープする。
+
 ## ライセンス
 
 MIT。データは各提供元の条件に従い、回答には出典を表示すること。

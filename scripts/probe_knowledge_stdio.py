@@ -72,6 +72,9 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
                 raise ValueError("ROR establishment must not be a publication year")
             if cite["source"] == "zenodo" and not {"file_license", "access_right"}.issubset(cite):
                 raise ValueError("Zenodo file conditions are missing")
+        if cite["source"] in ("npm", "crates"):
+            if cite.get("summary_kind") != "registry_description":
+                raise ValueError("package registry evidence kind mismatch")
         S._kb_http_url(cite["url"])
         if not set(cite.get("providers") or [cite["source"]]).issubset(served):
             raise ValueError("merged citation provider mismatch")

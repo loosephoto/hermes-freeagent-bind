@@ -91,6 +91,11 @@ def measure_round(index: int | None = None, sources: list[str] | None = None,
             names = ["CERN", "University of Tokyo", "Massachusetts Institute of Technology",
                      "University of Oxford", "CNRS", "Kyoto University"]
             query = names[(now.hour if index is None else index) % len(names)]
+        if src in ("npm", "crates"):
+            # パッケージ検索は論文キーワードだと空振りする。空振りと障害を混同しない
+            terms = ["json schema validator", "http client", "websocket server",
+                     "markdown parser", "logging library", "unit testing"]
+            query = terms[(now.hour if index is None else index) % len(terms)]
         start = time.monotonic()
         try:
             res = S.KB_BACKENDS[src](query, 3, {"lang": "ja", "kind": "repo", "datacite_kind": datacite_kind})

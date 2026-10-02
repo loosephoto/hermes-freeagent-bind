@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 11 個のツール。モデルは Nous / OpenRouter / NVIDIA NIM / Hugging Face、検索は **9 ソース（既定6＋明示指定3）** に対応します。
+- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face の 4 プロバイダ、検索は **14 ソース（既定6＋明示指定8）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 > **まず試すなら**：「出典つきで調べて」は知識検索、「この設計の弱点を別の AI にも聞いて」は相談です。
@@ -23,7 +23,7 @@
 - [出力の読み方](#出力の読み方)
 - [つまずいたとき](#つまずいたとき)
 - [期待しないこと（実測に基づく）](#期待しないこと実測に基づく)
-- [API キーと推論バックエンド](#api-キーと推論バックエンド)
+- [API キーの設定](#api-キーの設定)
 - [知識バックエンド](#知識バックエンド)
 - [自動的に使わせたいとき](#自動的に使わせたいとき)
 - [停止・再開する](#停止再開する)
@@ -84,7 +84,7 @@ hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_HARNESS hermes
 - **Nous**：Hermes 側で Portal にログイン済みであることを確認し、別のターミナルで `hermes proxy start`。
   未ログインなら `hermes portal` でログインします。プロキシは動かしたままにします。
 - **OpenRouter / NVIDIA / Hugging Face**：使いたい提供元の API キーを設定します。
-  全部のキーを用意する必要はありません（[入手先と設定方法](#api-キーと推論バックエンド)）。
+  全部のキーを用意する必要はありません（[入手先と設定方法](#api-キーの設定)）。
 
 **別の提供元を使うなら、Nous プロキシの起動は必須ではありません。**
 
@@ -403,30 +403,50 @@ Nous ローカルプロキシで確認されている制約です（他プロバ
 反論＋別案を付けた回は約 24 秒で、提案者 2 体のうち 1 体がタイムアウトしました。
 速度の保証や、現在のモデル全体の性能評価ではありません。
 
-検索拡張時のローカル実測（2026-10-01、同一Python、各5回の中央値。
+検索拡張時のローカル実測（2026-10-02、同一Python、各7回の中央値。
 起動〜initialize〜tools/list〜終了を含むため、起動単体の保証値ではありません）:
 
-| 測定 | 第1/第2段階HEAD（1e26ed2） | 第3段階追加後 |
+| 測定 | 第3段階HEAD（28f89d1） | 第4段階追加後 |
 |---|---:|---:|
 | ツール数 | 11 | 11 |
-| ツール一覧JSON文字数（ensure_ascii=false・compact） | 12,981 | 13,116 |
-| stdioプロセス往復・終了 | 0.2018秒 | 0.1932秒 |
+| ツール一覧JSON文字数（ensure_ascii=false・compact） | 13,116 | 13,220 |
+| stdioプロセス往復・終了 | 0.2216秒 | 0.2267秒 |
 
 検索APIの追加は推論モデルの能力を増やしません。ツールスキーマの増加もメインLLMの入力負担になります。
 
-## API キーと推論バックエンド
+## API キーの設定
 
-使う提供元だけ設定します。**キーがあること、モデル一覧が見えること、実際に推論できることは別です。**
+**キーは「推論（サブ LLM）用」と「知識検索用」の 2 系統に分かれます。** 使う提供元だけ設定してください。
+キーがあること、モデル一覧が見えること、実際に推論できることは別です。
 
-| 提供元・キー | 用途・未設定時 | 入手先・注意点 |
+### 推論バックエンド（サブ LLM）の接続
+
+別の AI に答えさせる機能（`ask` / `panel` / `consult` / `grounded` / `agent` / `map` / `fanout`、
+`think` の `verify` / `propose_alternatives`）で使います。**4 プロバイダのうち、使うものを 1 つ以上**用意します。
+
+| プロバイダ | 必要なもの | 入手先・注意点 |
 |---|---|---|
-| Nous（推論用キーは不要） | ローカルプロキシ経由。停止中は使えません | `hermes portal` / `hermes proxy start`。Portal のログインと利用枠が必要 |
-| `OPENROUTER_API_KEY` | OpenRouter の推論。未設定でもモデル一覧は取得可能 | [API Keys](https://openrouter.ai/settings/keys)。`:free` でもレート制限やモデル単位の拒否があります |
-| `NVIDIA_API_KEY` | NVIDIA NIM の推論。未設定なら一覧のみ | [NVIDIA Build](https://build.nvidia.com)。一覧に未有効・廃止モデルが混じります |
-| `HF_TOKEN` | Hugging Face の推論。未設定なら一覧のみ | [Access Tokens](https://huggingface.co/settings/tokens)。Inference Providers の権限と残りクレジットを確認 |
-| `OPENALEX_API_KEY` | OpenAlex 検索。匿名検索が止められる場合があるので推奨 | [API 設定](https://openalex.org/settings/api)。キーがあっても利用上限はあります |
-| `GITHUB_TOKEN` / `GH_TOKEN` | GitHub の検索。コード検索は必須 | [Tokens](https://github.com/settings/tokens)。リポジトリ・Issue は未認証でも利用可能ですが枠が小さくなります |
-| `FREEAGENT_MAILTO` | Crossref / OpenAlex / DataCite 用の連絡先。キーではありません | 自分のメールアドレス。未設定でも他ソースの利用は可能 |
+| **Nous**（キー不要） | `hermes proxy start` で起動するローカルプロキシ | `hermes portal` でログイン。Portal の利用枠が必要。プロキシ停止中はこのプロバイダだけ使えません |
+| **OpenRouter** | `OPENROUTER_API_KEY` | [API Keys](https://openrouter.ai/settings/keys)。`:free` モデルでもキーは必須。レート制限・モデル単位の拒否があります |
+| **NVIDIA NIM** | `NVIDIA_API_KEY` | [NVIDIA Build](https://build.nvidia.com)。一覧に未有効・廃止モデルが混じるため生存確認を推奨 |
+| **Hugging Face** | `HF_TOKEN` | [Access Tokens](https://huggingface.co/settings/tokens)。**Make calls to Inference Providers** 権限と月次クレジット残が必要 |
+
+- 未設定のプロバイダは「モデル一覧の取得のみ」になり、推論はできません。
+- 全プロバイダ未設定でも、知識検索と思考ノート（サブを呼ばない範囲）は使えます。
+
+### 知識検索（検索ソース）のキー
+
+検索は**基本的にキー不要**です。以下は任意ですが、設定すると安定・高速になります。
+
+| 変数 | 対象ソース | 効果・注意点 |
+|---|---|---|
+| `OPENALEX_API_KEY` | openalex | 匿名検索が提供元側で止められることがあり（実測 503/429）、キーで回避。[API 設定](https://openalex.org/settings/api) |
+| `GITHUB_TOKEN` / `GH_TOKEN` | github | コード検索は必須。リポジトリ / Issue 検索は未認証でも可（枠 10 req/分と小さい） |
+| `FREEAGENT_MAILTO` | crossref / openalex / datacite | キーではなく連絡先。polite pool に入り安定します |
+
+wikipedia / wikidata / arxiv / doaj / npm / crates / europepmc / openaire / zenodo / ror はキー不要・匿名で使えます。
+
+### キーの渡し方
 
 **このサーバーは `.env` を自動で読みません。** Hermes の MCP `env` へ渡してください。
 最近の Hermes は [環境変数参照](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference#environment-variable-references)
@@ -478,9 +498,12 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `europepmc`（明示指定） | 医学・生命科学系の抄録・書誌 | `core`検索。全文は取得せず、プレプリント種別・ライセンスを保持 |
 | `zenodo`（明示指定） | 研究データ・ソフトウェア・論文等の公開メタデータ | 説明・注記を取得。全文/ファイルは取得しない。メタデータCC0とファイル条件を分離 |
 | `ror`（明示指定） | 研究機関の候補・種別・国・都市・設立年 | v2の構造化情報。論文検索ではなく機関情報の補完。機関を自動同定しない |
+| `doaj`（明示指定） | オープンアクセス誌の記事メタデータ・抄録 | 記事メタデータはCC0。OA記事限定。OpenAlexが不安定なときの科学系検索の受け皿 |
+| `npm`（明示指定） | npm パッケージの検索結果（名前・説明・版・リンク） | 説明は登録者の自己申告で、品質・安全性の審査結果ではありません |
+| `crates`（明示指定） | crates.io のクレート検索結果（名前・説明・版・DL数） | 同上。Rust パッケージ。GitHub の検索枠を消費しません |
 
 `sources` を省略すると**従来の6ソースのみ**、指定すると指定したソースだけを検索します。
-追加5ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
+追加8ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
 `limit` は**各ソースの上限**です。全体の結果は重複除去などで減るので、合計件数を保証する値ではありません。
 本文という場合も、取得できた説明・導入部・アブストラクトを指します。原典の全文とは限りません。
 
@@ -489,7 +512,8 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 - **第1段階：DataCite** — 「arXiv論文をDataCiteから探して」「その研究に使えるデータセットを探して」。
 - **第2段階：OpenAIRE / Europe PMC** — 「OpenAIREでも論文を探して」「生命科学の根拠をEurope PMCから探して」。
 - **第3段階：Zenodo / ROR** — 「Zenodoでグラフェンの研究データを探して」「RORでCERNの機関候補を探して」。公開メタデータだけを使います。
-- **元の候補4APIは保留** — J-STAGE（用途/商用承認・主コンテンツ・保存条件）、Stack Exchange（AI開発/テスト向け自動取得の事前書面許諾）、CiNii（appid登録・用途承認・抄録権利）、CORE（検索/API組込みの相談）。既定offだけでは利用許諾にならないため、まだ登録しません。
+- **第4段階：DOAJ / npm / crates.io** — 「DOAJでオープンアクセス論文を探して」「npmでJSONスキーマ検証のパッケージを探して」「crates.ioで非同期HTTPクライアントを探して」。DOAJは科学系、npm / crates.ioはプログラミング系の検索を広げます。
+- **保留中の候補** — J-STAGE（用途/商用承認・主コンテンツ・保存条件）、Stack Exchange（AI開発/テスト向け自動取得の事前書面許諾）、CiNii（appid登録・用途承認・抄録権利）、CORE（検索/API組込みの相談）、HAL（抽出データの非商用条項が曖昧）、Semantic Scholar（匿名は429頻発。無料キー運用なら将来候補）。既定offだけでは利用許諾にならないため、まだ登録しません。
 
 ツールへ渡す引数の例（端末コマンドではありません）:
 
@@ -504,6 +528,11 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 {"query":"graphene","sources":["zenodo"],"limit":2}
 // 研究機関の候補（論文抄録ではありません）
 {"query":"CERN","sources":["ror"],"limit":2}
+// オープンアクセス論文の検索（記事メタデータCC0）
+{"query":"transformer attention mechanism","sources":["doaj"],"limit":2}
+// プログラミング: npm / crates.io のパッケージ検索（説明は登録者の自己申告）
+{"query":"json schema validator","sources":["npm"],"limit":2}
+{"query":"async http client","sources":["crates"],"limit":2}
 // 自然語arXiv検索の失敗・遅延時にのみ、DataCiteの追加利用を明示許可
 {"query":"language model hallucination","sources":["arxiv"],"fallback":true,"limit":2}
 ```
@@ -571,12 +600,14 @@ Zenodoも説明のない結果には、ファイルを読んだかのような�
 後の再検証ではEurope PMCが6.21秒まで変動しましたが、8秒の締切内で取得できました。
 第3段階の実stdio検証（同日、`CERN`、各2件）ではZenodoが2.33秒、RORが0.87秒、取得4件中3件に根拠テキストがありました。
 これは第1/第2段階の速度とは異なる問いのスポット計測です。
+第4段階の実stdio検証（2026-10-02）: DOAJ 0.38秒（`transformer attention mechanism`・抄録2件）、
+npm 0.34秒（`json schema validator`・説明2件）、crates.io 0.78秒（`async http client`・説明2件）。
 **代替APIにも速度のムラがあります。一時点の成功は24時間の安定性の保証ではありません**。
 
 | 症状 | 理由・対処 |
 |---|---|
 | 追加ソースが検索されない | `sources`に明示指定してください。既定6ソースは変えていません |
-| 「ローカルのアクセス間隔制御」 | 同じホストの予算待ちです。DataCiteは0.61秒、Europe PMCは1秒、OpenAIREは60.1秒、Zenodoは2.01秒、RORは6.1秒間隔。待機せずエラーを返すため表示された秒数後に再試行 |
+| 「ローカルのアクセス間隔制御」 | 同じホストの予算待ちです。DataCiteは0.61秒、Europe PMCは1秒、OpenAIREは60.1秒、Zenodoは2.01秒、RORは6.1秒、DOAJは0.51秒、npmは1秒、crates.ioは1.01秒間隔。待機せずエラーを返すため表示された秒数後に再試行 |
 | OpenAIREを別プロセスでも使う | 間隔制御はプロセス内のみ。同一IPの別MCP/CLIを含め提供元の枠を共有するため、並行実行を避ける。今回のOpenAIRE認証枠の拡張は未実装 |
 | 書誌はあるがgroundedの根拠がない | 抄録無しの追加ソースは本文を生成で補いません。別ソースを明示指定 |
 | arXivの代替が起動しない | `fallback=true`、自然語検索、締切内、障害/遅延という条件を確認 |
@@ -587,7 +618,11 @@ Zenodoも説明のない結果には、ファイルを読んだかのような�
 python scripts/probe_knowledge_stdio.py
 python scripts/probe_knowledge_stdio.py --sources datacite --datacite-kind dataset --query graphene
 python scripts/probe_knowledge_stdio.py --sources zenodo ror --query CERN
+python scripts/probe_knowledge_stdio.py --sources doaj --query "machine learning"
+python scripts/probe_knowledge_stdio.py --sources npm --query "json schema validator"
+python scripts/probe_knowledge_stdio.py --sources crates --query "async http client"
 python scripts/measure_kb.py --sources zenodo ror
+python scripts/measure_kb.py --sources doaj npm crates
 python scripts/measure_kb.py --sources datacite openaire europepmc
 python scripts/measure_kb.py --sources datacite --datacite-kind dataset
 python scripts/measure_kb.py --report
@@ -600,7 +635,10 @@ python scripts/measure_kb.py --report
 [OpenAIRE](https://graph.openaire.eu/docs/apis/terms) /
 [Europe PMC](https://europepmc.org/RestfulWebService) /
 [Zenodo](https://about.zenodo.org/terms/)（非軍事用途のみ・ファイル条件は別） /
-[ROR](https://ror.org/terms/)（IDs/metadataはCC0）。リンク先全文の利用条件はメタデータの条件とは別です。
+[ROR](https://ror.org/terms/)（IDs/metadataはCC0） /
+[DOAJ](https://doaj.org/terms/)（記事メタデータCC0・レートは全ルート2req/s） /
+[npm](https://www.npmjs.com/policies/open-source-terms)（Public APIsによる複製を明示許可） /
+[crates.io](https://crates.io/policies)（Crawler Policy: 1req/s・識別UA必須）。リンク先全文・パッケージ本体の利用条件はメタデータの条件とは別です。
 元候補の保留根拠: [J-STAGE](https://www.jstage.jst.go.jp/static/pages/WebAPI/-char/ja) /
 [Stack Exchange AUP](https://stackoverflow.com/legal/acceptable-use-policy) /
 [CiNii登録](https://support.nii.ac.jp/ja/cinii/api/developer) / [CORE](https://core.ac.uk/terms)。
@@ -724,24 +762,29 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_ARXIV_INTERVAL` | 3.0 | arXiv の最小呼び出し間隔（秒） |
 | `FREEAGENT_EVIDENCE_ITEM_CHARS` / `_TOTAL_CHARS` | 360 / 3200 | 根拠本文をサブLLMへ注入する 1 件あたり・全体の上限（0 で本文を入れない） |
 | `FREEAGENT_EMPTY_TOKEN_FLOOR` / `_CAP` | 512 / 2048 | 空応答時の予算引き上げ幅 |
-| `FREEAGENT_USER_AGENT` | `hermes-freeagent-bind/0.1 (+…/hermes-freeagent-bind)` | 知識 API に名乗る UA（連絡先入りが望ましい） |
-| `FREEAGENT_MAILTO` | 空 | Crossref / OpenAlex の polite pool 用メールアドレス |
+| `FREEAGENT_USER_AGENT` | `hermes-freeagent-bind/0.1 (+…/hermes-freeagent-bind)` | 知識 API に名乗る UA（連絡先入りが望ましい。crates.io は識別可能な UA が必須） |
 | `FREEAGENT_CONNECT_TIMEOUT` / `FREEAGENT_READ_TIMEOUT` | 10.0 / 180.0 | 外部 HTTP の (connect, read) タイムアウト（秒） |
 | `FREEAGENT_KB_TTL` / `FREEAGENT_KB_TIMEOUT` | 1800.0 / 20.0 | 知識取得のキャッシュ TTL・読み取りタイムアウト（秒） |
 | `FREEAGENT_TRACE` / `FREEAGENT_STATS` / `FREEAGENT_COOLDOWN` | 1 | トレース・品質統計・クールダウンの記録 |
 | `FREEAGENT_DEBUG_LOG` | 空 | 指定パスへ stdio の送受信を 1 行ずつ追記（クライアント互換の切り分け用） |
 | `FREEAGENT_HERMES_BIN` | `hermes`（`which` で探索） | `freeagent_delegate` に使う実行ファイル |
 
-**キー（プロバイダの資格情報）**
+**推論バックエンド（サブ LLM）のキー**
 
 | 変数 | 既定 | 意味 |
 |---|---|---|
 | `OPENROUTER_API_KEY` | 空 | OpenRouter の推論。無料 `:free` SKU でも必須（一覧は未認証でも取れる） |
 | `NVIDIA_API_KEY` | 空 | NVIDIA NIM の推論（一覧は未認証でも取れる。生存確認が必須） |
 | `HF_TOKEN`（別名 `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN`） | 空 | Hugging Face の推論。**Inference Providers 権限**が必要 |
+| `FREEAGENT_API_KEY` | `proxy-attaches-real-credentials` | `nous` プロキシ用のダミー（実資格情報はプロキシが付与） |
+
+**知識検索（検索ソース）のキー・連絡先**
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
 | `OPENALEX_API_KEY` | 空 | OpenAlex の検索。無いと匿名検索が停止されうる |
 | `GITHUB_TOKEN` / `GH_TOKEN` | 空 | GitHub のレート制限緩和（コード検索は必須） |
-| `FREEAGENT_API_KEY` | `proxy-attaches-real-credentials` | `nous` プロキシ用のダミー（実資格情報はプロキシが付与） |
+| `FREEAGENT_MAILTO` | 空 | Crossref / OpenAlex / DataCite の polite pool 用メールアドレス（キーではない） |
 
 **接続先の上書き（通常は触らない）**
 
@@ -828,4 +871,4 @@ python scripts/measure_kb.py --unschedule  # 登録したタスクを解除
 
 ## ライセンス
 
-MIT。データは各提供元（arXiv / Crossref / OpenAlex / Wikimedia / GitHub）の条件に従って利用し、回答には出典を表示してください。
+MIT。データは各提供元（arXiv / Crossref / OpenAlex / Wikimedia / GitHub、明示指定の DataCite / OpenAIRE / Europe PMC / Zenodo / ROR / DOAJ / npm / crates.io）の条件に従って利用し、回答には出典を表示してください。

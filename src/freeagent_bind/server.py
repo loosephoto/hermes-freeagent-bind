@@ -13,7 +13,8 @@
                                              §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 /
                                              §2.7 思考台帳の構造（分解・改訂・分岐・仮説））
   §3 プロバイダとモデル  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
-                    §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR）
+                    §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR /
+                    §5.16 DOAJ・npm・crates.io）
   §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号）
   §7 ツール定義         §8 表示（content）
   §8.5 失敗時の「次の一手」（structuredContent.next_action）
@@ -2937,6 +2938,147 @@ KB_BACKENDS.update({"zenodo": lambda q, limit, opts: kb_zenodo(q, limit),
                     "ror": lambda q, limit, opts: kb_ror(q, limit)})
 
 
+# ---------------------------------------------------------------- §5.16 第4段階: DOAJ / npm / crates.io（明示指定のみ）
+#
+# 採用根拠（2026-10-02 の利用条件確認と実プローブ）:
+#   * DOAJ: 記事メタデータは CC0 明記（doaj.org/terms/）。公式レート制限は全ルート 2 req/s。
+#     匿名・キー不要で記事のキーワード+抄録検索ができる（OpenAlex 匿名検索の 503/429 時の科学系の受け皿）。
+#   * npm registry: /-/v1/search は公式公開 API。Open Source Terms が「Public APIs による複製」を明示許可。
+#     レート数値の公表は無いが責任ある利用が前提 → プロセス内 1 req/s に自制。
+#   * crates.io: Crawler Policy が「最大 1 req/s + 識別可能な User-Agent」を要求。KB_USER_AGENT は連絡先入り。
+# いずれも論文全文・パッケージ本体は取得しない（検索メタデータのみ）。PyPI / deps.dev はキーワード検索 API が
+# 無い（名前直引きのみ）ため登録しない。PubMed / bioRxiv は Europe PMC が索引済みで重複、PLOS は 10 req/min
+# で 8 秒締切と不整合、HAL は商用利用条項が曖昧なため保留（規約 29 の保留群と同じ扱い）。
+
+
+def kb_doaj(query: str, limit: int = 5) -> dict:
+    """DOAJ のオープンアクセス記事メタデータ（CC0）。抄録を本文根拠に使う。全文は取得しない。"""
+    query = as_str(query)
+    limit = as_int(limit, 5, 1, 20)
+    if not query:
+        return {"source": "doaj", "error": "query は必須です"}
+    def produce():
+        path = urllib.parse.quote(_literal_search(query), safe="")
+        data, err = _kb_new_json("https://doaj.org/api/search/articles/" + path
+                                + "?" + urllib.parse.urlencode({"pageSize": limit}), 0.51)
+        if err:
+            return {"source": "doaj", "error": err}
+        rows = _kb_array(_kb_object(data, "DOAJ応答").get("results"), "results")
+        items = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                raise ValueError("DOAJ record はオブジェクトではありません")
+            bib = _kb_object(row.get("bibjson"), "bibjson")
+            title = _plain_text(as_str(bib.get("title")), 300)
+            if not title:
+                continue
+            doi = next((as_str(i.get("id")) for i in _kb_array(bib.get("identifier"), "identifier")
+                        if isinstance(i, dict) and as_str(i.get("type")).lower() == "doi"), "")
+            link = next((as_str(l.get("url")) for l in _kb_array(bib.get("link"), "link")
+                         if isinstance(l, dict) and as_str(l.get("url"))), "")
+            if doi:
+                link = "https://doi.org/" + doi
+            if not link:
+                continue
+            journal = _kb_object(bib.get("journal"), "journal")
+            authors = [as_str(a.get("name")) for a in _kb_array(bib.get("author"), "author")
+                       if isinstance(a, dict)]
+            summary = _plain_text(as_str(bib.get("abstract")), 600)
+            items.append({"title": title, "url": link, "doi": doi, "year": as_str(bib.get("year")),
+                          "summary": summary, "authors": [a for a in authors if a][:8],
+                          "journal": _plain_text(as_str(journal.get("title")), 200),
+                          "metadata_only": not bool(summary)})
+        return _kb_paper_result("doaj", items,
+                               attribution="データ提供: DOAJ（記事メタデータCC0） https://doaj.org/")
+    return _kb_new_cached(f"doaj:{query}:{limit}", "doaj", produce)
+
+
+def _kb_package_result(source: str, items: list[dict], attribution: str) -> dict:
+    """パッケージ検索の正規化。説明文はレジストリ登録者の自己申告で、品質・安全性の審査結果ではない。"""
+    cites = []
+    for item in items:
+        summary = item.get("summary") or ""
+        cite = _cite(source, item["title"], item["url"], year=item.get("year") or "",
+                     metadata_only=not bool(summary), attribution=attribution,
+                     summary_kind="registry_description")
+        cite["summary"] = summary
+        for field in ("version", "downloads", "repository_url", "keywords"):
+            if item.get(field):
+                cite[field] = item[field]
+        cites.append(cite)
+    return {"source": source, "items": items, "citations": cites, "attribution": attribution,
+            "error": "" if items else "該当なし"}
+
+
+def kb_npm(query: str, limit: int = 5) -> dict:
+    """npm 公式レジストリのパッケージ検索。説明は登録者の自己申告（審査結果ではない）。"""
+    query = as_str(query)
+    limit = as_int(limit, 5, 1, 20)
+    if not query:
+        return {"source": "npm", "error": "query は必須です"}
+    def produce():
+        data, err = _kb_new_json("https://registry.npmjs.org/-/v1/search?"
+                                + urllib.parse.urlencode({"text": query, "size": limit}), 1.0)
+        if err:
+            return {"source": "npm", "error": err}
+        rows = _kb_array(_kb_object(data, "npm応答").get("objects"), "objects")
+        items = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                raise ValueError("npm object はオブジェクトではありません")
+            pkg = _kb_object(row.get("package"), "package")
+            name = as_str(pkg.get("name"))
+            if not name:
+                continue
+            links = _kb_object(pkg.get("links"), "links")
+            link = as_str(links.get("npm")) or "https://www.npmjs.com/package/" + urllib.parse.quote(name, safe="")
+            summary = _plain_text(as_str(pkg.get("description")), 400)
+            keywords = [as_str(k) for k in _kb_array(pkg.get("keywords"), "keywords") if as_str(k)]
+            items.append({"title": name, "url": link, "version": as_str(pkg.get("version")),
+                          "year": as_str(pkg.get("date"))[:4], "summary": summary,
+                          "repository_url": as_str(links.get("repository")),
+                          "keywords": keywords[:8], "metadata_only": not bool(summary)})
+        return _kb_package_result("npm", items,
+                                  "データ提供: npm public registry https://registry.npmjs.org/")
+    return _kb_new_cached(f"npm:{query}:{limit}", "npm", produce)
+
+
+def kb_crates(query: str, limit: int = 5) -> dict:
+    """crates.io のクレート検索。Crawler Policy（1 req/s・識別UA）に従う。"""
+    query = as_str(query)
+    limit = as_int(limit, 5, 1, 20)
+    if not query:
+        return {"source": "crates", "error": "query は必須です"}
+    def produce():
+        data, err = _kb_new_json("https://crates.io/api/v1/crates?"
+                                + urllib.parse.urlencode({"q": query, "per_page": limit}), 1.01)
+        if err:
+            return {"source": "crates", "error": err}
+        rows = _kb_array(_kb_object(data, "crates.io応答").get("crates"), "crates")
+        items = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                raise ValueError("crates.io record はオブジェクトではありません")
+            name = as_str(row.get("name"))
+            if not name:
+                continue
+            summary = _plain_text(as_str(row.get("description")), 400)
+            items.append({"title": name, "url": "https://crates.io/crates/" + urllib.parse.quote(name, safe=""),
+                          "version": as_str(row.get("max_stable_version")) or as_str(row.get("max_version")),
+                          "year": as_str(row.get("updated_at"))[:4], "summary": summary,
+                          "repository_url": as_str(row.get("repository")),
+                          "downloads": row.get("downloads") if type(row.get("downloads")) is int else None,
+                          "metadata_only": not bool(summary)})
+        return _kb_package_result("crates", items, "データ提供: crates.io https://crates.io/")
+    return _kb_new_cached(f"crates:{query}:{limit}", "crates", produce)
+
+
+SOURCES = (*SOURCES, "doaj", "npm", "crates")
+KB_BACKENDS.update({"doaj": lambda q, limit, opts: kb_doaj(q, limit),
+                    "npm": lambda q, limit, opts: kb_npm(q, limit),
+                    "crates": lambda q, limit, opts: kb_crates(q, limit)})
+
+
 # ================================================================ §6 ツール実装
 #
 # どのツールも例外を外へ漏らさず、content（人間向け）と structuredContent（LLM向け純粋JSON）を
@@ -4573,7 +4715,8 @@ TOOLS: list[dict] = [
         "description": (
             "【使う条件】出典URLが要る／判断の前に知識を補強したい／LLM を介さず一次情報に当たりたい。"
             "【差分】LLM を使わないので幻覚が無い。arXiv・Crossref・OpenAlex（論文）／Wikipedia・Wikidata"
-            "（百科・構造化）／GitHub（コード）を並列に引く。追加の datacite / openaire / europepmc / zenodo / ror は"
+            "（百科・構造化）／GitHub（コード）を並列に引く。追加の datacite / openaire / europepmc / zenodo / ror / "
+            "doaj（OA論文）/ npm / crates（パッケージ検索）は"
             "sources で明示指定する。DataCite は自然語の各語を AND 検索、datacite_kind=dataset で研究データ。"
             "fallback=true のときだけ自然語 arXiv検索の失敗/遅延を DataCite で代替する（取得元を明示）。"
             "【使わない条件】単一の事実だけなら web_search が速い。"
@@ -4583,7 +4726,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "query": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / europepmc / zenodo / ror"},
+                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
                 "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語（既定 ja）"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須）"},
@@ -4608,7 +4751,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "question": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6種。明示追加: datacite / openaire / europepmc / zenodo / ror。RORは機関属性、Zenodoは説明メタデータで全文ではない"},
+                            "description": "既定6種。明示追加: datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / cratesの説明は登録者の自己申告"},
                 "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
                 "limit": {"type": "integer"},
