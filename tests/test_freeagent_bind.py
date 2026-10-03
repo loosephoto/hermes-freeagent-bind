@@ -1016,6 +1016,239 @@ class TestMultiProvider(unittest.TestCase):
         self.assertNotIn("401", upstream.split("（")[0])
 
 
+class TestProviderAvailabilityDiagnostics(unittest.TestCase):
+    def test_provider_status_separates_setup_catalog_and_free_eligibility(self):
+        specs = {
+            "missing": {"key_env": "MISSING_KEY", "free_kind": "pricing"},
+            "proxy": {"always_ready": True, "free_kind": "pricing"},
+            "empty": {"always_ready": True, "free_kind": "pricing"},
+            "paid": {"always_ready": True, "free_kind": "pricing"},
+            "free": {"always_ready": True, "free_kind": "pricing"},
+        }
+        catalogs = {
+            "missing": [], "proxy": [], "empty": [],
+            "paid": [{"id": "paid/model", "provider": "paid", "free": False}],
+            "free": [{"id": "free/model", "provider": "free", "free": True}],
+        }
+        cache = {"proxy": {"error": "URLError: connection refused"}}
+        with (
+            unittest.mock.patch.object(S, "PROVIDER_ORDER", list(specs)),
+            unittest.mock.patch.object(S, "PROVIDER_SPECS", specs),
+            unittest.mock.patch.object(S, "_MODELS_CACHE", cache),
+            unittest.mock.patch.object(S, "fetch_provider_models", side_effect=lambda p: catalogs[p]),
+        ):
+            rows = {row["provider"]: row for row in S.provider_status()}
+
+        self.assertEqual(rows["missing"]["state"], "needs_configuration")
+        self.assertEqual(rows["proxy"]["state"], "endpoint_unreachable")
+        self.assertEqual(rows["empty"]["state"], "empty_catalog")
+        self.assertEqual(rows["paid"]["state"], "no_free_candidates")
+        self.assertEqual(rows["free"]["state"], "candidate_unverified")
+        self.assertFalse(rows["missing"]["ready"])
+        self.assertTrue(rows["free"]["ready"])
+
+    def test_models_summary_reports_unreachable_endpoint_separately_from_no_free_models(self):
+        providers = [{"provider": "nous", "state": "endpoint_unreachable", "models": 0, "free": 0}]
+        with (
+            unittest.mock.patch.object(S, "provider_status", return_value=providers),
+            unittest.mock.patch.object(S, "free_model_refs", return_value=[]),
+            unittest.mock.patch.object(S, "cooling_refs", return_value={}),
+            unittest.mock.patch.object(S, "default_model", return_value=""),
+        ):
+            got = S.tool_models({})
+
+        self.assertEqual(got["availability"]["state"], "endpoint_unreachable")
+        self.assertEqual(got["availability"]["free_candidates"], 0)
+        self.assertEqual(got["availability"]["usable_now"], 0)
+
+    def test_no_model_failure_includes_provider_availability_diagnostics(self):
+        providers = [{"provider": "nous", "ready": True, "state": "endpoint_unreachable"}]
+        with (
+            unittest.mock.patch.object(S, "provider_status", return_value=providers),
+            unittest.mock.patch.object(S, "free_model_refs", return_value=[]),
+        ):
+            got = S._no_models()
+
+        self.assertEqual(got["availability"]["state"], "endpoint_unreachable")
+        self.assertEqual(got["providers"], providers)
+
+    def test_no_model_diagnostic_reports_all_candidates_cooling(self):
+        providers = [{"provider": "nous", "ready": True, "state": "candidate_unverified"}]
+        with (
+            unittest.mock.patch.object(S, "provider_status", return_value=providers),
+            unittest.mock.patch.object(S, "free_model_refs", return_value=["nous/shared/model"]),
+            unittest.mock.patch.object(S, "is_cooling", return_value=True),
+        ):
+            got = S._no_models()
+
+        self.assertEqual(got["availability"]["state"], "all_candidates_cooling")
+        self.assertEqual(got["availability"]["free_candidates"], 1)
+        self.assertEqual(got["availability"]["usable_now"], 0)
+
+    def test_unavailable_backend_advice_uses_provider_status(self):
+        got = S.error_advice({
+            "error": "推論可能な Free モデルが 0 件です。",
+            "availability": {"state": "endpoint_unreachable"},
+            "providers": [{"provider": "nous", "state": "endpoint_unreachable", "ready": True}],
+        })
+        self.assertEqual(got["kind"], "unavailable_backend")
+        self.assertIn("hermes proxy status", got["check"])
+        self.assertIn("hermes proxy start", got["reenable"])
+
+    def test_models_marks_uncooldown_count_as_unverified_not_immediately_usable(self):
+        providers = [{"provider": "openrouter", "ready": True, "state": "candidate_unverified",
+                      "models": 3, "free": 2, "error": ""}]
+        with (
+            unittest.mock.patch.object(S, "provider_status", return_value=providers),
+            unittest.mock.patch.object(S, "free_model_refs", return_value=["openrouter/a", "openrouter/b"]),
+            unittest.mock.patch.object(S, "is_cooling", side_effect=[False, True]),
+            unittest.mock.patch.object(S, "cooling_refs", return_value={}),
+            unittest.mock.patch.object(S, "default_model", return_value="openrouter/a"),
+        ):
+            data = S.tool_models({})
+            text = S.render("freeagent_models", data)
+
+        self.assertEqual(data["usable_now"], 1)
+        self.assertEqual(data["availability"]["usable_now"], 1)
+        self.assertIn("クールダウン外 1", text)
+        self.assertIn("候補あり・推論未検証", text)
+        self.assertNotIn("今すぐ使用可", text)
+
+    def test_unverified_candidates_offer_explicit_probe_only(self):
+        got = S.error_advice({
+            "error": "推論可能な Free モデルが 0 件です。",
+            "availability": {"state": "candidate_unverified", "free_candidates": 105,
+                              "usable_now": 105},
+            "providers": [{"provider": "openrouter", "state": "candidate_unverified"}],
+        })
+        self.assertEqual(got["kind"], "unavailable_backend")
+        self.assertIn("probe=true", got["check"] + got["advice"])
+        self.assertIn("明示", got["advice"])
+        self.assertIn("自動", got["advice"])
+
+    def test_models_render_explains_unreachable_backend(self):
+        text = S.render("freeagent_models", {
+            "providers": [], "total_models": 0, "free_candidates": 0, "usable_now": 0,
+            "default_model": "", "availability": {"state": "endpoint_unreachable"},
+        })
+        self.assertIn("接続先に到達できません", text)
+
+    def test_models_refresh_requests_error_catalogs_without_probing(self):
+        calls = []
+
+        def status(**kwargs):
+            calls.append(kwargs)
+            return [{"provider": "nous", "ready": True, "models": 0, "free": 0,
+                     "state": "endpoint_unreachable"}]
+
+        with (
+            unittest.mock.patch.object(S, "provider_status", side_effect=status),
+            unittest.mock.patch.object(S, "free_model_refs", return_value=[]),
+            unittest.mock.patch.object(S, "cooling_refs", return_value={}),
+            unittest.mock.patch.object(S, "default_model", return_value=""),
+            unittest.mock.patch.object(S, "all_models", side_effect=AssertionError("not search mode")),
+            unittest.mock.patch.object(S, "call_model", side_effect=AssertionError("refresh must not infer")),
+        ):
+            got = S.tool_models({"refresh": True})
+
+        self.assertEqual(calls, [{"refresh_errors": True}])
+        self.assertTrue(got["availability"]["refreshed_errors"])
+
+    def test_failed_catalog_cache_expires_before_successful_catalog_cache(self):
+        cache = {"nous": {"at": 100.0, "rows": [], "error": "URLError: connection refused"}}
+        payload = {"data": [{"id": "recovered/model", "pricing": {"prompt": 0, "completion": 0}}]}
+        with (
+            unittest.mock.patch.object(S, "_MODELS_CACHE", cache),
+            unittest.mock.patch.object(S, "now_ts", side_effect=[114.0, 116.0, 116.0]),
+            unittest.mock.patch.object(S, "provider_http", return_value=payload) as request,
+        ):
+            cached = S.fetch_provider_models("nous", ttl=600.0)
+            recovered = S.fetch_provider_models("nous", ttl=600.0)
+
+        self.assertEqual(cached, [])
+        self.assertEqual([row["id"] for row in recovered], ["recovered/model"])
+        request.assert_called_once()
+
+    def test_explicit_refresh_bypasses_only_cached_catalog_errors(self):
+        cache = {"nous": {"at": 100.0, "rows": [], "error": "URLError: connection refused"}}
+        payload = {"data": [{"id": "recovered/model", "pricing": {"prompt": 0, "completion": 0}}]}
+        with (
+            unittest.mock.patch.object(S, "_MODELS_CACHE", cache),
+            unittest.mock.patch.object(S, "_MODELS_INFLIGHT", {}),
+            unittest.mock.patch.object(S, "now_ts", side_effect=[101.0, 102.0, 103.0]),
+            unittest.mock.patch.object(S, "provider_http", return_value=payload) as request,
+        ):
+            rows = S.fetch_provider_models("nous", refresh_errors=True)
+            cached_success = S.fetch_provider_models("nous", refresh_errors=True)
+
+        self.assertEqual([row["id"] for row in rows], ["recovered/model"])
+        self.assertEqual(cached_success, rows)
+        request.assert_called_once()
+
+    def test_catalog_rate_limit_cache_respects_retry_after(self):
+        body = unittest.mock.Mock()
+        error = S.urllib.error.HTTPError(
+            "https://catalog.example/models", 429, "Too Many Requests",
+            {"Retry-After": "120"}, body)
+        cache = {}
+        with (
+            unittest.mock.patch.object(S, "_MODELS_CACHE", cache),
+            unittest.mock.patch.object(S, "_MODELS_INFLIGHT", {}),
+            unittest.mock.patch.object(S, "now_ts", return_value=100.0),
+            unittest.mock.patch.object(S, "provider_http", side_effect=error) as request,
+        ):
+            rows = S.fetch_provider_models("nous")
+            cached = S.fetch_provider_models("nous", refresh_errors=True)
+
+        self.assertEqual(rows, [])
+        self.assertEqual(cached, [])
+        self.assertEqual(cache["nous"]["error_ttl"], 120.0)
+        request.assert_called_once()
+        body.close.assert_called_once()
+
+    def test_concurrent_model_catalog_requests_share_one_http_call(self):
+        import threading
+
+        callers = threading.Barrier(3)
+        in_http = threading.Barrier(2)
+        count = []
+        count_lock = threading.Lock()
+        results = []
+        payload = {"data": [{"id": "shared/model", "pricing": {"prompt": 0, "completion": 0}}]}
+
+        def fake_provider_http(*args, **kwargs):
+            with count_lock:
+                count.append(1)
+            try:
+                in_http.wait(timeout=0.1)
+            except threading.BrokenBarrierError:
+                pass
+            return payload
+
+        def fetch():
+            callers.wait(timeout=1)
+            results.append(S.fetch_provider_models("nous"))
+
+        with (
+            unittest.mock.patch.object(S, "_MODELS_CACHE", {}),
+            unittest.mock.patch.object(S, "_MODELS_INFLIGHT", {}),
+            unittest.mock.patch.object(S, "now_ts", return_value=100.0),
+            unittest.mock.patch.object(S, "provider_http", side_effect=fake_provider_http),
+        ):
+            workers = [threading.Thread(target=fetch) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            callers.wait(timeout=1)
+            for worker in workers:
+                worker.join(timeout=2)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(len(count), 1)
+        self.assertEqual([[row["id"] for row in result] for result in results],
+                         [["shared/model"], ["shared/model"]])
+
+
+
 class TestProbeSelectionAndAuthMemory(unittest.TestCase):
     """一覧が実態と乖離する世界での「検索→利用」: 生存確認・多様性・認証記憶。"""
 

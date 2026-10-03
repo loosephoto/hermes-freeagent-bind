@@ -19,10 +19,10 @@
 | §0 | 定数・環境変数・プロバイダ仕様 |
 | §1 | ユーティリティ（防御的変換・テキスト類似・原子書き込み） |
 | §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳） |
-| §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行） |
+| §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行 / §3.2 可用性診断・一覧回復） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
 | §5 | 知識バックエンド14種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io） |
-| §6 | ツール実装（11本、§6.11 本文の注入番号・引用認定） |
+| §6 | ツール実装（11本、§6.11 本文の注入番号・引用認定 / §6.12 共有エビデンス実験） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
 | §8.5 / §8.6 | 失敗時の「次の一手」（`next_action`） / ハーネス判別（Hermes 以外で起動されたときの警告） |
@@ -126,6 +126,17 @@
   `huggingface/…`）。プロバイダ順は最良モデルの順位で決めるので品質順は捨てない。
 - **認証で失敗中のプロバイダは自動選抜から外す**（`provider_auth.json`、既定 15 分）。明示 `requested`
   は常に試す＝キーを直せば即復帰する。除外は `notes` に出す（黙って隠さない）。
+
+### 4.4 可用性診断とカタログ回復（§3.2）
+
+- `provider_status[].ready` は従来どおり**設定条件の充足**を示し、接続や推論の成功を意味しない。`configured` は同じ互換値。`state` は次の段階を区別する: `needs_configuration` / `endpoint_unreachable` / `authentication_error` / `rate_limited` / `catalog_error` / `empty_catalog` / `no_free_candidates` / `candidate_unverified`。
+- `eligible_free` は設定済みproviderのFree候補数。`free` はcatalogに載るFreeモデル数なので、未設定providerの表示候補と推論可能候補を混ぜない。`freeagent_models.availability.state` は候補あり（未検証）/全候補cooldown/endpoint不通/認証・レート制限/一覧エラー/Free候補なし/未設定を集約し、provider別 `state` と併せて読む。
+- Hermes proxyはOAuthと独立プロセスのライフサイクルをHermes/利用者に残す。MCPサーバーからproxyをspawn/終了しない。診断は実際に動いているMCP子プロセスの環境とprovider endpointで行う。新しい`state`はreason code、`missing_settings`は環境変数名だけを返し、資格情報値は返さない。provider例外の`error`表示は既存どおり診断用。
+- 正常なprovider catalogは既定600秒キャッシュする。失敗一覧は `FREEAGENT_MODEL_ERROR_TTL`（既定15秒、1〜300秒）で短くnegative-cacheし、HTTP 429は `Retry-After`（秒数/HTTP-date、既定/上限はcooldown契約）を優先する。`freeagent_models(refresh=true)` はキャッシュ済みの環境接続障害だけを即時再確認し、成功cache・認証・429のcooldownを迂回せず、実推論probeも行わない。
+- 同一providerへの並行catalog要求はsingle-flightで一つにまとめ、HTTP I/O中に `_MODELS_LOCK` を保持しない。待機側は完了後のcache結果を共有する。
+- `usable_now` はクールダウン外の候補数であり、推論成功数ではない。人間向け表示も「クールダウン外」と表現し、`candidate_unverified` を明示する。機械向けの `usable_now` 名は互換維持。
+- `candidate_unverified` の `next_action` は候補一覧と実推論確認を区別する。probeは推論利用枠を使うため、利用者の明示許可なしに呼ばず、初回は少数候補に限定する。
+- 実推論による生存確認は従来どおり `probe=true` の明示指定だけ。状態確認/refreshは推論利用枠を使わない。
 
 ## 5. 呼び出し（§4）
 
@@ -320,6 +331,15 @@
   返すregistryを先頭8件に切らず、返却番号と出典配列の対応を保つ。
 - `_cited_numbers(..., allowed=...)`で存在するだけの出典や予算切れ番号を成功にしない。書誌は別の`bibliography`に置く。
 
+### 7.2 共有エビデンス評価実験（`freeagent_agent`・§6.12）
+
+- `communication` の既定は `independent` で、従来動作を変えない。`shared_evidence` は明示opt-inであり、異なるモデル2体以上と固定評価基準 `evaluation`（`task_id` と `required_terms` または `required_citations`）を要求する。条件不足なら**推論前にエラー**を返す。
+- 共有板は `tool_agent` の1回の呼び出し内だけに存在し、永続化しない。`_kb_has_evidence` とHTTP(S) URL確認を通る引用だけを追記する。agentはpeer本文を番号付きで再注入できるが、引用形式の検査は内容の意味的な真偽を証明しない。共有した要約/URLは別providerにも送るため、機密課題には使わない。論文の長時間CLI/共有ファイル作業を再現せず、読み取り専用知識調査への限定的な適合である。
+- 評価条件はagent promptに注入しない。`required_terms` は回答の大文字小文字を無視した部分文字列、`required_citations` は引用のDOI/URLの部分一致で採点する。`allowed_citations` を指定した場合は範囲外引用も記録する。返す `best_agent_score` / `pass_any`（個別回答）と `team_coverage_score`（複数回答の条件を合算した診断値）は分ける。いずれもタスクの意味的正しさの保証ではない。
+- `experiment` には task id・task fingerprint・モード・指定モデル列・実際に応答した `served_by_models`/`served_by_by_agent`・`max_steps`・`max_tokens_per_step`・採点結果・計測値（wall time、model calls、provider usageが返したprompt/completion tokens、引用/ソース数、peer injection数）を含める。usageが欠落するproviderではtoken総数を `null` にし、ゼロ扱いしない。
+- `scripts/compare_agent_experiments.py RUNS.jsonl` は保存されたMCP `structuredContent` を読むだけのオフライン比較器。task idごとに `independent` と `shared_evidence` を1つずつ要求し、task fingerprint・指定モデル列・実served_byモデルのagent別割当・手順/トークン上限・評価条件の不一致は拒否する。タスクIDは比較ペアごとに一意にし、別試行は別IDを使う。比較器は推論を呼ばず、採用を自動決定しない。
+- 実モデル比較では両モードに同じ課題、モデル列、上限、基準を使う。knowledge cacheを跨がせないため各実行は新しいMCPプロセスで行う。正解率に加えtoken/time・coverage・unexpected citationを確認し、複数課題/試行で改善が再現しない限り既定へ昇格しない。現在のテスト結果はコード契約の検証のみで、共有方式の回答品質差は未測定。
+
 ## 7.5 思考台帳（`freeagent_think`・§2.6 / §6.9）
 
 分解 → 修正 → 分岐 → 仮説検証を 1 ステップずつ積む。**思考の中身はメインが書く**ので、このツールの
@@ -491,4 +511,10 @@ python scripts/check_offline.py              # 全滅時の縮退（例外漏れ
 python scripts/measure_adoption.py           # 自発利用率（state.db を読むだけ）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存
 env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py   # モデルの生存確認を定着
+```
+
+共有エビデンス実験の `structuredContent` をJSONLに保存した後の比較器（ローカルのみ）:
+
+```bash
+python scripts/compare_agent_experiments.py runs.jsonl
 ```

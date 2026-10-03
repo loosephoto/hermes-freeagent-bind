@@ -12,10 +12,10 @@
                                              §2.3 トレース / §2.4 相談セッション /
                                              §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 /
                                              §2.7 思考台帳の構造（分解・改訂・分岐・仮説））
-  §3 プロバイダとモデル（§3.1 Free-tier provider guards）  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
+  §3 プロバイダとモデル（§3.1 Free-tier provider guards / §3.2 backend availability・catalog recovery）  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
                     §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR /
                     §5.16 DOAJ・npm・crates.io）
-  §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号）
+  §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号 / §6.12 共有エビデンス実験）
   §7 ツール定義         §8 表示（content）
   §8.5 失敗時の「次の一手」（structuredContent.next_action）
   §8.6 ハーネス判別（Hermes 以外で起動されたときの警告）   §9 JSON-RPC / stdio
@@ -37,6 +37,7 @@ from __future__ import annotations
 import copy
 import datetime
 import email.utils
+import hashlib
 import json
 import math
 import os
@@ -216,6 +217,7 @@ OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "")
 
 _MODELS_CACHE: dict[str, dict] = {}   # provider -> {"at": float, "rows": [...], "error": str}
 _MODELS_LOCK = threading.Lock()
+_MODELS_INFLIGHT: dict[str, threading.Event] = {}  # 同一providerの同時catalog取得を1回へ集約
 WRITE_LOCK = threading.Lock()         # stdout への書き込み直列化
 _DEBUG_LOCK = threading.Lock()
 _STATE_LOCK = threading.RLock()
@@ -1386,17 +1388,40 @@ def _context_length(provider: str, raw: dict):
     return raw.get("context_length") or raw.get("context_window")
 
 
-def fetch_provider_models(provider: str, ttl: float = 600.0) -> list[dict]:
-    """モデル一覧。Free モデルは入れ替わるので**固定しない**（毎回ここから解決する）。"""
+def fetch_provider_models(provider: str, ttl: float = 600.0, *,
+                          refresh_errors: bool = False) -> list[dict]:
+    """モデル一覧。失敗キャッシュだけ明示更新でき、同一providerの同時取得は共有する。"""
     spec = PROVIDER_SPECS.get(provider) or {}
     if spec.get("catalog_requires_ready") and not provider_ready(provider):
         return []
-    with _MODELS_LOCK:
-        cached = _MODELS_CACHE.get(provider)
-        if cached and now_ts() - as_float(cached.get("at"), 0.0) < ttl:
-            return list(cached.get("rows") or [])
+
+    force_refresh = refresh_errors
+    while True:
+        with _MODELS_LOCK:
+            cached = _MODELS_CACHE.get(provider)
+            cache_ttl = (as_float(cached.get("error_ttl"), MODEL_CATALOG_ERROR_TTL)
+                         if cached and cached.get("error") else ttl)
+            refreshable_error = bool(force_refresh and cached and
+                                     is_env_failure(as_str(cached.get("error"))))
+            if cached and not refreshable_error and now_ts() - as_float(cached.get("at"), 0.0) < cache_ttl:
+                return list(cached.get("rows") or [])
+            event = _MODELS_INFLIGHT.get(provider)
+            if event is None:
+                event = threading.Event()
+                _MODELS_INFLIGHT[provider] = event
+                leader = True
+            else:
+                leader = False
+        if leader:
+            break
+        # ネットワーク I/O の間はグローバルLockを保持しない。
+        event.wait()
+        # 進行中要求の結果を共有する。再びnegative cacheを迂回しない。
+        force_refresh = False
+
     rows: list[dict] = []
     error = ""
+    error_ttl = MODEL_CATALOG_ERROR_TTL
     try:
         data = provider_http(spec.get("models_path") or "/models", provider=provider,
                              timeout=min(30.0, READ_TIMEOUT))
@@ -1414,10 +1439,28 @@ def fetch_provider_models(provider: str, ttl: float = 600.0) -> list[dict]:
                 "pricing": raw.get("pricing") or {},
                 "access": raw.get("access"),
             })
+    except urllib.error.HTTPError as exc:
+        try:
+            error = f"{type(exc).__name__}: {exc}"
+            if exc.code == 429:
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                error_ttl = max(error_ttl, _parse_retry_after(retry_after))
+        finally:
+            try:
+                exc.close()
+            except Exception:
+                pass
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-    with _MODELS_LOCK:
-        _MODELS_CACHE[provider] = {"at": now_ts(), "rows": rows, "error": error}
+    finally:
+        with _MODELS_LOCK:
+            _MODELS_CACHE[provider] = {
+                "at": now_ts(), "rows": rows, "error": error,
+                "error_ttl": error_ttl if error else None,
+            }
+            current = _MODELS_INFLIGHT.pop(provider, None)
+            if current is not None:
+                current.set()
     return rows
 
 
@@ -1477,22 +1520,70 @@ def all_models(ttl: float = 600.0) -> list[dict]:
     return out
 
 
-def provider_status() -> list[dict]:
+# ---------------------------------------------------------------- §3.2 Provider availability and catalog recovery
+# A transient provider outage must not pin an empty model list for the normal 10-minute TTL.
+MODEL_CATALOG_ERROR_TTL = max(1.0, min(300.0, _env_float("FREEAGENT_MODEL_ERROR_TTL", 15.0)))
+# `ready` remains the legacy configuration gate; it is not a runtime health check.
+# The state below separates missing setup, catalog reachability, Free eligibility,
+# and an unprobed candidate without ever returning credential values.
+def _provider_availability_state(spec: dict, models: list[dict], error: str) -> str:
+    if _provider_missing_settings(spec):
+        return "needs_configuration"
+    if error:
+        if is_env_failure(error):
+            return "endpoint_unreachable"
+        kind = classify_error(error)
+        if kind == "auth":
+            return "authentication_error"
+        if kind == "rate_limited":
+            return "rate_limited"
+        return "catalog_error"
+    if not models:
+        return "empty_catalog"
+    if not any(m.get("free") for m in models):
+        return "no_free_candidates"
+    return "candidate_unverified"
+
+
+def _backend_availability_state(providers: list[dict], free_candidates: int,
+                                usable_now: int) -> str:
+    if usable_now:
+        return "candidate_unverified"
+    if free_candidates:
+        return "all_candidates_cooling"
+    states = {row.get("state") for row in providers}
+    for state in ("endpoint_unreachable", "authentication_error", "rate_limited",
+                  "catalog_error", "needs_configuration"):
+        if state in states:
+            return state
+    if "empty_catalog" in states or "no_free_candidates" in states:
+        return "no_free_candidates"
+    return "no_configured_provider"
+
+
+def provider_status(*, refresh_errors: bool = False) -> list[dict]:
     rows = []
     for provider in PROVIDER_ORDER:
-        models = fetch_provider_models(provider)
+        models = (fetch_provider_models(provider, refresh_errors=True)
+                  if refresh_errors else fetch_provider_models(provider))
         spec = PROVIDER_SPECS.get(provider) or {}
+        missing = _provider_missing_settings(spec)
+        configured = not missing
         with _MODELS_LOCK:
             error = (_MODELS_CACHE.get(provider) or {}).get("error") or ""
+        free = sum(1 for m in models if m.get("free"))
         rows.append({
             "provider": provider,
-            "ready": provider_ready(provider),
+            "ready": configured,
+            "configured": configured,
+            "state": _provider_availability_state(spec, models, error),
             "models": len(models),
-            "free": sum(1 for m in models if m.get("free")),
+            "free": free,
+            "eligible_free": free if configured else 0,
             "key_env": spec.get("key_env"),
             "note": spec.get("note"),
             "requires_activation": bool(spec.get("catalog_requires_ready")),
-            "missing_settings": _provider_missing_settings(spec),
+            "missing_settings": missing,
             "error": error,
         })
     return rows
@@ -3340,11 +3431,18 @@ def parse_verdict(text: str) -> dict:
 def _no_models() -> dict:
     status = provider_status()
     ready = [row["provider"] for row in status if row["ready"]]
+    free = free_model_refs()
+    usable_now = sum(1 for ref in free if not is_cooling(ref))
     return {
         "error": "推論可能な Free モデルが 0 件です。"
                  "`hermes proxy start` が動いているか、プロバイダのキーを確認してください。",
         "providers": status,
         "ready_providers": ready,
+        "availability": {
+            "state": _backend_availability_state(status, len(free), usable_now),
+            "free_candidates": len(free),
+            "usable_now": usable_now,
+        },
     }
 
 
@@ -3386,7 +3484,8 @@ def tool_models(args: dict) -> dict:
     **一覧に載っているが呼べないモデル**（廃止 410 / アカウント未有効 404 など）を除外する。
     ここで得た `provider/model`（HF は `:提供元` を付けられる）は他ツールの `models` 引数に渡せる。
     """
-    status = provider_status()
+    refresh_errors = as_flag(args.get("refresh"))
+    status = provider_status(refresh_errors=True) if refresh_errors else provider_status()
     free = free_model_refs()
     usable = [ref for ref in free if not is_cooling(ref)]
     query = as_str(args.get("query")) or as_str(args.get("q"))
@@ -3400,6 +3499,12 @@ def tool_models(args: dict) -> dict:
         "default_model": default_model(),
         "cooling": {ref: row for ref, row in cooling_refs().items()},
         "ranking_enabled": RANK_ENABLED,
+        "availability": {
+            "state": _backend_availability_state(status, len(free), len(usable)),
+            "free_candidates": len(free),
+            "usable_now": len(usable),
+            "refreshed_errors": refresh_errors,
+        },
     }
     harness = harness_status()   # §8.6（initialize 前は None）
     if harness:
@@ -3968,6 +4073,143 @@ def tool_consult(args: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------- §6.12 共有エビデンス実験
+# 共有対象は有効URLとsummaryを持つ引用のみ。これは出典の形式確認であり、主張の意味的正しさの証明ではない。
+class _SharedEvidenceBoard:
+    """1回のtool_agent呼び出しだけに生存する、追記専用の引用エビデンス板。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries: dict[tuple, dict] = {}
+        self._peer_evidence_injections = 0
+        self._injections_by_agent: dict[str, int] = {}
+
+    def publish(self, model: str, citation: dict) -> bool:
+        url = as_str(citation.get("url")) if isinstance(citation, dict) else ""
+        parsed_url = urllib.parse.urlparse(url)
+        if (not _kb_has_evidence(citation) or parsed_url.scheme not in {"http", "https"}
+                or not parsed_url.netloc):
+            return False
+        key = _kb_citation_key(citation)
+        with self._lock:
+            if key in self._entries:
+                return False
+            self._entries[key] = {"origin": model, "citation": copy.deepcopy(citation)}
+        return True
+
+    def take_for(self, model: str, seen: set[tuple]) -> list[dict]:
+        with self._lock:
+            snapshot = list(self._entries.items())
+        out = []
+        for key, row in snapshot:
+            if row["origin"] == model or key in seen:
+                continue
+            seen.add(key)
+            out.append({"key": key, "origin": row["origin"],
+                        "citation": copy.deepcopy(row["citation"])})
+        return out
+
+    def record_injections(self, model: str, count: int) -> None:
+        if count <= 0:
+            return
+        with self._lock:
+            self._peer_evidence_injections += count
+            self._injections_by_agent[model] = self._injections_by_agent.get(model, 0) + count
+
+    def summary(self) -> dict:
+        with self._lock:
+            return {
+                "published_evidence": len(self._entries),
+                "peer_evidence_injections": self._peer_evidence_injections,
+                "injections_by_agent": dict(self._injections_by_agent),
+            }
+
+
+def _normalize_agent_evaluation(raw: object) -> tuple[dict | None, str]:
+    if raw is None:
+        return None, ""
+    if not isinstance(raw, dict):
+        return None, "evaluation は object で指定してください"
+    task_id = as_str(raw.get("task_id")).strip()[:120]
+    required_terms = [s.strip()[:200] for s in as_str_list(raw.get("required_terms")) if s.strip()][:32]
+    required_citations = [s.strip()[:300] for s in as_str_list(raw.get("required_citations")) if s.strip()][:32]
+    allowed_citations = [s.strip()[:300] for s in as_str_list(raw.get("allowed_citations")) if s.strip()][:64]
+    if not task_id:
+        return None, "evaluation.task_id は必須です"
+    if not required_terms and not required_citations:
+        return None, "evaluation に required_terms または required_citations が必要です"
+    return {
+        "task_id": task_id,
+        "required_terms": list(dict.fromkeys(required_terms)),
+        "required_citations": list(dict.fromkeys(required_citations)),
+        "allowed_citations": list(dict.fromkeys(allowed_citations)),
+    }, ""
+
+
+def _score_agent_results(results: list[dict], evaluation: dict) -> dict:
+    """利用者が定義した文字列/引用IDオラクルによる再現可能な採点。意味理解は判定しない。"""
+    terms = evaluation.get("required_terms") or []
+    required_citations = evaluation.get("required_citations") or []
+    allowed_citations = evaluation.get("allowed_citations") or []
+    criteria = [("term", item) for item in terms] + [("citation", item) for item in required_citations]
+    per_agent = []
+    team_hits: set[tuple[str, str]] = set()
+    all_unexpected: dict[tuple, dict] = {}
+
+    for row in results:
+        answer = as_str(row.get("answer")).casefold()
+        cites = [cite for cite in row.get("citations") or [] if isinstance(cite, dict)]
+        citation_values = [value.casefold().rstrip("/")
+                           for cite in cites
+                           for value in (as_str(cite.get("doi")), as_str(cite.get("url"))) if value]
+        matched = []
+        for kind, expected in criteria:
+            if kind == "term":
+                hit = expected.casefold() in answer
+            else:
+                needle = expected.casefold().rstrip("/")
+                hit = any(needle and needle in value for value in citation_values)
+            if hit:
+                matched.append({"kind": kind, "expected": expected})
+                team_hits.add((kind, expected))
+        score = len(matched) / len(criteria) if criteria else 0.0
+        per_agent.append({"model": as_str(row.get("model")), "score": round(score, 4),
+                          "passed": len(matched) == len(criteria), "matched": matched})
+
+        if allowed_citations:
+            for cite in cites:
+                values = [as_str(cite.get("doi")).casefold().rstrip("/"),
+                          as_str(cite.get("url")).casefold().rstrip("/")]
+                if any(any(allowed.casefold().rstrip("/") in value for value in values if value)
+                       for allowed in allowed_citations):
+                    continue
+                key = _kb_citation_key(cite)
+                all_unexpected[key] = {"model": as_str(row.get("model")),
+                                       "doi": as_str(cite.get("doi")),
+                                       "url": as_str(cite.get("url"))}
+
+    team_score = len(team_hits) / len(criteria) if criteria else 0.0
+    return {
+        "task_id": evaluation["task_id"],
+        "scorer": "exact_substring_and_citation_id",
+        "criteria_count": len(criteria),
+        "best_agent_score": max((row["score"] for row in per_agent), default=0.0),
+        "pass_any": any(row["passed"] for row in per_agent),
+        "team_coverage_score": round(team_score, 4),
+        "team_coverage_pass": team_score == 1.0,
+        "agents": per_agent,
+        "unexpected_citations": list(all_unexpected.values()),
+        "note": "決定的な文字列/引用ID照合であり、意味的妥当性は判定しません。",
+    }
+
+
+def _agent_usage_total(results: list[dict], key: str) -> int | None:
+    values = [(row.get("tokens") or {}).get(key) for row in results]
+    if not values or any(value is None for value in values):
+        return None
+    return sum(as_int(value, 0, 0, 10**9) for value in values)
+
+
 def _agent_tool_call(parsed: dict) -> dict:
     """サブエージェントが要求した読み取り専用ツールを実行する（書き込み系は無い）。"""
     tool = as_str(parsed.get("tool"))
@@ -4028,19 +4270,34 @@ def _cited_numbers(answer: str, total: int, allowed: list[int] | None = None) ->
 
 
 def tool_agent(args: dict) -> dict:
-    """サブLLMが自分で知識ツールを呼んで調査するループ（読み取り専用・並列）。"""
+    """知識検索ループ。通常は独立実行、固定評価基準つきでのみ共有エビデンス実験を許可する。"""
     task = as_str(args.get("task") or args.get("prompt"))
     if not task:
         return {"error": "task は必須です"}
+    communication = as_str(args.get("communication"), "independent")
+    if communication not in {"independent", "shared_evidence"}:
+        return {"error": "communication は independent / shared_evidence のいずれかです"}
+    evaluation, evaluation_error = _normalize_agent_evaluation(args.get("evaluation"))
+    if evaluation_error:
+        return {"error": evaluation_error}
+    if communication == "shared_evidence" and evaluation is None:
+        return {"error": "shared_evidence は objective evaluation.task_id と required_terms / required_citations が必要です"}
+    started = time.perf_counter()
     refs, info = _select_or_error(args, default_size=2)
     if not refs:
         return _no_models()
+    if communication == "shared_evidence" and len(set(refs)) < 2:
+        return {"error": "shared_evidence には異なるモデルが2体以上必要です"}
     max_steps = as_int(args.get("max_steps"), 2, 1, 4)
     main_reply = as_str(args.get("main_reply"))
     max_tokens = as_int(args.get("max_tokens"), 600, 16, 3000)
+    shared_board = _SharedEvidenceBoard() if communication == "shared_evidence" else None
     base = f"【依頼】\n{task}"
     if main_reply:
         base += f"\n\n【メインからの回答（最優先の前提）】\n{truncate(main_reply, 3000)}"
+    if shared_board:
+        base += ("\n\n【共有エビデンス実験】他エージェントが取得した本文根拠は出典形式が検証されていますが、"
+                 "その主張の意味的正しさまで保証しません。根拠を自分で評価し、裏付けのない結論を採用しないでください。")
 
     def run_one(ref: str) -> dict:
         history = base
@@ -4050,6 +4307,28 @@ def tool_agent(args: dict) -> dict:
         numbers: dict[tuple, int] = {}
         evidence: list[str] = []
         injected: set[int] = set()
+        shared_seen: set[tuple] = set()
+        token_prompt = 0
+        token_completion = 0
+        token_usage_complete = True
+        model_calls = 0
+        served_by_models: list[str] = []
+        agent_started = time.perf_counter()
+
+        def token_summary() -> dict:
+            if not token_usage_complete:
+                return {"prompt": None, "completion": None, "total": None}
+            return {"prompt": token_prompt, "completion": token_completion,
+                    "total": token_prompt + token_completion}
+
+        def observe_usage(res: dict) -> None:
+            nonlocal token_prompt, token_completion, token_usage_complete
+            usage = res.get("tokens") or {}
+            if usage.get("prompt") is None or usage.get("completion") is None:
+                token_usage_complete = False
+                return
+            token_prompt += as_int(usage.get("prompt"), 0, 0, 10**9)
+            token_completion += as_int(usage.get("completion"), 0, 0, 10**9)
 
         def register(new_cites: list[dict]) -> list[tuple[int, dict]]:
             """新しい根拠に通し番号を振る（同じ URL には同じ番号を保つ）。"""
@@ -4069,16 +4348,42 @@ def tool_agent(args: dict) -> dict:
 
         for step in range(max_steps):
             final_step = step == max_steps - 1
+            if shared_board:
+                peer_entries = shared_board.take_for(ref, shared_seen)
+                peer_added = register([entry["citation"] for entry in peer_entries])
+                if peer_added:
+                    peer_window = _evidence_window(
+                        [cite for _, cite in peer_added], item_chars=300, total_chars=1200,
+                        numbers=[number for number, _ in peer_added])
+                    if peer_window["numbers"]:
+                        injected.update(peer_window["numbers"])
+                        evidence.extend(f"共有根拠: {cite.get('title') or cite.get('url') or ''}"
+                                        for _, cite in peer_added[:6])
+                        history += ("\n\n【別エージェントが取得した本文根拠】\n"
+                                    + peer_window["text"]
+                                    + "\n出典本文は利用できますが、主張の意味的妥当性は自分で確認してください。")
+                        shared_board.record_injections(ref, len(peer_window["numbers"]))
             res = call_model(ref, history + f"\n\n（{step + 1}/{max_steps} ステップ目。"
                                             "JSON を1つだけ出力）",
                              system=AGENT_SYSTEM_FINAL if final_step else AGENT_SYSTEM,
                              max_tokens=max_tokens, kind="agent")
+            model_calls += 1
+            observe_usage(res)
+            served_by = as_str(res.get("served_by"))
+            if served_by and served_by not in served_by_models:
+                served_by_models.append(served_by)
             if res.get("error"):
-                return {"model": ref, "error": res["error"], "steps": step, "trace": trace}
+                return {"model": ref, "error": res["error"], "steps": step, "trace": trace,
+                        "tokens": token_summary(), "model_calls": model_calls,
+                        "served_by_models": list(served_by_models),
+                        "elapsed_s": round(time.perf_counter() - agent_started, 3)}
             parsed = _parse_agent_reply(res["text"])
             if parsed.get("tool") and not final_step:
                 got = _agent_tool_call(parsed)
                 added = register(got.get("citations") or [])
+                if shared_board:
+                    for _, cite in added:
+                        shared_board.publish(ref, cite)
                 bibliography.extend(got.get("bibliography") or [])
                 trace.append({"tool": parsed.get("tool"), "args": parsed, "hits": got["hits"],
                               "new_citations": len(added)})
@@ -4097,18 +4402,27 @@ def tool_agent(args: dict) -> dict:
                         "answer": truncate(answer, 1500), "trace": trace,
                         "citations": registry, "bibliography": bibliography, "injected_citations": sorted(injected),
                         "cited": cited, "cited_ok": bool(cited),
-                        "unsupported_citations": unsupported}
+                        "unsupported_citations": unsupported,
+                        "tokens": token_summary(), "model_calls": model_calls,
+                        "served_by_models": list(served_by_models),
+                        "elapsed_s": round(time.perf_counter() - agent_started, 3)}
             # 最終ステップでツールを求められた場合は実行しない（予算切れ）。推測で埋めず、
             # **集めた根拠だけを返して「回答に到達しなかった」と明示する**。
             return {"model": ref, "served_by": res.get("served_by"), "steps": step + 1,
                     "answer": "", "steps_exhausted": True, "trace": trace,
                     "evidence": evidence[:8], "citations": registry, "bibliography": bibliography,
                     "injected_citations": sorted(injected),
-                    "cited": [], "cited_ok": False}
+                    "cited": [], "cited_ok": False,
+                    "tokens": token_summary(), "model_calls": model_calls,
+                    "served_by_models": list(served_by_models),
+                    "elapsed_s": round(time.perf_counter() - agent_started, 3)}
         return {"model": ref, "steps": max_steps, "trace": trace, "answer": "",
                 "steps_exhausted": True, "evidence": evidence[:8], "citations": registry, "bibliography": bibliography,
-                    "injected_citations": sorted(injected),
-                "cited": [], "cited_ok": False}
+                "injected_citations": sorted(injected),
+                "cited": [], "cited_ok": False,
+                "tokens": token_summary(), "model_calls": model_calls,
+                "served_by_models": list(served_by_models),
+                "elapsed_s": round(time.perf_counter() - agent_started, 3)}
 
     results = run_parallel(refs, run_one, max_workers=min(len(refs), MAX_WORKERS))
     good = [r for r in results if not r.get("error")]
@@ -4119,8 +4433,50 @@ def tool_agent(args: dict) -> dict:
             if key not in seen:
                 seen.add(key)
                 citations.append(cite)
+    prompt_tokens = _agent_usage_total(results, "prompt")
+    completion_tokens = _agent_usage_total(results, "completion")
+    board_metrics = shared_board.summary() if shared_board else {
+        "published_evidence": 0, "peer_evidence_injections": 0, "injections_by_agent": {}}
+    experiment = None
+    if evaluation is not None:
+        objective_evaluation = _score_agent_results(results, evaluation)
+        experiment = {
+            "task_id": evaluation["task_id"],
+            "task_fingerprint": hashlib.sha256(json.dumps(
+                {"task": task, "main_reply": main_reply}, ensure_ascii=False, sort_keys=True
+            ).encode("utf-8")).hexdigest(),
+            "communication": communication,
+            "models": list(refs),
+            "max_steps": max_steps,
+            "max_tokens_per_step": max_tokens,
+            "served_by_models": sorted({model for row in results
+                                         for model in (row.get("served_by_models") or [])}),
+            "served_by_by_agent": [
+                {"requested": as_str(row.get("model")),
+                 "served_by": list(row.get("served_by_models") or [])}
+                for row in results
+            ],
+            "criteria": evaluation,
+            "objective_evaluation": objective_evaluation,
+            "metrics": {
+                "wall_time_s": round(time.perf_counter() - started, 3),
+                "model_calls": sum(as_int(row.get("model_calls"), 0, 0, 10000) for row in results),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": (prompt_tokens + completion_tokens
+                                 if prompt_tokens is not None and completion_tokens is not None else None),
+                "knowledge_tool_calls": sum(len(row.get("trace") or []) for row in results),
+                "unique_citations": len(citations),
+                "distinct_sources": len({as_str(cite.get("source")) for cite in citations
+                                          if as_str(cite.get("source"))}),
+                **board_metrics,
+            },
+            "scoring_limit": "The exact-string verifier is a benchmark proxy, not semantic fact verification.",
+        }
     return {
         "task": truncate(task, 300), "models": refs, "selection": info,
+        "communication": communication,
+        **({"experiment": experiment} if experiment is not None else {}),
         "agents": results, "answered": len(good), "failed": len(results) - len(good),
         "tool_calls": sum(len(r.get("trace") or []) for r in results),
         "citations": citations, "citation_count": len(citations),
@@ -4746,11 +5102,12 @@ TOOLS: list[dict] = [
     {
         "name": "freeagent_models",
         "description": (
-            "【使う条件】使えるモデルを**検索**したい（どのプロバイダにどんな Free モデルがあるか）／"
-            "品質統計やクールダウンを確認したいとき。"
-            "【差分】`query`（ID の部分一致）と `provider`（nous / openrouter / nvidia / huggingface / groq / cloudflare / gemini）で絞り込む。"
-            "返る `ref` は他ツールの `models` 引数にそのまま渡せる（HF は `:提供元` を付けて経路を固定できる）。"
-            "【使わない条件】通常は不要（panel/consult 等が自動で選ぶ）。"
+            "【使う条件】使えるモデルを**検索**したい（どのプロバイダにどんな Free モデルがあるか）、"
+            "backendが使えない理由を切り分けたい、品質統計やクールダウンを確認したいとき。"
+            "【使わない条件】通常のpanel/consult等では不要（候補は自動選抜する）。生存probeは利用枠を使うため明示依頼がある場合だけ。"
+            "【競合より優先】backend診断は実際のMCPプロセス環境を見る本ツールを、シェル側の環境確認より優先する。"
+            "【差分】`query` / `provider` で絞り込む。`refresh=true` は接続失敗の一覧だけを再取得（429はRetry-Afterを尊重、推論probeなし）。"
+            "返る `ref` は他ツールの `models` 引数に渡せる（HF は `:提供元` を付けて経路固定）。"
         ),
         "inputSchema": {
             "type": "object",
@@ -4763,6 +5120,8 @@ TOOLS: list[dict] = [
                 "offset": {"type": "integer", "description": "読み飛ばす件数（ページ送り）"},
                 "free_only": {"type": "boolean", "description": "有料モデルを除き、Free だけを対象にする"},
                 "all": {"type": "boolean", "description": "検索モードを強制（引数なしで全件を見たいとき）"},
+                "refresh": {"type": "boolean",
+                            "description": "接続失敗の一覧だけを即時再取得。429のRetry-Afterは迂回せず、生存probeもしない"},
                 "probe": {"type": "boolean",
                           "description": "候補を実際に呼んで生存確認し、**呼べないモデルを除外**する"
                                          "（一覧は廃止・未有効を含むため。呼び出しが発生する）"},
@@ -4996,12 +5355,11 @@ TOOLS: list[dict] = [
     {
         "name": "freeagent_agent",
         "description": (
-            "【使う条件】サブに自分で調べさせたい（読み取り専用の知識ツールを自分で叩く）／"
-            "根拠を集めさせてから結論を出させたい。"
-            "【差分】サブLLMが lookup(arXiv/Crossref/OpenAlex/Wikipedia/Wikidata/GitHub) を自分で呼ぶループ。"
-            "ツール結果は番号つきの本文で返し、回答中の [n] を根拠と照合して引用の有無を返す。"
-            "書き込み・外部副作用は無い。"
-            "【使わない条件】1回の問いで足りるなら ask。"
+            "【使う条件】サブに読み取り専用で自分で調べさせたい／根拠を集めて結論を出させたい。"
+            "【差分】lookup(arXiv/Crossref/OpenAlex/Wikipedia/Wikidata/GitHub)のループ。引用番号を根拠と照合する。"
+            "communication=shared_evidence は異なる2モデル以上・objective evaluation必須の明示的な評価実験専用。出典本文だけを1 tool call内で共有する。"
+            "評価は指定語句/引用IDの一致のみで、意味の正しさは判定しない。"
+            "【使わない条件】通常調査は独立モードのまま。1回の問いで足りるなら ask。書き込み・外部データ保存はしない。"
         ),
         "inputSchema": {
             "type": "object",
@@ -5012,6 +5370,22 @@ TOOLS: list[dict] = [
                 "max_steps": {"type": "integer", "description": "1体あたりのツール呼び出し上限（既定 2）"},
                 "main_reply": {"type": "string", "description": "メインの補足（最優先の前提として注入）"},
                 "max_tokens": {"type": "integer"},
+                "communication": {"type": "string", "enum": ["independent", "shared_evidence"],
+                                  "description": "既定independent。shared_evidenceは異なる2モデル以上とobjective evaluationが必要。引用要約を他providerにも送る明示opt-in"},
+                "evaluation": {
+                    "type": "object",
+                    "description": "固定ベンチ用の決定的採点条件。LLMへは見せず、最終回答だけを完全一致/部分文字列で採点",
+                    "properties": {
+                        "task_id": {"type": "string", "description": "比較ペアで一致させる課題ID（試行ごとに一意）"},
+                        "required_terms": {"type": "array", "items": {"type": "string"},
+                                              "description": "回答に必要なリテラル語句"},
+                        "required_citations": {"type": "array", "items": {"type": "string"},
+                                                   "description": "回答に必要なDOI/URL"},
+                        "allowed_citations": {"type": "array", "items": {"type": "string"},
+                                                  "description": "省略時は想定外引用を評価しない。指定時は範囲外URL/DOIを記録"},
+                    },
+                    "required": ["task_id"],
+                },
             },
             "required": ["task"],
         },
@@ -5116,6 +5490,12 @@ def _render_body(name: str, data: dict) -> str:
 
     if name == "freeagent_models":
         lines = []
+        state_labels = {
+            "needs_configuration": "要設定", "endpoint_unreachable": "接続先に到達できません",
+            "authentication_error": "認証/権限エラー", "rate_limited": "レート制限",
+            "catalog_error": "一覧取得エラー", "empty_catalog": "一覧0件",
+            "no_free_candidates": "Free候補なし", "candidate_unverified": "候補あり・推論未検証",
+        }
         for row in data.get("providers") or []:
             # ✓ は「資格情報がある」だけでなく「一覧が取れている」ことも表す。取れていないのに ✓ だと、
             # モデル 0 件の理由（プロキシ停止など）が分からない（実測: nous が ✓ 0 件で並んだ）。
@@ -5132,13 +5512,23 @@ def _render_body(name: str, data: dict) -> str:
                 note = f"  [{row['key_env']} 未設定 → 検索のみ]"
             else:
                 note = ""
-            lines.append(f"  {mark} {row['provider']:11} {row['models']:4} モデル / Free {row['free']:3}{note}")
+            state_note = state_labels.get(row.get("state"), "")
+            state_note = f"  [{state_note}]" if state_note else ""
+            lines.append(f"  {mark} {row['provider']:11} {row['models']:4} モデル / Free {row['free']:3}{state_note}{note}")
             if row.get("error"):
                 lines.append(f"      到達不可: {row['error'][:100]}")
         head = (f"サブLLMバックエンド（{sum(1 for r in data.get('providers') or [] if r.get('ready'))} プロバイダ有効）\n"
                 + "\n".join(lines))
-        head += (f"\nFree候補 {data.get('free_candidates')} 件（うち今すぐ使用可 {data.get('usable_now')}）"
+        head += (f"\nFree候補 {data.get('free_candidates')} 件（クールダウン外 {data.get('usable_now')}）"
                  f" / 全 {data.get('total_models')} モデル\n既定: {data.get('default_model')}")
+        availability = data.get("availability") or {}
+        state = availability.get("state")
+        if state:
+            label = state_labels.get(state) or {
+                "all_candidates_cooling": "全候補がクールダウン中",
+                "no_configured_provider": "利用設定済みProviderなし",
+            }.get(state, state)
+            head += f"\n可用性: {label}"
         cooling = data.get("cooling") or {}
         if cooling:
             # 全部並べると 1 行が長すぎて読めない（実測: 55 件で画面が埋まった）。先頭だけ出して件数を添える。
@@ -5403,6 +5793,19 @@ def _render_body(name: str, data: dict) -> str:
                  f" / 出典 {data.get('citation_count')} 件"
                  f" / 根拠を引用した回答 {data.get('answers_with_citations')} 体"
                  f" / 合意度 {data.get('agreement')}"]
+        experiment = data.get("experiment") or {}
+        if experiment:
+            evaluation = experiment.get("objective_evaluation") or {}
+            metrics = experiment.get("metrics") or {}
+            mode = as_str(experiment.get("communication"), "independent")
+            label = "共有エビデンス実験" if mode == "shared_evidence" else "独立ベースライン評価"
+            lines.append(
+                f"{label} [{experiment.get('task_id')}]: best_agent={evaluation.get('best_agent_score')}"
+                f" / pass_any={evaluation.get('pass_any')} / team_coverage={evaluation.get('team_coverage_score')}"
+                f" / tokens={metrics.get('total_tokens')} / {metrics.get('wall_time_s')}s"
+                f" / peer evidence={metrics.get('peer_evidence_injections', 0)}"
+            )
+            lines.append("  ※指定語句/引用IDの一致のみで採点。意味的妥当性は未評価。")
         for row in (data.get("agents") or []):
             if row.get("error"):
                 lines.append(f"  • {row['model']}: ✗ {truncate(row['error'], 120)}")
@@ -5459,15 +5862,64 @@ def error_advice(data: dict) -> dict:
             "reenable": "hermes config set mcp_servers.freeagent-bind.enabled true   # 反映には再起動",
         })
     elif is_env_failure(err) or "Free モデルが 0 件" in err or "モデルが解決できませんでした" in err:
+        availability = data.get("availability") or {}
+        state = as_str(availability.get("state"))
+        providers = data.get("providers") or []
+        missing = sorted({name for row in providers if row.get("state") == "needs_configuration"
+                          for name in (row.get("missing_settings") or [])})
+        if state == "endpoint_unreachable":
+            nous_unreachable = any(row.get("provider") == "nous" and
+                                   row.get("state") == "endpoint_unreachable" for row in providers)
+            advice_text = ("Nous Portalの上流認証とローカルproxyの待受は別です。hermes proxy statusで上流状態を確認し、"
+                           "proxy未起動なら別ターミナルでhermes proxy startを実行してください。復旧後はfreeagent_models(refresh=true)で再確認し、"
+                           "同じ推論呼び出しは繰り返さないでください。" if nous_unreachable else
+                           "MCPプロセスからprovider endpointへ到達できません。providers[].provider/state/errorを確認し、"
+                           "接続先を直した後にfreeagent_models(refresh=true)で再確認してください。同じ推論呼び出しは繰り返さないでください。")
+            check = ("hermes proxy status; hermes proxy start（別ターミナル、必要な場合）; "
+                     "MCP内でfreeagent_models(refresh=true)" if nous_unreachable else
+                     "freeagent_models.providers の endpoint_unreachable と error を確認")
+            reenable = ("別ターミナルでhermes proxy startを実行し、起動したままにする" if nous_unreachable else
+                        "外部proxy/providerを起動・復旧し、MCP processから到達可能にする（資格情報を会話へ貼らない）")
+        elif state == "needs_configuration":
+            advice_text = "Free推論providerの設定または明示確認が不足しています。providers[].missing_settingsの環境変数名だけを確認し、Hermes MCPのenvへ設定してから再起動してください。キー値を会話や診断ログに出さないでください。"
+            check = "freeagent_models.providers[].missing_settings を確認"
+            reenable = "必要なprovider設定をHermes MCPのenvへ追加し、MCPを再起動する"
+            if missing:
+                advice_text += " 不足名: " + ", ".join(missing)
+        elif state == "authentication_error":
+            advice_text = "providerの認証または権限で拒否されています。該当providerの資格情報/権限を直すまで同じ推論を再試行せず、他の設定済みFree providerかfallbackを使ってください。"
+            check = "freeagent_models.providers[].error と missing_settings を確認"
+            reenable = "providerの資格情報/権限を修正し、必要ならMCPを再起動する"
+        elif state == "rate_limited":
+            advice_text = "providerのモデル一覧がrate limitされています。Retry-Afterまたは負キャッシュの期限まで待ってください。refresh=trueで制限を迂回せず、回答にはfallbackを使ってください。"
+            check = "freeagent_models.providers[].state / error を確認"
+            reenable = "期限後にfreeagent_models(refresh=true)で再確認する"
+        elif state == "no_free_candidates":
+            advice_text = "設定済みproviderは応答しましたが、Free条件に合う推論候補がありません。有料モデルへ自動切替しないため、Free対象providerの設定/提供状況を確認するか、通常のfallbackで回答してください。"
+            check = "freeagent_models.providers[].state / free / eligible_free を確認"
+            reenable = "利用可能なFree providerを設定する（有料tierを暗黙に有効化しない）"
+        elif state == "all_candidates_cooling":
+            advice_text = "Free候補はありますが、全てクールダウン中です。期限まで待つか、別providerを選んでください。"
+            check = "freeagent_models.cooling を確認"
+            reenable = "cooldown期限後に再試行する"
+        elif state == "candidate_unverified":
+            advice_text = ("Free候補は一覧上にありますが、実推論成功は未確認です。クールダウン外の件数も成功の証拠ではありません。"
+                           "同じ推論を連打せず、まずfallbackで回答を続けてください。生存probeは推論枠を使うため、"
+                           "利用者の明示許可がない限り自動実行しないでください。")
+            check = "freeagent_models の provider/state/cooling を確認。実推論の確認は利用者の明示許可後だけ `probe=true` を使う"
+            reenable = "明示許可後に freeagent_models(probe=true, probe_limit=2) で少数候補を確認する"
+        else:
+            advice_text = ("推論backendを利用できません。**同じ呼び出しを繰り返さない**。"
+                           "provider状態を確認し、このMCPに依存せずターンを完遂してください。"
+                           "代替に落ちたら、実際に応答した独立ソース数を明記してください。")
+            check = "freeagent_models でproviderごとの設定・一覧取得状態を確認"
+            reenable = "proxy/providerの接続または設定を復旧してから再試行する"
         advice.update({
             "kind": "unavailable_backend",
-            "advice": ("推論バックエンドに到達できない。**同じ呼び出しを繰り返さない**（同じ失敗が返る）。"
-                       "この MCP に依存せずターンを完遂し、多視点が必要なら下の fallback_tools を使う。"
-                       "代替に落ちたら、実際に応答した独立ソースの件数を回答に明記する。"),
+            "advice": advice_text,
             "fallback_tools": ["delegate_task", "web_search", "web_extract"],
-            "check": "hermes proxy start  → curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8645/v1/models",
-            "reenable": "hermes proxy start（プロキシ）／キー設定（hermes config set "
-                        "mcp_servers.freeagent-bind.env.<NAME> '<値>'）→ 反映には再起動",
+            "check": check,
+            "reenable": reenable,
         })
     elif classify_error(err) == "auth":
         advice.update({

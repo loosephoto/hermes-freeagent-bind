@@ -19,6 +19,7 @@
 - [はじめに設定する](#はじめに設定する)
 - [会話での頼み方](#会話での頼み方)
 - [どのツールを使うか](#どのツールを使うか)
+- [エージェント共有実験（freeagent_agent）](#エージェント共有実験freeagent_agent)
 - [複雑な問題を段階的に考える（freeagent_think）](#複雑な問題を段階的に考えるfreeagent_think)
 - [出力の読み方](#出力の読み方)
 - [つまずいたとき](#つまずいたとき)
@@ -81,8 +82,8 @@ hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_HARNESS hermes
 
 **知識検索と、サブを呼ばない思考ノートだけなら、この手順は不要です。** 相談も使うなら、次のどちらかを用意します。
 
-- **Nous**：Hermes 側で Portal にログイン済みであることを確認し、別のターミナルで `hermes proxy start`。
-  未ログインなら `hermes portal` でログインします。プロキシは動かしたままにします。
+- **Nous**：`hermes proxy status` で Portal の上流認証を確認し、別のターミナルで `hermes proxy start`。
+  未ログインなら `hermes portal` でログインします。`status` の `ready` は上流認証の状態で、proxy HTTP サーバーの待受を意味しません。起動後はプロキシを動かしたままにします。
 - **OpenRouter / NVIDIA / Hugging Face**：使いたい提供元の API キーを設定します。
   全部のキーを用意する必要はありません（[入手先と設定方法](#api-キーの設定)）。
 
@@ -152,7 +153,7 @@ freeagent_think で、この設計案を手順に分解してから検討して�
 | 同じ指示で多数の要素を処理する | `freeagent_map` | 最大 64 件。`reduce` で追加の統合処理 |
 | 前提を更新しながら往復相談する | `freeagent_consult` | 1 回だけなら panel。深い討論は待ち時間が増えます |
 | 計画・仮説・改訂・別案を記録する | `freeagent_think` | [思考ノートの使い方](#複雑な問題を段階的に考えるfreeagent_think) |
-| サブが自分で知識検索する | `freeagent_agent` | 読み取り専用の調査ループ。ステップ上限があります |
+| サブが自分で知識検索する | `freeagent_agent` | 通常は独立実行。固定基準がある比較実験だけ `shared_evidence` を明示 opt-in |
 | Hermes 本体を別プロセスで動かす | `freeagent_delegate` | **既定では無効**。フルツールを使うため、許可すると実作業の副作用もありえます |
 
 複数モデルを使うツールは、`models` を省略すると、資格情報・品質統計・クールダウンなどを考慮して候補を選びます。
@@ -161,6 +162,61 @@ freeagent_think で、この設計案を手順に分解してから検討して�
 モデルを固定したい場合は、`freeagent_models` が返す `ref`（`provider/model`）を使います。
 `ask` / `map` は単数の `model`、`panel` などは配列の `models` です。
 HF はモデル ID の末尾に `:提供元` を付けて経路を固定できます。
+
+## エージェント共有実験（`freeagent_agent`）
+
+`freeagent_agent` は通常、各サブエージェントが別々に知識を集めます。論文由来の共有方式は一般会話へ常時適用せず、
+**固定の客観評価基準を用意した実験時だけ** `communication="shared_evidence"` を指定してください。
+実験モードは**異なる2モデル以上**と評価基準を要求します。1 回の呼び出し中に限り、別エージェントが取得した **URL と本文要約のある引用**を共有します。
+ファイルやプロセス間へ保存せず、共有エビデンスは意味的に正しいと保証しません。共有した本文要約・URLは別providerのモデルにもプロンプトとして送られるため、機密情報を含む課題には使わないでください。論文の長時間CLI作業・共有ファイルシステム全体を再現するものではなく、読み取り専用知識調査への限定的な適合です。
+
+評価基準は LLM へのプロンプトに注入せず、返答後にだけ使います。
+`required_terms` は回答中の大文字小文字を無視した部分文字列、`required_citations` は出典の DOI / URL との照合です。
+これは再現可能な採点用の**限定オラクル**であり、文章の意味や推論の正しさを採点するものではありません。
+`allowed_citations` を指定すると、範囲外の DOI / URL も記録します。
+
+### 比較の手順
+
+同じ `task_id`、`models`、`max_steps`、`max_tokens`、評価基準で、独立モードと共有モードをそれぞれ実行してください。
+`task_id` は比較ペアごとに一意にします。評価基準は結果を見る前に決め、ペア間で変えないでください。モデル一覧は明示指定し、比較間で変わっていないことを確認します。
+知識検索のプロセス内キャッシュが比較へ混ざらないよう、**独立／共有の各実行は新しい MCP プロセスで行う**のが基本です。
+
+引数の形は次のとおりです（`<…>` は実験者が決める値です。これは呼び出し例で、測定結果ではありません）。
+
+```json
+{
+  "task": "固定した調査課題",
+  "models": ["provider/model-a", "provider/model-b"],
+  "max_steps": 2,
+  "max_tokens": 600,
+  "communication": "shared_evidence",
+  "evaluation": {
+    "task_id": "case-a-trial-1",
+    "required_terms": ["評価用の必須語句"],
+    "required_citations": ["10.xxxx/example"],
+    "allowed_citations": ["10.xxxx/example"]
+  }
+}
+```
+
+独立ベースラインは同じ引数から `communication` だけを `independent` にします。
+各呼び出しの `structuredContent.experiment` を JSONL に1件ずつ保存し、次でペア比較します。
+
+```bash
+python scripts/compare_agent_experiments.py runs.jsonl
+```
+
+比較器は task ID／課題fingerprint・指定/実際のモデル割当・手順上限・評価基準が一致しないペアを拒否し、best-agent score、pass rate、チーム内カバレッジ、
+トークン数、時間、引用数、peer evidence 注入数、範囲外引用を並べます。**比較器はネットワークや推論を呼びません。**
+
+### 何を根拠に採否を決めるか
+
+- 同じモデルと各エージェントの上限で比べ、品質だけでなく実測トークン数・時間も見る。
+- 1 回の成功で昇格させない。複数の固定課題・試行で改善が再現し、追加コストと範囲外引用が許容できるかを確認する。
+- exact-match score はベンチマーク用の手掛かりで、正しさの証明ではない。自由記述タスクでの合意や引用数だけでは昇格させない。
+- 共有モードは通常動作の既定にせず、利用者が明示した場合だけ実行する。実行時は実際のサブLLM呼び出しを行い、利用枠・遅延・既存の品質統計に影響します。
+
+この変更では実モデルのA/B測定を行っていません。実験出力が揃うまでは、共有方式が独立方式より高品質・低コストだとは結論できません。
 
 ## 複雑な問題を段階的に考える（`freeagent_think`）
 
@@ -303,11 +359,21 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 
 | 表示・項目 | 意味 | これだけでは分からないこと |
 |---|---|---|
-| `✓ openrouter …` / `ready=true` | キーが設定され、一覧を取得できている（nous はキー不要） | キーの有効性、クレジット残量、個別モデルの応答可否 |
-| `未設定 → 検索のみ` | 一覧は取れるが、推論用のキーがない | キーを入れた後に実際に回答できるか |
-| `到達不可` | 一覧を取得できない。理由を表示する | 「モデルが存在しない」とは限らない |
-| `Free候補` / `usable_now`（今すぐ使用可） | キーなどの条件を満たす候補数。`usable_now` はクールダウン中を除いた数 | **未検証モデルを含むため、実際に答えられる数ではない** |
+| `ready=true` / `configured=true` | キー・tier確認などの設定条件が揃っている（Nousはキー不要） | 接続先の稼働や実際の推論成功 |
+| provider `state` | 設定不足・接続失敗・一覧取得失敗・Free候補なし・未検証候補を区別する状態 | `candidate_unverified` は実推論成功を保証しない |
+| `eligible_free` | 設定条件を満たすprovider内のFreeモデル数 | モデルが生きているか、現在応答できるか |
+| `Free候補` / `usable_now` | `usable_now` はクールダウン外の候補数（推論成功数ではない） | **候補は未検証。実際に答えられることは `probe=alive` で確認** |
+| `availability.state` | 全体の診断状態。接続不可・設定不足・Free候補なし・クールダウン等を示す | provider別の原因は `providers[]` を確認 |
 | `probe=alive` | 生存確認で実際に回答した | 次の呼び出しでも成功するとは限らない |
+
+主なprovider `state`: `needs_configuration`（設定不足）、`endpoint_unreachable`（接続先に到達できない）、
+`authentication_error`、`rate_limited`、`catalog_error`、`empty_catalog`、`no_free_candidates`、
+`candidate_unverified`（条件に合う候補はあるがprobe未確認）。全体の `availability.state` には `all_candidates_cooling` と `no_configured_provider` もあります。エラーのカタログ一覧は既定15秒で再確認し、
+正常一覧の既定10分キャッシュより早く復旧を反映します（`FREEAGENT_MODEL_ERROR_TTL` で1〜300秒に調整可能）。
+状態確認だけではモデル推論を呼びません。proxyを起動・復旧した直後に負キャッシュを待たず再確認したいときは、`freeagent_models` に `refresh=true` を付けます。これは接続失敗の一覧だけを再取得し、成功キャッシュは維持します。HTTP 429 では `Retry-After` を迂回しません。生存確認の `probe=true` とは異なり、モデル推論を呼びません。
+
+診断は実際のMCP子プロセス内で行います。シェルで起動する単体スクリプトはHermes MCPの `env:` を自動では引き継がないため、
+シェル側の「0 Free」とMCP側の設定状態は一致しない場合があります（[APIキーの設定](#api-キーの設定)も参照）。
 
 生存確認は会話で「Free 候補を少数だけ `probe=true` で確認して」と頼めます。
 大量に確認すると時間・無料枠を使うので、初回は 2〜4 件程度で十分です。
@@ -346,6 +412,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 |---|---|
 | ツールが出てこない | `hermes mcp test freeagent-bind` で登録と接続を確認。設定変更後は Hermes を再起動 |
 | 接続テストは成功したが回答できない | 接続テストは 11 ツールの発見まで。`freeagent_ask` で実応答を試し、キー・利用枠・プロキシを確認 |
+| `freeagent_models` が `endpoint_unreachable` | Nous は別ターミナルで `hermes proxy start`。`hermes proxy status` はOAuth上流の状態、`freeagent_models` は実MCPからの接続を確認。proxy復旧後、必要なら `freeagent_models` に `refresh=true` を付ける |
 | 検索はできるが相談だけ失敗する | 推論の接続問題です。キー未設定なら設定。Nous を使うなら `hermes proxy start` |
 | `nous` が `WinError 10061` | ローカルプロキシが停止しています。他プロバイダが使えるなら全体は止まりません |
 | `401`、認証を示す `403` | キー・トークン権限を確認。HF では **Make calls to Inference Providers** が必要。変更後は再起動 |
@@ -763,6 +830,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |
 | `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini` | 一覧に出すプロバイダと優先順。オプション3社は契約確認変数が無い間は通信しない |
 | `FREEAGENT_AUTH_TTL` | 900 | 認証失敗を覚えて自動選抜から外す時間（秒） |
+| `FREEAGENT_MODEL_ERROR_TTL` | 15.0 | 失敗したモデル一覧の負キャッシュ寿命（秒、1〜300）。HTTP 429 は `Retry-After` が長ければそちらを優先。成功一覧のTTLは10分 |
 | `FREEAGENT_PROBE_TIMEOUT` | 25.0 | 生存確認 1 件の読み取りタイムアウト（秒） |
 | `FREEAGENT_PROBE_WORKERS` | 8 | 生存確認の並列度（1〜8） |
 | `FREEAGENT_SESSIONS` | 1 | 相談セッションを永続化する |
@@ -858,6 +926,12 @@ python scripts/measure_adoption.py
 python scripts/measure_kb.py --report
 python scripts/apply_proactive.py
 python scripts/apply_proactive.py --check
+```
+
+共有エビデンス実験の結果ファイルをペア比較する場合（このコマンド自体は推論・ネットワークを使いません）:
+
+```bash
+python scripts/compare_agent_experiments.py runs.jsonl
 ```
 
 追加のネットワーク検証:
