@@ -21,7 +21,7 @@
 | §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳） |
 | §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
-| §5 | 知識バックエンド14種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io） |
+| §5 | 知識バックエンド15種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須）） |
 | §6 | ツール実装（11本、§6.11 本文の注入番号・引用認定） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
@@ -129,8 +129,11 @@
 
 ## 5. 呼び出し（§4）
 
-- 外部 HTTP は **接続タイムアウトと読み取りタイムアウトを分けて設定**する（既定 10 秒 / 180 秒）。接続後は urllib の response socket を読み取りタイムアウトへ切り替える。環境障害（接続不可・timeout）は同じプロバイダ系列の fallback を打ち切り、全候補へ同じ不通を繰り返さない。
-  - **実測の限界**: 切り替えは `urlopen` が**応答ヘッダを受け取った後**にしか効かない。ローカルプロキシは上流の生成が終わるまで本文もヘッダも返さないため（実測: TTFB 6.13 秒 = total 6.13 秒）、生成が `CONNECT_TIMEOUT`（10 秒）を超えると `TimeoutError` になり、読み取り 180 秒は使われない（実測: 1200 トークンの要求が 10.0 秒で timeout）。この失敗は `is_env_failure` に該当するため**統計にも残らない**。回避は `max_tokens` を小さく保つ・`FREEAGENT_CONNECT_TIMEOUT` を上げる（遮断ホストへの fail fast が鈍る）。根本対策は `http.client` で接続と読み取りを別々に設定すること（未着手・README の「既知の制約」に記載）。
+- 外部 HTTP は **接続タイムアウトと読み取りタイムアウトを分けて設定**する（既定 10 秒 / 180 秒）。`_urlopen` は §3 の共有 `_OPENER` を使う。これは `http.client` の接続クラスに `_ShortConnectMixin` を混ぜ、`HTTPHandler` / `HTTPSHandler` を差し替えたもので、**接続（TCP と TLS ハンドシェイク）の間だけ** `CONNECT_TIMEOUT` を適用し、接続直後に socket を `READ_TIMEOUT` へ切り替える。`build_opener` はサブクラスを既定ハンドラの置換と見なすので、リダイレクト（`HTTPRedirectHandler`）・プロキシ（`ProxyHandler`）・`HTTPError` の既定挙動は保たれる。環境障害（接続不可・timeout）は同じプロバイダ系列の fallback を打ち切り、全候補へ同じ不通を繰り返さない。
+  - **実測（修正前）**: `urlopen(timeout=CONNECT_TIMEOUT)` の上限は**応答ヘッダの待ち時間にも掛かった**。ローカルプロキシは上流の生成が終わるまで本文もヘッダも返さないため（実測: TTFB 6.13 秒 = total 6.13 秒）、生成が `CONNECT_TIMEOUT`（10 秒）を超えると `TimeoutError` になり、読み取り 180 秒は使われなかった（実測: 1200 トークンの要求が 10.0 秒で timeout）。この失敗は `is_env_failure` に該当するため**統計にも残らない**。
+  - **修正後の契約**: ヘッダ待ちと本文読取は `READ_TIMEOUT` まで待てる。接続できないホストへの fail fast は接続上限のまま。`tests/test_audit_regressions.py` の `TestHttpTimeoutSeparation` が localhost の遅延サーバで 5 点（接続上限 < ヘッダ遅延 < 読み取り上限 → 成功 / 読み取り上限で打ち切り / 不通ホストは接続上限内で失敗 / 302 追従 / 4xx は `HTTPError`）を検査する。実サーバーでも確認（https://httpbin.org/delay/12 = 12 秒遅延: 旧方式 10.58 秒で `TimeoutError` → 新方式 10.76 秒で成功）。
+  - **版差の吸収**: 3.13 以前の `HTTPSHandler` は `check_hostname` を保持して `do_open` へ渡すが、**3.14 以降は渡さない**（`HTTPSConnection` も `check_hostname` を受け付けない）。`getattr(self, "_check_hostname", None)` で吸収する。実バックエンド検証で `AttributeError` を検出して修正した（localhost の http テストだけでは通ってしまうので、`_HTTPSHandler` を直接検査する回帰テストを併置している）。
+  - これにより、`think` の代替案の `max_tokens` 既定 400 を縛っていた「proxy 経由の 10 秒制約」も解消した（既定値は待ち時間と利用枠の理由で据え置き）。
 - 429 は `Retry-After` を尊重してクールダウンへ記録。404/410 は長め（1 時間）、429 は既定 60 秒
   （上限 900 秒）。402（クレジット枯渇）はプロバイダ全体の認証障害として記憶せず、該当モデルだけ既定 60 秒間クールダウンする。
 - **401/403 はプロバイダ単位で記憶**して自動選抜から外し、原因と直し方を `last_error` に残す
@@ -177,7 +180,7 @@
 - 注入する本文は 1 件あたり `FREEAGENT_EVIDENCE_ITEM_CHARS`（既定 360）、全体で
   `FREEAGENT_EVIDENCE_TOTAL_CHARS`（既定 3200）に収める。入れすぎると小型 Free モデルが予算を
   使い切って空応答・切断になる（逆効果）。
-- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加8種（datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。
+- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加9種（datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates / cinii）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。ciniiは`FREEAGENT_CINII_APPID`が前提で、未設定ならHTTPを出さずに案内を返す（§6.7）。
 - `fallback=true`のJSON真偽値だけが、自然語arXiv検索をDataCiteへ追加送信する明示許可。文字列`"true"`等は許可にしない。
 - 1 ソースの失敗で全体を落とさない（`errors` に集約し、成功分だけ返す）。
 
@@ -204,8 +207,8 @@
 - 1 巡で全ソースを並列に 1 回ずつ引き、1 ソース 1 行を `FREEAGENT_KB_LATENCY_PATH`（既定
   `FREEAGENT_STATE_DIR/kb_latency.jsonl`・最大 20,000 行・超えたら古い行から tmp + `os.replace` で捨てる）へ追記。
   記録は `ts` / `hour`（日本時間）/ `source` / `elapsed_s` / `ok` / `items` / `error`（160 字）/ `mailto` /
-  `openalex_key` / `env_failure` に加え `datacite_kind` / `summaries`（本文がある件数）を記録し、**タイトル・本文は残さない**。
-  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応11ソースを測る。RORだけは機関名の6問を巡回し、論文キーワードの空振りと混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
+  `openalex_key` / `cinii_appid` / `env_failure` に加え `datacite_kind` / `summaries`（本文がある件数）を記録し、**タイトル・本文は残さない**。
+  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応15ソースを測る（ciniiはappid未設定なら外す・§6.7）。RORだけは機関名の6問を巡回し、論文キーワードの空振りと混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
 - 全ソースが接続系の失敗なら `env_failure=true`（こちらのネットワーク障害）とし、`--report` の集計から外す。
 - `--schedule N` は Windows のタスク（`pythonw`＝窓を出さない）を 1 時間おきに登録し、残り回数を
   `kb_latency.jsonl.schedule.json` で数えて、最後の 1 回でタスクを自分で消す（`/ED` `/ET` は HOURLY との
@@ -287,6 +290,62 @@
 - `measure_kb.py`はnpm/cratesにパッケージ系の問い（json schema validator等）を巡回させ、論文キーワードの
   空振りと障害を混同しない（RORの機関名巡回と同じ考え方）。
 
+### 6.6 保留候補の許諾確認（一次情報・2026-10-04）
+
+規約 29/30 の基準（検索できる公認 API か・規約が参照する AUP/bot/AI 制限・既存ソースとの重複・8 秒締切との整合）で
+保留候補を**公式文書**で再確認した。**結論: J-STAGE / CiNii / CORE は登録しない**（新規実装なし）。
+
+- **J-STAGE WebAPI**（[利用規約](https://www.jstage.jst.go.jp/static/pages/WebAPI/-char/ja)・
+  [マニュアル](https://www.jstage.jst.go.jp/static/files/ja/manual_api.pdf)）— 非営利目的は利用申請不要（第 2 条 1）だが、
+  条件が実装義務として重い: ①「Powered by J-STAGE」クレジットと J-STAGE へのリンク表示（第 9 条）②機械可読な状態で
+  **24 時間以上の保存・キャッシュ禁止**（第 3 条 5）③**主たるコンテンツとして組み込まない**（第 3 条 3）④利用者運営
+  サービスの利用者に**本規約の存在を表示し遵守させる**（第 3 条 1）⑤常に最新を表示（第 3 条 6）。商用は有償/無償を
+  問わず申請＋承認（第 2 条 2）。加えて**内容が Crossref と重複する**: 論文検索結果取得の応答項目は論文タイトル
+  （en/ja）・著者・資料名・ISSN・巻号頁・発行年・DOI・JOI のみで**抄録を返さない**（マニュアル 4.レスポンス
+  フォーマット）。実測でも J-STAGE 掲載の日本語論文（10.14817/jlak.2016.49.25・10.1299/jsmemag.102.969_463_1 等）は
+  `freeagent_lookup` の crossref で取得できる。→ **保留継続**（規約表示・キャッシュ禁止の実装義務に対し、追加で
+  得られるのが書誌だけ）。
+- **CiNii**（[API 利用登録](https://support.nii.ac.jp/ja/cinii/api/developer)・
+  [ウェブ API 利用細則](https://support.nii.ac.jp/sites/default/files/cinii/webapi-term.pdf)・
+  [利用規程](https://support.nii.ac.jp/sites/default/files/cinii/content_services-term_1.pdf)）— ウェブ API 利用細則
+  第 3 条は利用目的を「**自己の学術研究**」または「**非営利の情報利活用**」に限り、それ以外は**書面で事前申請し承認を
+  得る**ことを要求する。第 4 条は申請の**審査・承認**と API キー発行、第 5 条は **API キーの第三者貸与・譲渡の禁止**、
+  第 6 条 1 は**再許諾の禁止**。利用規程 第 4 条は「自己の学術研究のため、又は学術研究の発展に資するため…**それ以外の
+  目的のために使用しない**」、第 5 条 2 は複製物を**他人が共同使用できるサーバ等に保管して利用すること**を禁じる。
+  → 汎用アシスタントへの組み込みは利用目的の限定と衝突しうるため、**プロジェクトの既定ソースにはしない**。
+  ただし利用者自身が承認を得て自分の appid を設定する場合は動かせるようにした（§5.17 / §6.7。
+  **プロジェクトがキーを同梱・共有することは第5条でできない**）。利用目的に当たるかの判断は利用者に委ねる。
+- **CORE**（[Terms & Conditions](https://core.ac.uk/terms)）— §3 は、CORE データを使う製品・サービス・ソフトウェアが
+  「**API・推薦・検索・探索システム・分析ダッシュボード等の CORE の既存サービスが提供する機能に関わる**」場合、
+  無料ライセンスの適格性にかかわらず **CORE への連絡が必要**と明記し、API の利用にはライセンスを要するとする。
+  → 本サーバーの lookup は検索・探索機能そのものなので**登録しない**（連絡して許諾を得るまで）。
+- **Semantic Scholar** — 匿名は 429（実測 3/3）。キーは申請フォーム経由で、**API の利用条件が明示された文書を公開
+  ページ / FAQ で確認できない**（FAQ はエラーコードのみ）。→ 条件が曖昧なため**保留継続**（規約 30）。
+- **HAL** — 非商用条項が曖昧なまま（変更なし）。
+- 副産物の実測: Crossref は `mailto` 無しの連続リクエストで **429** を返す（単発 3 回で発生）。`FREEAGENT_MAILTO` を
+  設定すると polite pool に入る（既存実装）。
+
+### 6.7 第5段階 CiNii Research（§5.17・appid 必須・明示指定のみ）
+
+- `cinii`を`SOURCES`/`KB_BACKENDS`へ追加するが`DEFAULT_SOURCES`は変更しない（明示指定のみ）。
+- **利用者自身の appid が前提**。`FREEAGENT_CINII_APPID`未設定なら**HTTPを一切出さずに**登録先と設定方法を
+  案内する（実測: appid 無しでも 200 が返るが、規約は登録を要求している）。プロジェクトは appid を同梱・共有
+  しない（ウェブAPI利用細則 第5条が第三者への貸与・譲渡を禁じる）。**利用目的に当たるかは利用者が判断する**
+  （検索内容の判断は利用者に信託し、サーバーは代わりに同意しない）。
+- エンドポイントは`https://cir.nii.ac.jp/opensearch/all`（`q`＝各語を引用してAND結合・`format=json`・`count`・
+  `appid`）。応答はJSON-LDで、`items[]`の`title`/`dc:creator`/`dc:publisher`/`dc:type`/`prism:publicationName`/
+  `prism:publicationDate`/`prism:startingPage`/`dc:identifier`（`cir:NAID`・`cir:NCID`・`cir:ISBN`・`cir:DOI`）/
+  `link.@id`を書誌として正規化する。`dc:creator`は文字列のときもある。`dc:identifier`の辞書キーや文字列の
+  各文字を値にしない。DOIがあれば引用URLは`https://doi.org/`を優先し、CiNiiのページURLは`cir_uri`に残す。
+- **抄録を返さない**（実測: 応答項目にabstract/descriptionが無い）。全件`metadata_only=true`とし、
+  `_kb_has_evidence`・本文注入番号の対象にしない（利用規程 第5条2の複製・編集の制限に触れないため）。
+- レートは公表が無いためプロセス内1ホスト2.0秒間隔に自制する（同 第6条3の短時間大量アクセス回避）。
+  他アプリ・他IPとの共有ではない（§5.11と同じ但し書き）。
+- **実経路の計測は未完了**: 応答形式は実応答（appid無しで200が返る1回の確認）から写した実データで
+  `tests/test_knowledge_cinii.py`（10件）が検証するが、appidを使ったstdio・レイテンシの実測は
+  **appidを持つ利用者が**`probe_knowledge_stdio.py --sources cinii`と`measure_kb.py --sources cinii`で行う
+  （どちらもappid未設定なら検査・計測せずに外す）。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。
@@ -359,8 +418,8 @@
 | 仮説 | `kind=hypothesis` | ステップの `hypothesis_status`（初期 `open`） | 同じ番号で書き直しても `hypothesis_status` / `tested_by` は失わない |
 | 仮説の検証 | `tests_hypothesis` + `hypothesis_status` | 仮説側の `tested_by` / `hypothesis_status` | 対象は `kind=hypothesis` のみ。検証ステップ自身は `kind=test`（既定で推定） |
 | 見積り総数 | `total_thoughts` | ステップの `total_thoughts`、台帳メタ `total_history` | 省略時は台帳の値を引き継ぐ。**番号が見積りを超えたら番号まで引き上げ**、`total_auto_adjusted` と `notes` に出す |
-| 代替案 | `propose_alternatives` | ステップの `alternatives` | 検証者とも別のモデル（台帳の使用済みモデルを除外）。`THINK_ALT_SYSTEM` で「代替: …」を最大 3 行。フォールバックも検証者に落とさない（`avoid`）。`truncated`（上限で打ち切り）なら**最終行の案を捨てる**（文の途中で切れた案を完全な案として残さない。実測「代替: 親プロセスのコマン」）。既定の上限は 400 のまま（上げると proxy 経由で 10 秒の接続タイムアウトを超えやすい。§5）。全員が環境障害なら**書かない** |
-| 閲覧 | `view=true` + `session_id` | — | 何も書かない。サブも呼ばない（`verify` が付いていても） |
+| 代替案 | `propose_alternatives` | ステップの `alternatives` | 検証者とも別のモデル（台帳の使用済みモデルを除外）。`THINK_ALT_SYSTEM` で「代替: …」を最大 3 行。フォールバックも検証者に落とさない（`avoid`）。`truncated`（上限で打ち切り）なら**最終行の案を捨てる**（文の途中で切れた案を完全な案として残さない。実測「代替: 親プロセスのコマン」）。既定の上限は 400 のまま（接続タイムアウトの旧制約は §5 の修正で解消したが、予算を増やすと待ち時間と利用枠の消費が増えるため据え置き）。全員が環境障害なら**書かない** |
+| 閲覧 | `view=true` + `session_id`（`brief=true` で要約） | — | 何も書かない。サブも呼ばない（`verify` が付いていても）。`brief` は**現行の道筋**（改訂済み・棄却分岐を除く）だけを返し、省いた件数を `omitted` に出す（黙って隠さない）。計画・仮説・分岐・`active_path` は要約でも残す |
 
 - **推測で繋がない**: 参照先が無い操作はエラーで返し（`known_thoughts` / `known_branches` を添える）、
   台帳を書かない。誤った番号のまま積むと以後の `active_path` が静かに壊れる。
@@ -389,7 +448,10 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
 - MCP `env` とシェルの環境は別で、単体スクリプトは MCP `env` を自動で読み込まない。
   `smoke_stdio.py` のネットワークモードは一覧までの検査で、実推論の成功を検査しない。
   `warmup_models.py` の終了コード 0 も生存モデルが 1 件以上ある保証ではない。
-- `measure_adoption.py` の割合は対象セッション全体での利用割合で、必要場面に限定した自発率ではない。
+- `measure_adoption.py` は全セッション比の採用率に加えて、依頼文の言い回しから「必要場面」を近似判定した採用率と見逃しを出す（`NEED_CUES`）。判定は近似であり、必要場面の完全な判定ではない。既定では `messages.tool_calls` を持つセッションだけが対象で、ツールを 1 つも呼ばなかったセッションは `--include-tool-free` を付けたときだけ分母に入る。見逃しに添える競合の回数は**そのセッション全体の回数**で、必要能力を置き換えた回数そのものではない。
+  - **誤検出の型（すべて実測で特定して修正）**: (a) 「読み取り専用の再レビュー。…を読み、」＝**自分で読む依頼**（`_COMMON_EXCLUDE`）。(b) `@url` で貼られた**添付ページ本文**の英語 "sources"（`utm_source` やページ見出し）を依頼文と誤認（`_request_only` で添付を落とす）。(c) **委譲の完了通知**（`[ASYNC DELEGATION …]` が user ロールで保存される）の本文（`_MACHINE_NOTICE`）。(d) サービス・提供元・公式条件を探す依頼は学術コーパス外（`sources` の `exclude`。ただし `strong`＝文献・論文・先行研究・サーベイがあれば除外しない）。
+  - **コーパス外の根拠（実測）**: `freeagent_lookup` に「LLM inference API provider comparison alternatives」を引くと**論文 9 件が返り、提供元の一覧は返らない**（学術ソースは API 提供元を索引していない）。同様に「J-STAGE / CiNii の公式利用条件」も該当コーパスが無い。この型は `web_search` が正しい選択なので見逃しに数えない。
+  - これらを直した結果、直近 25 セッションの必要場面は **12→6 件**、必要場面の採用率は **62%→100%（6/6・見逃し 0）**。**数字が良くなったのは計測器を直した結果で、モデルの行動は変えていない**（自発率の改善と読まないこと）。必要場面が 6 件しかないので、この 100% を「問題が無い」証拠としない（**見つけられなくなった**が正確）。判定は依然として言い回し依存の近似なので、`--excerpt` で中身を確認してから判断する。
 - 設定は自動監視しない。反映は Hermes の再起動を案内する。最近の Hermes の `/reload-mcp` は
   [公式設定リファレンス](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference#reloading-config) に案内がある。
 - キーの説明はサーバー自身の `.env` 自動読み込み（なし）と、Hermes の秘密情報参照（クライアント機能）を区別する。
@@ -474,6 +536,13 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   kind=hypothesis と tests_hypothesis で仮説の生成と検証を積む」を指示する。1 問 1 答・単純な事実確認・雑談は
   対象外（全問で開くと 1 ターンが無駄に伸びる）。台帳側でも補強する: 計画なしの 1 ステップ目と、仮説・分岐・
   改訂が 1 つも無い 3 ステップ目に**だけ** `suggestions` で促す（毎ステップ出すと雑音になる）。
+- **文面に優先順位を足しても動かなかった（実測・否定的結果）**: 「出典・根拠が要る依頼では web_search /
+  web_extract の前に freeagent_lookup / grounded を検討する」を判断規則へ追加し、同じ依頼を新プロセスで
+  前後比較した（3 組。自己申告で、追加した文が実際に文脈へ入っていることも確認済み）。**3 組とも選択は
+  変わらなかった** — 既に正しく選べていた 2 組はそのまま、過去に見逃していた探索型の依頼
+  （「世界中から API を探して」）は前後とも `web_search` のままで `freeagent_lookup` を使わなかった。
+  同種の文面を足すだけでは動かないので**この追加は取り消した**。次に試すなら `description` 側
+  （`freeagent_lookup` の記述）を変え、同じ 3 組で測る。
 - **「有効な間だけ」効かせる**: 判断規則は `<!-- freeagent-bind: proactive-usage -->` 〜
   `<!-- /freeagent-bind: proactive-usage -->` のブロックで SOUL.md に置く。`--write-snippet` は**既存の
   ブロックを最新の文面に差し替え**（旧形式＝終端マーカー無しも可。ブロック外は触らない。改行コードは元の

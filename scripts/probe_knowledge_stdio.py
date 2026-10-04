@@ -6,6 +6,8 @@ python scripts/probe_knowledge_stdio.py --sources zenodo ror --query CERN
 
 各指定ソースの有効応答・出典・両チャネルを検査。失敗はexit 1（成功を捏造しない）。
 OpenAIREは匿名60/h。同一IP上の他プロセスも含め、連続実行には60秒以上の間隔を空ける。
+cinii は利用者自身の appid（FREEAGENT_CINII_APPID）が要る。未設定なら**検査せずに外す**
+（未設定は失敗ではない。登録: https://support.nii.ac.jp/ja/cinii/api/developer）。
 """
 from __future__ import annotations
 
@@ -75,6 +77,8 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
         if cite["source"] in ("npm", "crates"):
             if cite.get("summary_kind") != "registry_description":
                 raise ValueError("package registry evidence kind mismatch")
+        if cite["source"] == "cinii" and not cite.get("metadata_only"):
+            raise ValueError("CiNii は書誌のみ（抄録を返さない）ので metadata_only であること")
         S._kb_http_url(cite["url"])
         if not set(cite.get("providers") or [cite["source"]]).issubset(served):
             raise ValueError("merged citation provider mismatch")
@@ -90,6 +94,13 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=2)
     parser.add_argument("--fallback", action="store_true")
     args = parser.parse_args()
+    if "cinii" in args.sources and not S.CINII_APPID:
+        # 未設定は「失敗」ではない（利用者の appid が前提のソース）。検査対象から外して理由を出す
+        print("skip: cinii は FREEAGENT_CINII_APPID 未設定のため検査しません"
+              "（登録: https://support.nii.ac.jp/ja/cinii/api/developer）")
+        args.sources = [s for s in args.sources if s != "cinii"]
+        if not args.sources:
+            return 0
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
     env["PYTHONIOENCODING"] = "utf-8"

@@ -30,7 +30,7 @@ python -m unittest discover -s tests         # オフライン回帰（件数は
 python scripts/smoke_stdio.py                # 実クライアント経路（initialize/tools/list/tools/call）
 python scripts/probe_knowledge_stdio.py      # 新規知識ソースの実API・stdio（ネットワークあり）
 python scripts/check_offline.py              # バックエンド全滅: 例外漏れ・ハング・状態汚染が無いこと
-python scripts/measure_adoption.py           # 自発利用率の測定（state.db を読むだけ・副作用なし）
+python scripts/measure_adoption.py           # 自発利用率の測定（state.db を読むだけ・副作用なし。必要場面の近似判定も出す）
 python scripts/measure_kb.py --report         # 知識バックエンドの時間帯別の応答時間（記録を読むだけ）
 python scripts/apply_proactive.py            # 率先利用の設定（既定は表示のみ。--apply で適用）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存（プロキシが要る）
@@ -58,7 +58,8 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
    後回しにしないと「選択直後に 429 → 全候補がクールダウン中 → 1体へ縮退」が起きる。
 8. **失敗を content に出して隠さない**。討論ラウンドの脱落は `failed` / `debate_summary.dropped` に残し、
    表示は1行に集約する（LLM へは全ラウンドを返し、人間には重複なく見せる）。
-9. 外部 HTTP は **(connect, read) のタイムアウト必須**。遮断はホスト単位で記憶して fail fast。
+9. 外部 HTTP は **(connect, read) のタイムアウト必須**。`urllib` の `timeout` は**応答ヘッダ待ちにも掛かる**ので、
+   §3 の共有 `_OPENER`（接続の間だけ接続上限、接続後は読み取り上限）を使う。遮断はホスト単位で記憶して fail fast。
 10. arXiv は **https**（http は 301 の先で 406）かつ **3 秒間隔で直列化**する。
 11. 「結論/確信度/確認したい点」の解析は**1 行 1 ラベルと決め打たない**（同一行に複数ラベルが来る）。
 12. サブエージェントは**最終ステップでツールを封じて回答を要求する**。到達しなかったら推測で埋めず
@@ -165,6 +166,12 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     RORは機関候補の実属性を構造化根拠として返す。論文抄録を生成せず、設立年を出版年にしない。検索順位で機関同定を確定しない。
     既定6を維持し追加5は明示のみ。ROR6.1秒、Zenodo2.01秒のプロセス内間隔を他アプリ/IP全体の保証にしない。
     API規約が参照するAUP/bot/AI利用制限も実プローブ前に確認し、許諾未確認候補は登録しない。既定offは許諾ではない。
+    保留候補の条項レベルの確認結果は SPEC §6.6 に記録し、**再確認なしに登録しない**（J-STAGE は「Powered by J-STAGE」
+    表示・24時間以上のキャッシュ禁止・利用者への規約表示、CORE は T&C §3 が検索/探索機能に関わる製品の連絡を要求）。
+    **キーが前提のソースは利用者自身のキーがあるときだけ動かす**（CiNii = `FREEAGENT_CINII_APPID`・§5.17/§6.7）:
+    未設定なら HTTP を出さずに登録先を案内し、既定ソースには加えない。**プロジェクトはキーを同梱・共有しない**
+    （貸与・譲渡の禁止）。**利用目的に当たるかの判断は利用者に信託し、サーバーは代わりに同意しない**。
+    プローブと計測はキー未設定ならそのソースを外して続行する（未設定は失敗ではない）。
 
 30. **第4段階は検索できる公認APIだけ**（§5.16）。DOAJ（記事メタデータCC0・2req/s公認）/ npm（公式Public APIで
     複製を明示許可）/ crates.io（Crawler Policy: 1req/s＋識別UA）を明示指定ソースとして追加。既定6は不変。

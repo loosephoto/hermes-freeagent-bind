@@ -1,12 +1,19 @@
 """追加監査で再現した不具合の回帰テスト。"""
 import concurrent.futures
+import http.client
+import http.server
 import io
 import json
 import os
+import socket
+import sqlite3
 import sys
+import threading
 import time
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from unittest import mock
 
 os.environ.setdefault("FREEAGENT_STATE_DIR", os.path.join(tempfile.gettempdir(), "fa-audit-tests"))
@@ -143,15 +150,69 @@ class TestAuditRegressions(unittest.TestCase):
         self.assertEqual(len(count), 1)
         self.assertEqual(results, [{"items": ["ok"]}, {"items": ["ok"]}])
 
-    def test_urlopen_applies_distinct_connect_and_read_timeouts(self):
-        sock = mock.Mock()
+    def test_urlopen_passes_the_read_budget_to_the_shared_opener(self):
+        """新契約: `_urlopen` は接続/読み取りを分離した共有 opener へ読み取り上限を渡す。"""
         response = mock.Mock()
-        response.fp.raw._sock = sock
-        with mock.patch.object(S.urllib.request, "urlopen", return_value=response) as open_url:
+        with mock.patch.object(S._OPENER, "open", return_value=response) as open_url:
             self.assertIs(S._urlopen(S.urllib.request.Request("https://example.invalid"), 37), response)
         open_url.assert_called_once()
-        self.assertEqual(open_url.call_args.kwargs["timeout"], S.CONNECT_TIMEOUT)
-        sock.settimeout.assert_called_once_with(37)
+        self.assertEqual(open_url.call_args.kwargs["timeout"], 37)
+
+    def test_connect_budget_applies_only_while_connecting(self):
+        """接続中だけ短い上限を使い、接続後は読み取り上限へ戻す（10 秒制約の根本対策）。"""
+        seen = []
+
+        class _FakeConnection:
+            def __init__(self, timeout):
+                self.timeout = timeout
+                self.sock = mock.Mock()
+
+            def connect(self):
+                seen.append(self.timeout)  # 接続中に見えている上限
+                self.sock.settimeout(self.timeout)
+
+        class _Probe(S._ShortConnectMixin, _FakeConnection):
+            pass
+
+        conn = _Probe(180.0)
+        with mock.patch.object(S, "CONNECT_TIMEOUT", 7.5):
+            conn.connect()
+        self.assertEqual(seen, [7.5], "接続中は接続上限を使う")
+        self.assertEqual(conn.timeout, 180.0, "接続後は読み取り上限へ戻す")
+        conn.sock.settimeout.assert_called_with(180.0)
+
+    def test_short_connect_classes_keep_stdlib_behaviour(self):
+        """既定の HTTP/HTTPS 実装を継承し、リダイレクト・プロキシ・HTTPError の既定挙動を保つ。"""
+        self.assertTrue(issubclass(S._ShortConnectHTTPConnection, http.client.HTTPConnection))
+        self.assertTrue(issubclass(S._ShortConnectHTTPSConnection, http.client.HTTPSConnection))
+        self.assertTrue(issubclass(S._HTTPHandler, urllib.request.HTTPHandler))
+        self.assertTrue(issubclass(S._HTTPSHandler, urllib.request.HTTPSHandler))
+
+    def test_handlers_pass_our_connection_classes_to_do_open(self):
+        """ハンドラが自前の接続クラスを do_open へ渡す。3.14 の HTTPSHandler には
+        `_check_hostname` が無い（実バックエンド検証で AttributeError を検出した）ので、
+        版差を吸収して context だけを渡せていることも同時に確認する。"""
+        seen = {}
+
+        def fake_do_open(self, http_class, req, **kwargs):
+            seen["class"] = http_class
+            seen["kwargs"] = kwargs
+            return "response"
+
+        with mock.patch.object(urllib.request.AbstractHTTPHandler, "do_open", fake_do_open):
+            self.assertEqual(S._HTTPHandler().http_open(
+                urllib.request.Request("http://example.invalid")), "response")
+        self.assertIs(seen["class"], S._ShortConnectHTTPConnection)
+        self.assertEqual(seen["kwargs"], {})
+
+        with mock.patch.object(urllib.request.AbstractHTTPHandler, "do_open", fake_do_open):
+            self.assertEqual(S._HTTPSHandler().https_open(
+                urllib.request.Request("https://example.invalid")), "response")
+        self.assertIs(seen["class"], S._ShortConnectHTTPSConnection)
+        self.assertIn("context", seen["kwargs"])
+        if not hasattr(urllib.request.HTTPSHandler, "_check_hostname"):
+            self.assertNotIn("check_hostname", seen["kwargs"],
+                             "3.14 以降は check_hostname を渡さない（HTTPSConnection が受け付けない）")
 
     def test_invalid_jsonrpc_shapes_do_not_kill_stdio_server(self):
         batch = [{"jsonrpc": "2.0", "id": 1, "method": "ping"}]
@@ -352,6 +413,251 @@ class TestAuditRegressions(unittest.TestCase):
         self.assertEqual(row["unsupported_citations"], [])
         self.assertFalse(row["cited_ok"])
         self.assertIn("引用なし", S.render("freeagent_agent", got))
+
+
+class _HeaderDelayHandler(http.server.BaseHTTPRequestHandler):
+    """ヘッダを遅らせるサーバ（生成完了までヘッダを返さないローカルプロキシの模擬）。"""
+
+    protocol_version = "HTTP/1.0"
+
+    def do_GET(self):
+        if self.path.startswith("/stall"):
+            time.sleep(5.0)
+            self._respond(200, b'{"late": true}')
+        elif self.path.startswith("/slow"):
+            time.sleep(0.8)
+            self._respond(200, b'{"ok": true}')
+        elif self.path.startswith("/redirect"):
+            self.send_response(302)
+            self.send_header("Location", "/ok")
+            self.end_headers()
+        elif self.path.startswith("/missing"):
+            self._respond(404, b"nope")
+        else:
+            self._respond(200, b'{"ok": true}')
+
+    def _respond(self, status, body):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class TestHttpTimeoutSeparation(unittest.TestCase):
+    """接続と読み取りの分離を localhost の遅延サーバで実測する（外部ネットワーク不要）。
+
+    修正前: `urlopen(timeout=CONNECT_TIMEOUT)` の上限は**応答ヘッダの待ち時間にも掛かり**、
+    生成が 10 秒を超えるローカルプロキシでは読み取り上限（既定 180 秒）が使われずに
+    `TimeoutError` になった（実測: 1200 トークンの要求が 10.0 秒で失敗）。
+    修正後は接続だけが接続上限の対象で、ヘッダ待ちと本文は読み取り上限まで待てる。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _HeaderDelayHandler)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        # 環境のプロキシ設定で 127.0.0.1 が回り道をしないよう、同じハンドラで組んだ opener を使う。
+        cls.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), S._HTTPHandler, S._HTTPSHandler)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        patcher = mock.patch.object(S, "_OPENER", self.opener)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _url(self, path):
+        return "http://127.0.0.1:%d%s" % (self.port, path)
+
+    def _get(self, path, read_timeout=10.0):
+        return S._urlopen(urllib.request.Request(self._url(path)), read_timeout)
+
+    def test_header_wait_is_not_capped_by_the_connect_budget(self):
+        with mock.patch.object(S, "CONNECT_TIMEOUT", 0.25):
+            with self._get("/slow") as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertIn(b"ok", resp.read())
+
+    def test_read_budget_still_caps_a_stalled_response(self):
+        with mock.patch.object(S, "CONNECT_TIMEOUT", 0.25):
+            with self.assertRaises((TimeoutError, socket.timeout, urllib.error.URLError)):
+                self._get("/stall", read_timeout=0.3).read()
+
+    def test_unreachable_host_fails_fast_within_the_connect_budget(self):
+        started = time.time()
+        with mock.patch.object(S, "CONNECT_TIMEOUT", 0.5):
+            with self.assertRaises(urllib.error.URLError):
+                S._urlopen(urllib.request.Request("http://127.0.0.1:9/"), 30.0)
+        self.assertLess(time.time() - started, 5.0, "接続できないホストを読み取り上限まで待たない")
+
+    def test_redirects_are_followed(self):
+        with self._get("/redirect") as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn(b"ok", resp.read())
+
+    def test_http_errors_still_raise_httperror(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._get("/missing")
+        self.assertEqual(ctx.exception.code, 404)
+        ctx.exception.close()
+
+
+class TestMeasureAdoptionScenes(unittest.TestCase):
+    """自発利用の「必要場面」計測（依頼文からの近似判定）を一時 state.db で検査する。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "scripts", "measure_adoption.py")
+        spec = importlib.util.spec_from_file_location("measure_adoption", path)
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def test_classify_prompts_matches_japanese_and_english_cues(self):
+        self.assertEqual(self.mod.classify_prompts(["この設計の弱点を別のAIにも聞いて"]), ["multi_view"])
+        self.assertEqual(self.mod.classify_prompts(["出典つきで調べて"]), ["sources"])
+        self.assertEqual(self.mod.classify_prompts(["原因を切り分けて手順に分解して"]), ["stepwise"])
+        self.assertEqual(self.mod.classify_prompts(["100 件をそれぞれ要約して"]), ["bulk"])
+        self.assertEqual(self.mod.classify_prompts(["Please review this and cite sources"]),
+                         ["sources", "multi_view"])
+
+    def test_classify_prompts_ignores_small_talk(self):
+        for text in ("おはよう", "1+1 は？", "ありがとう", "", None):
+            self.assertEqual(self.mod.classify_prompts([text]), [], repr(text))
+
+    def test_classify_prompts_returns_each_cue_once(self):
+        self.assertEqual(self.mod.classify_prompts(["根拠を調べて", "根拠をもう一度"]), ["sources"])
+
+    def test_classify_prompts_ignores_self_reading_review_requests(self):
+        """実測: 「読み取り専用の再レビュー。…を読み、弱点があれば指摘して。」は自分で読む依頼で、
+        freeagent に投げる場面ではない（分類器の誤検出が見逃しを水増ししていた）。"""
+        for text in ("読み取り専用の再レビュー。server.py を読み、弱点があれば指摘して。",
+                     "読み取り専用コードレビュー。git diff を読んで、見落としを確認して。",
+                     "複数視点の相談機能が使えません。読み取り専用で状態を調べてください。"):
+            self.assertEqual(self.mod.classify_prompts([text]), [], text)
+        # 同じ語でも「読み取り専用」が無ければ必要場面として拾う
+        self.assertEqual(self.mod.classify_prompts(["この設計の弱点を指摘して"]), ["multi_view"])
+
+    def test_classify_prompts_excludes_service_and_terms_requests(self):
+        """実測: サービス・提供元・公式条件を探す依頼は学術コーパス外なので見逃しに数えない。
+
+        `freeagent_lookup` に "LLM inference API provider comparison alternatives" を引くと
+        **論文 9 件が返り、提供元の一覧は返らない**（＝この型は web_search が正しい選択）。
+        """
+        for text in (
+            "hermes freeagent bindの推論バックエンドAPIを、より良いAPIがあるか世界中から見つけて"
+            "代用できるか検討して下さい。プログラムや科学分野について利用できそうなAPIは無いか調べて下さい",
+            "第3段階候補J-STAGE/CiNii Research/COREの公式利用条件と現在API仕様を短く再調査。"
+            "商用承認・登録・検索サービス組込制限を実際に公式文書読んで根拠URLと引用文付きで報告。",
+        ):
+            self.assertEqual(self.mod.classify_prompts([text]), [], text)
+        # 学術コーパスの語があれば除外しない（API の話でも「論文を探して」は必要場面）
+        self.assertEqual(self.mod.classify_prompts(["この API の設計に関する論文を探して"]), ["sources"])
+        self.assertEqual(self.mod.classify_prompts(["宇宙エレベータの材料研究について出典つきで調べて"]),
+                         ["sources"])
+
+    def test_classify_prompts_ignores_attached_context(self):
+        """実測: `@url` で貼られたページ本文の英語 "sources" を依頼文と誤認していた。"""
+        attached = ("ブラウザベースのAIを複数集め会話させる実装は可能か？\n"
+                    "@url:`https://gemini.google.com/app`\n\n--- Attached Context ---\n\n"
+                    "[Sign in](https://accounts.google.com/ServiceLogin?continue=https://x)\n"
+                    "utm_source=gemini / 参考 sources の一覧\n")
+        self.assertEqual(self.mod.classify_prompts([attached]), [])
+        # 依頼文の側に手掛かりがあれば当然拾う
+        self.assertEqual(
+            self.mod.classify_prompts(["出典つきで調べて\n\n--- Attached Context ---\nsources の一覧\n"]),
+            ["sources"])
+
+    def test_classify_prompts_ignores_machine_notices(self):
+        """実測: 委譲の完了通知（機械が差し込む user ロール）の本文が誤検出されていた。"""
+        notice = ("[ASYNC DELEGATION BATCH COMPLETE — deleg_0732bc70] A background fan-out unit "
+                  "you dispatched earlier — 1 subagent(s) — has finished; its consolidated report "
+                  "lists sources and citations.")
+        self.assertEqual(self.mod.classify_prompts([notice]), [])
+        # 日本語の依頼が角括弧で始まっても依頼文として扱う
+        self.assertEqual(self.mod.classify_prompts(["[重要] 出典つきで調べて"]), ["sources"])
+
+    def _db(self, tmp):
+        """必要場面 2 件（うち 1 件は未使用）＋雑談 1 件の最小 state.db を作る。"""
+        path = os.path.join(tmp, "state.db")
+        con = sqlite3.connect(path)
+        con.execute("create table sessions (id text primary key, started_at real)")
+        con.execute("create table messages (id integer primary key autoincrement,"
+                    " session_id text, role text, content text, tool_calls text, timestamp real)")
+        freeagent = json.dumps([{"function": {"name": "mcp__freeagent_bind__freeagent_panel",
+                                              "arguments": "{}"}}])
+        competing = json.dumps([{"function": {"name": "web_search", "arguments": "{}"}}])
+        rows = [("s1", "出典つきで調べて", competing),
+                ("s2", "この設計の弱点を別のAIにも聞いて", freeagent),
+                ("s3", "おはよう", competing)]
+        for i, (sid, prompt, calls) in enumerate(rows):
+            con.execute("insert into sessions values (?, ?)", (sid, 1000.0 + i))
+            con.execute("insert into messages (session_id, role, content, tool_calls, timestamp)"
+                        " values (?, 'user', ?, null, ?)", (sid, prompt, 1000.0 + i))
+            con.execute("insert into messages (session_id, role, content, tool_calls, timestamp)"
+                        " values (?, 'assistant', '', ?, ?)", (sid, calls, 1000.0 + i))
+        con.commit()
+        con.close()
+        return path
+
+    def test_main_reports_needed_scene_adoption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            buf = io.StringIO()
+            with mock.patch.object(sys, "argv", ["measure_adoption.py", "--db", db]), \
+                 mock.patch.object(sys, "stdout", buf):
+                self.assertEqual(self.mod.main(), 0)
+        out = buf.getvalue()
+        self.assertIn("必要場面（依頼文からの近似判定）: 2/3 セッション", out)
+        self.assertIn("必要場面の採用率 50%", out)
+        self.assertIn("見逃し 1", out)
+        self.assertIn("web_search", out)
+
+    def test_main_json_exposes_needed_scenes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            buf = io.StringIO()
+            with mock.patch.object(sys, "argv", ["measure_adoption.py", "--db", db, "--json"]), \
+                 mock.patch.object(sys, "stdout", buf):
+                self.assertEqual(self.mod.main(), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["needed_scenes"]["needed_sessions"], 2)
+        self.assertEqual(data["needed_scenes"]["needed_using_freeagent"], 1)
+        self.assertEqual(data["needed_scenes"]["needed_rate"], 0.5)
+
+    def test_min_needed_rate_gate_returns_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            with mock.patch.object(sys, "argv",
+                                   ["measure_adoption.py", "--db", db, "--min-needed-rate", "0.9"]), \
+                 mock.patch.object(sys, "stdout", io.StringIO()), \
+                 mock.patch.object(sys, "stderr", io.StringIO()):
+                self.assertEqual(self.mod.main(), 1)
+
+    def test_include_tool_free_widens_the_denominator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp)
+            con = sqlite3.connect(db)  # messages を持たないセッションを足す
+            con.execute("insert into sessions values ('s4', 2000.0)")
+            con.commit()
+            con.close()
+            buf = io.StringIO()
+            with mock.patch.object(sys, "argv",
+                                   ["measure_adoption.py", "--db", db, "--include-tool-free"]), \
+                 mock.patch.object(sys, "stdout", buf):
+                self.assertEqual(self.mod.main(), 0)
+        self.assertIn("対象セッション: 4 件", buf.getvalue())
+        self.assertIn("ツール未使用も含む", buf.getvalue())
 
 
 if __name__ == "__main__":

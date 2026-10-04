@@ -714,6 +714,48 @@ class TestThinkStructure(unittest.TestCase):
         self.assertIn("閲覧", S.render("freeagent_think", data))
         self.assertIn("session_id", S.tool_think({"view": True})["error"])
 
+    def test_brief_view_returns_only_the_active_path(self):
+        """要約（brief）: 現行の道筋だけを返し、省いた件数は隠さない（大きな台帳の読み戻し用）。"""
+        sid = S.tool_think({"thought": "観測を集める", "plan": ["観測", "仮説"]})["session_id"]
+        S.tool_think({"thought": "原因は DNS", "session_id": sid, "kind": "hypothesis"})
+        S.tool_think({"thought": "切り分けの結果 DNS は違う", "session_id": sid,
+                      "tests_hypothesis": 2, "hypothesis_status": "refuted"})
+        S.tool_think({"thought": "観測をやり直す", "session_id": sid, "revises_thought": 1})
+
+        full = S.tool_think({"session_id": sid, "view": True})
+        brief = S.tool_think({"session_id": sid, "view": True, "brief": True})
+        self.assertEqual([r["n"] for r in full["ledger"]["latest"]], [1, 2, 3, 4])
+        self.assertEqual([r["n"] for r in brief["ledger"]["latest"]], [2, 3, 4],
+                         "改訂済みの思考は要約から外れる")
+        self.assertTrue(brief["ledger"]["brief"])
+        self.assertEqual(brief["ledger"]["omitted"], 1)
+        self.assertFalse(full["ledger"].get("brief"), "既定の view は従来どおり全文")
+        # 判断材料（計画・仮説・分岐・道筋）は要約でも落とさない
+        self.assertEqual(brief["ledger"]["plan_progress"]["total"], 2)
+        self.assertEqual([h["n"] for h in brief["ledger"]["hypotheses"]], [2])
+        self.assertEqual(brief["ledger"]["active_path"], [2, 3, 4])
+        text = S.render("freeagent_think", brief)
+        self.assertIn("（記録なし・要約）", text)
+        self.assertIn("改訂・棄却で外した思考 1 件は省略", text)
+        self.assertIn("#4", text)
+        self.assertEqual(self._steps(sid), 4, "view（要約）で台帳を書いてはいけない")
+
+    def test_brief_without_view_is_ignored_with_a_note(self):
+        sid = S.tool_think({"thought": "a"})["session_id"]
+        data = S.tool_think({"thought": "b", "session_id": sid, "brief": True})
+        self.assertTrue(any("brief は view=true のときだけ" in n for n in data["notes"]))
+        self.assertEqual(data["step"], 2)
+
+    def test_brief_suggestion_appears_for_large_ledgers(self):
+        """12 ステップを超えたら、読み戻しに brief を使うよう提案する（毎回は出さない）。"""
+        sid = S.tool_think({"thought": "s1"})["session_id"]
+        for i in range(2, 13):
+            last = S.tool_think({"thought": f"s{i}", "session_id": sid})
+        self.assertTrue(any("brief=true を併用" in s for s in last["suggestions"]))
+        brief = S.tool_think({"session_id": sid, "view": True, "brief": True})
+        self.assertFalse(any("brief=true を併用" in s for s in brief["suggestions"]),
+                         "要約で読んでいるのに要約を勧めない")
+
     def test_structure_nudges_when_unused(self):
         """常用の補強: 計画なしの 1 ステップ目、構造なしの 3 ステップ目にだけ促す（毎回は出さない）。"""
         first = S.tool_think({"thought": "a"})
@@ -820,7 +862,7 @@ class TestKnowledgeBackendRegistry(unittest.TestCase):
         self.assertEqual(set(S.DEFAULT_SOURCES),
                          {"wikipedia", "wikidata", "arxiv", "crossref", "openalex", "github"})
         self.assertEqual(set(S.KB_BACKENDS), set(S.DEFAULT_SOURCES) | {"datacite", "openaire", "europepmc", "zenodo", "ror",
-                                                                       "doaj", "npm", "crates"})
+                                                                       "doaj", "npm", "crates", "cinii"})
         self.assertEqual(set(S.SOURCES), set(S.KB_BACKENDS))
 
     def test_arxiv_uses_https(self):

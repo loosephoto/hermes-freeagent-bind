@@ -80,13 +80,17 @@ def measure_round(index: int | None = None, sources: list[str] | None = None,
     with S._KB_BLOCK_LOCK:
         S._KB_BLOCKED.clear()
     picked = list(dict.fromkeys(s for s in sources if s in S.KB_BACKENDS)) if sources is not None else list(S.KB_BACKENDS)
+    if "cinii" in picked and not getattr(S, "CINII_APPID", ""):
+        # appid 未設定では必ずエラーになる。障害として記録せず対象から外す（規約 21 と同じ考え方）
+        picked = [s for s in picked if s != "cinii"]
+        _say("skip: cinii は FREEAGENT_CINII_APPID 未設定のため計測しません")
     now = datetime.datetime.now(JST)
     en, ja = QUERIES[(now.hour if index is None else index) % len(QUERIES)]
     rows: dict[str, dict] = {}
 
     def one(src: str) -> None:
         # 日本語の問いは日本語版を持つソースだけ（Wikipedia / Wikidata）。論文系は英語で引く
-        query = ja if src in ("wikipedia", "wikidata") else en
+        query = ja if src in ("wikipedia", "wikidata", "cinii") else en
         if src == "ror":
             names = ["CERN", "University of Tokyo", "Massachusetts Institute of Technology",
                      "University of Oxford", "CNRS", "Kyoto University"]
@@ -108,6 +112,7 @@ def measure_round(index: int | None = None, sources: list[str] | None = None,
                      "items": len((res or {}).get("items") or []) if isinstance(res, dict) else 0,
                      "error": err[:160], "mailto": bool(S.KB_MAILTO),
                      "openalex_key": bool(getattr(S, "OPENALEX_API_KEY", "")),
+                     "cinii_appid": bool(getattr(S, "CINII_APPID", "")),
                      "datacite_kind": datacite_kind if src == "datacite" else "",
                      "summaries": sum(bool(c.get("summary")) for c in (res.get("citations") or [])
                                       if isinstance(c, dict)) if isinstance(res, dict) else 0}
@@ -263,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rounds", type=int, default=1)
     ap.add_argument("--interval", type=float, default=600.0)
     ap.add_argument("--report", action="store_true")
-    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help="計測対象（既定は対応11ソース）")
+    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help="計測対象（既定は対応15ソース）")
     ap.add_argument("--datacite-kind", choices=("all", "arxiv", "dataset"), default="all")
     ap.add_argument("--schedule", type=int, metavar="HOURS")
     ap.add_argument("--unschedule", action="store_true")

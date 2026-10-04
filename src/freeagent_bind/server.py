@@ -14,7 +14,7 @@
                                              §2.7 思考台帳の構造（分解・改訂・分岐・仮説））
   §3 プロバイダとモデル（§3.1 Free-tier provider guards）  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
                     §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR /
-                    §5.16 DOAJ・npm・crates.io）
+                    §5.16 DOAJ・npm・crates.io / §5.17 CiNii Research（appid 必須））
   §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号）
   §7 ツール定義         §8 表示（content）
   §8.5 失敗時の「次の一手」（structuredContent.next_action）
@@ -37,6 +37,7 @@ from __future__ import annotations
 import copy
 import datetime
 import email.utils
+import http.client
 import json
 import math
 import os
@@ -207,6 +208,9 @@ KB_USER_AGENT = os.environ.get(
     "FREEAGENT_USER_AGENT",
     "hermes-freeagent-bind/0.1 (+https://github.com/loosephoto/hermes-freeagent-bind)")
 KB_MAILTO = os.environ.get("FREEAGENT_MAILTO", "")  # OpenAlex / Crossref の polite pool 用（任意）
+# CiNii Research は利用登録（アプリケーションID）が前提。未設定なら cinii は HTTP を出さずにエラーを返す
+# （実測: appid 無しでも 200 が返るが、規約は登録を要求している。§5.17）。
+CINII_APPID = os.environ.get("FREEAGENT_CINII_APPID", "").strip()
 KB_TTL = _env_float("FREEAGENT_KB_TTL", 1800.0)     # 知識取得のメモリ内 TTL（秒）
 KB_TIMEOUT = _env_float("FREEAGENT_KB_TIMEOUT", 20.0)
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
@@ -1294,17 +1298,59 @@ def split_ref(ref: str) -> tuple[str, str]:
     return "", ref
 
 
+class _ShortConnectMixin:
+    """接続の間だけ接続上限を使い、接続後は urllib が渡した読み取り上限へ戻す。
+
+    実測（Python 3.11〜3.14）: `urlopen(timeout=…)` の上限は socket に残るため、応答ヘッダを
+    受信するまで読み取り上限へ切り替わらない。生成完了までヘッダを返さないローカルプロキシでは、
+    生成が `CONNECT_TIMEOUT`（既定 10 秒）を超えると `READ_TIMEOUT`（既定 180 秒）が使われずに
+    `TimeoutError` になった（実測: 1200 トークンの要求が 10.0 秒で失敗）。接続だけを短い上限に
+    絞ることで、**不通ホストへの fail fast は保ったまま**長時間の生成を待てる。
+    """
+
+    def connect(self):
+        read_timeout = self.timeout
+        self.timeout = CONNECT_TIMEOUT
+        try:
+            super().connect()  # 接続と TLS ハンドシェイクだけを接続上限で打ち切る
+        finally:
+            self.timeout = read_timeout
+        self.sock.settimeout(read_timeout)
+
+
+class _ShortConnectHTTPConnection(_ShortConnectMixin, http.client.HTTPConnection):
+    pass
+
+
+class _ShortConnectHTTPSConnection(_ShortConnectMixin, http.client.HTTPSConnection):
+    pass
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_ShortConnectHTTPConnection, req)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        # 版差: 3.13 以前の HTTPSHandler は check_hostname を保持して do_open へ渡すが、
+        # 3.14 以降は context だけを渡す（HTTPSConnection も check_hostname を受け付けない）。
+        # 実測: 3.14 で `self._check_hostname` を参照すると AttributeError になった。
+        kwargs = {"context": self._context}
+        check_hostname = getattr(self, "_check_hostname", None)
+        if check_hostname is not None:
+            kwargs["check_hostname"] = check_hostname
+        return self.do_open(_ShortConnectHTTPSConnection, req, **kwargs)
+
+
+# build_opener はサブクラスを既定ハンドラの置換と見なすので、リダイレクト（HTTPRedirectHandler）・
+# プロキシ（ProxyHandler）・HTTPError の既定挙動はそのまま残る（標準ライブラリのみ・依存ゼロ）。
+_OPENER = urllib.request.build_opener(_HTTPHandler, _HTTPSHandler)
+
+
 def _urlopen(req: urllib.request.Request, timeout: float):
-    """接続には短い上限を、接続後の応答読取には呼び出し別の上限を設定する。"""
-    response = urllib.request.urlopen(req, timeout=CONNECT_TIMEOUT)
-    # urllib の timeout は接続時にも socket に残るため、レスポンスを受け取ったら
-    # 本文読取のために read timeout へ切り替える（HTTPS/HTTP 標準実装の socket）。
-    try:
-        sock = response.fp.raw._sock
-        sock.settimeout(timeout)
-    except (AttributeError, OSError):
-        pass
-    return response
+    """接続は短い上限で、接続後のヘッダ待ちと本文読取は `timeout` で打ち切る。"""
+    return _OPENER.open(req, timeout=timeout)
 
 
 def provider_http(path: str, provider: str = "nous", payload: dict | None = None,
@@ -3195,10 +3241,98 @@ def kb_crates(query: str, limit: int = 5) -> dict:
     return _kb_new_cached(f"crates:{query}:{limit}", "crates", produce)
 
 
-SOURCES = (*SOURCES, "doaj", "npm", "crates")
+# ---------------------------------------------------------------- §5.17 CiNii Research（明示指定のみ・appid 必須）
+#
+# 利用条件（2026-10-04 に一次情報で確認。SPEC §6.6）:
+#   * 学術コンテンツサービスウェブAPI利用細則 第3条: 利用目的は「自己の学術研究」または「非営利の情報
+#     利活用」に限る。それ以外は**書面で事前申請し承認を得る**こと。
+#   * 同 第4条: 利用申請の**審査・承認**と API キー（appid）の発行。第5条: **appid の第三者貸与・譲渡を
+#     禁止**。第6条: 短時間の大量アクセスをしない。利用規程 第5条2: 複製物を**他人が共同利用できる
+#     サーバ等に保管して利用しない**。
+#   → したがって **利用者自身が取得した appid を `FREEAGENT_CINII_APPID` に設定したときだけ**動く。
+#     プロジェクトは appid を同梱・共有しない（第5条）。**利用目的に当たるかは利用者が判断する**
+#     （検索内容の判断は利用者に信託し、サーバーは代わりに同意しない）。未設定なら HTTP を一切出さずに
+#     エラーを返す（実測: appid 無しでも 200 が返るが、規約は登録を要求している）。
+#   * 応答は JSON-LD の**書誌のみで抄録を返さない**（実測 2026-10-04: items[] の title / dc:creator /
+#     dc:publisher / dc:type / prism:publicationName / prism:publicationDate / prism:startingPage /
+#     dc:identifier（cir:NAID・cir:NCID・cir:ISBN・cir:DOI）/ @id）。全件 `metadata_only` とし、
+#     本文根拠には使わない（規程 第5条2 の複製・編集の制限にも触れない）。
+#   * レートは公表が無いため 1 ホスト 2.0 秒間隔に自制する（同 第6条3 の短時間大量アクセス回避）。
+
+
+def _cinii_creators(row: dict) -> list[str]:
+    """dc:creator は配列で来る（文字列のときもある）。辞書キーや文字列を走査しない。"""
+    value = row.get("dc:creator")
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    return [as_str(v) for v in _kb_array(value, "dc:creator") if as_str(v)]
+
+
+def _cinii_identifiers(row: dict) -> dict[str, str]:
+    """dc:identifier の配列から種別ごとの値を取り出す（同じ種別は最初の1件）。"""
+    out: dict[str, str] = {}
+    for entry in _kb_array(row.get("dc:identifier"), "dc:identifier"):
+        if not isinstance(entry, dict):
+            continue
+        kind, value = as_str(entry.get("@type")), as_str(entry.get("@value"))
+        if kind and value and kind not in out:
+            out[kind] = value
+    return out
+
+
+def kb_cinii(query: str, limit: int = 5) -> dict:
+    """CiNii Research の日本語文献メタデータ（書誌のみ・抄録は返らない）。利用者自身の appid が必要。"""
+    query = as_str(query)
+    limit = as_int(limit, 5, 1, 20)
+    if not query:
+        return {"source": "cinii", "error": "query は必須です"}
+    if not CINII_APPID:
+        return {"source": "cinii",
+                "error": "appid 未設定: CiNii Research は利用登録（アプリケーションID）が必要です。"
+                         "https://support.nii.ac.jp/ja/cinii/api/developer で取得し、環境変数 "
+                         "FREEAGENT_CINII_APPID に設定してください（利用目的に当たるかの判断は利用者。"
+                         "設定するまで HTTP は出しません）"}
+
+    def produce() -> dict:
+        params = {"q": _literal_search(query), "format": "json", "count": limit, "appid": CINII_APPID}
+        data, err = _kb_new_json("https://cir.nii.ac.jp/opensearch/all?"
+                                 + urllib.parse.urlencode(params), 2.0)
+        if err:
+            return {"source": "cinii", "error": err}
+        rows = _kb_array(_kb_object(data, "CiNii応答").get("items"), "items")
+        items = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                raise ValueError("CiNii item はオブジェクトではありません")
+            title = _plain_text(as_str(row.get("title")), 300)
+            page = as_str(_kb_object(row.get("link"), "link").get("@id")) or as_str(row.get("@id"))
+            if not title or not page:
+                continue
+            ident = _cinii_identifiers(row)
+            doi = ident.get("cir:DOI", "")
+            doc_type = as_str(row.get("dc:type"))
+            items.append({"title": title, "url": _kb_http_url("https://doi.org/" + doi if doi else page),
+                          "cir_uri": _kb_http_url(page), "doi": doi,
+                          "year": as_str(row.get("prism:publicationDate"))[:4],
+                          "container": _plain_text(as_str(row.get("prism:publicationName")), 200),
+                          "publisher": _plain_text(as_str(row.get("dc:publisher")), 200),
+                          "authors": _cinii_creators(row)[:8],
+                          "publication_types": [doc_type] if doc_type else [],
+                          "identifier": ident.get("cir:NAID") or ident.get("cir:NCID")
+                                        or ident.get("cir:ISBN", ""),
+                          "metadata_only": True})
+        return _kb_paper_result("cinii", items,
+                                attribution="データ提供: CiNii Research（国立情報学研究所） "
+                                            "https://cir.nii.ac.jp/")
+
+    return _kb_new_cached(f"cinii:{query}:{limit}", "cinii", produce)
+
+
+SOURCES = (*SOURCES, "doaj", "npm", "crates", "cinii")
 KB_BACKENDS.update({"doaj": lambda q, limit, opts: kb_doaj(q, limit),
                     "npm": lambda q, limit, opts: kb_npm(q, limit),
-                    "crates": lambda q, limit, opts: kb_crates(q, limit)})
+                    "crates": lambda q, limit, opts: kb_crates(q, limit),
+                    "cinii": lambda q, limit, opts: kb_cinii(q, limit)})
 
 
 # ================================================================ §6 ツール実装
@@ -4214,8 +4348,13 @@ def _think_prompt(question: str, steps: list[dict], step: dict, row: dict | None
     return "\n\n".join(parts)
 
 
-def _think_ledger_view(steps: list[dict], *, keep: int = 8, row: dict | None = None) -> dict:
-    """台帳の要約（計画・分岐・修正・仮説・最新の思考）。**全文は返さず末尾だけ**を載せる。"""
+def _think_ledger_view(steps: list[dict], *, keep: int = 8, row: dict | None = None,
+                       brief: bool = False) -> dict:
+    """台帳の要約（計画・分岐・修正・仮説・最新の思考）。**全文は返さず末尾だけ**を載せる。
+
+    `brief=True` は**現行の道筋だけ**を載せる（改訂済み・棄却分岐の本文を省く。文脈圧縮後の復帰用）。
+    省いた件数は `omitted` に残す（黙って隠さない）。
+    """
     row = row or {}
     meta = row.get("branch_meta") if isinstance(row.get("branch_meta"), dict) else {}
     branches: dict[str, list[int]] = {bid: [] for bid in meta}
@@ -4224,7 +4363,8 @@ def _think_ledger_view(steps: list[dict], *, keep: int = 8, row: dict | None = N
             branches.setdefault(step["branch_id"], []).append(as_int(step.get("n"), 0, 0, 9999))
     active = _think_active(steps, row)
     plan = [p for p in (row.get("plan") or []) if isinstance(p, dict)]
-    return {
+    shown = active if brief else steps[-keep:]
+    out = {
         "steps_recorded": len(steps),
         "branches": [{"branch_id": bid, "steps": ns,
                       "from": (meta.get(bid) or {}).get("from"),
@@ -4258,11 +4398,17 @@ def _think_ledger_view(steps: list[dict], *, keep: int = 8, row: dict | None = N
                     "hypothesis_status": s.get("hypothesis_status"),
                     "tests_hypothesis": s.get("tests_hypothesis"),
                     "subgoal": s.get("subgoal"),
-                    "text": truncate(s.get("text") or "", 300)} for s in steps[-keep:]],
+                    "text": truncate(s.get("text") or "", 200 if brief else 300)} for s in shown],
         # 直近に宣言された見積り総数（増減してよい・調整はメインが行う）。台帳に残して履歴化する。
         "total_thoughts": _think_latest_total(steps),
         "total_history": [h for h in (row.get("total_history") or []) if isinstance(h, dict)],
     }
+    if brief:
+        active_ns = {as_int(s.get("n"), 0, 0, 9999) for s in active}
+        out["brief"] = True
+        # 省いた件数は隠さない（「要約だから無い」と「そもそも無い」を混同させない）。
+        out["omitted"] = sum(1 for s in steps if as_int(s.get("n"), 0, 0, 9999) not in active_ns)
+    return out
 
 
 def _think_suggestions(data: dict, steps: list[dict], needed: bool) -> list[str]:
@@ -4319,6 +4465,9 @@ def _think_suggestions(data: dict, steps: list[dict], needed: bool) -> list[str]
                    "（据え置き・減らすのも可。総数はメインが動的に調整します）。")
     if not needed:
         out.append("next_thought_needed=false。最終結論はメインで確定してください。")
+    if ledger.get("steps_recorded", 0) >= 12 and not data.get("brief"):
+        out.append(f"台帳が {ledger['steps_recorded']} ステップあります。読み戻すときは view=true に "
+                   "brief=true を併用すると、現行の道筋だけを軽く読めます。")
     return out
 
 
@@ -4340,13 +4489,15 @@ def tool_think(args: dict) -> dict:
     sid_in = as_str(args.get("session_id"))
     stored = thought_get(sid_in) if sid_in else None
     if as_flag(args.get("view")):
-        return _think_view(sid_in, stored)
+        return _think_view(sid_in, stored, brief=as_flag(args.get("brief")))
     thought = as_str(args.get("thought"))
     if not thought:
         return {"error": "thought は必須です（空文字は不可。台帳を読むだけなら view=true と session_id）"}
 
     steps = [s for s in ((stored or {}).get("steps") or []) if isinstance(s, dict)]
     notes: list[str] = []
+    if as_flag(args.get("brief")):
+        notes.append("brief は view=true のときだけ効きます（思考の記録には影響しません）。")
     if sid_in and stored is None:
         notes.append(f"セッション {truncate(sid_in, 40)} は見つかりません（期限切れ／未知）。"
                      "新しい台帳を開始しました（古い思考は復活させません）。")
@@ -4670,8 +4821,11 @@ def _think_structure(args: dict, steps: list[dict], n: int, row: dict) -> tuple[
                   "plan": plan, "subgoal": sub, "subgoal_done": sub_done, "notes": notes}
 
 
-def _think_view(sid: str, stored: dict | None) -> dict:
-    """台帳を**書かずに**読む（文脈圧縮・再起動の後に、積んだ思考へ戻るため）。"""
+def _think_view(sid: str, stored: dict | None, brief: bool = False) -> dict:
+    """台帳を**書かずに**読む（文脈圧縮・再起動の後に、積んだ思考へ戻るため）。
+
+    `brief=True` は現行の道筋と未解決の項目だけを返す（大きな台帳を軽く読み戻すため）。
+    """
     if not sid:
         return {"error": "view=true には session_id が必要です"}
     if stored is None:
@@ -4681,9 +4835,10 @@ def _think_view(sid: str, stored: dict | None) -> dict:
     last = max([as_int(s.get("n"), 0, 0, 9999) for s in steps] + [0])
     total = _think_latest_total(steps)
     data = {
-        "session_id": sid, "view": True, "step": last or None, "question": stored.get("question") or "",
+        "session_id": sid, "view": True, "brief": bool(brief), "step": last or None,
+        "question": stored.get("question") or "",
         "total_thoughts": total, "next_thought_needed": True,
-        "ledger": _think_ledger_view(steps, keep=THOUGHT_MAX_STEPS, row=stored),
+        "ledger": _think_ledger_view(steps, keep=THOUGHT_MAX_STEPS, row=stored, brief=brief),
         "verification": None, "verified": False, "alternatives": None,
         "verifier_models": [m for m in (stored.get("verifier_models") or []) if isinstance(m, str)],
         "notes": [],
@@ -4705,7 +4860,8 @@ def _think_alternatives(args: dict, question: str, steps: list[dict], step: dict
         return _no_models()
     prompt = _think_prompt(question, steps, step, row).rsplit("\n\n", 1)[0] + (
         "\n\n上の道筋とは異なる代替の仮説・解法・道筋を「代替: …」の形式で最大3行だけ挙げてください。")
-    # 既定 400 のまま: 上げると proxy 経由で CONNECT_TIMEOUT（10 秒）を超えやすい（SPEC §3 の実測）。
+    # 既定 400 のまま: 予算を増やすと 1 体あたりの待ち時間と利用枠の消費が増える。
+    # （proxy 経由の 10 秒接続タイムアウトという旧制約は 2026-10-04 の接続/読み取り分離で解消した。）
     # 打ち切り（truncated）で文の途中で切れた最後の案は parse_alternatives が捨てる（実測「代替: 親プロセスのコマン」）。
     # avoid: フォールバックが同じ呼び出しの**検証者**に落ちると「検証者とも別のモデル」が破れる（実測）。
     results = ask_many(refs, prompt, system=THINK_ALT_SYSTEM,
@@ -4848,7 +5004,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "query": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates"},
+                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates / cinii（cinii は利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみで抄録は返らない）"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
                 "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語（既定 ja）"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須）"},
@@ -4944,7 +5100,8 @@ TOOLS: list[dict] = [
             "tests_hypothesis）／生成者以外の独立モデルに反証（verify）や代替案（propose_alternatives）を出させたい。"
             "【差分】構造つきの思考台帳（計画の進捗・現行の道筋・分岐の決着・仮説の状態）。参照先の番号が"
             "無ければ推測で繋がずエラー。verify / propose_alternatives のときだけ別の Free モデルを呼ぶ。"
-            "view=true で書かずに台帳全体を読める（文脈圧縮後の復帰）。"
+            "view=true で書かずに台帳を読める（文脈圧縮後の復帰）。**台帳が大きいときは brief=true を併用**すると"
+            "現行の道筋だけを軽く読める。"
             "【使わない条件】単発の問いは panel / consult が速い。思考の記録だけなら思考メモ帳系の軽量ツールで足りる。"
             "【注意】返る検証・代替案は仮説であり、合意は正しさの保証ではありません。判断はメインが行います。"
         ),
@@ -4955,6 +5112,9 @@ TOOLS: list[dict] = [
                 "session_id": {"type": "string",
                                "description": "継続する台帳のID（返り値の next_call に同梱。省略で新規）"},
                 "view": {"type": "boolean", "description": "台帳を読むだけ（書かない・session_id 必須）"},
+                "brief": {"type": "boolean",
+                          "description": "view と併用。現行の道筋（改訂済み・棄却済み分岐を除く）だけを返す"
+                                         "（台帳が大きいときの読み戻し用。省いた件数は omitted に入る）"},
                 "question": {"type": "string", "description": "解こうとしている問い（検証者へ渡す文脈）"},
                 "kind": {"type": "string", "enum": list(THOUGHT_KINDS),
                          "description": "思考の種類（既定 step。tests_hypothesis 指定時は test）"},
@@ -5327,7 +5487,8 @@ def _render_body(name: str, data: dict) -> str:
             if data.get("total_auto_adjusted"):
                 head += "（自動で引き上げ）"
         if data.get("view"):
-            head = "【台帳の閲覧（記録なし）】" + head
+            head = ("【台帳の閲覧（記録なし・要約）】" if data.get("brief")
+                    else "【台帳の閲覧（記録なし）】") + head
         lines = [head]
         plan = ledger.get("plan") or []
         if plan:
@@ -5351,7 +5512,11 @@ def _render_body(name: str, data: dict) -> str:
             lines.append("仮説: " + " / ".join(
                 f"#{h.get('n')} {hyp_ja.get(h.get('status') or 'open', h.get('status'))}"
                 + ("（改訂済み）" if h.get("superseded_by") else "") for h in hyps))
-        for row in (ledger.get("latest") or [])[-(12 if data.get("view") else 5):]:
+        # 要約（brief）は現行の道筋だけなので全部出す。通常は末尾だけ（閲覧 12 / 記録 5）。
+        shown_rows = ledger.get("latest") or []
+        if not data.get("brief"):
+            shown_rows = shown_rows[-(12 if data.get("view") else 5):]
+        for row in shown_rows:
             tag = f" [{row['branch_id']}]" if row.get("branch_id") else ""
             tag += " [修正]" if row.get("is_revision") else ""
             if row.get("kind") == "hypothesis":
@@ -5363,6 +5528,8 @@ def _render_body(name: str, data: dict) -> str:
             if row.get("superseded_by"):
                 tag += f" [#{row['superseded_by']} で改訂済み]"
             lines.append(f"  • #{row.get('n')}{tag}: {truncate(row.get('text') or '', 140)}")
+        if data.get("brief") and ledger.get("omitted"):
+            lines.append(f"  （改訂・棄却で外した思考 {ledger['omitted']} 件は省略。全文は brief なしで view）")
         verify = data.get("verification")
         if verify:
             counts = verify.get("verdicts") or {}

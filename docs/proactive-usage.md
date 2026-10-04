@@ -30,6 +30,7 @@ python scripts/apply_proactive.py --apply    # 競合の汎用面を外す設定
 #  → memory へ判断規則を保存（エージェントに頼む）か、表示された文面を SOUL.md へ
 #  → Hermes を再起動（MCP はホットリロードしない）
 python scripts/measure_adoption.py --sessions 20
+python scripts/measure_adoption.py --sessions 20 --min-needed-rate 0.5   # 必要場面の採用率でゲート
 ```
 
 **最低 2 標本で測る。** 1/2 と 2/2 の差は標本 1 つでは判定できない。測定は**新しいプロセス**で

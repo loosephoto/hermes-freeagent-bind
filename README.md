@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API の 7 プロバイダ、検索は **14 ソース（既定6＋明示指定8）** に対応します。
+- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API の 7 プロバイダ、検索は **15 ソース（既定6＋明示指定9）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 > **まず試すなら**：「出典つきで調べて」は知識検索、「この設計の弱点を別の AI にも聞いて」は相談です。
@@ -179,7 +179,7 @@ Hermes を再起動しても（既定の保存期限内なら）続きから再�
 | **仮説を立てて確かめる** | 「原因の仮説を立てて」→「確かめた結果、仮説は外れ」 | 仮説ごとの状態（未検証／支持／反証／保留） |
 | **別のモデルに反論してもらう** | 「このステップを独立したモデルに検証させて」（`verify`） | 判定（妥当／要修正／根拠不足）・反論・見落とし |
 | **別のモデルに別案を出してもらう** | 「他の可能性も別のモデルに挙げさせて」（`propose_alternatives`） | 代替案（1 体あたり最大 3 件） |
-| **ノートを読み返す** | 「さっきの思考ノートを見せて」（`view`） | 何も書き込まない |
+| **ノートを読み返す** | 「さっきの思考ノートを見せて」（`view`）／長い台帳は「現行の道筋だけ見せて」（`brief`） | 何も書き込まない |
 
 引数の名前を覚える必要はありません。**やりたいことを普通の言葉で頼めば、メイン LLM が引数に直して
 呼び出します**（詳しい引数は[下の一覧](#引数の一覧)）。
@@ -254,6 +254,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | `✗ モデル名: エラー` | 答えられなかったモデル。**脱落も隠さず表示**します |
 | `検証なし（台帳のみ）` | サブを呼んでいない（ノートに書いただけ）。「検証済み」ではありません |
 | `【台帳の閲覧（記録なし）】` | 読み返しただけ。何も書き込んでいない |
+| `【台帳の閲覧（記録なし・要約）】` | `brief` 付きで読んだ。現行の道筋だけを出し、省いた件数は下の行に表示する |
 
 ### 速さの目安（過去の実測）
 
@@ -288,7 +289,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | 仮説 | `kind: "hypothesis"`、検証は `tests_hypothesis: n` + `hypothesis_status`（`supported` 支持 / `refuted` 反証 / `inconclusive` 保留） |
 | ステップ数 | `thought_number`（省略すると末尾＋1）、`total_thoughts`（見込み。増やしても減らしてもよい。省略するとノートの値を引き継ぐ）、`next_thought_needed: false`（結論に入る） |
 | サブに頼む | `verify: true`（反論）、`propose_alternatives: true`（別案）、`size`（人数・既定 2・最大 4）、`models` / `prefer` / `exclude`、`max_tokens` |
-| 読み返す | `view: true` + `session_id` |
+| 読み返す | `view: true` + `session_id`（大きい台帳は `brief: true` を併用すると現行の道筋だけを返す。省いた件数は `omitted`） |
 
 次の一手の提案（「未検証の仮説があります」「未決着の分岐が 2 本あります」など）は、画面の表示ではなく
 メイン LLM 向けの `structuredContent.suggestions` に入ります。
@@ -353,7 +354,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | HF が `402` | 月次クレジット枯渇。連続再試行せず別プロバイダへ。キーを変えるだけでは直りません |
 | NVIDIA が `404` / `410` | 未有効・廃止など。一覧の件数を信用せず、少数を `probe=true` で確認 |
 | `429` / クールダウン | 枠や頻度の制限。待つ、`size`・並列度を減らす、別モデルへ。プローブの連打は避ける |
-| 約 10 秒で `TimeoutError` | 既定の HTTP 実装では、応答ヘッダ待ちにも接続上限が掛かります。下の説明を参照 |
+| 10 秒で `TimeoutError` | 接続（TCP / TLS）が上限に届かなかった場合です。生成が長いだけなら、ヘッダ待ちは読み取り上限まで待てます。下の説明を参照 |
 | 回答が空 | サーバーはトークン予算を上げて 1 回だけ自動再試行します。問いを短くするか、別モデルへ。予算を増やすと遅延も増えます |
 | OpenAlex だけ `503` / `429` | 匿名検索が制限される場合があります。`OPENALEX_API_KEY` を設定。成功した他ソースは利用可能 |
 | arXiv が `406` | 提供元の拒否。間隔制御と最大 3 回の再試行でも失敗する場合があります。他ソースで続行 |
@@ -365,17 +366,21 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | AI が自分から使わない | 登録だけで自動利用は保証されません。まず会話でツール名を指定。必要なら[自動利用の設定](#自動的に使わせたいとき) |
 | ログに「ハーネスを判別できません」 | `FREEAGENT_HARNESS=hermes` を設定して再起動。判別不能でも動作は変わりません |
 
-### 約 10 秒のタイムアウトについて（既知の未修正制約）
+### タイムアウトの考え方（接続と読み取りを分離）
 
 `FREEAGENT_CONNECT_TIMEOUT` は既定 10 秒、`FREEAGENT_READ_TIMEOUT` は既定 180 秒です。
-ただし現実装は、**応答ヘッダを受信した後で**読み取り上限へ切り替えます。
-生成完了までヘッダを返さない接続先では、生成が 10 秒を超えると、read 上限が 180 秒でもタイムアウトします。
-Nous ローカルプロキシで確認されている制約です（他プロバイダについては一律に断定できません）。
+**接続（TCP と TLS ハンドシェイク）の間だけ**が接続上限の対象で、応答ヘッダの待ち時間と本文の読み取りは
+読み取り上限まで待てます。生成完了までヘッダを返さない Nous ローカルプロキシでも、
+`max_tokens` を増やした長い生成が 10 秒で打ち切られることはありません。
 
-- まずは短い依頼、少人数・少ない `max_tokens` で試してください。
-- 長い生成が必要なら `FREEAGENT_CONNECT_TIMEOUT` を上げる回避策があります。
-  ただし、接続できないホストへの待ち時間も延びます。**`connect_timeout`（MCP 起動時の上限）とは別の設定です。**
-- HTTP 層で接続とヘッダ待ちを分離する根本対策は未実装です。
+- 接続できないホストへは、これまでどおり接続上限（既定 10 秒）で fail fast します。
+- 応答が読み取り上限を超えて止まった回は失敗します。`max_tokens` を下げるか、
+  `FREEAGENT_READ_TIMEOUT` を上げてください。
+- **`connect_timeout`（MCP 起動時の上限）とは別の設定です。**
+
+回帰テスト（`tests/test_audit_regressions.py` の `TestHttpTimeoutSeparation`）が localhost の遅延サーバで、
+接続上限 0.25 秒でもヘッダ遅延 0.8 秒の応答を取得できること・読み取り上限では打ち切られること・
+接続できないホストは接続上限内で失敗すること・302 を追うこと・4xx が `HTTPError` になることを検査します。
 
 ### 失敗の後に同じ呼び出しを繰り返さない
 
@@ -447,8 +452,10 @@ Nous ローカルプロキシで確認されている制約です（他プロバ
 | `OPENALEX_API_KEY` | openalex | 匿名検索が提供元側で止められることがあり（実測 503/429）、キーで回避。[API 設定](https://openalex.org/settings/api) |
 | `GITHUB_TOKEN` / `GH_TOKEN` | github | コード検索は必須。リポジトリ / Issue 検索は未認証でも可（枠 10 req/分と小さい） |
 | `FREEAGENT_MAILTO` | crossref / openalex / datacite | キーではなく連絡先。polite pool に入り安定します |
+| `FREEAGENT_CINII_APPID` | cinii | **このソースだけは必須**。CiNii Research の[利用登録](https://support.nii.ac.jp/ja/cinii/api/developer)で取得したアプリケーションID。未設定なら cinii は HTTP を出さず、登録先を案内します |
 
 wikipedia / wikidata / arxiv / doaj / npm / crates / europepmc / openaire / zenodo / ror はキー不要・匿名で使えます。
+**cinii だけは例外**で、利用者自身の appid が必要です（利用目的に当たるかの判断は利用者。SPEC §6.7）。
 
 ### キーの渡し方
 
@@ -474,6 +481,8 @@ hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_GEMINI_UNPAID_DATA_AC
 hermes config set mcp_servers.freeagent-bind.env.OPENALEX_API_KEY '${OPENALEX_API_KEY}'
 hermes config set mcp_servers.freeagent-bind.env.GITHUB_TOKEN '${GITHUB_TOKEN}'
 hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_MAILTO 'you@example.com'
+# CiNii を使う場合のみ。値は自分の appid（他人と共有しない）
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_CINII_APPID '<appid>'
 ```
 
 キーを直接 `env` に設定する方法もありますが、設定ファイルとシェル履歴に残る可能性があります。
@@ -514,9 +523,10 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `doaj`（明示指定） | オープンアクセス誌の記事メタデータ・抄録 | 記事メタデータはCC0。OA記事限定。OpenAlexが不安定なときの科学系検索の受け皿 |
 | `npm`（明示指定） | npm パッケージの検索結果（名前・説明・版・リンク） | 説明は登録者の自己申告で、品質・安全性の審査結果ではありません |
 | `crates`（明示指定） | crates.io のクレート検索結果（名前・説明・版・DL数） | 同上。Rust パッケージ。GitHub の検索枠を消費しません |
+| `cinii`（明示指定・**appid 必須**） | CiNii Research の日本語文献の書誌（タイトル・著者・資料名・巻号頁・発行年・DOI/NAID/NCID/ISBN・種別） | **利用者自身の appid** を `FREEAGENT_CINII_APPID` に設定したときだけ動きます（未設定なら登録先を案内して HTTP を出しません）。**抄録は返らない**ので本文根拠には使わず、書誌のみです |
 
 `sources` を省略すると**従来の6ソースのみ**、指定すると指定したソースだけを検索します。
-追加8ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
+追加9ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
 `limit` は**各ソースの上限**です。全体の結果は重複除去などで減るので、合計件数を保証する値ではありません。
 本文という場合も、取得できた説明・導入部・アブストラクトを指します。原典の全文とは限りません。
 
@@ -526,7 +536,8 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 - **第2段階：OpenAIRE / Europe PMC** — 「OpenAIREでも論文を探して」「生命科学の根拠をEurope PMCから探して」。
 - **第3段階：Zenodo / ROR** — 「Zenodoでグラフェンの研究データを探して」「RORでCERNの機関候補を探して」。公開メタデータだけを使います。
 - **第4段階：DOAJ / npm / crates.io** — 「DOAJでオープンアクセス論文を探して」「npmでJSONスキーマ検証のパッケージを探して」「crates.ioで非同期HTTPクライアントを探して」。DOAJは科学系、npm / crates.ioはプログラミング系の検索を広げます。
-- **保留中の候補** — J-STAGE（用途/商用承認・主コンテンツ・保存条件）、Stack Exchange（AI開発/テスト向け自動取得の事前書面許諾）、CiNii（appid登録・用途承認・抄録権利）、CORE（検索/API組込みの相談）、HAL（抽出データの非商用条項が曖昧）、Semantic Scholar（匿名は429頻発。無料キー運用なら将来候補）。既定offだけでは利用許諾にならないため、まだ登録しません。
+- **第5段階：CiNii Research（appid 必須）** — 「CiNiiで日本語の論文を探して」。日本語文献の書誌を引きます。**利用者自身が取得したアプリケーションID**を `FREEAGENT_CINII_APPID` に設定したときだけ動きます（取得: [CiNiiウェブAPI デベロッパー登録](https://support.nii.ac.jp/ja/cinii/api/developer)）。未設定なら HTTP を出さずに案内を返します。**抄録は返らない**ので書誌のみです。利用目的に当たるかの判断は利用者に委ねます（[ウェブAPI利用細則](https://support.nii.ac.jp/sites/default/files/cinii/webapi-term.pdf) 第3条は利用目的を学術研究／非営利の情報利活用に限定し、第5条は appid の第三者貸与・譲渡を禁じています）。
+- **保留中の候補（2026-10-04 に公式文書で再確認。いずれも登録しません）** — J-STAGE（非営利は申請不要だが「Powered by J-STAGE」表示・24時間以上のキャッシュ禁止・利用者への規約表示が義務。応答は書誌のみで Crossref と重複）、CORE（T&C §3 が検索・探索・API 機能に関わる製品は連絡が必要と明記）、Stack Exchange（AUP が AI 開発/テスト向けの自動取得に事前の書面許諾を要求）、HAL（非商用条項が曖昧）、Semantic Scholar（匿名は429頻発。キーの利用条件が明示された文書を確認できない）。既定offだけでは利用許諾にならないため、まだ登録しません。条項レベルの根拠は SPEC §6.6。CiNii は**利用者自身の appid がある場合だけ動く明示ソース**として実装済みです（第5段階・SPEC §6.7）。
 
 ツールへ渡す引数の例（端末コマンドではありません）:
 
@@ -546,6 +557,8 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 // プログラミング: npm / crates.io のパッケージ検索（説明は登録者の自己申告）
 {"query":"json schema validator","sources":["npm"],"limit":2}
 {"query":"async http client","sources":["crates"],"limit":2}
+// 日本語文献の書誌（利用者自身の appid が必要。抄録は返りません）
+{"query":"圧電材料","sources":["cinii"],"limit":2}
 // 自然語arXiv検索の失敗・遅延時にのみ、DataCiteの追加利用を明示許可
 {"query":"language model hallucination","sources":["arxiv"],"fallback":true,"limit":2}
 ```
@@ -651,10 +664,15 @@ python scripts/measure_kb.py --report
 [ROR](https://ror.org/terms/)（IDs/metadataはCC0） /
 [DOAJ](https://doaj.org/terms/)（記事メタデータCC0・レートは全ルート2req/s） /
 [npm](https://www.npmjs.com/policies/open-source-terms)（Public APIsによる複製を明示許可） /
-[crates.io](https://crates.io/policies)（Crawler Policy: 1req/s・識別UA必須）。リンク先全文・パッケージ本体の利用条件はメタデータの条件とは別です。
-元候補の保留根拠: [J-STAGE](https://www.jstage.jst.go.jp/static/pages/WebAPI/-char/ja) /
-[Stack Exchange AUP](https://stackoverflow.com/legal/acceptable-use-policy) /
-[CiNii登録](https://support.nii.ac.jp/ja/cinii/api/developer) / [CORE](https://core.ac.uk/terms)。
+[crates.io](https://crates.io/policies)（Crawler Policy: 1req/s・識別UA必須） /
+[CiNii Research](https://support.nii.ac.jp/sites/default/files/cinii/webapi-term.pdf)（**利用者自身のappidが必要**・利用目的は学術研究/非営利に限定・appidの貸与譲渡は禁止・2秒間隔に自制。§6.7）。
+
+リンク先全文・パッケージ本体の利用条件はメタデータの条件とは別です。
+元候補の保留根拠（条項レベルは SPEC §6.6）:
+[J-STAGE WebAPI 利用規約](https://www.jstage.jst.go.jp/static/pages/WebAPI/-char/ja)（第3条1・5、第9条） /
+[CiNii ウェブAPI利用細則](https://support.nii.ac.jp/sites/default/files/cinii/webapi-term.pdf)（第3〜5条） /
+[CORE T&C](https://core.ac.uk/terms)（§3） /
+[Stack Exchange AUP](https://stackoverflow.com/legal/acceptable-use-policy)（AI開発/テスト向け自動取得の事前書面許諾）。
 
 ### 遅いソースは締め切りで区切る
 
@@ -697,7 +715,10 @@ python scripts/apply_proactive.py
   自サーバーのハーネス目印を設定します。単なるテストではありません。先に表示内容を確認してください。
 - `--check`：除外パターンがライブの実ツール名に一致するか確認します。
 - `python scripts/measure_adoption.py --sessions 20`：保存済みセッションでの利用割合を調べます。
-  **対象に単純な質問なども含まれるので、そのまま「必要な場面で自発利用した率」ではありません。**
+  依頼文から「必要場面」を近似判定し、**必要場面だけの採用率**と**見逃し**（必要なのに使わなかった場面）も出します。
+  **判定は言い回しによる近似で、必要場面の完全な判定ではありません。**
+- `python scripts/measure_adoption.py --min-needed-rate 0.5`：必要場面の採用率を下限としてゲートにできます。
+  `--include-tool-free` を付けると、ツールを 1 つも呼ばなかったセッションも分母に入ります。
 
 変更後は再起動して確認します。過去のツール名を含まない依頼 2 件では 2/2 の利用を観測しましたが、
 少数の観測であり、すべての環境での自動利用を保証しません。
@@ -773,6 +794,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_THOUGHT_CHARS` | 2000 | 1 思考あたりに保存する文字数（超過は切り詰め） |
 | `FREEAGENT_ALLOW_AGENT` | 0 | `freeagent_delegate`（Hermes 本体の起動）を許可 |
 | `FREEAGENT_ARXIV_INTERVAL` | 3.0 | arXiv の最小呼び出し間隔（秒） |
+| `FREEAGENT_CINII_APPID` | 空 | CiNii Research のアプリケーションID（**利用者自身が取得**）。未設定なら cinii は HTTP を出さず案内を返す（SPEC §6.7） |
 | `FREEAGENT_EVIDENCE_ITEM_CHARS` / `_TOTAL_CHARS` | 360 / 3200 | 根拠本文をサブLLMへ注入する 1 件あたり・全体の上限（0 で本文を入れない） |
 | `FREEAGENT_EMPTY_TOKEN_FLOOR` / `_CAP` | 512 / 2048 | 空応答時の予算引き上げ幅 |
 | `FREEAGENT_USER_AGENT` | `hermes-freeagent-bind/0.1 (+…/hermes-freeagent-bind)` | 知識 API に名乗る UA（連絡先入りが望ましい。crates.io は識別可能な UA が必須） |
