@@ -2,7 +2,9 @@
 
 Hermes Agent の **Free モデルをサブ LLM として並列に走らせる** MCP サーバー（Python 3.11+ / 実行時依存ゼロ /
 単一ファイルのモノリス）。メイン LLM の知識補助として **arXiv / Crossref / OpenAlex / Wikipedia /
-Wikidata / GitHub** を既定で引き、**DataCite / OpenAIRE / Europe PMC / Zenodo / ROR** は明示指定で追加する。
+Wikidata / GitHub** を既定で引き、**DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates / CiNii /
+OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Libraries.io** は
+明示指定で追加する。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は対象外**。
 
 - 全体像は `README.md`、**実装の契約は `SPEC.md`**（変更時は両方を同一変更内で更新する）。
 - 本体は `src/freeagent_bind/server.py` の 1 ファイルで、**§0〜§9 の区画**に分かれている。
@@ -177,22 +179,35 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     複製を明示許可）/ crates.io（Crawler Policy: 1req/s＋識別UA）を明示指定ソースとして追加。既定6は不変。
     パッケージの説明文は**登録者の自己申告**であり審査結果ではない（`summary_kind=registry_description`で
     論文抄録と区別し、品質・安全性の根拠として提示しない）。キーワード検索APIが無いもの（PyPI / deps.dev）、
-    既存ソースと重複するもの（PubMed / bioRxiv ⊂ Europe PMC）、レートが8秒締切と不整合なもの（PLOS 10req/min）、
+    既存ソースと重複するもの、医学・生物学（対象外。§5.19）、レートが8秒締切と不整合なもの（PLOS 10req/min）、
     条件曖昧なもの（HAL 非商用条項）は登録しない。DOAJはパス埋め込み検索なので検索語を必ずURLエスケープする。
 
 31. **Free推論プロバイダは課金tierを推測しない**。APIがFree/paid tierを返さない場合は、モデルID allowlist・明示確認env・厳密な未許可model拒否を組み合わせる。確認envは利用者申告であり、契約そのものは検証できないとREADME/SPECに明記し、課金プラン変更後に解除するよう案内する。Google Unpaid tierのデータ利用/人手レビューなどプライバシー条件がある場合は別の明示確認を要求し、既定有効にしない。**クレジット型（Vercel AI Gateway / Ollama Cloud）はモデル単位の Free 判定ができず、無料枠はカタログのサブセット**（Vercel は認証付きの `include_availability` でしか対象を列挙できず、Ollama は starter の範囲を公表していない）ので、**公式に対象一覧を出しているものは許可リスト（Vercel = 実測 15 件）、出していないものはクレジット枠＋プラン確認 env**（Ollama）で扱い、サブセットである旨と 402 の扱い（フォールバック・記憶しない）を README/SPEC に明記する。
 
 32. **第6段階は「検索できる公認 API」＋「利用条件が明確」の 2 条件を満たすものだけ**（§5.18/§5.19）。
-    採用 13 種（osv / ietf / uniprot / chembl / pdb / quickgo / reactome / clinicaltrials / openfda /
-    inspirehep / oeis / gbif / hfhub）はすべて既定 off の明示指定。**同一ホストに複数サービスがある
-    ときは予算キーをサービス単位に分ける**（`_kb_new_json(..., budget_key=...)`）。ホスト単位のままだと
-    chembl と pdb の同時指定で片方が「アクセス間隔制御」で落ちる。遮断の記憶は netloc のまま。
-    **構造化レコードしか無いソースは `summary_kind=structured_record`** を付け、論文抄録と混同させない。
-    openfda は原典の免責を `attribution` に含める。**キーワード検索 API が無いものは登録しない**
+    第6段階で採った 13 種のうち、**2026-10-05 の方針変更で生命・医学系 9 種（europepmc / uniprot /
+    chembl / pdb / quickgo / reactome / clinicaltrials / openfda / gbif）を削除**した（対象は
+    「科学（物理・数学・計算機）＋プログラミング」まで。医学・生物学は対象外）。残るのは
+    osv / ietf / inspirehep / oeis / hfhub の 5 種で、いずれも既定 off の明示指定。**同一ホストに
+    複数サービスがあるときは予算キーをサービス単位に分ける**（`_kb_new_json(..., budget_key=...)`。
+    遮断の記憶は netloc のまま）。**構造化レコードしか無いソースは `summary_kind=structured_record`**
+    を付け、論文抄録と混同させない。**キーワード検索 API が無いものは登録しない**
     （PubChem / AlphaFold DB / Ensembl / STRING）。**検索式を弱めて代替しない**: IETF の
     `title__contains` は AND 不可なので、RFC 番号と draft 名は `name` で直引きし、それ以外は最長語で
     引いて全語一致を優先する（全文検索だと書かない）。Stack Exchange は AUP が事前の書面許諾を要求する
-    ので、実測 200 でも登録しない。
+    ので、実測 200 でも登録しない。Maven Central は新 ToS が商用インフラ利用を事前許諾なしに禁止する
+    ため登録しない。
+
+33. **第7段階は「世界中のプログラミング関連 API」から、検索でき・利用条件が明確なものだけ**（§5.20）。
+    採用 3 種（hn / swh / librariesio）は既定 off の明示指定。hn は Algolia HN Search（帰属表示必須・
+    10,000 req/h/IP。引用 URL は HN のアイテム URL とし、記事 URL は `extra.article_url` に残す）。
+    swh は Software Heritage（ポイントアクセス可・大量抽出不可。origin を `summary_kind=structured_record`）。
+    **キーが前提のソースは利用者自身のキーがあるときだけ動かす**（librariesio = `FREEAGENT_LIBRARIESIO_KEY`。
+    未設定なら HTTP を出さずに登録先を案内。プロジェクトはキーを同梱・共有しない）。grep.app（429 チャレンジ）/
+    searchcode.com（404）/ Gitee（11〜17 秒・トークン要）/ JSR・PyPI・pkg.go.dev（キーワード検索 API 無し）/
+    Homebrew・Go module index（一括ダンプ）/ Zenn（非公式 API）は登録しない。Artifact Hub / MetaCPAN /
+    RubyGems / Packagist / pub.dev / Hex / NuGet / Debian Sources は将来候補（集約の librariesio を採る
+    場合は schema コストに見合わない）。
 
 ## ライセンス
 

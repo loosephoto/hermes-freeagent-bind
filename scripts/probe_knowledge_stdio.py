@@ -5,8 +5,9 @@ python scripts/probe_knowledge_stdio.py --sources datacite --datacite-kind datas
 python scripts/probe_knowledge_stdio.py --sources zenodo ror --query CERN
 python scripts/probe_knowledge_stdio.py --sources osv --query jinja2
 python scripts/probe_knowledge_stdio.py --sources ietf --query "RFC 9110"
-python scripts/probe_knowledge_stdio.py --sources uniprot --query insulin
-python scripts/probe_knowledge_stdio.py --sources clinicaltrials --query melanoma
+python scripts/probe_knowledge_stdio.py --sources hn --query "rust ownership"
+python scripts/probe_knowledge_stdio.py --sources swh --query kubernetes
+python scripts/probe_knowledge_stdio.py --sources librariesio --query "json schema"
 python scripts/probe_knowledge_stdio.py --sources oeis --query Fibonacci
 
 各指定ソースの有効応答・出典・両チャネルを検査。失敗はexit 1（成功を捏造しない）。
@@ -67,7 +68,7 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
             raise ValueError("citation source/title mismatch")
         if not isinstance(cite["summary"], str):
             raise ValueError("citation summary must be a string")
-        if cite["source"] in ("datacite", "openaire", "europepmc") and "year" not in cite:
+        if cite["source"] in ("datacite", "openaire") and "year" not in cite:
             raise ValueError("new citation year field is missing")
         if "year" in cite and (type(cite["year"]) not in (str, int)):
             raise ValueError("citation year type is invalid")
@@ -82,7 +83,7 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
         if cite["source"] in ("npm", "crates"):
             if cite.get("summary_kind") != "registry_description":
                 raise ValueError("package registry evidence kind mismatch")
-        if cite["source"] in ("chembl", "pdb", "gbif", "hfhub"):
+        if cite["source"] in ("hfhub", "swh"):
             if cite.get("summary_kind") != "structured_record" or not cite.get("summary"):
                 raise ValueError("structured record evidence kind mismatch")
         if cite["source"] == "osv" and not cite.get("identifier"):
@@ -100,7 +101,7 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--sources", nargs="+", choices=S.SOURCES,
-                        default=["datacite", "openaire", "europepmc"])
+                        default=["datacite", "openaire"])
     parser.add_argument("--datacite-kind", choices=("all", "arxiv", "dataset"), default="arxiv")
     parser.add_argument("--query", default="CRISPR gene editing")
     parser.add_argument("--limit", type=int, default=2)
@@ -111,6 +112,13 @@ def main() -> int:
         print("skip: cinii は FREEAGENT_CINII_APPID 未設定のため検査しません"
               "（登録: https://support.nii.ac.jp/ja/cinii/api/developer）")
         args.sources = [s for s in args.sources if s != "cinii"]
+        if not args.sources:
+            return 0
+    if "librariesio" in args.sources and not S.LIBRARIESIO_KEY:
+        # 未設定は「失敗」ではない（利用者のキーが前提のソース）。検査対象から外して理由を出す
+        print("skip: librariesio は FREEAGENT_LIBRARIESIO_KEY 未設定のため検査しません"
+              "（登録: https://libraries.io/account）")
+        args.sources = [s for s in args.sources if s != "librariesio"]
         if not args.sources:
             return 0
     env = dict(os.environ)

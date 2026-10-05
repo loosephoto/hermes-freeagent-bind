@@ -21,7 +21,7 @@
 | §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳） |
 | §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
-| §5 | 知識バックエンド28種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学13種） |
+| §5 | 知識バックエンド22種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須）） |
 | §6 | ツール実装（11本、§6.11 本文の注入番号・引用認定） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
@@ -167,7 +167,6 @@
 | github | `api.github.com/search/*` | トークン推奨（コード検索は必須） | 枠は**エンドポイント別**（実測: search 30/分・code_search 10/分・未認証 10/分）→ 予算キーをサービス単位に分ける（§5.6）。code は `text_matches` の断片を返し、**ライセンス情報を含まない**。索引は default branch のみ・384KB 未満・直近 1 年に活動のあるリポジトリ等に限定 |
 | datacite | `api.datacite.org/dois` | 不要、mailto任意 | モード間でホスト予算共有。抄録・登録反映の欠落あり |
 | openaire | `api.openaire.eu/graph/v3/research-products` | 今回は匿名のみ | 公式60/h、メタデータCC-BY表示、本文欠落あり |
-| europepmc | `www.ebi.ac.uk/europepmc/webservices/rest/search` | 不要 | core検索、全文利用条件は別、生命科学系 |
 | zenodo | `zenodo.org/api/records/` | 公開検索は匿名 | 説明メタデータCC0（メール除外）、非軍事用途、ファイル条件は別 |
 | ror | `api.ror.org/v2/organizations` | 今回は匿名 | 機関属性CC0、検索候補であって機関同定の確定ではない |
 | doaj | `doaj.org/api/search/articles/` | 不要（キーは発行者向け） | 記事メタデータCC0、全ルート2req/s、OA記事限定 |
@@ -175,17 +174,12 @@
 | crates | `crates.io/api/v1/crates` | 不要、識別UA必須 | Crawler Policy: 1req/s上限。説明は登録者の自己申告 |
 | osv | `api.osv.dev/v1/query`・`/v1/querybatch`・`/v1/vulns/{id}` | 不要 | 生態系を省くと HTTP 400。10 生態系を querybatch で照合してから `/v1/query`。集約元は各脆弱性DB |
 | ietf | `datatracker.ietf.org/api/v1/doc/document/` | 不要 | `title__contains` は AND 不可（2 語で 0 件）。`type__in=draft,rfc` で slides/chairs を除外。RFC 番号と draft 名は `name` 直引き |
-| uniprot | `rest.uniprot.org/uniprotkb/search` | 不要 | `fields=` で配列と機能コメントに限定（未指定だと 1 件 180KB）。CC BY 4.0 |
-| chembl | `www.ebi.ac.uk/chembl/api/data/molecule/search` | 不要 | 名前・別名検索。`pref_name` が空の record がある。CC BY-SA 3.0 |
-| pdb | `www.ebi.ac.uk/pdbe/search/pdb/select` | 不要 | Solr。`fl=` でフィールド限定。CC0 |
-| quickgo | `www.ebi.ac.uk/QuickGO/services/ontology/go/search` | 不要 | 定義文が本文根拠。CC BY 4.0 |
-| reactome | `reactome.org/ContentService/search/query` | 不要 | `summation` は**配列ではなく HTML を含む文字列**（実測）。`name` に `<span>` が入る。CC0 |
-| clinicaltrials | `clinicaltrials.gov/api/v2/studies` | 不要 | `fields=` で応答を限定。米国政府 |
-| openfda | `api.fda.gov/drug/label.json` | 不要 | 複数語は引用句で送る。医療判断に使えない（免責を attribution に含める） |
 | inspirehep | `inspirehep.net/api/literature` | 不要 | `fields=` で限定。DOI を出典 URL に使う。CC0 |
 | oeis | `oeis.org/search` | 不要 | A 番号は `number`（`id` は旧 M/N 識別子）。0 件は JSON `null`。CC BY-SA 4.0 |
-| gbif | `api.gbif.org/v1/species/search` | 不要 | 分類は Backbone。出現データのライセンスはデータごとに異なる |
 | hfhub | `huggingface.co/api/models` | 不要 | `sort=downloads`。ライセンスはタグ（`license:`）から取る |
+| hn | `hn.algolia.com/api/v1/search` | 不要 | 帰属表示必須（Algolia）。10,000 req/h/IP。リンク投稿は本文が無く metadata_only |
+| swh | `archive.softwareheritage.org/api/1/origin/search/{pattern}/` | 不要 | API利用規約: ポイントアクセス可・大量抽出不可。origin を `structured_record` で返す |
+| librariesio | `libraries.io/api/search` | **FREEAGENT_LIBRARIESIO_KEY 必須** | 19+ 登録簿の横断検索。60 req/min。説明は登録者の自己申告 |
 
 - 結果は**必ず `citation`（source / title / url / year / summary）に正規化**する。表示も注入もこの形だけを使う。
 - 取得はメモリ TTL キャッシュ + ホスト単位の遮断記憶。**同一キーは single-flight** で同時取得を 1 回にまとめ、エラー応答はキャッシュしない（回復後の再取得を妨げない）。キャッシュ値は複製して返し、呼び出し側の変更が共有状態に伝播しない。**LLM を介さない**（＝幻覚が入らない経路）。
@@ -197,7 +191,7 @@
 - 注入する本文は 1 件あたり `FREEAGENT_EVIDENCE_ITEM_CHARS`（既定 360）、全体で
   `FREEAGENT_EVIDENCE_TOTAL_CHARS`（既定 3200）に収める。入れすぎると小型 Free モデルが予算を
   使い切って空応答・切断になる（逆効果）。
-- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加22種（datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates / cinii / osv / ietf / uniprot / chembl / pdb / quickgo / reactome / clinicaltrials / openfda / inspirehep / oeis / gbif / hfhub）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。ciniiは`FREEAGENT_CINII_APPID`が前提で、未設定ならHTTPを出さずに案内を返す（§6.7）。
+- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加16種（datacite / openaire / zenodo / ror / doaj / npm / crates / cinii / osv / ietf / inspirehep / oeis / hfhub / hn / swh / librariesio）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。ciniiは`FREEAGENT_CINII_APPID`、librariesioは`FREEAGENT_LIBRARIESIO_KEY`が前提で、未設定ならHTTPを出さずに案内を返す（§6.7 / §6.10）。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は含まない**（§6.9）。
 - `fallback=true`のJSON真偽値だけが、自然語arXiv検索をDataCiteへ追加送信する明示許可。文字列`"true"`等は許可にしない。
 - 1 ソースの失敗で全体を落とさない（`errors` に集約し、成功分だけ返す）。
 
@@ -225,7 +219,7 @@
   `FREEAGENT_STATE_DIR/kb_latency.jsonl`・最大 20,000 行・超えたら古い行から tmp + `os.replace` で捨てる）へ追記。
   記録は `ts` / `hour`（日本時間）/ `source` / `elapsed_s` / `ok` / `items` / `error`（160 字）/ `mailto` /
   `openalex_key` / `cinii_appid` / `env_failure` に加え `datacite_kind` / `summaries`（本文がある件数）を記録し、**タイトル・本文は残さない**。
-  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応28ソースを測る（ciniiはappid未設定なら外す・§6.7）。論文キーワードだと空振りするソース（ror / npm / crates / osv / ietf / uniprot / chembl / pdb / quickgo / reactome / clinicaltrials / openfda / inspirehep / oeis / gbif / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
+  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応22ソースを測る（cinii / librariesio はキー未設定なら外す・§6.7 / §6.10）。論文キーワードだと空振りするソース（ror / npm / crates / librariesio / osv / ietf / hn / swh / inspirehep / oeis / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
 - 全ソースが接続系の失敗なら `env_failure=true`（こちらのネットワーク障害）とし、`--report` の集計から外す。
 - `--schedule N` は Windows のタスク（`pythonw`＝窓を出さない）を 1 時間おきに登録し、残り回数を
   `kb_latency.jsonl.schedule.json` で数えて、最後の 1 回でタスクを自分で消す（`/ED` `/ET` は HOURLY との
@@ -236,15 +230,14 @@
 - DataCiteは`datacite_kind=all/arxiv/dataset`。自然語の各語をJSON引用符でエスケープしAND結合、`sort=relevance`を指定。
   arxivは`client-id=arxiv.content`（旧資料の型がTextでも落とさない）、datasetは`resource-type-id=dataset`。
   Abstract種別の実本文だけを採用。キャッシュキーはモード・検索語・件数。年/本文の欠落もキーとして返す。
-- Europe PMCは`resultType=core`・JSON・`pageSize`。実抄録、元source/id、プレプリント種別・原文ライセンスを保持。
-  OpenAIREはGraph V3の`search`・publication限定。DOI/instance URL/idをURLへ正規化、descriptionsを本文にする。
+- OpenAIREはGraph V3の`search`・publication限定。DOI/instance URL/idをURLへ正規化、descriptionsを本文にする。
   メタデータのOpenAIRE CC-BYクレジットと原文licenseを区別。今回は匿名のみで認証枠の拡張は未実装。
 - 新規3種は`_kb_new_cached`→既存single-flight/cache。上流の不正型・解析例外はsource付きerror。
   空/不正配列を成功扱いせず、失敗はキャッシュしない。本文が無い正常書誌は`metadata_only=true`。
   lookupには表示するが、既存ソースを含め本文なしの引用は`_kb_has_evidence`でgrounded/evidence注入・agent番号登録から除外する。
   agentの書誌は`bibliography`に分離する。生成で本文を埋めない。
 - `_kb_rate_acquire`はホスト単位にLock内で採番。待機・未来の予約をせず、アクセスできない場合はローカルHTTP429相当を返す。
-  DataCite0.61秒、Europe PMC1秒、OpenAIRE60.1秒。DataCiteのモードは同じ予算。
+  DataCite0.61秒、OpenAIRE60.1秒。DataCiteのモードは同じ予算。
   メモリ内・1プロセスの制御であり、他プロセス/IP上の他アプリとは共有しない。提供元のRetry-After/遮断記憶も従来通り。
 - 明示許可代替は`_kb_source_result`。arXivの429/5xx/接続系/遮断なら直ちに、応答待ちなら`KB_HEDGE_DELAY`（既定2秒）後にDataCiteへ。
   設定は`FREEAGENT_KB_HEDGE_DELAY`（非有限は2へ、0.05〜30秒）。全体締切は延長しない。
@@ -300,8 +293,8 @@
 - 採用根拠（2026-10-02実測）: DOAJ 0.38〜0.45秒・npm 0.31〜0.58秒・crates 0.75〜0.78秒、いずれも抄録/説明つき。
   DOAJはOpenAlex匿名検索の503/429時の科学系キーワード検索の受け皿、npm/cratesはGitHub未認証10req/minの
   パッケージ系クエリの分流先になる。
-- 見送りの記録: PyPI / deps.devはキーワード検索APIが無い（名前直引きのみ）。PubMed / bioRxivはEurope PMCが
-  索引済みで重複。PLOSは10req/min＋5秒待機推奨が8秒締切と不整合。HALは検索APIは公開だがOAI条項の
+- 見送りの記録: PyPI / deps.devはキーワード検索APIが無い（名前直引きのみ）。PubMed / bioRxivは医学・生物学で
+  対象外（§5.19）。PLOSは10req/min＋5秒待機推奨が8秒締切と不整合。HALは検索APIは公開だがOAI条項の
   非商用制限があり条件曖昧→保留群。Semantic Scholarは匿名が429頻発（実測3/3→再測でも429）でキー運用のみ
   将来候補。OpenCitationsはキーワード検索が無くDOI引用数の補完用途のみ。
 - `measure_kb.py`はnpm/cratesにパッケージ系の問い（json schema validator等）を巡回させ、論文キーワードの
@@ -404,41 +397,68 @@
 - 含意: CKAN は**共通 API** なので、実装を base URL 可変にすれば 1 つの実装で複数のポータルに展開できる
   （規約と権利者はポータルごとに個別判断）。
 
-### 6.9 第6段階ソースの採用根拠（§5.18 / §5.19）
+### 6.9 第6段階ソースの採用根拠（§5.18 / §5.19・2026-10-05 の方針変更を反映）
 
-2026-10-05 に約 40 エンドポイントを無認証で実プローブし、利用条件を一次情報で確認した。**採用 13 種**は
-すべて既定 off の明示指定で、`DEFAULT_SOURCES` は 6 種のまま変えていない。全ホストで
-`content-encoding` が `identity` であること（gzip 応答が無いこと）も実測した。
+2026-10-05 に約 40 エンドポイントを無認証で実プローブし、利用条件を一次情報で確認した。
+**同日の方針変更で、対象を「科学（物理・数学・計算機）＋プログラミング」に絞り、医学・生物学は
+対象外とした**。そのため第6段階で採った生命・医学系ソース（europepmc / uniprot / chembl / pdb /
+quickgo / reactome / clinicaltrials / openfda / gbif）は**削除**した（実装は git 履歴に残る）。
+既定 off の明示指定で残るのは **osv / ietf / inspirehep / oeis / hfhub の 5 種**で、
+`DEFAULT_SOURCES` は 6 種のまま変えていない。
 
-- **採用（プログラミング・標準）**: osv / ietf。**採用（科学）**: uniprot / chembl / pdb / quickgo /
-  reactome / clinicaltrials / openfda / inspirehep / oeis / gbif / hfhub。
+- **採用（プログラミング・標準）**: osv / ietf。**採用（科学）**: inspirehep（素粒子物理・CC0）/
+  oeis（整数列・CC BY-SA 4.0・出典表示必須）/ hfhub（ML モデル。計算機科学に含める）。
+- **削除（方針変更）**: europepmc / uniprot / chembl / pdb / quickgo / reactome / clinicaltrials /
+  openfda / gbif。生命・医学系を外したことで、EBI の同一ホスト同居（chembl / pdb / quickgo）を
+  前提としたサービス単位の予算キー `_ebi_key` も不要になり削除した（`_kb_new_json` の `budget_key`
+  自体は OSV が使うため残す）。
 - **見送りと理由**: Stack Exchange（AUP が生成AI/チャットボットの開発・試験目的の自動取得に**事前の
   書面許諾**を要求。実測 200 でも許諾が確認できない。規約 29）/ NVD（キー無しは 6 秒間隔の推奨で、
   OSV と役割が重複）/ Repology（検索結果が「プロジェクト → 全リポジトリのパッケージ」の塊で、
   実測 133 プロジェクト・`project/openssl` は 1008 件。8 秒締切と文脈予算に不向き）/ MDN（公開された
-  API ではなくサイト内部のエンドポイント）/ GitLab・Codeberg（GitHub と役割が重複）/ PubChem・
-  AlphaFold DB・Ensembl・STRING（名前直引きでキーワード検索 API が無い）/ KEGG（学術は無償・商用は
-  ライセンス必要）/ zbMATH（実測で TLS 証明書検証に失敗）/ SIMBAD（実測 17.95 秒）/ SciELO（Bunny
-  シールドの 403 チャレンジ）/ OpenML（Hugging Face Hub と重複）/ InterPro（実測 4.83 秒）/
-  BioModels・PRIDE（返るのが ID 中心）/ NASA Exoplanet（ADQL を組み立てる必要があり注入面が増える）。
-- **予算キーの分離**: §5.11 のレート予算は**ホスト単位**なので、(a) 1 回の取得で同じホストの複数
-  エンドポイントを叩く OSV、(b) 同一ホスト（`www.ebi.ac.uk`）に同居する chembl / pdb / quickgo は、
-  そのままだと 2 本目が「アクセス間隔制御」で落ちる。`_kb_new_json(..., budget_key=...)` で
-  **予算だけサービス単位に分け**、遮断の記憶は netloc のまま（ホスト単位）にした。
-  EBI の間隔はプロセス内のみで、他のアプリや IP と共有されない。
-- **本文根拠の区別**: 構造化レコードしか無い chembl / pdb / gbif / hfhub は、記録の値を 1 行にまとめて
-  `summary_kind=structured_record` を付ける（論文抄録と混同させない）。openfda は原典の免責を
-  `attribution` に必ず含める。cinii と同じく、書誌のみのソースは `metadata_only` のままにする。
+  API ではなくサイト内部のエンドポイント）/ GitLab・Codeberg（GitHub と役割が重複）/ Maven Central
+  （新 ToS の階層型アクセスモデルが「商用インフラ利用」を事前許諾なしに禁止）/ PubChem・
+  AlphaFold DB・Ensembl・STRING（名前直引きでキーワード検索 API が無い）/ zbMATH（実測で TLS 証明書
+  検証に失敗）/ SIMBAD（実測 17.95 秒）/ SciELO（Bunny シールドの 403 チャレンジ）/ OpenML（Hugging
+  Face Hub と重複）/ NASA Exoplanet（ADQL を組み立てる必要があり注入面が増える）。
+- **予算キーの分離**: §5.11 のレート予算は**ホスト単位**なので、1 回の取得で同じホストの複数
+  エンドポイントを叩く OSV は `_kb_new_json(..., budget_key=...)` で**予算だけサービス単位に分け**、
+  遮断の記憶は netloc のまま（ホスト単位）にする。
+- **本文根拠の区別**: 構造化レコードしか無い hfhub は、記録の値を 1 行にまとめて
+  `summary_kind=structured_record` を付ける（論文抄録と混同させない）。cinii と同じく、書誌のみの
+  ソースは `metadata_only` のままにする。
 - **IETF の検索は全文検索ではない**: `title__contains` は AND 不可（実測: 2 語指定で 0 件）。RFC 番号
   （`RFC 9110` / `rfc9110` / `9110`）と `draft-...` は `name` で直引きし、それ以外は最長語 1 つで引いて
   全語がタイトルに載るものを優先する。取りこぼす場合があることを README に明記する。
-- **実測（2026-10-05・実 stdio 経路・各 2 件）**: osv 0.92 秒 / ietf 0.63 秒 / uniprot 1.03 秒 /
-  chembl 1.85 秒 / pdb 1.05 秒 / quickgo 1.05 秒 / reactome 0.84 秒 / clinicaltrials 0.24 秒 /
-  openfda 1.48 秒 / inspirehep 0.86 秒 / oeis 1.29 秒 / gbif 0.98 秒 / hfhub 0.28 秒。
-  EBI の 3 サービス（chembl / pdb / quickgo）を同時指定しても 1.12 秒で 6 件・エラー 0 件だった。
-  **chembl の `molecule/search` はばらつきが大きい**（同日 6 問で 1.1〜5.9 秒、まれに 8 秒締切超え）。
-  締切超えは `timed_out` として脱落させ、取得は裏で続けて次回キャッシュから返す（§6.1 の契約どおり）。
-  一時点の計測なので、時間帯別の確認は `scripts/measure_kb.py --sources ...` で行う。
+- **実測（2026-10-05・実 stdio 経路・各 2 件）**: osv 0.92 秒 / ietf 0.63 秒 / inspirehep 0.86 秒 /
+  oeis 1.29 秒 / hfhub 0.28 秒。一時点の計測なので、時間帯別の確認は
+  `scripts/measure_kb.py --sources ...` で行う。
+
+### 6.10 第7段階ソースの採用根拠（§5.20・2026-10-05）
+
+「世界中のプログラミング関連 API」を無認証でプローブし、規約 32 の 2 条件（検索できる公認 API・
+利用条件が明確）で評価した。**採用 3 種**はすべて既定 off の明示指定。
+
+- **hn（Hacker News / Algolia 検索）** — 実務者の議論・Q&A。実測 0.7 秒・キー不要。Algolia HN Search
+  API は「free for use with attribution（"Search by Algolia" の帰属表示）」で 10,000 req/hour/IP が上限。
+  Stack Exchange が AUP（生成AI/チャットボットの自動取得に事前の書面許諾）で使えないため、議論面の
+  空白をこれが埋める。`tags=story` のリンク投稿は本文が無く `metadata_only`。引用 URL は HN の
+  アイテム URL とし、記事 URL は `extra.article_url` に残す（証拠は HN の投稿であって記事ではない）。
+- **swh（Software Heritage）** — 公開ソースコードの長期アーカイブ（Inria）。`/api/1/origin/search/<pattern>/`
+  がキー不要で実測 1.42 秒。API 利用規約は「ポイント単位のアクセスは自由・大量抽出は不可」で、
+  メタデータ（来歴・種別）は事実情報として自由に使える。コード本文は取得せず、origin（リポジトリ）の
+  存在・URL・取得方式を `summary_kind=structured_record` で返す（GitHub code 検索がトークン必須なことの補完）。
+- **librariesio（Libraries.io）** — 19+ のパッケージ登録簿を横断するキーワード検索。**利用者自身の
+  無料 API キーが前提**（60 req/min）。`FREEAGENT_LIBRARIESIO_KEY` 未設定なら HTTP を出さずに登録先を
+  案内する（cinii と同じ型。§6.2 の契約）。説明は登録者の自己申告（`summary_kind=registry_description`）。
+  プロジェクトはキーを同梱・共有しない。
+- **見送り（実測）**: Maven Central（新 ToS が商用インフラ利用を禁止）/ Docker Hub（商用・abuse 条項が
+  曖昧）/ grep.app（429 チャレンジ）/ searchcode.com（404）/ Gitee（11〜17 秒・トークン要）/ JSR・PyPI・
+  pkg.go.dev（キーワード検索 API 無し）/ Homebrew・Go module index（一括ダンプ）/ Zenn（非公式 API）。
+  **将来候補（キー不要で使えるが、集約の librariesio を採る場合は schema コストに見合わない）**:
+  Artifact Hub / MetaCPAN / RubyGems / Packagist / pub.dev / Hex / NuGet / Debian Sources。
+- **実測（2026-10-05・実 stdio 経路・各 2 件）**: hn 0.47〜0.5 秒 / swh 1.2 秒。librariesio はキー未設定
+  なら検査・計測せずに外す（`probe_knowledge_stdio.py` / `measure_kb.py`）。
 
 ## 7. ツールの規約（§6–§8）
 

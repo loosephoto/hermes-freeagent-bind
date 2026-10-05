@@ -1,4 +1,8 @@
-"""第6段階ソース（プログラミング・標準 / 科学）のオフライン回帰。HTTP のみ模擬する。"""
+"""第6段階ソース（プログラミング・標準 / 科学）のオフライン回帰。HTTP のみ模擬する。
+
+2026-10-05 の方針変更で生命・医学系（UniProt / ChEMBL / PDBe / QuickGO / Reactome /
+ClinicalTrials.gov / openFDA / GBIF）は削除した。残るのは osv / ietf / inspirehep / oeis / hfhub。
+"""
 import os
 import sys
 import unittest
@@ -7,8 +11,7 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "src"))
 from freeagent_bind import server as S
 
-STAGE6 = ("osv", "ietf", "uniprot", "chembl", "pdb", "quickgo", "reactome", "clinicaltrials",
-          "openfda", "inspirehep", "oeis", "gbif", "hfhub")
+STAGE6 = ("osv", "ietf", "inspirehep", "oeis", "hfhub")
 
 OSV_VULN = {"id": "GHSA-462w-v97r-4m45", "summary": "Jinja2 sandbox escape via string formatting",
             "details": "In Pallets Jinja before 2.10.1 ...", "aliases": ["CVE-2019-10906"],
@@ -21,45 +24,6 @@ IETF_DOC = {"name": "rfc9110", "title": "HTTP Semantics",
             "rfc_number": 9110, "pages": 194, "rev": "06",
             "std_level": "/api/v1/name/stdlevelname/std/", "time": "2026-05-20T15:43:39Z"}
 
-UNIPROT_ROW = {"entryType": "UniProtKB reviewed (Swiss-Prot)", "primaryAccession": "P01308",
-               "uniProtkbId": "INS_HUMAN",
-               "proteinDescription": {"recommendedName": {"fullName": {"value": "Insulin"}}},
-               "organism": {"scientificName": "Homo sapiens"},
-               "genes": [{"geneName": {"value": "INS"}}], "sequence": {"length": 110},
-               "comments": [{"commentType": "FUNCTION",
-                             "texts": [{"value": "Insulin decreases blood glucose concentration."}]}]}
-
-CHEMBL_ROW = {"molecule_chembl_id": "CHEMBL25", "pref_name": "ASPIRIN", "max_phase": 4,
-              "molecule_properties": {"full_molformula": "C9H8O4", "full_mwt": "180.16"},
-              "molecule_structures": {"canonical_smiles": "CC(=O)Oc1ccccc1C(=O)O"},
-              "molecule_synonyms": [{"molecule_synonym": "Acetylsalicylic acid"}]}
-
-PDB_DOC = {"pdb_id": "3a59", "title": "Structure of Hemoglobin from flightless bird",
-           "experimental_method": ["X-ray diffraction"], "resolution": 3.41,
-           "deposition_date": "2009-08-03T01:00:00Z",
-           "organism_scientific_name": ["Struthio camelus"], "journal": "To be published"}
-
-QUICKGO_ROW = {"id": "GO:0097194", "name": "execution phase of apoptosis",
-               "definition": {"text": "A stage of the apoptotic process ..."},
-               "aspect": "biological_process", "isObsolete": False}
-
-# 実測: summation は配列ではなく HTML を含む文字列（旧実装は配列として走査して落ちた）
-REACTOME_ROW = {"stId": "R-HSA-109581", "name": "<span class=\"highlighting\" >Apoptosis</span>",
-                "type": "Pathway", "species": ["Homo sapiens"], "isDisease": False,
-                "summation": "<span class=\"highlighting\" >Apoptosis</span> is a distinct form of cell death."}
-
-CT_STUDY = {"protocolSection": {
-    "identificationModule": {"nctId": "NCT05913388", "briefTitle": "GB1211 and Pembrolizumab"},
-    "statusModule": {"overallStatus": "ACTIVE_NOT_RECRUITING", "startDateStruct": {"date": "2024-02-29"}},
-    "conditionsModule": {"conditions": ["Metastatic Melanoma"]},
-    "designModule": {"phases": ["PHASE2"]},
-    "descriptionModule": {"briefSummary": "The purpose of this study is to determine ..."}}}
-
-OPENFDA_ROW = {"set_id": "000155a8-709c-44e5", "effective_time": "20240101", "id": "abc",
-               "indications_and_usage": ["1 INDICATIONS AND USAGE Naproxen tablets are indicated for ..."],
-               "openfda": {"brand_name": ["Naproxen"], "generic_name": ["NAPROXEN"],
-                           "manufacturer_name": ["Acme"]}}
-
 INSPIRE_HIT = {"id": "2181837", "metadata": {
     "titles": [{"title": "The Higgs boson in the CP-violating NB-LSSM"}],
     "dois": [{"value": "10.1140/epjc/s10052-026-15520-7"}],
@@ -71,10 +35,6 @@ INSPIRE_HIT = {"id": "2181837", "metadata": {
 OEIS_ROW = {"number": 45, "id": "M0692 N0256", "data": "0,1,1,2,3,5,8,13",
             "name": "Fibonacci numbers: F(n) = F(n-1) + F(n-2).",
             "comment": ["D. E. Knuth writes: ..."], "keyword": "nonn,core,nice"}
-
-GBIF_ROW = {"key": 147345877, "scientificName": "Panthera leo", "canonicalName": "Panthera leo",
-            "rank": "SPECIES", "taxonomicStatus": "ACCEPTED", "genus": "Panthera",
-            "numOccurrences": 0}
 
 HF_ROW = {"id": "meta-llama/Llama-3.2-1B-Instruct", "pipeline_tag": "text-generation",
           "library_name": "transformers", "downloads": 7575085, "likes": 120,
@@ -105,6 +65,13 @@ class TestStage6Registry(unittest.TestCase):
                        ["inputSchema"]["properties"]["sources"]["description"])
             for name in STAGE6:
                 self.assertIn(name, desc, (tool, name))
+
+    def test_removed_science_sources_are_gone(self):
+        """生命・医学系は方針変更で削除済み。名前もハンドラも残っていないこと。"""
+        for name in ("europepmc", "uniprot", "chembl", "pdb", "quickgo", "reactome",
+                     "clinicaltrials", "openfda", "gbif"):
+            self.assertNotIn(name, S.SOURCES, name)
+            self.assertNotIn(name, S.KB_BACKENDS, name)
 
     def test_no_stage6_source_touches_the_network_without_arguments(self):
         for name in STAGE6:
@@ -210,73 +177,16 @@ class TestScienceSources(unittest.TestCase):
         guard.start()
         self.addCleanup(guard.stop)
 
-    def test_uniprot_function_comment_is_the_evidence(self):
-        with mock.patch.object(S, "kb_json", return_value=({"results": [UNIPROT_ROW]}, "")) as http:
-            got = S.kb_uniprot("insulin")
-        self.assertIn("fields=", http.call_args[0][0])
-        cite = got["citations"][0]
-        self.assertEqual(cite["title"], "Insulin (P01308)")
-        self.assertEqual(cite["summary"], "Insulin decreases blood glucose concentration.")
-        self.assertEqual(cite["container"], "Homo sapiens")
-        self.assertEqual(cite["url"], "https://www.uniprot.org/uniprotkb/P01308/entry")
-        self.assertTrue(S._kb_has_evidence(cite))
+    def test_hfhub_is_labelled_a_structured_record(self):
+        with mock.patch.object(S, "kb_json", return_value=([HF_ROW], "")):
+            cite = S.kb_hfhub("llama")["citations"][0]
+        self.assertEqual(cite["summary_kind"], "structured_record")
+        self.assertTrue(cite["summary"])
+        self.assertFalse(cite["metadata_only"])
+        self.assertEqual(cite["source"], "hfhub")
+        self.assertEqual(cite["extra"]["license"], "llama3.2")
 
-    def test_uniprot_without_function_comment_is_metadata_only(self):
-        row = {**UNIPROT_ROW, "comments": []}
-        with mock.patch.object(S, "kb_json", return_value=({"results": [row]}, "")):
-            cite = S.kb_uniprot("insulin")["citations"][0]
-        self.assertTrue(cite["metadata_only"])
-
-    def test_structured_record_sources_are_labelled(self):
-        cases = [(S.kb_chembl, {"molecules": [CHEMBL_ROW]}, "chembl"),
-                 (S.kb_pdb, {"response": {"docs": [PDB_DOC]}}, "pdb"),
-                 (S.kb_gbif, {"results": [GBIF_ROW]}, "gbif"),
-                 (S.kb_hfhub, [HF_ROW], "hfhub")]
-        for fn, payload, name in cases:
-            S._KB_CACHE.clear()
-            with mock.patch.object(S, "kb_json", return_value=(payload, "")):
-                cite = fn("q")["citations"][0]
-            self.assertEqual(cite["summary_kind"], "structured_record", name)
-            self.assertTrue(cite["summary"], name)
-            self.assertFalse(cite["metadata_only"], name)
-            self.assertEqual(cite["source"], name)
-
-    def test_chembl_keeps_identifier_and_facts(self):
-        with mock.patch.object(S, "kb_json", return_value=({"molecules": [CHEMBL_ROW]}, "")):
-            cite = S.kb_chembl("aspirin")["citations"][0]
-        self.assertEqual(cite["identifier"], "CHEMBL25")
-        self.assertIn("C9H8O4", cite["summary"])
-        self.assertEqual(cite["url"], "https://www.ebi.ac.uk/chembl/compound_report_card/CHEMBL25/")
-
-    def test_quickgo_definition_is_the_evidence(self):
-        with mock.patch.object(S, "kb_json", return_value=({"results": [QUICKGO_ROW]}, "")):
-            cite = S.kb_quickgo("apoptosis")["citations"][0]
-        self.assertEqual(cite["title"], "GO:0097194: execution phase of apoptosis")
-        self.assertIn("apoptotic process", cite["summary"])
-        self.assertEqual(cite["url"], "https://www.ebi.ac.uk/QuickGO/term/GO:0097194")
-
-    def test_reactome_summation_is_a_string_not_a_list(self):
-        """実測: summation は HTML を含む文字列。配列として走査すると落ちる（回帰）。"""
-        with mock.patch.object(S, "kb_json", return_value=({"results": [{"entries": [REACTOME_ROW]}]}, "")):
-            got = S.kb_reactome("apoptosis")
-        self.assertFalse(got.get("error"), got)
-        cite = got["citations"][0]
-        self.assertNotIn("<span", cite["summary"])
-        self.assertIn("distinct form of cell death", cite["summary"])
-        self.assertEqual(cite["url"], "https://reactome.org/content/detail/R-HSA-109581")
-
-    def test_clinicaltrials_and_openfda_and_inspirehep_use_prose(self):
-        with mock.patch.object(S, "kb_json", return_value=({"studies": [CT_STUDY]}, "")):
-            ct = S.kb_clinicaltrials("melanoma")["citations"][0]
-        self.assertEqual(ct["url"], "https://clinicaltrials.gov/study/NCT05913388")
-        self.assertIn("purpose of this study", ct["summary"])
-        S._KB_CACHE.clear()
-        with mock.patch.object(S, "kb_json", return_value=({"results": [OPENFDA_ROW]}, "")):
-            fda = S.kb_openfda("aspirin")["citations"][0]
-        self.assertIn("INDICATIONS AND USAGE", fda["summary"])
-        self.assertIn("dailymed", fda["url"])
-        self.assertIn("医療判断", S.kb_openfda.__doc__ or "")
-        S._KB_CACHE.clear()
+    def test_inspirehep_uses_prose_and_doi(self):
         with mock.patch.object(S, "kb_json", return_value=({"hits": {"hits": [INSPIRE_HIT]}}, "")):
             hep = S.kb_inspirehep("higgs")["citations"][0]
         self.assertEqual(hep["url"], "https://doi.org/10.1140/epjc/s10052-026-15520-7")
@@ -300,15 +210,7 @@ class TestScienceSources(unittest.TestCase):
 
     def test_malformed_responses_do_not_leak(self):
         payloads = {
-            S.kb_uniprot: (None, [], {"results": "x"}, {"results": ["x"]}),
-            S.kb_chembl: (None, [], {"molecules": "x"}, {"molecules": ["x"]}),
-            S.kb_pdb: (None, [], {"response": "x"}, {"response": {"docs": "x"}}),
-            S.kb_quickgo: (None, [], {"results": "x"}, {"results": ["x"]}),
-            S.kb_reactome: (None, [], {"results": "x"}, {"results": [{"entries": "x"}]}),
-            S.kb_clinicaltrials: (None, [], {"studies": "x"}, {"studies": ["x"]}),
-            S.kb_openfda: (None, [], {"results": "x"}, {"results": ["x"]}),
             S.kb_inspirehep: (None, [], {"hits": "x"}, {"hits": {"hits": "x"}}),
-            S.kb_gbif: (None, [], {"results": "x"}, {"results": ["x"]}),
             S.kb_hfhub: (None, [], {"results": "x"}),
         }
         for fn, variants in payloads.items():
@@ -320,19 +222,12 @@ class TestScienceSources(unittest.TestCase):
                 self.assertFalse(got.get("citations"), (fn.__name__, data))
 
     def test_rate_budget_failure_is_reported_not_waited(self):
-        for name in ("uniprot", "chembl", "pdb", "quickgo", "reactome", "clinicaltrials",
-                     "openfda", "inspirehep", "oeis", "gbif", "hfhub"):
+        for name in ("inspirehep", "oeis", "hfhub"):
             with mock.patch.object(S, "_kb_rate_acquire", return_value=1.5), \
                  mock.patch.object(S, "kb_json") as http:
                 got = S.KB_BACKENDS[name]("q", 3, {})
                 http.assert_not_called()
             self.assertIn("429", got["error"], name)
-
-    def test_ebi_services_have_separate_budgets_on_one_host(self):
-        """www.ebi.ac.uk に同居する chembl / pdb / quickgo が互いを締め出さないこと。"""
-        keys = [S._ebi_key("chembl"), S._ebi_key("pdbe"), S._ebi_key("QuickGO")]
-        self.assertEqual(len(set(keys)), 3)
-        self.assertTrue(all(k.startswith("www.ebi.ac.uk/") for k in keys))
 
     def test_budget_key_splits_one_host_but_blocking_stays_per_host(self):
         calls = []
@@ -377,9 +272,9 @@ class TestRateBudgetSplit(unittest.TestCase):
 
     def test_same_host_services_do_not_block_each_other(self):
         S._KB_RATE_NEXT.clear()
-        self.assertEqual(S._kb_rate_acquire(S._ebi_key("chembl"), 1.0), 0.0)
-        self.assertEqual(S._kb_rate_acquire(S._ebi_key("pdbe"), 1.0), 0.0)
-        self.assertGreater(S._kb_rate_acquire(S._ebi_key("chembl"), 1.0), 0.0)
+        self.assertEqual(S._kb_rate_acquire("www.example.org/svcA", 1.0), 0.0)
+        self.assertEqual(S._kb_rate_acquire("www.example.org/svcB", 1.0), 0.0)
+        self.assertGreater(S._kb_rate_acquire("www.example.org/svcA", 1.0), 0.0)
         S._KB_RATE_NEXT.clear()
 
     def test_host_key_still_throttles_a_repeat(self):

@@ -10,7 +10,7 @@
     python scripts/measure_kb.py                  # 1 巡測って追記
     python scripts/measure_kb.py --rounds 6 --interval 600   # 10 分おきに 6 巡（1 時間）
     python scripts/measure_kb.py --report         # 時間帯（日本時間の時）× ソースで集計
-    python scripts/measure_kb.py --sources datacite openaire europepmc
+    python scripts/measure_kb.py --sources datacite openaire
     python scripts/measure_kb.py --sources datacite --datacite-kind dataset
     python scripts/measure_kb.py --schedule 24    # Windows のタスクで 1 時間おきに 24 回（終われば自動で削除）
     python scripts/measure_kb.py --unschedule     # タスクを消す
@@ -79,20 +79,15 @@ SOURCE_QUERIES = {
             "markdown parser", "logging library", "unit testing"],
     "crates": ["json schema validator", "http client", "websocket server",
                "markdown parser", "logging library", "unit testing"],
+    "librariesio": ["json schema validator", "http client", "websocket server",
+                    "markdown parser", "logging library", "unit testing"],
     "osv": ["jinja2", "requests", "lodash", "serde", "express", "axios"],
     "ietf": ["DNSSEC", "QUIC", "CoAP", "TLS", "HTTP", "DNS"],
-    "uniprot": ["insulin", "p53", "hemoglobin", "kinase", "albumin", "collagen"],
-    "chembl": ["aspirin", "ibuprofen", "metformin", "caffeine", "penicillin", "warfarin"],
-    "pdb": ["hemoglobin", "lysozyme", "insulin receptor", "protease", "antibody", "ribosome"],
-    "quickgo": ["apoptosis", "DNA repair", "cell cycle", "autophagy", "mitosis", "translation"],
-    "reactome": ["apoptosis", "glycolysis", "cell cycle", "DNA repair", "immune system",
-                 "signal transduction"],
-    "clinicaltrials": ["melanoma", "diabetes", "asthma", "breast cancer", "stroke", "influenza"],
-    "openfda": ["aspirin", "ibuprofen", "metformin", "insulin", "atorvastatin", "amoxicillin"],
+    "hn": ["rust ownership", "python asyncio", "database index", "docker networking",
+           "typescript generics", "postgres performance"],
+    "swh": ["kubernetes", "linux", "vscode", "tensorflow", "redis", "react"],
     "inspirehep": ["higgs boson", "dark matter", "neutrino", "supersymmetry", "black hole", "QCD"],
     "oeis": ["Fibonacci", "prime", "Catalan", "factorial", "partition", "1,2,3,5,7,11"],
-    "gbif": ["Panthera leo", "Quercus", "Apis mellifera", "Danaus plexippus", "Ginkgo",
-             "Homo sapiens"],
     "hfhub": ["llama", "bert", "whisper", "diffusion", "mistral", "embedding"],
 }
 
@@ -108,6 +103,10 @@ def measure_round(index: int | None = None, sources: list[str] | None = None,
         # appid 未設定では必ずエラーになる。障害として記録せず対象から外す（規約 21 と同じ考え方）
         picked = [s for s in picked if s != "cinii"]
         _say("skip: cinii は FREEAGENT_CINII_APPID 未設定のため計測しません")
+    if "librariesio" in picked and not getattr(S, "LIBRARIESIO_KEY", ""):
+        # キー未設定では必ずエラーになる。障害として記録せず対象から外す
+        picked = [s for s in picked if s != "librariesio"]
+        _say("skip: librariesio は FREEAGENT_LIBRARIESIO_KEY 未設定のため計測しません")
     now = datetime.datetime.now(JST)
     en, ja = QUERIES[(now.hour if index is None else index) % len(QUERIES)]
     rows: dict[str, dict] = {}
@@ -291,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rounds", type=int, default=1)
     ap.add_argument("--interval", type=float, default=600.0)
     ap.add_argument("--report", action="store_true")
-    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help="計測対象（既定は対応15ソース）")
+    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help="計測対象（既定は対応22ソース）")
     ap.add_argument("--datacite-kind", choices=("all", "arxiv", "dataset"), default="all")
     ap.add_argument("--schedule", type=int, metavar="HOURS")
     ap.add_argument("--unschedule", action="store_true")

@@ -171,23 +171,6 @@ class TestAdditionalPaperBackends(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def test_europepmc_core_abstract_and_preprint_provenance(self):
-        self.assertIn("europepmc", S.KB_BACKENDS)
-        data = {"resultList": {"result": [{"source": "PPR", "id": "PPR1", "title": "Paper",
-                "pubYear": "2025", "abstractText": "<p>Actual abstract</p>", "doi": "10.1/test",
-                "authorList": {"author": [{"fullName": "A"}]}, "pubTypeList": {"pubType": ["Preprint"]},
-                "isOpenAccess": "Y", "license": "cc-by", "citedByCount": 4}]}}
-        with mock.patch.object(S, "kb_json", return_value=(data, "")) as http:
-            out = S.tool_lookup({"query": "CRISPR", "sources": ["europepmc"], "limit": 1})
-        self.assertFalse(out["errors"])
-        self.assertEqual(parse_qs(urlsplit(http.call_args.args[0]).query)["resultType"], ["core"])
-        self.assertEqual(out["citations"][0]["summary"], "Actual abstract")
-        self.assertEqual(out["citations"][0]["source"], "europepmc")
-        item = out["results"]["europepmc"]["items"][0]
-        self.assertEqual(item["publication_types"], ["Preprint"])
-        self.assertEqual(item["url"], "https://europepmc.org/article/PPR/PPR1")
-        self.assertEqual(item["license"], "cc-by")
-
     def test_openaire_v3_credit_pid_and_description(self):
         self.assertIn("openaire", S.KB_BACKENDS)
         data = {"results": [{"id": "id1", "mainTitle": "Paper", "descriptions": ["<p>Abstract</p>"],
@@ -231,7 +214,7 @@ class TestAdditionalPaperBackends(unittest.TestCase):
             self.assertFalse(result.get("citations"), fields)
 
     def test_metadata_errors_and_limits(self):
-        for source, fn in (("openaire", S.kb_openaire), ("europepmc", S.kb_europepmc)):
+        for source, fn in (("openaire", S.kb_openaire),):
             for data in (None, [], {"results": "wrong", "resultList": {"result": "wrong"}}):
                 S._KB_CACHE.clear()
                 with mock.patch.object(S, "kb_json", return_value=(data, "")):
@@ -507,9 +490,9 @@ class TestKnowledgeIntegration(unittest.TestCase):
         got = S._kb_merge_citations([
             {"source": "openaire", "doi": "10.1234/x", "url": "https://example.org/x", "summary": "Short",
              "attribution": "OpenAIRE CC-BY", "licenses": ["CC BY NC ND"], "publication_types": ["Preprint"]},
-            {"source": "europepmc", "doi": "10.1234/x", "url": "https://example.org/y", "summary": "Longer actual body",
+            {"source": "doaj", "doi": "10.1234/x", "url": "https://example.org/y", "summary": "Longer actual body",
              "license": "cc-by"}])[0]
-        self.assertEqual(got["summary_source"], "europepmc")
+        self.assertEqual(got["summary_source"], "doaj")
         self.assertEqual(got["license"], "cc-by")
         self.assertNotIn("licenses", got)
         self.assertIn("OpenAIRE CC-BY", got["attributions"])

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """hermes-freeagent-bind — Hermes Agent の Free モデルをサブLLMとして並列に走らせ、
-外部知識（既定6ソース＋DataCite / OpenAIRE / Europe PMC / Zenodo / ROR）で根拠づける MCP サーバー。
+外部知識（既定6ソース＋DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates / CiNii /
+OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Libraries.io）で
+根拠づける MCP サーバー。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は
+対象外**（第6段階で採った生命・医学系ソースは 2026-10-05 に方針変更で削除。§5.19 に記録）。
 
 これは **モノリス**（単一ファイル）として書く。理由: 配布物が 1 つの stdio スクリプトで完結し、
 遅延 import や相対 import の取り回しでクライアント側の起動が壊れる事故が無い（実測: stdio 起動後に
@@ -13,8 +16,9 @@
                                              §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 /
                                              §2.7 思考台帳の構造（分解・改訂・分岐・仮説））
   §3 プロバイダとモデル（§3.1 Free-tier provider guards）  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
-                    §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR /
-                    §5.16 DOAJ・npm・crates.io / §5.17 CiNii Research（appid 必須））
+                    §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR /
+                    §5.16 DOAJ・npm・crates.io / §5.17 CiNii Research（appid 必須） / §5.18 プログラミング・標準 /
+                    §5.19 科学（医学・生物学は対象外） / §5.20 プログラミング特化: HN・Software Heritage・Libraries.io）
   §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号）
   §7 ツール定義         §8 表示（content）
   §8.5 失敗時の「次の一手」（structuredContent.next_action）
@@ -246,6 +250,9 @@ KB_MAILTO = os.environ.get("FREEAGENT_MAILTO", "")  # OpenAlex / Crossref の po
 # CiNii Research は利用登録（アプリケーションID）が前提。未設定なら cinii は HTTP を出さずにエラーを返す
 # （実測: appid 無しでも 200 が返るが、規約は登録を要求している。§5.17）。
 CINII_APPID = os.environ.get("FREEAGENT_CINII_APPID", "").strip()
+# Libraries.io は無料の登録 API キーが前提（60 req/min）。未設定なら librariesio は HTTP を出さずにエラーを返す
+# （§5.20。cinii と同じ「キー必須の明示ソース」の型）。
+LIBRARIESIO_KEY = os.environ.get("FREEAGENT_LIBRARIESIO_KEY", "").strip()
 KB_TTL = _env_float("FREEAGENT_KB_TTL", 1800.0)     # 知識取得のメモリ内 TTL（秒）
 KB_TIMEOUT = _env_float("FREEAGENT_KB_TIMEOUT", 20.0)
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
@@ -2814,7 +2821,7 @@ def _kb_new_json(url: str, interval: float, payload: dict | None = None,
     return kb_json(url, extra_headers=headers, payload=payload)
 
 
-# ---------------------------------------------------------------- §5.12 Europe PMC / OpenAIRE Graph V3（明示指定のみ）
+# ---------------------------------------------------------------- §5.12 OpenAIRE Graph V3（明示指定のみ）
 
 
 def _kb_array(value, field: str) -> list:
@@ -2851,43 +2858,6 @@ def _kb_paper_result(source: str, items: list[dict], **extra) -> dict:
         cites.append(cite)
     return {"source": source, "items": items, "citations": cites,
             "error": "" if items else "該当なし", **extra}
-
-
-def kb_europepmc(query: str, limit: int = 5) -> dict:
-    """生命科学系の抄録。全文は取得しない。プレプリント・原文ライセンスを保持する。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "europepmc", "error": "query は必須です"}
-    def produce():
-        params = {"query": _literal_search(query), "format": "json", "resultType": "core", "pageSize": limit}
-        data, err = _kb_new_json("https://www.ebi.ac.uk/europepmc/webservices/rest/search?"
-                                + urllib.parse.urlencode(params), 1.0)
-        if err:
-            return {"source": "europepmc", "error": err}
-        rows = (data.get("resultList") or {}).get("result") if isinstance(data, dict) else None
-        if not isinstance(rows, list):
-            return {"source": "europepmc", "error": "Europe PMC の応答形式が不正です"}
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict) or not as_str(row.get("title")):
-                continue
-            record_id, origin = as_str(row.get("id")), as_str(row.get("source"))
-            if not record_id or not origin:
-                continue
-            summary = _plain_text(as_str(row.get("abstractText")), 600)
-            authors = [as_str(a.get("fullName")) for a in ((row.get("authorList") or {}).get("author") or [])
-                       if isinstance(a, dict)]
-            items.append({"title": truncate(row["title"], 300), "summary": summary,
-                          "url": "https://europepmc.org/article/" + urllib.parse.quote(origin, safe="")
-                                 + "/" + urllib.parse.quote(record_id, safe=""),
-                          "doi": as_str(row.get("doi")), "year": as_str(row.get("pubYear")),
-                          "id": record_id, "repository": origin, "authors": [a for a in authors if a][:8],
-                          "publication_types": (row.get("pubTypeList") or {}).get("pubType") or [],
-                          "is_oa": row.get("isOpenAccess") == "Y", "license": as_str(row.get("license")),
-                          "cited_by": row.get("citedByCount"), "metadata_only": not bool(summary)})
-        return _kb_paper_result("europepmc", items)
-    return _kb_new_cached(f"europepmc:{query}:{limit}", "europepmc", produce)
 
 
 def kb_openaire(query: str, limit: int = 5) -> dict:
@@ -2937,9 +2907,8 @@ def kb_openaire(query: str, limit: int = 5) -> dict:
     return _kb_new_cached(f"openaire:{query}:{limit}", "openaire", produce)
 
 
-SOURCES = (*SOURCES, "openaire", "europepmc")
-KB_BACKENDS.update({"openaire": lambda q, limit, opts: kb_openaire(q, limit),
-                    "europepmc": lambda q, limit, opts: kb_europepmc(q, limit)})
+SOURCES = (*SOURCES, "openaire")
+KB_BACKENDS.update({"openaire": lambda q, limit, opts: kb_openaire(q, limit)})
 
 
 # ---------------------------------------------------------------- §5.13 同一識別子の引用統合（独立した裏付けには数えない）
@@ -3223,7 +3192,7 @@ KB_BACKENDS.update({"zenodo": lambda q, limit, opts: kb_zenodo(q, limit),
 #     レート数値の公表は無いが責任ある利用が前提 → プロセス内 1 req/s に自制。
 #   * crates.io: Crawler Policy が「最大 1 req/s + 識別可能な User-Agent」を要求。KB_USER_AGENT は連絡先入り。
 # いずれも論文全文・パッケージ本体は取得しない（検索メタデータのみ）。PyPI / deps.dev はキーワード検索 API が
-# 無い（名前直引きのみ）ため登録しない。PubMed / bioRxiv は Europe PMC が索引済みで重複、PLOS は 10 req/min
+# 無い（名前直引きのみ）ため登録しない。PubMed / bioRxiv は医学・生物学で対象外（§5.19）、PLOS は 10 req/min
 # で 8 秒締切と不整合、HAL は商用利用条項が曖昧なため保留（規約 29 の保留群と同じ扱い）。
 
 
@@ -3469,9 +3438,9 @@ KB_BACKENDS.update({"doaj": lambda q, limit, opts: kb_doaj(q, limit),
 #     - Repology: 検索結果が「プロジェクト → 全リポジトリのパッケージ」の塊で（実測 133 プロジェクト・
 #       project/openssl は 1008 件）、8 秒締切と文脈予算に不向き。
 #     - MDN: 公開された API ではなくサイト内部のエンドポイント。GitLab / Codeberg: GitHub と役割が重複。
-#     - PubChem: 名前直引きのみでキーワード検索 API が無い（PyPI / deps.dev と同じ理由）。
-#     - KEGG: 学術は無償だが商用はライセンスが必要（条件が用途で割れる）。
-#     - InterPro: 実測 4.83 秒で 8 秒締切に近い。BioModels / PRIDE: 返るのが ID 中心で本文根拠にならない。
+#     - Maven Central: 実測 1.06 秒で応答するが、Central Repository ToS が階層型アクセスモデルを採用し
+#       「商用インフラ利用（商用サービス・ツール・スキャナ等の一部としての利用）」を事前許諾なしに禁止する。
+#     - grep.app: 429 のボットチャレンジ。searchcode.com: API が 404（廃止/移設）。
 
 _OSV_ECOSYSTEMS = ("PyPI", "npm", "crates.io", "Go", "Maven", "RubyGems", "NuGet", "Packagist",
                    "Hex", "Pub")
@@ -3657,362 +3626,20 @@ def kb_ietf(query: str, limit: int = 5) -> dict:
     return _kb_new_cached(f"ietf:{query}:{limit}", "ietf", produce)
 
 
-# ---------------------------------------------------------------- §5.19 第6段階: 科学（明示指定のみ）
+# ---------------------------------------------------------------- §5.19 科学（明示指定のみ）
 #
-# 採用根拠（2026-10-05 の利用条件確認と実プローブ。すべて無認証・実測 0.4〜2.9 秒・content-encoding は identity）:
-#   * UniProt（タンパク質・CC BY 4.0）/ ChEMBL（化合物・CC BY-SA 3.0）/ PDBe（構造・CC0）/
-#     QuickGO（Gene Ontology・CC BY 4.0）/ Reactome（経路・CC0）は EMBL-EBI 系。EBI の利用条件は
-#     「提供元の条件に追加の制限を課さない・出典表示を期待する」で、サービス固有条件が優先する。
-#   * ClinicalTrials.gov v2（臨床試験登録・米国政府）/ openFDA（医薬品ラベル・米国政府）は公的データ。
-#     openFDA は「医療判断に使うな」の免責が必須なので attribution に含める。
+# **対象は科学（物理・数学・計算機）まで。医学・生物学は対象外**（2026-10-05 の方針変更）。
+# 第6段階で採った生命・医学系ソース（UniProt / ChEMBL / PDBe / QuickGO / Reactome /
+# ClinicalTrials.gov / openFDA / GBIF）は本変更で削除した。理由: 本サーバーの用途を
+# プログラミング・コンピュータとその基礎科学に絞るため（削除した実装は git 履歴に残る）。
+# 残す科学系:
 #   * INSPIRE-HEP（素粒子物理・CC0）/ OEIS（整数列・CC BY-SA 4.0・出典表示必須）/
-#     GBIF（生物種・データごとに CC0/CC BY/CC BY-NC）/ Hugging Face Hub（モデル・データセット）。
-#   * 構造化レコードしか無いソース（ChEMBL / PDBe / GBIF / HF Hub）は、記録の値をそのまま 1 行に
-#     まとめて summary にし `summary_kind=structured_record` を付ける（論文抄録と混同させない）。
-#   * 見送り: PubMed・bioRxiv（Europe PMC が両方を索引済みで重複）/ KEGG（商用はライセンス必要）/
-#     zbMATH（実測で TLS 証明書検証に失敗）/ SIMBAD（実測 17.95 秒で 8 秒締切に不整合）/
-#     SciELO（Bunny シールドの 403 チャレンジ）/ OpenML（Hugging Face Hub と重複）/
-#     PubChem・AlphaFold DB・Ensembl・STRING（名前直引きでキーワード検索 API が無い）/
-#     NASA Exoplanet（ADQL を組み立てる必要があり、検索語の注入面が増える）。
-#   * EBI 系は**同一ホスト（www.ebi.ac.uk）に複数サービス**があるため、予算キーをサービス単位にする。
-#     ホスト単位のままだと chembl と pdb を同時に指定したとき片方が「アクセス間隔制御」で落ちる。
-#     この間隔は**プロセス内のみ**で、他のアプリや IP と共有されない（EBI は数値のレートを公表していない）。
-
-_EBI_INTERVAL = 1.0
-
-
-def _ebi_key(path: str) -> str:
-    """www.ebi.ac.uk 上のサービス単位の予算キー（ホストが同じでも別サービスとして数える）。"""
-    return "www.ebi.ac.uk/" + path.strip("/").split("/")[0]
-
-
-def kb_uniprot(query: str, limit: int = 5) -> dict:
-    """UniProtKB のタンパク質（CC BY 4.0）。配列そのものは返さず、機能コメントを本文根拠にする。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "uniprot", "error": "query は必須です"}
-    attribution = "データ提供: UniProt（CC BY 4.0） https://www.uniprot.org/"
-    fields = "accession,id,protein_name,organism_name,length,gene_names,cc_function"
-
-    def produce() -> dict:
-        params = {"query": query, "format": "json", "size": limit, "fields": fields}
-        data, err = _kb_new_json("https://rest.uniprot.org/uniprotkb/search?"
-                                 + urllib.parse.urlencode(params), 1.0)
-        if err:
-            return {"source": "uniprot", "error": err}
-        rows = _kb_array(_kb_object(data, "UniProt応答").get("results"), "results")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("UniProt の結果はオブジェクトではありません")
-            acc = as_str(row.get("primaryAccession"))
-            if not acc:
-                continue
-            desc = _kb_object(row.get("proteinDescription"), "proteinDescription")
-            full = _kb_object(_kb_object(desc.get("recommendedName"), "recommendedName")
-                              .get("fullName"), "fullName")
-            name = as_str(full.get("value")) or as_str(row.get("uniProtkbId")) or acc
-            genes = [as_str(_kb_object(g.get("geneName"), "geneName").get("value"))
-                     for g in _kb_array(row.get("genes"), "genes") if isinstance(g, dict)]
-            summary = ""
-            for comment in _kb_array(row.get("comments"), "comments"):
-                if not isinstance(comment, dict) or as_str(comment.get("commentType")) != "FUNCTION":
-                    continue
-                texts = [as_str(_kb_object(t, "text").get("value"))
-                         for t in _kb_array(comment.get("texts"), "texts")]
-                summary = _plain_text(" ".join(t for t in texts if t), 600)
-                break
-            length = _kb_object(row.get("sequence"), "sequence").get("length")
-            items.append({"title": f"{name} ({acc})",
-                          "url": "https://www.uniprot.org/uniprotkb/"
-                                 + urllib.parse.quote(acc, safe="") + "/entry",
-                          "summary": summary, "identifier": acc,
-                          "container": as_str(_kb_object(row.get("organism"), "organism")
-                                              .get("scientificName")),
-                          "authors": [g for g in genes if g][:4], "kind": "protein",
-                          "extra": {"length_aa": length if type(length) is int else None,
-                                    "reviewed": "reviewed" in as_str(row.get("entryType")).lower()}})
-        return _kb_generic_result("uniprot", items, attribution)
-
-    return _kb_new_cached(f"uniprot:{query}:{limit}", "uniprot", produce)
-
-
-def kb_chembl(query: str, limit: int = 5) -> dict:
-    """ChEMBL の化合物（CC BY-SA 3.0）。名前・別名からの検索で、構造そのものは返さない。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "chembl", "error": "query は必須です"}
-    attribution = "データ提供: ChEMBL（CC BY-SA 3.0） https://www.ebi.ac.uk/chembl/"
-
-    def produce() -> dict:
-        data, err = _kb_new_json("https://www.ebi.ac.uk/chembl/api/data/molecule/search.json?"
-                                 + urllib.parse.urlencode({"q": query, "limit": limit}),
-                                 _EBI_INTERVAL, budget_key=_ebi_key("chembl"))
-        if err:
-            return {"source": "chembl", "error": err}
-        rows = _kb_array(_kb_object(data, "ChEMBL応答").get("molecules"), "molecules")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("ChEMBL の record はオブジェクトではありません")
-            cid = as_str(row.get("molecule_chembl_id"))
-            if not cid:
-                continue
-            props = _kb_object(row.get("molecule_properties"), "molecule_properties")
-            name = _plain_text(as_str(row.get("pref_name")), 200) or cid
-            facts = [f"化合物ID {cid}"]
-            if as_str(props.get("full_molformula")):
-                facts.append(f"分子式 {as_str(props.get('full_molformula'))}")
-            if as_str(props.get("full_mwt")):
-                facts.append(f"分子量 {as_str(props.get('full_mwt'))}")
-            phase = as_int(row.get("max_phase"), -1, 0, 9)
-            if phase >= 0:
-                facts.append(f"最大相 {phase}")
-            synonyms = [as_str(s.get("molecule_synonym"))
-                        for s in _kb_array(row.get("molecule_synonyms"), "molecule_synonyms")
-                        if isinstance(s, dict)]
-            items.append({"title": f"{name} ({cid})",
-                          "url": "https://www.ebi.ac.uk/chembl/compound_report_card/"
-                                 + urllib.parse.quote(cid, safe="") + "/",
-                          "summary": "／".join(facts), "identifier": cid,
-                          "summary_kind": "structured_record",
-                          "authors": [s for s in synonyms if s][:5], "kind": "compound",
-                          "extra": {"smiles": as_str(_kb_object(row.get("molecule_structures"),
-                                                                "molecule_structures")
-                                                     .get("canonical_smiles"))[:200]}})
-        return _kb_generic_result("chembl", items, attribution)
-
-    return _kb_new_cached(f"chembl:{query}:{limit}", "chembl", produce)
-
-
-def kb_pdb(query: str, limit: int = 5) -> dict:
-    """PDBe（旧 PDBe 検索）の構造。CC0。実験手法・分解能・生物種を 1 行にまとめる。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "pdb", "error": "query は必須です"}
-    attribution = "データ提供: PDBe（CC0） https://www.ebi.ac.uk/pdbe/"
-
-    def produce() -> dict:
-        params = {"q": query, "rows": limit, "wt": "json",
-                  "fl": "title,pdb_id,experimental_method,resolution,deposition_date,"
-                        "organism_scientific_name,journal"}
-        data, err = _kb_new_json("https://www.ebi.ac.uk/pdbe/search/pdb/select?"
-                                 + urllib.parse.urlencode(params), _EBI_INTERVAL,
-                                 budget_key=_ebi_key("pdbe"))
-        if err:
-            return {"source": "pdb", "error": err}
-        docs = _kb_array(_kb_object(_kb_object(data, "PDBe応答").get("response"), "response")
-                         .get("docs"), "docs")
-        items = []
-        for doc in docs[:limit]:
-            if not isinstance(doc, dict):
-                raise ValueError("PDBe の doc はオブジェクトではありません")
-            pid = as_str(doc.get("pdb_id")).lower()
-            title = _plain_text(as_str(doc.get("title")), 300)
-            if not pid or not title:
-                continue
-            methods = [as_str(m) for m in _kb_array(doc.get("experimental_method"),
-                                                    "experimental_method") if as_str(m)]
-            organisms = [as_str(o) for o in _kb_array(doc.get("organism_scientific_name"),
-                                                      "organism_scientific_name") if as_str(o)]
-            facts = [f"PDB ID {pid.upper()}"]
-            if methods:
-                facts.append("実験手法 " + ", ".join(methods[:2]))
-            resolution = doc.get("resolution")
-            if isinstance(resolution, (int, float)):
-                facts.append(f"分解能 {resolution} Å")
-            if organisms:
-                facts.append("生物種 " + organisms[0])
-            if as_str(doc.get("journal")):
-                facts.append("雑誌 " + _plain_text(as_str(doc.get("journal")), 80))
-            items.append({"title": title,
-                          "url": "https://www.ebi.ac.uk/pdbe/entry/pdb/" + urllib.parse.quote(pid, safe=""),
-                          "summary": "／".join(facts), "identifier": pid.upper(),
-                          "summary_kind": "structured_record",
-                          "authors": organisms[:3], "kind": "structure",
-                          "year": as_str(doc.get("deposition_date"))[:4]})
-        return _kb_generic_result("pdb", items, attribution)
-
-    return _kb_new_cached(f"pdb:{query}:{limit}", "pdb", produce)
-
-
-def kb_quickgo(query: str, limit: int = 5) -> dict:
-    """QuickGO の Gene Ontology 用語（CC BY 4.0）。定義文を本文根拠にする。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "quickgo", "error": "query は必須です"}
-    attribution = "データ提供: QuickGO / Gene Ontology（CC BY 4.0） https://www.ebi.ac.uk/QuickGO/"
-
-    def produce() -> dict:
-        params = {"query": query, "limit": limit, "page": 1}
-        data, err = _kb_new_json("https://www.ebi.ac.uk/QuickGO/services/ontology/go/search?"
-                                 + urllib.parse.urlencode(params), _EBI_INTERVAL,
-                                 budget_key=_ebi_key("QuickGO"))
-        if err:
-            return {"source": "quickgo", "error": err}
-        rows = _kb_array(_kb_object(data, "QuickGO応答").get("results"), "results")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("QuickGO の結果はオブジェクトではありません")
-            gid = as_str(row.get("id"))
-            name = _plain_text(as_str(row.get("name")), 200)
-            if not gid or not name:
-                continue
-            definition = _kb_object(row.get("definition"), "definition")
-            items.append({"title": f"{gid}: {name}",
-                          "url": "https://www.ebi.ac.uk/QuickGO/term/" + urllib.parse.quote(gid, safe=":"),
-                          "summary": _plain_text(as_str(definition.get("text")), 600),
-                          "identifier": gid, "kind": "ontology-term",
-                          "extra": {"aspect": as_str(row.get("aspect")),
-                                    "obsolete": row.get("isObsolete") is True}})
-        return _kb_generic_result("quickgo", items, attribution)
-
-    return _kb_new_cached(f"quickgo:{query}:{limit}", "quickgo", produce)
-
-
-def kb_reactome(query: str, limit: int = 5) -> dict:
-    """Reactome の経路・反応（CC0）。全生物種を対象にし、種別ごとのクラスタを平坦化する。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "reactome", "error": "query は必須です"}
-    attribution = "データ提供: Reactome（CC0） https://reactome.org/"
-
-    def produce() -> dict:
-        data, err = _kb_new_json("https://reactome.org/ContentService/search/query?"
-                                 + urllib.parse.urlencode({"query": query, "cluster": "true"}), 1.0)
-        if err:
-            return {"source": "reactome", "error": err}
-        items = []
-        for cluster in _kb_array(_kb_object(data, "Reactome応答").get("results"), "results"):
-            if not isinstance(cluster, dict):
-                continue
-            for entry in _kb_array(cluster.get("entries"), "entries"):
-                if len(items) >= limit:
-                    break
-                if not isinstance(entry, dict):
-                    continue
-                st_id = as_str(entry.get("stId"))
-                name = _plain_text(as_str(entry.get("name")), 200)
-                if not st_id or not name:
-                    continue
-                # 実測: summation は文字列（<span class="highlighting"> を含む HTML）。配列ではない。
-                summary = _plain_text(as_str(entry.get("summation")), 600)
-                species = [as_str(s) for s in _kb_array(entry.get("species"), "species") if as_str(s)]
-                items.append({"title": f"{st_id}: {name}",
-                              "url": "https://reactome.org/content/detail/"
-                                     + urllib.parse.quote(st_id, safe=""),
-                              "summary": summary, "identifier": st_id,
-                              "kind": as_str(entry.get("type")) or "pathway",
-                              "authors": species[:3],
-                              "extra": {"disease": entry.get("isDisease") is True}})
-            if len(items) >= limit:
-                break
-        return _kb_generic_result("reactome", items, attribution)
-
-    return _kb_new_cached(f"reactome:{query}:{limit}", "reactome", produce)
-
-
-def kb_clinicaltrials(query: str, limit: int = 5) -> dict:
-    """ClinicalTrials.gov v2（臨床試験の登録情報・米国政府）。結果の要約は返らない（概要のみ）。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "clinicaltrials", "error": "query は必須です"}
-    attribution = "データ提供: ClinicalTrials.gov（米国国立医学図書館） https://clinicaltrials.gov/"
-
-    def produce() -> dict:
-        params = {"query.term": query, "pageSize": limit,
-                  "fields": "NCTId,BriefTitle,OverallStatus,StartDate,Condition,BriefSummary,Phase"}
-        data, err = _kb_new_json("https://clinicaltrials.gov/api/v2/studies?"
-                                 + urllib.parse.urlencode(params), 1.0)
-        if err:
-            return {"source": "clinicaltrials", "error": err}
-        items = []
-        for study in _kb_array(_kb_object(data, "ClinicalTrials応答").get("studies"), "studies"):
-            if not isinstance(study, dict):
-                continue
-            section = _kb_object(study.get("protocolSection"), "protocolSection")
-            ident = _kb_object(section.get("identificationModule"), "identificationModule")
-            nct = as_str(ident.get("nctId"))
-            title = _plain_text(as_str(ident.get("briefTitle")), 300)
-            if not nct or not title:
-                continue
-            status = _kb_object(section.get("statusModule"), "statusModule")
-            conditions = [as_str(c) for c in _kb_array(_kb_object(section.get("conditionsModule"),
-                                                                  "conditionsModule").get("conditions"),
-                                                       "conditions") if as_str(c)]
-            phases = [as_str(p) for p in _kb_array(_kb_object(section.get("designModule"),
-                                                              "designModule").get("phases"),
-                                                   "phases") if as_str(p)]
-            start = as_str(_kb_object(status.get("startDateStruct"), "startDateStruct").get("date"))
-            items.append({"title": title,
-                          "url": "https://clinicaltrials.gov/study/" + urllib.parse.quote(nct, safe=""),
-                          "summary": _plain_text(as_str(_kb_object(section.get("descriptionModule"),
-                                                                   "descriptionModule")
-                                                        .get("briefSummary")), 600),
-                          "identifier": nct, "kind": "clinical-trial", "year": start[:4],
-                          "authors": conditions[:5],
-                          "extra": {"status": as_str(status.get("overallStatus")), "start": start,
-                                    "phases": phases}})
-        return _kb_generic_result("clinicaltrials", items, attribution)
-
-    return _kb_new_cached(f"clinicaltrials:{query}:{limit}", "clinicaltrials", produce)
-
-
-def kb_openfda(query: str, limit: int = 5) -> dict:
-    """openFDA の医薬品ラベル（米国政府・パブリックドメイン）。医療判断には使えない。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "openfda", "error": "query は必須です"}
-    attribution = ("データ提供: openFDA（米国政府・パブリックドメイン） https://open.fda.gov/。"
-                   "医療判断に使わないでください（原典の免責）")
-    search = '"' + query.replace('"', " ") + '"' if " " in query else query
-
-    def produce() -> dict:
-        data, err = _kb_new_json("https://api.fda.gov/drug/label.json?"
-                                 + urllib.parse.urlencode({"search": search, "limit": limit}), 1.0)
-        if err:
-            return {"source": "openfda", "error": err}
-        items = []
-        for row in _kb_array(_kb_object(data, "openFDA応答").get("results"), "results"):
-            if not isinstance(row, dict):
-                raise ValueError("openFDA の結果はオブジェクトではありません")
-            openfda = _kb_object(row.get("openfda"), "openfda")
-            brands = [as_str(b) for b in _kb_array(openfda.get("brand_name"), "brand_name") if as_str(b)]
-            generics = [as_str(g) for g in _kb_array(openfda.get("generic_name"), "generic_name")
-                        if as_str(g)]
-            set_id = as_str(row.get("set_id"))
-            name = (brands or generics or [as_str(row.get("id"))])[0]
-            if not name:
-                continue
-            summary = ""
-            for field in ("indications_and_usage", "purpose", "warnings", "dosage_and_administration"):
-                values = [as_str(v) for v in _kb_array(row.get(field), field) if as_str(v)]
-                if values:
-                    summary = _plain_text(values[0], 600)
-                    break
-            manufacturers = [as_str(m) for m in _kb_array(openfda.get("manufacturer_name"),
-                                                         "manufacturer_name") if as_str(m)]
-            items.append({"title": name,
-                          "url": ("https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid="
-                                  + urllib.parse.quote(set_id, safe="")) if set_id
-                                 else "https://open.fda.gov/apis/drug/label/",
-                          "summary": summary, "identifier": set_id,
-                          "kind": "drug-label", "year": as_str(row.get("effective_time"))[:4],
-                          "container": generics[0] if generics else "",
-                          "authors": manufacturers[:2],
-                          "extra": {"generic_name": generics[0] if generics else ""}})
-        return _kb_generic_result("openfda", items, attribution)
-
-    return _kb_new_cached(f"openfda:{query}:{limit}", "openfda", produce)
-
+#     Hugging Face Hub（ML モデル・データセット。計算機科学に含める）。
+#   * 構造化レコードしか無いソース（HF Hub）は、記録の値をそのまま 1 行にまとめて summary にし
+#     `summary_kind=structured_record` を付ける（論文抄録と混同させない）。
+#   * 見送り（変更なし）: zbMATH（実測で TLS 証明書検証に失敗）/ SIMBAD（実測 17.95 秒）
+#     SciELO（403 チャレンジ）/ OpenML（HF Hub と重複）/ PubChem・AlphaFold DB・Ensembl・STRING
+#     （名前直引きでキーワード検索 API が無い）/ NASA Exoplanet（ADQL を組み立てる必要がある）。
 
 def kb_inspirehep(query: str, limit: int = 5) -> dict:
     """INSPIRE-HEP の素粒子物理文献（CC0）。DOI があれば DOI を出典 URL にする。"""
@@ -4113,50 +3740,6 @@ def kb_oeis(query: str, limit: int = 5) -> dict:
     return _kb_new_cached(f"oeis:{query}:{limit}", "oeis", produce)
 
 
-def kb_gbif(query: str, limit: int = 5) -> dict:
-    """GBIF の生物種（バックボーン分類）。種データのライセンスはデータごとに異なる。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "gbif", "error": "query は必須です"}
-    attribution = ("データ提供: GBIF（分類は GBIF Backbone。出現データはデータごとに "
-                   "CC0 / CC BY / CC BY-NC） https://www.gbif.org/")
-
-    def produce() -> dict:
-        data, err = _kb_new_json("https://api.gbif.org/v1/species/search?"
-                                 + urllib.parse.urlencode({"q": query, "limit": limit}), 1.0)
-        if err:
-            return {"source": "gbif", "error": err}
-        rows = _kb_array(_kb_object(data, "GBIF応答").get("results"), "results")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("GBIF の結果はオブジェクトではありません")
-            key = row.get("key")
-            name = _plain_text(as_str(row.get("scientificName")), 200)
-            if type(key) is not int or not name:
-                continue
-            facts = [f"学名 {name}"]
-            if as_str(row.get("rank")):
-                facts.append("ランク " + as_str(row.get("rank")))
-            if as_str(row.get("taxonomicStatus")):
-                facts.append("地位 " + as_str(row.get("taxonomicStatus")))
-            for field in ("kingdom", "phylum", "class", "order", "family", "genus"):
-                if as_str(row.get(field)):
-                    facts.append(f"{field} {as_str(row.get(field))}")
-            occurrences = row.get("numOccurrences")
-            if type(occurrences) is int:
-                facts.append(f"出現記録 {occurrences} 件")
-            items.append({"title": name,
-                          "url": "https://www.gbif.org/species/" + str(key),
-                          "summary": "／".join(facts), "identifier": str(key),
-                          "summary_kind": "structured_record", "kind": "taxon",
-                          "extra": {"canonical_name": as_str(row.get("canonicalName"))}})
-        return _kb_generic_result("gbif", items, attribution)
-
-    return _kb_new_cached(f"gbif:{query}:{limit}", "gbif", produce)
-
-
 def kb_hfhub(query: str, limit: int = 5) -> dict:
     """Hugging Face Hub のモデル検索。モデルのライセンス・品質はリポジトリごとに異なる。"""
     query = as_str(query)
@@ -4204,23 +3787,161 @@ def kb_hfhub(query: str, limit: int = 5) -> dict:
     return _kb_new_cached(f"hfhub:{query}:{limit}", "hfhub", produce)
 
 
-SOURCES = (*SOURCES, "osv", "ietf", "uniprot", "chembl", "pdb", "quickgo", "reactome",
-           "clinicaltrials", "openfda", "inspirehep", "oeis", "gbif", "hfhub")
+SOURCES = (*SOURCES, "osv", "ietf", "inspirehep", "oeis", "hfhub")
 KB_BACKENDS.update({
     "osv": lambda q, limit, opts: kb_osv(q, limit),
     "ietf": lambda q, limit, opts: kb_ietf(q, limit),
-    "uniprot": lambda q, limit, opts: kb_uniprot(q, limit),
-    "chembl": lambda q, limit, opts: kb_chembl(q, limit),
-    "pdb": lambda q, limit, opts: kb_pdb(q, limit),
-    "quickgo": lambda q, limit, opts: kb_quickgo(q, limit),
-    "reactome": lambda q, limit, opts: kb_reactome(q, limit),
-    "clinicaltrials": lambda q, limit, opts: kb_clinicaltrials(q, limit),
-    "openfda": lambda q, limit, opts: kb_openfda(q, limit),
     "inspirehep": lambda q, limit, opts: kb_inspirehep(q, limit),
     "oeis": lambda q, limit, opts: kb_oeis(q, limit),
-    "gbif": lambda q, limit, opts: kb_gbif(q, limit),
     "hfhub": lambda q, limit, opts: kb_hfhub(q, limit),
 })
+
+
+# ---------------------------------------------------------------- §5.20 第7段階: プログラミング特化（明示指定のみ）
+#
+# 採用根拠（2026-10-05 の無認証プローブと利用条件の一次確認。対象をプログラミング・コンピュータへ寄せる）:
+#   * Hacker News（Algolia 検索）: 実務者の議論・Q&A。キー不要・実測 0.7 秒。Algolia HN Search API は
+#     「free for use with attribution（"Search by Algolia" の帰属表示）」で 10,000 req/hour/IP が上限。
+#     Stack Exchange が AUP（生成AI/チャットボットの自動取得に事前の書面許諾）で使えないため、
+#     議論面の空白をこれが埋める。tags=story のリンク投稿は本文が無く metadata_only になる。
+#   * Software Heritage: 公開ソースコードの長期アーカイブ（Inria）。`/api/1/origin/search/<pattern>/` が
+#     キー不要で実測 1.42 秒。API 利用規約は「ポイント単位のアクセスは自由・大量抽出は不可」で、
+#     メタデータ（来歴・種別）は事実情報として自由に使える。コード本文は取得せず、origin（リポジトリ）の
+#     存在・URL・取得方式を `summary_kind=structured_record` で返す（GitHub code 検索がトークン必須なことの補完）。
+#   * Libraries.io: 19+ のパッケージ登録簿を横断するキーワード検索（`/api/search?q=`）。**利用者自身の
+#     無料 API キーが前提**（60 req/min）。未設定なら HTTP を出さずに登録先を案内する（cinii と同じ型）。
+#     説明は登録者の自己申告（`summary_kind=registry_description`）。プロジェクトはキーを同梱・共有しない。
+#   * 見送り: Maven Central（ToS が商用インフラ利用を禁止）/ Docker Hub（商用・abuse 条項が曖昧）/
+#     grep.app（429 チャレンジ）/ searchcode.com（404）/ Gitee（11〜17 秒・トークン要）/ JSR・PyPI・
+#     pkg.go.dev（キーワード検索 API 無し）/ Homebrew・Go module index（一括ダンプ）/ Zenn（非公式 API）。
+
+
+def kb_hn(query: str, limit: int = 5) -> dict:
+    """Hacker News（Algolia 検索）の投稿。帰属表示が必要。本文は投稿者による議論テキスト。"""
+    query = as_str(query)
+    limit = as_int(limit, 5, 1, 20)
+    if not query:
+        return {"source": "hn", "error": "query は必須です"}
+    attribution = ("データ提供: Hacker News（Algolia HN Search。帰属表示必須） "
+                   "https://hn.algolia.com/")
+
+    def produce() -> dict:
+        params = {"query": query, "tags": "story", "hitsPerPage": limit}
+        data, err = _kb_new_json("https://hn.algolia.com/api/v1/search?"
+                                 + urllib.parse.urlencode(params), 0.4)
+        if err:
+            return {"source": "hn", "error": err}
+        rows = _kb_array(_kb_object(data, "HN応答").get("hits"), "hits")
+        items = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                raise ValueError("HN の hit はオブジェクトではありません")
+            oid = as_str(row.get("objectID"))
+            title = _plain_text(as_str(row.get("title")), 300)
+            if not oid or not title:
+                continue
+            points, comments = row.get("points"), row.get("num_comments")
+            items.append({"title": title,
+                          "url": "https://news.ycombinator.com/item?id=" + urllib.parse.quote(oid, safe=""),
+                          "summary": _plain_text(as_str(row.get("story_text")), 600),
+                          "identifier": oid, "kind": "hn-story", "summary_kind": "discussion",
+                          "year": as_str(row.get("created_at"))[:4], "container": "Hacker News",
+                          "authors": [as_str(row.get("author"))] if as_str(row.get("author")) else [],
+                          "extra": {"points": points if type(points) is int else None,
+                                    "comments": comments if type(comments) is int else None,
+                                    "article_url": as_str(row.get("url"))}})
+        return _kb_generic_result("hn", items, attribution)
+
+    return _kb_new_cached(f"hn:{query}:{limit}", "hn", produce)
+
+
+def kb_swh(query: str, limit: int = 5) -> dict:
+    """Software Heritage の公開コードアーカイブ。リポジトリ（origin）の存在・URL・取得方式を引く。"""
+    query = as_str(query)
+    limit = as_int(limit, 5, 1, 20)
+    if not query:
+        return {"source": "swh", "error": "query は必須です"}
+    attribution = ("データ提供: Software Heritage（Inria。API 利用規約に従う） "
+                   "https://www.softwareheritage.org/")
+
+    def produce() -> dict:
+        pattern = urllib.parse.quote(query.strip(), safe="")
+        data, err = _kb_new_json("https://archive.softwareheritage.org/api/1/origin/search/"
+                                 + pattern + "/?" + urllib.parse.urlencode({"limit": limit}), 1.0)
+        if err:
+            return {"source": "swh", "error": err}
+        rows = _kb_array(data, "origins")
+        items = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                raise ValueError("Software Heritage の origin はオブジェクトではありません")
+            origin = as_str(row.get("url"))
+            if not origin:
+                continue
+            visit_types = [as_str(v) for v in _kb_array(row.get("visit_types"), "visit_types")
+                           if as_str(v)]
+            facts = [f"アーカイブ済み origin: {origin}"]
+            if visit_types:
+                facts.append("取得方式 " + ", ".join(visit_types[:3]))
+            items.append({"title": origin, "url": origin, "summary": "／".join(facts),
+                          "identifier": origin, "kind": "software-origin",
+                          "summary_kind": "structured_record",
+                          "extra": {"visit_types": visit_types,
+                                    "browse_url": "https://archive.softwareheritage.org/browse/origin/"
+                                                  "?origin_url=" + urllib.parse.quote(origin, safe="")}})
+        return _kb_generic_result("swh", items, attribution)
+
+    return _kb_new_cached(f"swh:{query}:{limit}", "swh", produce)
+
+
+def kb_librariesio(query: str, limit: int = 5) -> dict:
+    """Libraries.io のパッケージ検索（19+ 登録簿を横断）。説明は登録者の自己申告。利用者自身のキーが必要。"""
+    query = as_str(query)
+    limit = as_int(limit, 5, 1, 20)
+    if not query:
+        return {"source": "librariesio", "error": "query は必須です"}
+    if not LIBRARIESIO_KEY:
+        return {"source": "librariesio",
+                "error": "API キー未設定: Libraries.io は無料の登録キーが必要です。"
+                         "https://libraries.io/account で取得し、環境変数 FREEAGENT_LIBRARIESIO_KEY に"
+                         "設定してください（設定するまで HTTP は出しません）"}
+    attribution = "データ提供: Libraries.io https://libraries.io/（各登録簿の条件に従う）"
+
+    def produce() -> dict:
+        params = {"q": query, "per_page": limit, "api_key": LIBRARIESIO_KEY}
+        data, err = _kb_new_json("https://libraries.io/api/search?"
+                                 + urllib.parse.urlencode(params), 1.0)
+        if err:
+            return {"source": "librariesio", "error": err}
+        rows = _kb_array(data, "projects")
+        items = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                raise ValueError("Libraries.io の project はオブジェクトではありません")
+            name, platform = as_str(row.get("name")), as_str(row.get("platform"))
+            if not name or not platform:
+                continue
+            downloads = row.get("downloads")
+            items.append({"title": f"{platform}/{name}",
+                          "url": "https://libraries.io/" + urllib.parse.quote(platform, safe="")
+                                 + "/" + urllib.parse.quote(name, safe=""),
+                          "summary": _plain_text(as_str(row.get("description")), 400),
+                          "identifier": name, "version": as_str(row.get("latest_release_number")),
+                          "year": as_str(row.get("latest_release_published_at"))[:4],
+                          "repository_url": as_str(row.get("repository_url")),
+                          "downloads": downloads if type(downloads) is int else None,
+                          "keywords": [as_str(k) for k in _kb_array(row.get("keywords"), "keywords")
+                                       if as_str(k)][:8]})
+        return _kb_package_result("librariesio", items, attribution)
+
+    return _kb_new_cached(f"librariesio:{query}:{limit}", "librariesio", produce)
+
+
+SOURCES = (*SOURCES, "hn", "swh", "librariesio")
+KB_BACKENDS.update({"hn": lambda q, limit, opts: kb_hn(q, limit),
+                    "swh": lambda q, limit, opts: kb_swh(q, limit),
+                    "librariesio": lambda q, limit, opts: kb_librariesio(q, limit)})
+
 
 # ================================================================ §6 ツール実装
 #
@@ -4249,8 +3970,8 @@ AGENT_SYSTEM_FINAL = (
 AGENT_SYSTEM = (
     "あなたは調査補佐です。次のいずれか**1つだけ**を JSON で出力してください。\n"
     '  ツールを使う: {"tool": "lookup", "query": "<検索語>", "sources": ["arxiv","crossref",...]}\n'
-    '  使える source: wikipedia, wikidata, arxiv, crossref, openalex, github, datacite, openaire, europepmc, zenodo, ror, doaj, npm, crates, cinii\n'
-    '  追加（明示指定のみ）: osv, ietf, uniprot, chembl, pdb, quickgo, reactome, clinicaltrials, openfda, inspirehep, oeis, gbif, hfhub\n'
+    '  使える source: wikipedia, wikidata, arxiv, crossref, openalex, github, datacite, openaire, zenodo, ror, doaj, npm, crates, cinii\n'
+    '  追加（明示指定のみ）: osv, ietf, inspirehep, oeis, hfhub, hn, swh, librariesio\n'
     '  追加sourceは明示指定のみ。datacite_kind: all / arxiv / dataset。fallback: trueでarXivのDataCite代替を許可。\n'
     '  回答する:     {"answer": "<回答。使った根拠の番号 [n] を本文に書く>"}\n'
     "ツール結果は [1] [2] … の番号つきで返ります。回答では使った根拠の番号を本文に書き、"
@@ -5881,10 +5602,10 @@ TOOLS: list[dict] = [
         "description": (
             "【使う条件】出典URLが要る／判断の前に知識を補強したい／LLM を介さず一次情報に当たりたい。"
             "【差分】LLM を使わないので幻覚が無い。arXiv・Crossref・OpenAlex（論文）／Wikipedia・Wikidata"
-            "（百科・構造化）／GitHub（コード）を並列に引く。追加の datacite / openaire / europepmc / zenodo / ror / "
-            "doaj（OA論文）/ npm / crates（パッケージ検索）／osv・ietf（脆弱性・標準）／"
-            "uniprot・chembl・pdb・quickgo・reactome（生命科学）／clinicaltrials・openfda（医薬）／"
-            "inspirehep・oeis・gbif・hfhub（物理・数学・生物・ML）は sources で明示指定する。"
+            "（百科・構造化）／GitHub（コード）を並列に引く。追加の datacite / openaire / zenodo / ror / "
+            "doaj（OA論文）/ npm / crates / librariesio（パッケージ検索）／osv・ietf（脆弱性・標準）／"
+            "inspirehep・oeis・hfhub（物理・数学・ML）／hn（Hacker News の議論）／swh（Software Heritage の"
+            "コードアーカイブ）は sources で明示指定する。"
             "DataCite は自然語の各語を AND 検索、datacite_kind=dataset で研究データ。"
             "fallback=true のときだけ自然語 arXiv検索の失敗/遅延を DataCite で代替する（取得元を明示）。"
             "【使わない条件】単一の事実だけなら web_search が速い。"
@@ -5894,7 +5615,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "query": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates / cinii（cinii は利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみで抄録は返らない） / osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ uniprot / chembl / pdb / quickgo / reactome / clinicaltrials / openfda / inspirehep / oeis / gbif / hfhub"},
+                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）。対象は科学とプログラミングまでで医学・生物学は含まない"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
                 "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語（既定 ja）"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須・10 req/分）。code はファイルへのポインタと一致箇所の断片を返し、ライセンス情報を含まない（取り込む前に repo 検索で確認する）。repo: owner/name・path:・language:・filename:・in:file の修飾子を付けると精度が上がる"},
@@ -5919,7 +5640,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "question": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6種。明示追加: datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates / cinii / osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ uniprot / chembl / pdb / quickgo / reactome / clinicaltrials / openfda / inspirehep / oeis / gbif / hfhub。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / cratesの説明は登録者の自己申告。chembl / pdb / gbif / hfhub は構造化レコードを1行にまとめた summary_kind=structured_record"},
+                            "description": "既定6種。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。医学・生物学は対象外"},
                 "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
                 "limit": {"type": "integer"},

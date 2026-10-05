@@ -861,12 +861,10 @@ class TestKnowledgeBackendRegistry(unittest.TestCase):
     def test_default_six_and_opt_in_backends(self):
         self.assertEqual(set(S.DEFAULT_SOURCES),
                          {"wikipedia", "wikidata", "arxiv", "crossref", "openalex", "github"})
-        self.assertEqual(set(S.KB_BACKENDS), set(S.DEFAULT_SOURCES) | {"datacite", "openaire", "europepmc", "zenodo", "ror",
+        self.assertEqual(set(S.KB_BACKENDS), set(S.DEFAULT_SOURCES) | {"datacite", "openaire", "zenodo", "ror",
                                                                        "doaj", "npm", "crates", "cinii",
-                                                                       "osv", "ietf", "uniprot", "chembl", "pdb",
-                                                                       "quickgo", "reactome", "clinicaltrials",
-                                                                       "openfda", "inspirehep", "oeis", "gbif",
-                                                                       "hfhub"})
+                                                                       "osv", "ietf", "inspirehep", "oeis",
+                                                                       "hfhub", "hn", "swh", "librariesio"})
         self.assertEqual(set(S.SOURCES), set(S.KB_BACKENDS))
 
     def test_arxiv_uses_https(self):

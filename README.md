@@ -412,11 +412,11 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 バックエンド拡張時のローカル実測（2026-10-02、同一Python、各7回の中央値。
 起動〜initialize〜tools/list〜終了を含むため、起動単体の保証値ではありません）:
 
-| 測定 | 第3段階HEAD（28f89d1） | 第4段階追加後 | 推論プロバイダ追加後 | CiNii追加後（1f653b6） | 第6段階追加後 | GitHubコード検索の改良後 |
-|---|---:|---:|---:|---:|---:|---:|
-| ツール数 | 11 | 11 | 11 | 11 | 11 | 11 |
-| ツール一覧JSON文字数（ensure_ascii=false・compact） | 13,116 | 13,220 | 13,278 | 13,513 | 14,092 | 14,230 |
-| stdioプロセス往復・終了（7回中央値） | 0.2216秒 | 0.2267秒 | 0.2181秒 | 0.1652秒 | 0.1664秒 | 0.1611秒 |
+| 測定 | 第3段階HEAD（28f89d1） | 第4段階追加後 | 推論プロバイダ追加後 | CiNii追加後（1f653b6） | 第6段階追加後 | GitHubコード検索の改良後 | 第7段階（医学・生物を外しHN/SWH/Libraries.io追加）後 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ツール数 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
+| ツール一覧JSON文字数（ensure_ascii=false・compact） | 13,116 | 13,220 | 13,278 | 13,513 | 14,092 | 14,230 | 14,316 |
+| stdioプロセス往復・終了（7回中央値） | 0.2216秒 | 0.2267秒 | 0.2181秒 | 0.1652秒 | 0.1664秒 | 0.1611秒 | 0.2305秒 |
 
 文字数の列は同じ方法で測り直した値です（`8f0df1e` で 13,278 を再現して方法を確認）。
 往復時間は実行環境の負荷で変わり、同じコミットでも 0.22 秒 → 0.17 秒の差が出ます。
@@ -425,6 +425,8 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 推論プロバイダの追加（Vercel AI Gateway / Ollama Cloud）はツール定義を変えないため、
 文字数は 14,092 のままでした。GitHub コード検索の改良で `github_kind` の説明が伸び、
 **+138 文字（+1.0%）** の 14,230 になりました。
+第7段階では生命・医学系 9 ソースを外し HN / Software Heritage / Libraries.io を足したため、
+説明は入れ替わりで **+86 文字（+0.6%）** の 14,316 になりました（ツール数は 11 のまま）。
 
 検索APIの追加は推論モデルの能力を増やしません。ツールスキーマの増加もメインLLMの入力負担になります。
 
@@ -465,11 +467,12 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | `GITHUB_TOKEN` / `GH_TOKEN` | github | コード検索は必須。枠はエンドポイント別（認証あり: リポジトリ / Issue 30 req/分・コード 10 req/分。未認証はどちらも 10 req/分） |
 | `FREEAGENT_MAILTO` | crossref / openalex / datacite | キーではなく連絡先。polite pool に入り安定します |
 | `FREEAGENT_CINII_APPID` | cinii | **このソースだけは必須**。CiNii Research の[利用登録](https://support.nii.ac.jp/ja/cinii/api/developer)で取得したアプリケーションID。未設定なら cinii は HTTP を出さず、登録先を案内します |
+| `FREEAGENT_LIBRARIESIO_KEY` | librariesio | **このソースだけは必須**。[Libraries.io](https://libraries.io/account)の無料アカウントで取得する API キー。未設定なら librariesio は HTTP を出さず、登録先を案内します（60 req/分） |
 
-wikipedia / wikidata / arxiv / doaj / npm / crates / europepmc / openaire / zenodo / ror /
-osv / ietf / uniprot / chembl / pdb / quickgo / reactome / clinicaltrials / openfda / inspirehep /
-oeis / gbif / hfhub はキー不要・匿名で使えます。
-**cinii だけは例外**で、利用者自身の appid が必要です（利用目的に当たるかの判断は利用者。SPEC §6.7）。
+wikipedia / wikidata / arxiv / doaj / npm / crates / openaire / zenodo / ror /
+osv / ietf / inspirehep / oeis / hfhub / hn / swh はキー不要・匿名で使えます。
+**cinii と librariesio だけは例外**で、利用者自身の appid / API キーが必要です
+（利用目的に当たるかの判断は利用者。SPEC §6.7 / §6.10）。
 
 ### キーの渡し方
 
@@ -531,7 +534,6 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `github` | リポジトリ / Issue / コードの検索結果。コード検索は一致箇所の**断片**（`snippet`）も返す | コード検索はトークン必須（10 req/分）。**ライセンス情報を含まない**ので取り込み前に確認 |
 | `datacite`（明示指定） | DOIメタデータ・抄録、研究データ | `datacite_kind`: `all` / `arxiv` / `dataset`。各語を引用したAND検索＋関連度順 |
 | `openaire`（明示指定） | Graph V3の論文書誌・抄録・掲載先 | 匿名API。60.1秒間隔で制御。抄録欠落あり、OpenAIREのクレジットを表示 |
-| `europepmc`（明示指定） | 医学・生命科学系の抄録・書誌 | `core`検索。全文は取得せず、プレプリント種別・ライセンスを保持 |
 | `zenodo`（明示指定） | 研究データ・ソフトウェア・論文等の公開メタデータ | 説明・注記を取得。全文/ファイルは取得しない。メタデータCC0とファイル条件を分離 |
 | `ror`（明示指定） | 研究機関の候補・種別・国・都市・設立年 | v2の構造化情報。論文検索ではなく機関情報の補完。機関を自動同定しない |
 | `doaj`（明示指定） | オープンアクセス誌の記事メタデータ・抄録 | 記事メタデータはCC0。OA記事限定。OpenAlexが不安定なときの科学系検索の受け皿 |
@@ -540,31 +542,27 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `cinii`（明示指定・**appid 必須**） | CiNii Research の日本語文献の書誌（タイトル・著者・資料名・巻号頁・発行年・DOI/NAID/NCID/ISBN・種別） | **利用者自身の appid** を `FREEAGENT_CINII_APPID` に設定したときだけ動きます（未設定なら登録先を案内して HTTP を出しません）。**抄録は返らない**ので本文根拠には使わず、書誌のみです |
 | `osv`（明示指定） | パッケージの既知脆弱性（OSV スキーマ。ID・概要・別名 CVE・深刻度・影響パッケージ） | キー不要・公称レート無し。パッケージ名は PyPI / npm / crates.io / Go / Maven / RubyGems / NuGet / Packagist / Hex / Pub の順に照合し、Maven は `groupId:artifactId` の形が必要。`CVE-` / `GHSA-` / `PYSEC-` 等のIDなら直引き |
 | `ietf`（明示指定） | RFC / Internet-Draft の書誌と抄録（RFC 番号・標準レベル・ページ数・版） | キー不要。`RFC 9110` / `rfc9110` / `9110` は name 直引き、`draft-...` は名前部分一致、それ以外は**タイトルの 1 語部分一致**（複数語は最長語で引いて全語一致を優先）。全文検索ではありません。文書は英語 |
-| `uniprot`（明示指定） | タンパク質の推奨名・生物種・遺伝子名・配列長・機能コメント | データは CC BY 4.0。配列そのものは返さず、機能コメントを本文根拠にします |
-| `chembl`（明示指定） | 化合物の名前・分子式・分子量・最大相・別名 | データは CC BY-SA 3.0。構造そのものは返しません。summary は記録の値を 1 行にまとめた `structured_record` |
-| `pdb`（明示指定） | PDB 構造の題名・実験手法・分解能・生物種・雑誌 | PDBe 経由。データは CC0。summary は `structured_record` |
-| `quickgo`（明示指定） | Gene Ontology の用語（ID・名前・定義・アスペクト） | データは CC BY 4.0。定義文を本文根拠にします |
-| `reactome`（明示指定） | 経路・反応（ID・名前・要約・生物種） | データは CC0。全生物種が対象で、種別ごとのクラスタを平坦化して返します |
-| `clinicaltrials`（明示指定） | 臨床試験の登録情報（NCT ID・表題・状態・開始日・対象疾患・概要） | 米国政府の公的データ。**結果の要約は返らず**、登録時の概要だけです |
-| `openfda`（明示指定） | 医薬品ラベルの適応・用途・警告（ブランド名・一般名・製造元） | 米国政府のパブリックドメイン。**医療判断に使えません**（原典の免責を `attribution` に含みます）。ラベル全文の検索なので、問いと完全一致しない薬が先頭に来ることがあります |
 | `inspirehep`（明示指定） | 素粒子物理の文献（表題・抄録・DOI・arXiv ID・被引用数） | データは CC0。DOI があれば DOI を出典 URL にします |
 | `oeis`（明示指定） | 整数列（A 番号・名前・先頭項・キーワード） | CC BY-SA 4.0 で**出典表示が必須**。数列そのものでも語でも引けます |
-| `gbif`（明示指定） | 生物種の学名・ランク・分類学上の地位・上位分類・出現記録数 | 分類は GBIF Backbone。出現データのライセンスは**データごとに CC0 / CC BY / CC BY-NC** と異なります |
 | `hfhub`（明示指定） | Hugging Face Hub のモデル（ID・タスク・ライブラリ・DL 数・likes・ライセンスタグ） | モデルごとにライセンス・品質が異なります。summary は `structured_record` |
+| `hn`（明示指定） | Hacker News の投稿（表題・本文・点数・コメント数・投稿者） | Algolia HN Search 経由。**帰属表示が必須**（"Search by Algolia"）。リンク投稿は本文が無く `metadata_only`。引用 URL は HN の投稿で、記事 URL は `extra.article_url` に残します |
+| `swh`（明示指定） | Software Heritage のリポジトリ（origin）の URL・取得方式 | 公開コードの長期アーカイブ。**コード本文は取得しません**。summary は `structured_record`。API 利用規約はポイントアクセス可・大量抽出不可 |
+| `librariesio`（明示指定・**キー必須**） | 19+ のパッケージ登録簿を横断した検索（名前・説明・版・DL数・ライセンス） | **利用者自身の無料 API キー**を `FREEAGENT_LIBRARIESIO_KEY` に設定したときだけ動きます（未設定なら登録先を案内して HTTP を出しません）。説明は登録者の自己申告 |
 
 `sources` を省略すると**従来の6ソースのみ**、指定すると指定したソースだけを検索します。
-追加22ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
+追加16ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
 `limit` は**各ソースの上限**です。全体の結果は重複除去などで減るので、合計件数を保証する値ではありません。
 本文という場合も、取得できた説明・導入部・アブストラクトを指します。原典の全文とは限りません。
 
 ### 段階的に追加した検索を使う
 
 - **第1段階：DataCite** — 「arXiv論文をDataCiteから探して」「その研究に使えるデータセットを探して」。
-- **第2段階：OpenAIRE / Europe PMC** — 「OpenAIREでも論文を探して」「生命科学の根拠をEurope PMCから探して」。
+- **第2段階：OpenAIRE** — 「OpenAIREでも論文を探して」。分野横断の論文メタデータを引きます。
 - **第3段階：Zenodo / ROR** — 「Zenodoでグラフェンの研究データを探して」「RORでCERNの機関候補を探して」。公開メタデータだけを使います。
 - **第4段階：DOAJ / npm / crates.io** — 「DOAJでオープンアクセス論文を探して」「npmでJSONスキーマ検証のパッケージを探して」「crates.ioで非同期HTTPクライアントを探して」。DOAJは科学系、npm / crates.ioはプログラミング系の検索を広げます。
 - **第5段階：CiNii Research（appid 必須）** — 「CiNiiで日本語の論文を探して」。日本語文献の書誌を引きます。**利用者自身が取得したアプリケーションID**を `FREEAGENT_CINII_APPID` に設定したときだけ動きます（取得: [CiNiiウェブAPI デベロッパー登録](https://support.nii.ac.jp/ja/cinii/api/developer)）。未設定なら HTTP を出さずに案内を返します。**抄録は返らない**ので書誌のみです。利用目的に当たるかの判断は利用者に委ねます（[ウェブAPI利用細則](https://support.nii.ac.jp/sites/default/files/cinii/webapi-term.pdf) 第3条は利用目的を学術研究／非営利の情報利活用に限定し、第5条は appid の第三者貸与・譲渡を禁じています）。
-- **第6段階：プログラミング・標準 / 科学（13ソース）** — 「log4j-core の脆弱性を調べて」（osv）／「RFC 9110 の概要を教えて」（ietf）／「インスリンの機能を UniProt で調べて」（uniprot）／「アスピリンの分子式を ChEMBL で調べて」（chembl）／「ヘモグロビンの構造を PDBe で調べて」（pdb）／「apoptosis の GO 用語を調べて」（quickgo）／「apoptosis の経路を Reactome で調べて」（reactome）／「メラノーマの臨床試験を探して」（clinicaltrials）／「アスピリンの添付文書を openFDA で調べて」（openfda）／「ヒッグス粒子の論文を INSPIRE-HEP で探して」（inspirehep）／「Fibonacci 数列を OEIS で調べて」（oeis）／「Panthera leo の分類を GBIF で調べて」（gbif）／「Llama のモデルを Hugging Face で探して」（hfhub）。すべて既定 off の明示指定で、キーは不要です。
+- **第6段階：プログラミング・標準 / 科学（5ソース）** — 「log4j-core の脆弱性を調べて」（osv）／「RFC 9110 の概要を教えて」（ietf）／「ヒッグス粒子の論文を INSPIRE-HEP で探して」（inspirehep）／「Fibonacci 数列を OEIS で調べて」（oeis）／「Llama のモデルを Hugging Face で探して」（hfhub）。すべて既定 off の明示指定で、キーは不要です。**2026-10-05 の方針変更で、対象を科学（物理・数学・計算機）とプログラミングまでに絞り、医学・生物学は対象外としました**（第6段階で採った生命・医学系 9 ソース＝europepmc / uniprot / chembl / pdb / quickgo / reactome / clinicaltrials / openfda / gbif は削除。SPEC §6.9）。
+- **第7段階：プログラミング特化（3ソース）** — 「Rust の所有権について Hacker News の議論を探して」（hn）／「cargo が Software Heritage に保存されているか調べて」（swh）／「JSON スキーマ検証のパッケージを横断検索して」（librariesio）。hn / swh はキー不要、librariesio は**利用者自身の無料 API キー**（`FREEAGENT_LIBRARIESIO_KEY`）が必要です。SPEC §6.10。
 - **保留中の候補（2026-10-04 に公式文書で再確認。いずれも登録しません）** — J-STAGE（非営利は申請不要だが「Powered by J-STAGE」表示・24時間以上のキャッシュ禁止・利用者への規約表示が義務。応答は書誌のみで Crossref と重複）、CORE（T&C §3 が検索・探索・API 機能に関わる製品は連絡が必要と明記）、Stack Exchange（AUP が AI 開発/テスト向けの自動取得に事前の書面許諾を要求）、HAL（非商用条項が曖昧）、Semantic Scholar（匿名は429頻発。キーの利用条件が明示された文書を確認できない）。既定offだけでは利用許諾にならないため、まだ登録しません。条項レベルの根拠は SPEC §6.6。CiNii は**利用者自身の appid がある場合だけ動く明示ソース**として実装済みです（第5段階・SPEC §6.7）。
 - **日本のオープンデータ系（2026-10-04 に評価。未実装）** — **採用候補**: e-Gov データポータル（= DATA GO JP。キー不要・実測 0.46 秒・PDL1.0）、データカタログ横断検索システム search.ckan.jp（NII・自治体を横断。実測 0.1 秒・規約は要確認）、e-Stat（appid 必須・統計表メタデータに限定）。**見送り**: 東京都オープンデータAPI（apiId 直引きのみで検索 API が無い）、opendataapi.jp（非公認・α版・小規模）、BODIK ODCS / odp.jig.jp / data eye / Open data stack / LinkData（有償・非公認・API 非公開）。根拠は SPEC §6.8。
 
@@ -575,8 +573,8 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 {"query":"language model hallucination","sources":["datacite"],"datacite_kind":"arxiv","limit":2}
 // 研究データを検索（Dataset型でも品質を保証しません）
 {"query":"graphene","sources":["datacite"],"datacite_kind":"dataset","limit":2}
-// 分野横断検索と生命科学検索
-{"query":"CRISPR gene editing","sources":["openaire","europepmc"],"limit":2}
+// 分野横断検索（生命科学系 europepmc は 2026-10-05 の方針変更で削除）
+{"query":"CRISPR gene editing","sources":["openaire"],"limit":2}
 // 公開研究成果のメタデータ（ファイルは取得しません）
 {"query":"graphene","sources":["zenodo"],"limit":2}
 // 研究機関の候補（論文抄録ではありません）
@@ -592,18 +590,14 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 {"query":"jinja2","sources":["osv"],"limit":2}
 // 標準文書（RFC 番号・draft 名は直引き、それ以外はタイトルの1語一致）
 {"query":"RFC 9110","sources":["ietf"],"limit":2}
-// 生命科学（タンパク質・化合物・構造・オントロジー・経路）
-{"query":"insulin","sources":["uniprot"],"limit":2}
-{"query":"aspirin","sources":["chembl","pdb"],"limit":2}
-{"query":"apoptosis","sources":["quickgo","reactome"],"limit":2}
-// 医薬・臨床（openFDA は医療判断に使えません）
-{"query":"melanoma","sources":["clinicaltrials"],"limit":2}
-{"query":"aspirin","sources":["openfda"],"limit":2}
-// 物理・数学・生物・ML
+// 物理・数学・ML
 {"query":"higgs boson","sources":["inspirehep"],"limit":2}
 {"query":"Fibonacci","sources":["oeis"],"limit":2}
-{"query":"Panthera leo","sources":["gbif"],"limit":2}
 {"query":"llama","sources":["hfhub"],"limit":2}
+// プログラミング特化（HN は議論、SWH はリポジトリ、librariesio はキー必須の横断検索）
+{"query":"rust ownership","sources":["hn"],"limit":2}
+{"query":"kubernetes","sources":["swh"],"limit":2}
+{"query":"json schema validator","sources":["librariesio"],"limit":2}
 // 自然語arXiv検索の失敗・遅延時にのみ、DataCiteの追加利用を明示許可
 {"query":"language model hallucination","sources":["arxiv"],"fallback":true,"limit":2}
 ```
@@ -656,36 +650,34 @@ agentは後のステップで未注入の出典を読ませた場合だけ、そ
 機関候補が2件出ても、両者を同じ機関と決める結果ではありません。
 Zenodoも説明のない結果には、ファイルを読んだかのような本文を補いません。
 
-実stdio経路での第1/第2段階の出力（2026-10-01、`CRISPR gene editing`・各2件、題名の行は省略）:
+実stdio経路での第1/第2段階の出力（2026-10-01、`CRISPR gene editing`・各2件、題名の行は省略。
+**europepmc は 2026-10-05 の方針変更で削除済み**。下記は当時の実測のまま残す）:
 
 ```text
-出典 6 件（datacite, openaire, europepmc）
+出典 6 件（datacite, openaire, europepmc）   ← 当時の実測
   ✓ datacite (2 件・1.4 秒)
   ✓ openaire (2 件・1.8 秒)
       データ提供: OpenAIRE（CC-BY） https://graph.openaire.eu/
-  ✓ europepmc (2 件・3.0 秒)
+  ✓ europepmc (2 件・3.0 秒)   ← 現在は削除済み
 ```
 
 この回は取得6件中5件に本文があり、締切脱落・代替切替は発生しませんでした。
 データセット検索も実stdioで2件・1.59秒、本文2件を確認しました。
-後の再検証ではEurope PMCが6.21秒まで変動しましたが、8秒の締切内で取得できました。
 第3段階の実stdio検証（同日、`CERN`、各2件）ではZenodoが2.33秒、RORが0.87秒、取得4件中3件に根拠テキストがありました。
 これは第1/第2段階の速度とは異なる問いのスポット計測です。
 第4段階の実stdio検証（2026-10-02）: DOAJ 0.38秒（`transformer attention mechanism`・抄録2件）、
 npm 0.34秒（`json schema validator`・説明2件）、crates.io 0.78秒（`async http client`・説明2件）。
-第6段階の実stdio検証（2026-10-05、各2件）: osv 0.92秒 / ietf 0.63秒（`RFC 9110`）/ uniprot 1.03秒 /
-chembl 1.85秒 / pdb 1.05秒 / quickgo 1.05秒 / reactome 0.84秒 / clinicaltrials 0.24秒 /
-openfda 1.48秒 / inspirehep 0.86秒 / oeis 1.29秒 / gbif 0.98秒 / hfhub 0.28秒。
-同じホスト（www.ebi.ac.uk）の chembl・pdb・quickgo を同時指定しても 1.12 秒で 6 件・エラー 0 件でした。
-ただし chembl の `molecule/search` は**ばらつきが大きく**、同じ日に 1.1〜5.9 秒（6 問）を観測し、
-まれに 8 秒の締切を超えて `⏱ chembl`（脱落）になります。脱落しても取得は裏で続き、
+第6段階の実stdio検証（2026-10-05、各2件。生命・医学系は同日の方針変更で削除）: osv 0.92秒 /
+ietf 0.63秒（`RFC 9110`）/ inspirehep 0.86秒 / oeis 1.29秒 / hfhub 0.28秒。
+第7段階の実stdio検証（2026-10-05、各2件）: hn 0.47〜0.5秒（`rust ownership`）/ swh 1.2秒（`kubernetes`）。
+librariesio はキー未設定なら検査・計測せずに外します。脱落したソースは取得が裏で続き、
 同じ問いの次回はキャッシュから返ります。
 **代替APIにも速度のムラがあります。一時点の成功は24時間の安定性の保証ではありません**。
 
 | 症状 | 理由・対処 |
 |---|---|
 | 追加ソースが検索されない | `sources`に明示指定してください。既定6ソースは変えていません |
-| 「ローカルのアクセス間隔制御」 | 同じホストの予算待ちです。DataCiteは0.61秒、Europe PMCは1秒、OpenAIREは60.1秒、Zenodoは2.01秒、RORは6.1秒、DOAJは0.51秒、npmは1秒、crates.ioは1.01秒間隔。第6段階は osv 0.5秒（エンドポイント単位）、ietf / uniprot / reactome / clinicaltrials / openfda / inspirehep / oeis / gbif / hfhub は1秒、EBI系（chembl / pdb / quickgo）はサービス単位に1秒。待機せずエラーを返すため表示された秒数後に再試行 |
+| 「ローカルのアクセス間隔制御」 | 同じホストの予算待ちです。DataCiteは0.61秒、OpenAIREは60.1秒、Zenodoは2.01秒、RORは6.1秒、DOAJは0.51秒、npmは1秒、crates.ioは1.01秒、librariesioは1秒間隔。第6段階は osv 0.5秒（エンドポイント単位）、ietf / inspirehep / oeis / hfhub は1秒。第7段階は hn 0.4秒、swh 1秒。待機せずエラーを返すため表示された秒数後に再試行 |
 | OpenAIREを別プロセスでも使う | 間隔制御はプロセス内のみ。同一IPの別MCP/CLIを含め提供元の枠を共有するため、並行実行を避ける。今回のOpenAIRE認証枠の拡張は未実装 |
 | 書誌はあるがgroundedの根拠がない | 抄録無しの追加ソースは本文を生成で補いません。別ソースを明示指定 |
 | arXivの代替が起動しない | `fallback=true`、自然語検索、締切内、障害/遅延という条件を確認 |
@@ -701,14 +693,15 @@ python scripts/probe_knowledge_stdio.py --sources npm --query "json schema valid
 python scripts/probe_knowledge_stdio.py --sources crates --query "async http client"
 python scripts/probe_knowledge_stdio.py --sources osv --query jinja2
 python scripts/probe_knowledge_stdio.py --sources ietf --query "RFC 9110"
-python scripts/probe_knowledge_stdio.py --sources uniprot --query insulin
-python scripts/probe_knowledge_stdio.py --sources clinicaltrials --query melanoma
+python scripts/probe_knowledge_stdio.py --sources hn --query "rust ownership"
+python scripts/probe_knowledge_stdio.py --sources swh --query kubernetes
+python scripts/probe_knowledge_stdio.py --sources librariesio --query "json schema"
 python scripts/probe_knowledge_stdio.py --sources oeis --query Fibonacci
 python scripts/measure_kb.py --sources zenodo ror
 python scripts/measure_kb.py --sources doaj npm crates
-python scripts/measure_kb.py --sources datacite openaire europepmc
-python scripts/measure_kb.py --sources osv ietf uniprot chembl pdb quickgo reactome
-python scripts/measure_kb.py --sources clinicaltrials openfda inspirehep oeis gbif hfhub
+python scripts/measure_kb.py --sources datacite openaire
+python scripts/measure_kb.py --sources osv ietf inspirehep oeis hfhub
+python scripts/measure_kb.py --sources hn swh librariesio
 python scripts/measure_kb.py --sources datacite --datacite-kind dataset
 python scripts/measure_kb.py --report
 ```
@@ -718,7 +711,6 @@ python scripts/measure_kb.py --report
 
 利用条件・仕様: [DataCite](https://support.datacite.org/docs/rest-api) /
 [OpenAIRE](https://graph.openaire.eu/docs/apis/terms) /
-[Europe PMC](https://europepmc.org/RestfulWebService) /
 [Zenodo](https://about.zenodo.org/terms/)（非軍事用途のみ・ファイル条件は別） /
 [ROR](https://ror.org/terms/)（IDs/metadataはCC0） /
 [DOAJ](https://doaj.org/terms/)（記事メタデータCC0・レートは全ルート2req/s） /
@@ -727,18 +719,12 @@ python scripts/measure_kb.py --report
 [CiNii Research](https://support.nii.ac.jp/sites/default/files/cinii/webapi-term.pdf)（**利用者自身のappidが必要**・利用目的は学術研究/非営利に限定・appidの貸与譲渡は禁止・2秒間隔に自制。§6.7） /
 [OSV](https://osv.dev/docs/)（OpenSSF OSV スキーマの集約。各脆弱性DBの条件に従う） /
 [IETF Datatracker](https://datatracker.ietf.org/api/)（公開の読み取り専用 API） /
-[UniProt](https://www.uniprot.org/help/license)（CC BY 4.0） /
-[ChEMBL](https://www.ebi.ac.uk/chembl/)（CC BY-SA 3.0） /
-[PDBe](https://www.ebi.ac.uk/pdbe/)（CC0） /
-[QuickGO / Gene Ontology](https://www.ebi.ac.uk/QuickGO/)（CC BY 4.0） /
-[Reactome](https://reactome.org/)（CC0） /
-[EMBL-EBI 利用条件](https://www.ebi.ac.uk/about/terms-of-use)（提供元の条件に追加の制限を課さない・出典表示を期待） /
-[ClinicalTrials.gov](https://clinicaltrials.gov/about-site/terms-conditions)（米国政府） /
-[openFDA](https://open.fda.gov/terms/)（米国政府。**医療判断に使えない**） /
 [INSPIRE-HEP](https://inspirehep.net/)（CC0） /
 [OEIS](https://oeis.org/wiki/The_OEIS_End-User_License_Agreement)（CC BY-SA 4.0・出典表示必須） /
-[GBIF](https://www.gbif.org/terms)（出現データはデータごとに CC0 / CC BY / CC BY-NC） /
-[Hugging Face](https://huggingface.co/terms-of-service)（モデルごとの条件）。
+[Hugging Face](https://huggingface.co/terms-of-service)（モデルごとの条件） /
+[Hacker News Search（Algolia）](https://hn.algolia.com/api)（**帰属表示が必須**・10,000 req/h/IP） /
+[Software Heritage API](https://www.softwareheritage.org/legal/api-terms-of-use/)（ポイントアクセス可・大量抽出不可） /
+[Libraries.io](https://libraries.io/terms)（**利用者自身の無料APIキーが必要**・60 req/min。§6.10）。
 
 リンク先全文・パッケージ本体の利用条件はメタデータの条件とは別です。
 元候補の保留根拠（条項レベルは SPEC §6.6）:
@@ -994,4 +980,4 @@ python scripts/measure_kb.py --unschedule  # 登録したタスクを解除
 
 ## ライセンス
 
-MIT。データは各提供元（arXiv / Crossref / OpenAlex / Wikimedia / GitHub、明示指定の DataCite / OpenAIRE / Europe PMC / Zenodo / ROR / DOAJ / npm / crates.io）の条件に従って利用し、回答には出典を表示してください。
+MIT。データは各提供元（arXiv / Crossref / OpenAlex / Wikimedia / GitHub、明示指定の DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates.io / CiNii / OSV / IETF / INSPIRE-HEP / OEIS / Hugging Face / Hacker News / Software Heritage / Libraries.io）の条件に従って利用し、回答には出典を表示してください。対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は対象外です。
