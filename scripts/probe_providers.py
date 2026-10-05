@@ -20,7 +20,8 @@ for r in S.provider_status():
 
 print("\n=== 各プロバイダの Free モデルで実推論 ===")
 prompt = "「並列」を英単語1つで答えよ。記号も説明も書くな。"
-for provider in ("openrouter", "nvidia", "huggingface", "groq", "cloudflare", "gemini"):
+for provider in ("openrouter", "nvidia", "huggingface", "groq", "cloudflare", "gemini",
+                 "vercel", "ollama"):
     if not S.provider_ready(provider):
         print(f"  {provider}: API key/Free-tier確認が無いのでスキップ")
         continue

@@ -63,7 +63,7 @@
 
 ## 4. モデル解決と選抜
 
-### 4.1 プロバイダ（7 つ）
+### 4.1 プロバイダ（9 つ）
 
 | プロバイダ | base_url | Free 判定 | 一覧の取得 | 実測（2026-09 時点） |
 |---|---|---|---|---|
@@ -74,16 +74,20 @@
 | `groq` | `api.groq.com/openai/v1` | Free plan確認 + 3 ID許可リスト | API key必須 (`/models`) | 未実測（資格情報なし）。Free limitsは組織/モデル別 |
 | `cloudflare` | `api.cloudflare.com/client/v4/accounts/{id}/ai` | Workers Free確認 + 2 ID許可リスト | API token必須。`/models/search?format=openrouter` | 未実測（資格情報なし）。Free割当 10,000 Neurons/日 |
 | `gemini` | `generativelanguage.googleapis.com/v1beta/openai` | Unpaid確認・データ利用確認 + 2 ID許可リスト | API key必須 (`/models`) | 未実測（資格情報なし）。OpenAI互換はBeta |
+| `vercel` | `ai-gateway.vercel.sh/v1` | Free tier確認 + 15 ID許可リスト | API key必須 (`/models`) | カタログ **406 件**（未認証可・各行に pricing）。Free Tier 対象は **15 件**を実測採取 |
+| `ollama` | `ollama.com/v1` | Free plan確認 + `free_kind="credit"` | API key必須 (`/models`) | カタログ **17 件**（未認証可・pricing なし）。starter の範囲は非公開 |
 
 ### 4.1.1 追加プロバイダの Free / 課金防護
 
-- Groq / Cloudflare / Gemini はAPIからアカウントの課金tierを確実に判定できないため、必要なAPI資格情報に加えて専用の確認envを必須にする。確認envは文字列 `1` / `true` / `yes` / `on` のいずれかのみ有効。値は利用者の申告であり、実際の契約をAPI検証するものではない。プラン/Billing設定を変更したら確認envを外す。
-- 3社はモデル一覧のpricingが0でもFreeとはみなさず、`free_model_ids` の完全一致だけをFreeにする。`call_model` の明示model指定も同じ許可リストで拒否し、catalogに出た有料/未知モデルへ直接HTTPしない。
+- Groq / Cloudflare / Gemini / Vercel / Ollama はAPIからアカウントの課金tierを確実に判定できないため、必要なAPI資格情報に加えて専用の確認envを必須にする。確認envは文字列 `1` / `true` / `yes` / `on` のいずれかのみ有効。値は利用者の申告であり、実際の契約をAPI検証するものではない。プラン/Billing設定を変更したら確認envを外す。
+- 許可リスト方式のプロバイダ（Groq / Cloudflare / Gemini / Vercel）はモデル一覧のpricingが0でもFreeとはみなさず、`free_model_ids` の完全一致だけをFreeにする。`call_model` の明示model指定も同じ許可リストで拒否し、catalogに出た有料/未知モデルへ直接HTTPしない。
 - Groqは `GROQ_API_KEY` と `FREEAGENT_GROQ_FREE_TIER=1` が揃った時だけ一覧/推論を有効化。許可IDは `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `qwen/qwen3.8-27b`。Free planの上限はモデル・組織ごとに変わるためアカウントのLimitsを確認し、Developer planは従量課金であることを警告する。
 - Cloudflareは `CLOUDFLARE_API_TOKEN`、32桁hexの`CLOUDFLARE_ACCOUNT_ID`、Workers AI Read権限、`FREEAGENT_CLOUDFLARE_FREE_PLAN=1` が揃った時のみ利用。チャットは `/v1/chat/completions`、モデル一覧はアカウントREST APIの`format=openrouter`を使う（互換APIの`/models`ではない）。Free許可IDは `@cf/openai/gpt-oss-20b` と `@cf/zai-org/glm-4.7-flash`。Workers Freeは10,000 Neurons/日超過後に処理停止、Workers Paidは超過分を課金するため、Free plan確認を外さない。CloudflareはCustomer Contentをモデル学習/サービス改善に使わないと明記する（ストレージサービス連携時は保存される可能性）。
 - Geminiは `GEMINI_API_KEY`（別名 `GOOGLE_API_KEY`）、`FREEAGENT_GEMINI_FREE_TIER=1`、`FREEAGENT_GEMINI_UNPAID_DATA_ACK=1` が全て揃った時のみ利用。許可IDは `gemini-3.8-flash` と `gemini-3.7-flash`。Free/unpaid tierでは入力・出力がGoogle製品改善に利用され、人手レビューされる場合があるため、機密・個人情報を送らない。
+- Vercel AI Gatewayは `AI_GATEWAY_API_KEY` と `FREEAGENT_VERCEL_FREE_TIER=1` が揃った時のみ利用。Free tierは**月 $5 のクレジット**で、使えるのは **Free Tier 対象モデルだけ**（カタログ 406 件すべてではない）。対象は公式モデル一覧の `freeTier` フィルタから **15 件を実測採取**して許可リストにした（2026-10）。**$0 価格のモデルとは一致しない**（実測: 15 件中 $0 は 3 件のみで、残りは有料価格だがクレジット対象）。対象は増減するため `probe` で生存を確かめ、外れた ID は許可リストから外す。クレジットを購入すると paid tier に移り月次の無料クレジットは適用されない。
+- Ollama Cloudは `OLLAMA_API_KEY` と `FREEAGENT_OLLAMA_FREE_PLAN=1` が揃った時のみ利用。Free planは **starter モデル向けの月次クレジット**で、**どの ID が starter かは提供元が公表しておらず**、一覧 17 件も pricing を持たない（実測）ため許可リストを作れない。よって `free_kind="credit"`（クレジット枠）として扱い、**無料対象はカタログの一部**であることを明記し、`probe` で実際に応答するモデルを確認してから使う。対象外のモデルは 402 を返すが、402 はフォールバック対象でプロバイダ記憶には入れない（§3）。同時 1 リクエスト。提供元はプロンプト/応答をログ・学習しないと明記している。
 - これらのallowlistはFree提供条件の保守対象。提供元仕様/モデル提供条件を定期確認し、実アカウントが無い状態では認証付き一覧・推論成功を主張しない。
-- 根拠: [Groq rate limits](https://console.groq.com/docs/rate-limits) / [billing](https://console.groq.com/docs/billing-faqs); [Cloudflare model search](https://developers.cloudflare.com/api/resources/ai/subresources/models/methods/list/) / [pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) / [OpenAI compatibility](https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/) / [data usage](https://developers.cloudflare.com/workers-ai/platform/data-usage/); [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) / [OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai) / [terms](https://ai.google.dev/gemini-api/terms).
+- 根拠: [Groq rate limits](https://console.groq.com/docs/rate-limits) / [billing](https://console.groq.com/docs/billing-faqs); [Cloudflare model search](https://developers.cloudflare.com/api/resources/ai/subresources/models/methods/list/) / [pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) / [OpenAI compatibility](https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/) / [data usage](https://developers.cloudflare.com/workers-ai/platform/data-usage/); [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) / [OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai) / [terms](https://ai.google.dev/gemini-api/terms); [Vercel AI Gateway pricing](https://vercel.com/docs/ai-gateway/pricing) / [models](https://vercel.com/ai-gateway/models?freeTier=true) / [OpenAI compatibility](https://vercel.com/docs/ai-gateway/openai-compatibility); [Ollama Cloud](https://docs.ollama.com/cloud) / [OpenAI compatibility](https://docs.ollama.com/api/openai-compatibility) / [pricing](https://ollama.com/pricing).
 
 - **HF はトップレベルに料金と文脈長を持たない**。`providers[]` の各要素が `pricing` / `context_length` /
   `is_free` / `status` を持つので、`status == "live"` かつ無料の提供元があるときだけ Free と判定する

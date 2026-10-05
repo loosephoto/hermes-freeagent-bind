@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API の 7 プロバイダ、検索は **15 ソース（既定6＋明示指定9）** に対応します。
+- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud の 9 プロバイダ、検索は **15 ソース（既定6＋明示指定9）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 > **まず試すなら**：「出典つきで調べて」は知識検索、「この設計の弱点を別の AI にも聞いて」は相談です。
@@ -421,6 +421,8 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 往復時間は実行環境の負荷で変わり、同じコミットでも 0.22 秒 → 0.17 秒の差が出ます。
 第6段階で **+579 文字（+4.3%）** 増えました。追加ソース名は `sources` の説明に載るため、
 ソースを増やすほどメイン LLM の入力は重くなります（既定6ソースは変えていません）。
+推論プロバイダの追加（Vercel AI Gateway / Ollama Cloud）はツール定義を変えないため、
+ツール数 11・文字数 **14,092 のまま**です（同じ方法で測り直して確認）。
 
 検索APIの追加は推論モデルの能力を増やしません。ツールスキーマの増加もメインLLMの入力負担になります。
 
@@ -432,7 +434,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 ### 推論バックエンド（サブ LLM）の接続
 
 別の AI に答えさせる機能（`ask` / `panel` / `consult` / `grounded` / `agent` / `map` / `fanout`、
-`think` の `verify` / `propose_alternatives`）で使います。**7 プロバイダのうち、使うものを 1 つ以上**用意します。
+`think` の `verify` / `propose_alternatives`）で使います。**9 プロバイダのうち、使うものを 1 つ以上**用意します。
 
 | プロバイダ | 必要なもの | 入手先・注意点 |
 |---|---|---|
@@ -443,9 +445,12 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | **Groq** | `GROQ_API_KEY` と `FREEAGENT_GROQ_FREE_TIER=1` | [API Keys](https://console.groq.com/keys)。Free tier契約を利用者が確認した場合だけ有効。Free対象モデルIDを限定し、Developer tierは従量課金なのでプラン変更時は確認変数を解除してください |
 | **Cloudflare Workers AI** | `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`、`FREEAGENT_CLOUDFLARE_FREE_PLAN=1` | [API Tokens](https://dash.cloudflare.com/profile/api-tokens)。Workers **Free** planの利用者向け。10,000 Neurons/日の共有枠を超えるとFreeでは停止しますが、Workers Paidでは超過分が課金されます。CloudflareはCustomer Contentをモデル学習・サービス改善に使わないとしています（別途ストレージ連携時は保存の可能性あり）。Paid planなら確認変数を設定しないでください |
 | **Gemini Developer API** | `GEMINI_API_KEY`（別名 `GOOGLE_API_KEY`）と2つの確認変数 | [Google AI Studio API key](https://aistudio.google.com/apikey)。Free/unpaid tierの入力・出力は製品改善や人手レビューに使われる場合があります。**機密・個人情報は送らず**、Free tierとデータ用途を確認した場合だけ有効にしてください |
+| **Vercel AI Gateway** | `AI_GATEWAY_API_KEY` と `FREEAGENT_VERCEL_FREE_TIER=1` | [AI Gateway](https://vercel.com/ai-gateway)。Free tierは**月 $5 のクレジット**で、使えるのはFree Tier対象モデルだけです（実測15件を許可リスト化）。**クレジットを購入するとpaid tierに移り、月次の無料クレジットは消えます** |
+| **Ollama Cloud** | `OLLAMA_API_KEY` と `FREEAGENT_OLLAMA_FREE_PLAN=1` | [API keys](https://ollama.com/settings/keys)。Free planはstarterモデル向けの月次クレジットで、**対象範囲は提供元が公表していません**（`probe`で実際に応答するモデルを確認）。同時1リクエスト。プロンプト/応答はログ・学習されないと提供元が明記しています |
 
-- Groq / Cloudflare / Gemini は、確認変数がそろうまでモデル一覧取得も推論も行いません。これは契約プランをAPIから検証する仕組みではなく、利用者の明示確認です。プランやBilling設定を変更したら、確認変数を解除して再確認してください。
-- これら3社はコード側のFreeモデル許可リストに含まれるIDだけを呼び出し、明示指定でも有料・未許可モデルを拒否します。Free枠・モデルの提供条件は変更されるため、最新の提供元ページも確認してください。
+- Groq / Cloudflare / Gemini / Vercel / Ollama は、確認変数がそろうまでモデル一覧取得も推論も行いません。これは契約プランをAPIから検証する仕組みではなく、利用者の明示確認です。プランやBilling設定を変更したら、確認変数を解除して再確認してください。
+- Groq / Cloudflare / Gemini / Vercel はコード側のFreeモデル許可リストに含まれるIDだけを呼び出し、明示指定でも有料・未許可モデルを拒否します。
+- Ollama は無料対象の範囲が非公開でAPIから判定できないため許可リストを作らず、クレジット枠として扱います。**対象外のモデルは提供元が 402 を返し**、フォールバックします（モデルの失敗としては記録しません）。Vercel も同様に、無料対象はカタログのごく一部です。Free枠・モデルの提供条件は変更されるため、最新の提供元ページも確認してください。
 - 全プロバイダ未設定でも、知識検索と思考ノート（サブを呼ばない範囲）は使えます。
 
 ### 知識検索（検索ソース）のキー
@@ -848,7 +853,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_HARNESS` | 空 | 起動元の目印。Hermes から使うなら `hermes`（[Hermes 以外で使うとき](#hermes-以外で使うとき)） |
 | `FREEAGENT_HARNESS_WARN` | 1 | `0` で Hermes 以外のときの警告を止める（判定結果は `structuredContent.harness` に残る） |
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |
-| `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini` | 一覧に出すプロバイダと優先順。オプション3社は契約確認変数が無い間は通信しない |
+| `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama` | 一覧に出すプロバイダと優先順。オプション5社は契約確認変数が無い間は通信しない |
 | `FREEAGENT_AUTH_TTL` | 900 | 認証失敗を覚えて自動選抜から外す時間（秒） |
 | `FREEAGENT_PROBE_TIMEOUT` | 25.0 | 生存確認 1 件の読み取りタイムアウト（秒） |
 | `FREEAGENT_PROBE_WORKERS` | 8 | 生存確認の並列度（1〜8） |
@@ -880,10 +885,14 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `GROQ_API_KEY` | 空 | Groqの推論。Freeモデルallowlistは3 IDに固定。`FREEAGENT_GROQ_FREE_TIER=1`でFree tierを明示確認 |
 | `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` | 空 | Workers AIの推論とモデル検索。Workers AI Read権限が必要。Free plan確認は`FREEAGENT_CLOUDFLARE_FREE_PLAN=1` |
 | `GEMINI_API_KEY`（別名 `GOOGLE_API_KEY`） | 空 | Gemini Developer API。Free対象の2モデルのみ。Free tier確認とデータ利用同意を個別に設定 |
+| `AI_GATEWAY_API_KEY` | 空 | Vercel AI Gatewayの推論。Free Tier対象の15モデルのみ許可。Free tier確認は`FREEAGENT_VERCEL_FREE_TIER=1` |
+| `OLLAMA_API_KEY` | 空 | Ollama Cloudの推論。無料対象は非公開のため`probe`で確認。Free plan確認は`FREEAGENT_OLLAMA_FREE_PLAN=1` |
 | `FREEAGENT_GROQ_FREE_TIER` | 未設定（無効） | GroqアカウントがFree tierであることを明示確認。Developer tierは従量課金 |
 | `FREEAGENT_CLOUDFLARE_FREE_PLAN` | 未設定（無効） | Workers Free planであることを明示確認。Workers Paidでは日次割当超過分が課金される |
 | `FREEAGENT_GEMINI_FREE_TIER` | 未設定（無効） | GeminiプロジェクトのFree/unpaid tierを明示確認 |
 | `FREEAGENT_GEMINI_UNPAID_DATA_ACK` | 未設定（無効） | Gemini Free tierの入力・出力がGoogleの製品改善や人手レビューに使われる可能性を理解した確認 |
+| `FREEAGENT_VERCEL_FREE_TIER` | 未設定（無効） | Vercel AI GatewayがFree tier（クレジット未購入）であることを明示確認。クレジット購入でpaid tierに移る |
+| `FREEAGENT_OLLAMA_FREE_PLAN` | 未設定（無効） | Ollama CloudがFree planであることを明示確認。クレジット購入で全モデルが課金対象になる |
 | `FREEAGENT_API_KEY` | `proxy-attaches-real-credentials` | `nous` プロキシ用のダミー（実資格情報はプロキシが付与） |
 
 **知識検索（検索ソース）のキー・連絡先**
@@ -904,6 +913,8 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_HF_BASE_URL` | `https://router.huggingface.co/v1` | HF Inference Providers の接続先 |
 | `FREEAGENT_GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Groqの接続先（通常は変更不要） |
 | `FREEAGENT_GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` | Gemini APIのOpenAI互換接続先（Beta） |
+| `FREEAGENT_VERCEL_BASE_URL` | `https://ai-gateway.vercel.sh/v1` | Vercel AI GatewayのOpenAI互換接続先 |
+| `FREEAGENT_OLLAMA_BASE_URL` | `https://ollama.com/v1` | Ollama CloudのOpenAI互換接続先 |
 
 **蓄積ストアのパス上書き**（既定は `FREEAGENT_STATE_DIR` 配下。**作業状態・統計が消えない場所**に置く）
 

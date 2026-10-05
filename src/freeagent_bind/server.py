@@ -179,6 +179,41 @@ PROVIDER_SPECS: dict[str, dict] = {
         "catalog_requires_ready": True,
         "note": "Gemini Free tierと非機密データ利用の両確認が必須。Unpaid prompts/outputs may be reviewed and used to improve Google products; OpenAI compatibility is Beta",
     },
+    # Vercel AI Gateway。Free tier は「月 $5 のクレジット」で、使えるのは **Free Tier 対象モデル**だけ
+    # （カタログ 406 件すべてではない）。対象は公式のモデル一覧の freeTier フィルタから 15 件を実測採取した
+    # （2026-10）。$0 価格のモデルとは一致しない（実測: 15 件中 $0 は 3 件だけで、残りは有料価格だが
+    # クレジット対象）。対象は増減するので `freeagent_models` の `probe: true` で生存を確かめ、外れたら
+    # この許可リストを更新する。クレジットを購入すると paid tier に移り、月次の無料クレジットは消える。
+    "vercel": {
+        "base_url": os.environ.get("FREEAGENT_VERCEL_BASE_URL", "https://ai-gateway.vercel.sh/v1"),
+        "key": os.environ.get("AI_GATEWAY_API_KEY", ""),
+        "key_env": "AI_GATEWAY_API_KEY", "free_kind": "allowlist", "always_ready": False,
+        "free_model_ids": ("openai/gpt-oss-120b", "openai/gpt-5-mini", "openai/gpt-5-mini-fast",
+                            "openai/gpt-5-nano", "openai/gpt-4o-mini",
+                            "google/gemini-2.5-flash-lite",
+                            "inclusionai/ling-3.1-flash", "inclusionai/ling-3.1-flash-free",
+                            "alibaba/qwen3.7-flash", "stepfun/step-3.7-flash",
+                            "poolside/laguna-s-2.1-free",
+                            "nvidia/nemotron-3-ultra-550b-a55b",
+                            "xiaomi/mimo-v2.5", "xiaomi/mimo-v2.5-pro",
+                            "xiaomi/mimo-v2.6-flash"),
+        "required_env_flags": ("FREEAGENT_VERCEL_FREE_TIER",), "catalog_requires_ready": True,
+        "note": "Vercel AI GatewayのFree tier（月 $5 クレジット）確認が必須（FREEAGENT_VERCEL_FREE_TIER=1）。"
+                "無料枠の対象は Free Tier 対象モデルのサブセット（実測 15 件だけを許可）。"
+                "クレジットを購入すると paid tier に移り、月次の無料クレジットは適用されません",
+    },
+    # Ollama Cloud。Free plan は「starter モデル向けの月次 starter クレジット」で、全モデルは対象外。
+    # どの ID が starter かは提供元が公表しておらず、一覧 17 件も pricing を持たない（実測）ので
+    # 許可リストを作れない → クレジット枠＋プラン確認で扱い、`probe` で実際に応答するモデルを確かめる。
+    # 対象外のモデルは 402 を返すが、402 はフォールバック対象でプロバイダ記憶には入れない（§3）。
+    "ollama": {
+        "base_url": os.environ.get("FREEAGENT_OLLAMA_BASE_URL", "https://ollama.com/v1"),
+        "key": os.environ.get("OLLAMA_API_KEY", ""),
+        "key_env": "OLLAMA_API_KEY", "free_kind": "credit", "always_ready": False,
+        "required_env_flags": ("FREEAGENT_OLLAMA_FREE_PLAN",), "catalog_requires_ready": True,
+        "note": "Ollama Cloud Free plan確認が必須（FREEAGENT_OLLAMA_FREE_PLAN=1）。無料は starter モデルだけで"
+                "範囲は非公開 → probe で確認。同時 1 リクエスト。クレジットを購入すると全モデルが使えますが課金対象です",
+    },
 }
 # MCP の `initialize` 応答に載せる `instructions`。**Hermes はこれを読まない**（実測: 旧実装で
 # 自発率が上がらず、現行版のソース `tools/mcp_tool_*.py` にも参照が無いことを確認）。それでも
@@ -200,7 +235,7 @@ PROACTIVE_INSTRUCTIONS = (
 )
 
 PROVIDER_ORDER = [n.strip() for n in os.environ.get(
-    "FREEAGENT_PROVIDER_ORDER", "nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini").split(",")
+    "FREEAGENT_PROVIDER_ORDER", "nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama").split(",")
     if n.strip() in PROVIDER_SPECS] or ["nous"]
 
 # 知識バックエンドの識別用 User-Agent。MediaWiki / OpenAlex / Crossref は連絡先入りの UA を求める。
