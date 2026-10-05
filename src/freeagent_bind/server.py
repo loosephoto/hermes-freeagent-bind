@@ -2115,6 +2115,16 @@ def _plain_text(text: str, limit: int = 600) -> str:
     return truncate(" ".join(re.sub(r"<[^>]+>", " ", text or "").split()), limit)
 
 
+def _code_excerpt(text: str, limit: int = 400) -> str:
+    """コード断片を引用用に整える。**`_plain_text` は使わない**。
+
+    `_plain_text` は `<[^>]+>` を落とすので、Java / C# / TypeScript のジェネリクス
+    （`List<String>` など）が消えて意味が変わる。改行とインデントは保つ。
+    """
+    lines = [ln.rstrip() for ln in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    return truncate("\n".join(lines).strip(), limit)
+
+
 def _openalex_abstract(row: dict, limit: int = 500) -> str:
     """OpenAlex は本文を `abstract_inverted_index`（語 → 位置の配列）で返すので復元する。
 
@@ -2419,8 +2429,31 @@ def kb_openalex(query: str, limit: int = 5) -> dict:
 
 # ---------------------------------------------------------------- §5.6 GitHub
 
+# GitHub の検索枠はエンドポイント別に分かれている（実測: search 30/分・code_search 10/分・
+# 未認証は 10/分）。予算キーをサービス単位に分けないと、code の 10/分に repo / issue が
+# 巻き込まれて片方だけが先に落ちる（AGENTS 規約 32 と同じ理由）。
+_GH_SEARCH_INTERVAL = 2.0          # repo / issue（認証あり・30/分）
+_GH_SEARCH_INTERVAL_UNAUTH = 6.0   # repo / issue（未認証・10/分）
+_GH_CODE_INTERVAL = 6.0            # code（10/分・認証必須）
+
+
+def _gh_fragment(row: dict) -> str:
+    """code 検索の `text_matches` から一致断片を取り出す（同じファイルで最大 2 件まで返る）。"""
+    matches = row.get("text_matches")
+    if not isinstance(matches, list):
+        return ""
+    parts = [as_str(m.get("fragment"), "") for m in matches[:2] if isinstance(m, dict)]
+    return "\n…\n".join(p for p in parts if p)
+
+
 def kb_github(query: str, kind: str = "repo", limit: int = 5) -> dict:
-    """リポジトリ / コード / Issue の検索。**コード検索はトークン必須**（未設定なら理由を返す）。"""
+    """リポジトリ / コード / Issue の検索。**コード検索はトークン必須**（未設定なら理由を返す）。
+
+    `kind="code"` で返るのは **ファイルへのポインタと一致箇所の断片**だけで、
+    **ライセンス情報を含まない**（取り込む前に `kind="repo"` などで別途確認する）。
+    GitHub 側の索引も default branch のみ・384KB 未満・直近 1 年に活動のあるリポジトリなどに
+    限られるので、「探して出ない」は「存在しない」を意味しない。
+    """
     kind = as_str(kind, "repo")
     if kind not in ("repo", "code", "issue"):
         kind = "repo"
@@ -2430,15 +2463,21 @@ def kb_github(query: str, kind: str = "repo", limit: int = 5) -> dict:
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
         if GITHUB_TOKEN:
             headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-        if kind == "code" and not GITHUB_TOKEN:
-            return {"source": "github", "kind": kind, "items": [], "citations": [],
-                    "error": "コード検索は GITHUB_TOKEN（または GH_TOKEN）が必要です。"
-                             "トークンを設定するか kind=\"repo\"/\"issue\" を使ってください"}
+        if kind == "code":
+            if not GITHUB_TOKEN:
+                return {"source": "github", "kind": kind, "items": [], "citations": [],
+                        "error": "コード検索は GITHUB_TOKEN（または GH_TOKEN）が必要です。"
+                                 "トークンを設定するか kind=\"repo\"/\"issue\" を使ってください"}
+            # 一致箇所の断片（text_matches.fragment）を受け取る。付けないと本文が一切返らない。
+            headers["Accept"] = "application/vnd.github.text-match+json"
         endpoint = {"repo": "repositories", "code": "code", "issue": "issues"}[kind]
         sort = "&sort=stars&order=desc" if kind == "repo" else ""
         url = (f"https://api.github.com/search/{endpoint}?"
                + urllib.parse.urlencode({"q": query, "per_page": limit}) + sort)
-        data, err = kb_json(url, extra_headers=headers)
+        interval = (_GH_CODE_INTERVAL if kind == "code" else
+                    (_GH_SEARCH_INTERVAL if GITHUB_TOKEN else _GH_SEARCH_INTERVAL_UNAUTH))
+        data, err = _kb_new_json(url, interval, budget_key=f"api.github.com/search/{endpoint}",
+                                 extra_headers=headers)
         if err:
             return {"source": "github", "kind": kind, "error": err}
         rows = (data or {}).get("items") or []
@@ -2458,15 +2497,22 @@ def kb_github(query: str, kind: str = "repo", limit: int = 5) -> dict:
                               "created_at": row.get("created_at"),
                               "repository_url": row.get("repository_url") or ""})
             else:
+                repo = row.get("repository") or {}
                 title = row.get("name") or ""
+                fragment = _code_excerpt(_gh_fragment(row), 400)
                 items.append({"title": title, "url": row.get("html_url") or "",
-                              "repository": ((row.get("repository") or {}).get("full_name")) or "",
-                              "path": row.get("path") or ""})
-            body_text = (row.get("description") or "") if kind == "repo" else (
-                row.get("body") or "" if kind == "issue" else
-                f"{((row.get('repository') or {}).get('full_name')) or ''} {row.get('path') or ''}")
-            cites.append(_cite("github", title, row.get("html_url") or "", kind=kind,
-                               summary=_plain_text(body_text, 400)))
+                              "repository": repo.get("full_name") or "",
+                              "repo_url": repo.get("html_url") or "",
+                              "path": row.get("path") or "",
+                              "snippet": fragment})
+            if kind == "repo":
+                summary = _plain_text(row.get("description") or "", 400)
+            elif kind == "issue":
+                summary = _plain_text(row.get("body") or "", 400)
+            else:
+                # 断片はコードなので _plain_text を通さない（ジェネリクスが消える）。
+                summary = fragment or f"{((row.get('repository') or {}).get('full_name')) or ''} {row.get('path') or ''}"
+            cites.append(_cite("github", title, row.get("html_url") or "", kind=kind, summary=summary))
         return {"source": "github", "kind": kind, "items": items, "citations": cites,
                 "error": "" if items else "該当なし"}
 
@@ -2746,7 +2792,7 @@ def _kb_rate_acquire(host: str, interval: float) -> float:
 
 
 def _kb_new_json(url: str, interval: float, payload: dict | None = None,
-                 budget_key: str = "") -> tuple[dict | None, str]:
+                 budget_key: str = "", extra_headers: dict | None = None) -> tuple[dict | None, str]:
     """ホスト別の予算を取ってから JSON を取る。`payload` を渡すと POST。
 
     `budget_key` は §5.18 / §5.19 用の逃げ道で、**同じホストに別サービスが同居する**ときや
@@ -2760,7 +2806,12 @@ def _kb_new_json(url: str, interval: float, payload: dict | None = None,
     if wait:
         return None, f"HTTP 429: ローカルのアクセス間隔制御（あと {wait:.1f} 秒）。同一ホストの枠を共有します"
     # payload 無しのときは従来どおり位置引数 1 つで呼ぶ（呼び出し側の互換を壊さない）。
-    return kb_json(url, payload=payload) if payload is not None else kb_json(url)
+    if payload is None:
+        return kb_json(url, extra_headers=extra_headers) if extra_headers else kb_json(url)
+    headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    return kb_json(url, extra_headers=headers, payload=payload)
 
 
 # ---------------------------------------------------------------- §5.12 Europe PMC / OpenAIRE Graph V3（明示指定のみ）
@@ -5846,7 +5897,7 @@ TOOLS: list[dict] = [
                             "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates / cinii（cinii は利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみで抄録は返らない） / osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ uniprot / chembl / pdb / quickgo / reactome / clinicaltrials / openfda / inspirehep / oeis / gbif / hfhub"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
                 "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語（既定 ja）"},
-                "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須）"},
+                "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須・10 req/分）。code はファイルへのポインタと一致箇所の断片を返し、ライセンス情報を含まない（取り込む前に repo 検索で確認する）。repo: owner/name・path:・language:・filename:・in:file の修飾子を付けると精度が上がる"},
                 "fallback": {"type": "boolean", "description": "既定 false。自然語 arXiv検索の失敗/遅延時に DataCite を許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"],
                                   "description": "DataCite の対象（既定 all）。自然語の各語を AND 検索"},

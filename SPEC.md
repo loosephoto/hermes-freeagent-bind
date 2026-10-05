@@ -164,7 +164,7 @@
 | arxiv | `https://export.arxiv.org/api/query` | 不要 | **http は 301 の先で 406**。連続アクセスで 406 → **3 秒間隔で直列化** |
 | crossref | `api.crossref.org/works` | 不要 | `mailto` 未設定だと polite pool に入れない |
 | openalex | `api.openalex.org/works` | **常用では無料APIキーを推奨（匿名基本利用も可）** | 匿名検索は提供元が制限中（実測 `503 Anonymous search is paused` / `429 Rate limit exceeded`） |
-| github | `api.github.com/search/*` | トークン推奨（コード検索は必須） | 未認証は 10 リクエスト/分 |
+| github | `api.github.com/search/*` | トークン推奨（コード検索は必須） | 枠は**エンドポイント別**（実測: search 30/分・code_search 10/分・未認証 10/分）→ 予算キーをサービス単位に分ける（§5.6）。code は `text_matches` の断片を返し、**ライセンス情報を含まない**。索引は default branch のみ・384KB 未満・直近 1 年に活動のあるリポジトリ等に限定 |
 | datacite | `api.datacite.org/dois` | 不要、mailto任意 | モード間でホスト予算共有。抄録・登録反映の欠落あり |
 | openaire | `api.openaire.eu/graph/v3/research-products` | 今回は匿名のみ | 公式60/h、メタデータCC-BY表示、本文欠落あり |
 | europepmc | `www.ebi.ac.uk/europepmc/webservices/rest/search` | 不要 | core検索、全文利用条件は別、生命科学系 |
