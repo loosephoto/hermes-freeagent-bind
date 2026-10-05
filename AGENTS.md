@@ -182,6 +182,18 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
 
 31. **Free推論プロバイダは課金tierを推測しない**。APIがFree/paid tierを返さない場合は、モデルID allowlist・明示確認env・厳密な未許可model拒否を組み合わせる。確認envは利用者申告であり、契約そのものは検証できないとREADME/SPECに明記し、課金プラン変更後に解除するよう案内する。Google Unpaid tierのデータ利用/人手レビューなどプライバシー条件がある場合は別の明示確認を要求し、既定有効にしない。
 
+32. **第6段階は「検索できる公認 API」＋「利用条件が明確」の 2 条件を満たすものだけ**（§5.18/§5.19）。
+    採用 13 種（osv / ietf / uniprot / chembl / pdb / quickgo / reactome / clinicaltrials / openfda /
+    inspirehep / oeis / gbif / hfhub）はすべて既定 off の明示指定。**同一ホストに複数サービスがある
+    ときは予算キーをサービス単位に分ける**（`_kb_new_json(..., budget_key=...)`）。ホスト単位のままだと
+    chembl と pdb の同時指定で片方が「アクセス間隔制御」で落ちる。遮断の記憶は netloc のまま。
+    **構造化レコードしか無いソースは `summary_kind=structured_record`** を付け、論文抄録と混同させない。
+    openfda は原典の免責を `attribution` に含める。**キーワード検索 API が無いものは登録しない**
+    （PubChem / AlphaFold DB / Ensembl / STRING）。**検索式を弱めて代替しない**: IETF の
+    `title__contains` は AND 不可なので、RFC 番号と draft 名は `name` で直引きし、それ以外は最長語で
+    引いて全語一致を優先する（全文検索だと書かない）。Stack Exchange は AUP が事前の書面許諾を要求する
+    ので、実測 200 でも登録しない。
+
 ## ライセンス
 
 MIT。データは各提供元の条件に従い、回答には出典を表示すること。

@@ -72,6 +72,30 @@ def _say(text: str) -> None:
         print(text)
 
 
+# ソースごとに**分野の合う問い**を回す。論文キーワードだとパッケージ検索や生物種検索は空振りし、
+# 空振りと障害を混同する（規約 27 の計測規律）。
+SOURCE_QUERIES = {
+    "npm": ["json schema validator", "http client", "websocket server",
+            "markdown parser", "logging library", "unit testing"],
+    "crates": ["json schema validator", "http client", "websocket server",
+               "markdown parser", "logging library", "unit testing"],
+    "osv": ["jinja2", "requests", "lodash", "serde", "express", "axios"],
+    "ietf": ["DNSSEC", "QUIC", "CoAP", "TLS", "HTTP", "DNS"],
+    "uniprot": ["insulin", "p53", "hemoglobin", "kinase", "albumin", "collagen"],
+    "chembl": ["aspirin", "ibuprofen", "metformin", "caffeine", "penicillin", "warfarin"],
+    "pdb": ["hemoglobin", "lysozyme", "insulin receptor", "protease", "antibody", "ribosome"],
+    "quickgo": ["apoptosis", "DNA repair", "cell cycle", "autophagy", "mitosis", "translation"],
+    "reactome": ["apoptosis", "glycolysis", "cell cycle", "DNA repair", "immune system",
+                 "signal transduction"],
+    "clinicaltrials": ["melanoma", "diabetes", "asthma", "breast cancer", "stroke", "influenza"],
+    "openfda": ["aspirin", "ibuprofen", "metformin", "insulin", "atorvastatin", "amoxicillin"],
+    "inspirehep": ["higgs boson", "dark matter", "neutrino", "supersymmetry", "black hole", "QCD"],
+    "oeis": ["Fibonacci", "prime", "Catalan", "factorial", "partition", "1,2,3,5,7,11"],
+    "gbif": ["Panthera leo", "Quercus", "Apis mellifera", "Danaus plexippus", "Ginkgo",
+             "Homo sapiens"],
+    "hfhub": ["llama", "bert", "whisper", "diffusion", "mistral", "embedding"],
+}
+
 def measure_round(index: int | None = None, sources: list[str] | None = None,
                   datacite_kind: str = "all") -> list[dict]:
     """全ソースを並列に 1 回ずつ引き、1 ソース 1 行の記録を返す（書き込みはしない）。"""
@@ -91,15 +115,14 @@ def measure_round(index: int | None = None, sources: list[str] | None = None,
     def one(src: str) -> None:
         # 日本語の問いは日本語版を持つソースだけ（Wikipedia / Wikidata）。論文系は英語で引く
         query = ja if src in ("wikipedia", "wikidata", "cinii") else en
+        slot = now.hour if index is None else index
         if src == "ror":
             names = ["CERN", "University of Tokyo", "Massachusetts Institute of Technology",
                      "University of Oxford", "CNRS", "Kyoto University"]
-            query = names[(now.hour if index is None else index) % len(names)]
-        if src in ("npm", "crates"):
-            # パッケージ検索は論文キーワードだと空振りする。空振りと障害を混同しない
-            terms = ["json schema validator", "http client", "websocket server",
-                     "markdown parser", "logging library", "unit testing"]
-            query = terms[(now.hour if index is None else index) % len(terms)]
+            query = names[slot % len(names)]
+        if src in SOURCE_QUERIES:
+            terms = SOURCE_QUERIES[src]
+            query = terms[slot % len(terms)]
         start = time.monotonic()
         try:
             res = S.KB_BACKENDS[src](query, 3, {"lang": "ja", "kind": "repo", "datacite_kind": datacite_kind})

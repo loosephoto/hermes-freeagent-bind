@@ -21,7 +21,7 @@
 | §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳） |
 | §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
-| §5 | 知識バックエンド15種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須）） |
+| §5 | 知識バックエンド28種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 Europe PMC・OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学13種） |
 | §6 | ツール実装（11本、§6.11 本文の注入番号・引用認定） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
@@ -169,6 +169,19 @@
 | doaj | `doaj.org/api/search/articles/` | 不要（キーは発行者向け） | 記事メタデータCC0、全ルート2req/s、OA記事限定 |
 | npm | `registry.npmjs.org/-/v1/search` | 不要 | 公式公開API。説明は登録者の自己申告（審査結果ではない） |
 | crates | `crates.io/api/v1/crates` | 不要、識別UA必須 | Crawler Policy: 1req/s上限。説明は登録者の自己申告 |
+| osv | `api.osv.dev/v1/query`・`/v1/querybatch`・`/v1/vulns/{id}` | 不要 | 生態系を省くと HTTP 400。10 生態系を querybatch で照合してから `/v1/query`。集約元は各脆弱性DB |
+| ietf | `datatracker.ietf.org/api/v1/doc/document/` | 不要 | `title__contains` は AND 不可（2 語で 0 件）。`type__in=draft,rfc` で slides/chairs を除外。RFC 番号と draft 名は `name` 直引き |
+| uniprot | `rest.uniprot.org/uniprotkb/search` | 不要 | `fields=` で配列と機能コメントに限定（未指定だと 1 件 180KB）。CC BY 4.0 |
+| chembl | `www.ebi.ac.uk/chembl/api/data/molecule/search` | 不要 | 名前・別名検索。`pref_name` が空の record がある。CC BY-SA 3.0 |
+| pdb | `www.ebi.ac.uk/pdbe/search/pdb/select` | 不要 | Solr。`fl=` でフィールド限定。CC0 |
+| quickgo | `www.ebi.ac.uk/QuickGO/services/ontology/go/search` | 不要 | 定義文が本文根拠。CC BY 4.0 |
+| reactome | `reactome.org/ContentService/search/query` | 不要 | `summation` は**配列ではなく HTML を含む文字列**（実測）。`name` に `<span>` が入る。CC0 |
+| clinicaltrials | `clinicaltrials.gov/api/v2/studies` | 不要 | `fields=` で応答を限定。米国政府 |
+| openfda | `api.fda.gov/drug/label.json` | 不要 | 複数語は引用句で送る。医療判断に使えない（免責を attribution に含める） |
+| inspirehep | `inspirehep.net/api/literature` | 不要 | `fields=` で限定。DOI を出典 URL に使う。CC0 |
+| oeis | `oeis.org/search` | 不要 | A 番号は `number`（`id` は旧 M/N 識別子）。0 件は JSON `null`。CC BY-SA 4.0 |
+| gbif | `api.gbif.org/v1/species/search` | 不要 | 分類は Backbone。出現データのライセンスはデータごとに異なる |
+| hfhub | `huggingface.co/api/models` | 不要 | `sort=downloads`。ライセンスはタグ（`license:`）から取る |
 
 - 結果は**必ず `citation`（source / title / url / year / summary）に正規化**する。表示も注入もこの形だけを使う。
 - 取得はメモリ TTL キャッシュ + ホスト単位の遮断記憶。**同一キーは single-flight** で同時取得を 1 回にまとめ、エラー応答はキャッシュしない（回復後の再取得を妨げない）。キャッシュ値は複製して返し、呼び出し側の変更が共有状態に伝播しない。**LLM を介さない**（＝幻覚が入らない経路）。
@@ -180,7 +193,7 @@
 - 注入する本文は 1 件あたり `FREEAGENT_EVIDENCE_ITEM_CHARS`（既定 360）、全体で
   `FREEAGENT_EVIDENCE_TOTAL_CHARS`（既定 3200）に収める。入れすぎると小型 Free モデルが予算を
   使い切って空応答・切断になる（逆効果）。
-- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加9種（datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates / cinii）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。ciniiは`FREEAGENT_CINII_APPID`が前提で、未設定ならHTTPを出さずに案内を返す（§6.7）。
+- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加22種（datacite / openaire / europepmc / zenodo / ror / doaj / npm / crates / cinii / osv / ietf / uniprot / chembl / pdb / quickgo / reactome / clinicaltrials / openfda / inspirehep / oeis / gbif / hfhub）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。ciniiは`FREEAGENT_CINII_APPID`が前提で、未設定ならHTTPを出さずに案内を返す（§6.7）。
 - `fallback=true`のJSON真偽値だけが、自然語arXiv検索をDataCiteへ追加送信する明示許可。文字列`"true"`等は許可にしない。
 - 1 ソースの失敗で全体を落とさない（`errors` に集約し、成功分だけ返す）。
 
@@ -208,7 +221,7 @@
   `FREEAGENT_STATE_DIR/kb_latency.jsonl`・最大 20,000 行・超えたら古い行から tmp + `os.replace` で捨てる）へ追記。
   記録は `ts` / `hour`（日本時間）/ `source` / `elapsed_s` / `ok` / `items` / `error`（160 字）/ `mailto` /
   `openalex_key` / `cinii_appid` / `env_failure` に加え `datacite_kind` / `summaries`（本文がある件数）を記録し、**タイトル・本文は残さない**。
-  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応15ソースを測る（ciniiはappid未設定なら外す・§6.7）。RORだけは機関名の6問を巡回し、論文キーワードの空振りと混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
+  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応28ソースを測る（ciniiはappid未設定なら外す・§6.7）。論文キーワードだと空振りするソース（ror / npm / crates / osv / ietf / uniprot / chembl / pdb / quickgo / reactome / clinicaltrials / openfda / inspirehep / oeis / gbif / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
 - 全ソースが接続系の失敗なら `env_failure=true`（こちらのネットワーク障害）とし、`--report` の集計から外す。
 - `--schedule N` は Windows のタスク（`pythonw`＝窓を出さない）を 1 時間おきに登録し、残り回数を
   `kb_latency.jsonl.schedule.json` で数えて、最後の 1 回でタスクを自分で消す（`/ED` `/ET` は HOURLY との
@@ -345,6 +358,83 @@
   `tests/test_knowledge_cinii.py`（10件）が検証するが、appidを使ったstdio・レイテンシの実測は
   **appidを持つ利用者が**`probe_knowledge_stdio.py --sources cinii`と`measure_kb.py --sources cinii`で行う
   （どちらもappid未設定なら検査・計測せずに外す）。
+
+### 6.8 日本のオープンデータ候補の評価（2026-10-04・保留。実装なし）
+
+知識ソースとして使えるかの**評価だけ**を行い、登録はしていない（保留）。判定は規約 29/30 と同じ基準（検索できる
+公認 API か・キー要否・規約が参照する先まで含めた制限・既存ソースとの重複・8 秒締切との整合・条件の曖昧さ）。
+
+**採用候補（未実装）**
+
+- **e-Gov データポータル（= DATA GO JP）** — キー不要。CKAN 標準の `package_search`。実測: `q=防災` が 200・
+  **0.46 秒**・3,759 件（`result.results[]` に title / notes / tags / organization）。規約は**公共データ利用規約
+  （PDL1.0）**（出典記載義務・加工時は加工した旨と主体を明示・商用可）。`https://www.data.go.jp/` は
+  `https://data.e-gov.go.jp/info/ja` へ**リダイレクト**し、旧 CKAN パスも生きていて 18,143 件を返す
+  （**DATA GO JP と e-Gov データポータルは同じカタログ**）。返るのは発行主体が書いた説明なので、npm/crates と
+  同じ「登録簿の自己申告」型として扱い `summary_kind` を分ける。
+- **データカタログ横断検索システム（search.ckan.jp・NII）** — キー不要。CKAN 互換 API。実測:
+  `backend/api/package_search?q=防災` が 200・**0.1 秒**・**4,185 件**、`xckan_site_name` のファセットで
+  DATA GO JP 1,490 / G 空間情報センター 1,310 / BODIK ODCS 704 / 東京都 270 / 学術機関リポジトリ 82 と
+  **省庁・自治体を横断**する。保証フィールドは `xckan_title` / `xckan_site_name` / `xckan_site_url` /
+  `xckan_last_updated` / `xckan_original_id` の 5 つ。**規約が API ドキュメントに見当たらない**ので登録前に
+  確認する（規約 29）。自治体カタログに検索 API が無い問題をこれが解消する。
+- **e-Stat** — **appid 必須**（利用登録・1 人 3 個まで・譲渡貸与禁止・クレジット表示義務・短時間大量アクセス禁止）。
+  実測: appId 無し / dummy とも `STATUS 100「認証に失敗しました」`＝ハードゲート。`getStatsList` は `searchWord`
+  （AND/OR/NOT 可）でキーワード検索でき、表題・府省・統計名・周期・更新日・ランディングページを返す。
+  **統計表メタデータまでに限定**する（`getStatsData` は最大 10 万行で、文脈注入に不向き・誤読を招く）。
+  cinii と同じ「キー必須の明示ソース」の型（§5.17 / §6.7）を流用できる。
+
+**見送り（登録しない）**
+
+- **東京都オープンデータAPI** — キー不要・CC BY だが `service.api.metro.tokyo.lg.jp/api/{apiId}/json` と
+  **apiId を知らないと叩けない**。検索は HTML の SPA で、機械可読な検索 API は見つからない（`/spec/api/search`
+  等は 404）。`query` を投げる知識ソースにできない（PyPI と同じ理由）。公共施設・バリアフリーは
+  tokyo-transit MCP（`gov_facility_search_support`）と役割が重なる。
+- **opendataapi.jp** — 個人開発の α 版（2025/01 公開）。タグ別に 0〜5 件の小規模。将来トークン管理・有償化を予定。
+  **公認 API ではない**ので規約 29/30 の「条件が曖昧なものは登録しない」に該当。
+- **awesome-japan-opendata の「プラットフォーム/ソフトウェア」節** — データではなくポータル構築の道具。
+  **BODIK ODCS** は 18,457 件を掲げるが実測 `odcs.bodik.jp/api/3/action/package_search` は **404**
+  （「CKAN/WordPress ベース」でも API は非公開）。**Open data stack** / **data eye** は有償、**odp.jig.jp** は
+  自治体向け有償（基本 150 万円/年）でデータの権利者は自治体、**LinkData** はユーザー投稿型。**CKAN** はソフトで
+  データではない。
+- 含意: CKAN は**共通 API** なので、実装を base URL 可変にすれば 1 つの実装で複数のポータルに展開できる
+  （規約と権利者はポータルごとに個別判断）。
+
+### 6.9 第6段階ソースの採用根拠（§5.18 / §5.19）
+
+2026-10-05 に約 40 エンドポイントを無認証で実プローブし、利用条件を一次情報で確認した。**採用 13 種**は
+すべて既定 off の明示指定で、`DEFAULT_SOURCES` は 6 種のまま変えていない。全ホストで
+`content-encoding` が `identity` であること（gzip 応答が無いこと）も実測した。
+
+- **採用（プログラミング・標準）**: osv / ietf。**採用（科学）**: uniprot / chembl / pdb / quickgo /
+  reactome / clinicaltrials / openfda / inspirehep / oeis / gbif / hfhub。
+- **見送りと理由**: Stack Exchange（AUP が生成AI/チャットボットの開発・試験目的の自動取得に**事前の
+  書面許諾**を要求。実測 200 でも許諾が確認できない。規約 29）/ NVD（キー無しは 6 秒間隔の推奨で、
+  OSV と役割が重複）/ Repology（検索結果が「プロジェクト → 全リポジトリのパッケージ」の塊で、
+  実測 133 プロジェクト・`project/openssl` は 1008 件。8 秒締切と文脈予算に不向き）/ MDN（公開された
+  API ではなくサイト内部のエンドポイント）/ GitLab・Codeberg（GitHub と役割が重複）/ PubChem・
+  AlphaFold DB・Ensembl・STRING（名前直引きでキーワード検索 API が無い）/ KEGG（学術は無償・商用は
+  ライセンス必要）/ zbMATH（実測で TLS 証明書検証に失敗）/ SIMBAD（実測 17.95 秒）/ SciELO（Bunny
+  シールドの 403 チャレンジ）/ OpenML（Hugging Face Hub と重複）/ InterPro（実測 4.83 秒）/
+  BioModels・PRIDE（返るのが ID 中心）/ NASA Exoplanet（ADQL を組み立てる必要があり注入面が増える）。
+- **予算キーの分離**: §5.11 のレート予算は**ホスト単位**なので、(a) 1 回の取得で同じホストの複数
+  エンドポイントを叩く OSV、(b) 同一ホスト（`www.ebi.ac.uk`）に同居する chembl / pdb / quickgo は、
+  そのままだと 2 本目が「アクセス間隔制御」で落ちる。`_kb_new_json(..., budget_key=...)` で
+  **予算だけサービス単位に分け**、遮断の記憶は netloc のまま（ホスト単位）にした。
+  EBI の間隔はプロセス内のみで、他のアプリや IP と共有されない。
+- **本文根拠の区別**: 構造化レコードしか無い chembl / pdb / gbif / hfhub は、記録の値を 1 行にまとめて
+  `summary_kind=structured_record` を付ける（論文抄録と混同させない）。openfda は原典の免責を
+  `attribution` に必ず含める。cinii と同じく、書誌のみのソースは `metadata_only` のままにする。
+- **IETF の検索は全文検索ではない**: `title__contains` は AND 不可（実測: 2 語指定で 0 件）。RFC 番号
+  （`RFC 9110` / `rfc9110` / `9110`）と `draft-...` は `name` で直引きし、それ以外は最長語 1 つで引いて
+  全語がタイトルに載るものを優先する。取りこぼす場合があることを README に明記する。
+- **実測（2026-10-05・実 stdio 経路・各 2 件）**: osv 0.92 秒 / ietf 0.63 秒 / uniprot 1.03 秒 /
+  chembl 1.85 秒 / pdb 1.05 秒 / quickgo 1.05 秒 / reactome 0.84 秒 / clinicaltrials 0.24 秒 /
+  openfda 1.48 秒 / inspirehep 0.86 秒 / oeis 1.29 秒 / gbif 0.98 秒 / hfhub 0.28 秒。
+  EBI の 3 サービス（chembl / pdb / quickgo）を同時指定しても 1.12 秒で 6 件・エラー 0 件だった。
+  **chembl の `molecule/search` はばらつきが大きい**（同日 6 問で 1.1〜5.9 秒、まれに 8 秒締切超え）。
+  締切超えは `timed_out` として脱落させ、取得は裏で続けて次回キャッシュから返す（§6.1 の契約どおり）。
+  一時点の計測なので、時間帯別の確認は `scripts/measure_kb.py --sources ...` で行う。
 
 ## 7. ツールの規約（§6–§8）
 

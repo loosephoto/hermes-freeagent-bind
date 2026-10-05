@@ -3,6 +3,11 @@
 python scripts/probe_knowledge_stdio.py
 python scripts/probe_knowledge_stdio.py --sources datacite --datacite-kind dataset --query graphene
 python scripts/probe_knowledge_stdio.py --sources zenodo ror --query CERN
+python scripts/probe_knowledge_stdio.py --sources osv --query jinja2
+python scripts/probe_knowledge_stdio.py --sources ietf --query "RFC 9110"
+python scripts/probe_knowledge_stdio.py --sources uniprot --query insulin
+python scripts/probe_knowledge_stdio.py --sources clinicaltrials --query melanoma
+python scripts/probe_knowledge_stdio.py --sources oeis --query Fibonacci
 
 各指定ソースの有効応答・出典・両チャネルを検査。失敗はexit 1（成功を捏造しない）。
 OpenAIREは匿名60/h。同一IP上の他プロセスも含め、連続実行には60秒以上の間隔を空ける。
@@ -77,6 +82,13 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
         if cite["source"] in ("npm", "crates"):
             if cite.get("summary_kind") != "registry_description":
                 raise ValueError("package registry evidence kind mismatch")
+        if cite["source"] in ("chembl", "pdb", "gbif", "hfhub"):
+            if cite.get("summary_kind") != "structured_record" or not cite.get("summary"):
+                raise ValueError("structured record evidence kind mismatch")
+        if cite["source"] == "osv" and not cite.get("identifier"):
+            raise ValueError("OSV citation must carry an id")
+        if cite["source"] == "ietf" and not cite.get("identifier"):
+            raise ValueError("IETF citation must carry a document name or RFC number")
         if cite["source"] == "cinii" and not cite.get("metadata_only"):
             raise ValueError("CiNii は書誌のみ（抄録を返さない）ので metadata_only であること")
         S._kb_http_url(cite["url"])

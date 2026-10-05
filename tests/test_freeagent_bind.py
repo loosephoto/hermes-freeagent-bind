@@ -862,7 +862,11 @@ class TestKnowledgeBackendRegistry(unittest.TestCase):
         self.assertEqual(set(S.DEFAULT_SOURCES),
                          {"wikipedia", "wikidata", "arxiv", "crossref", "openalex", "github"})
         self.assertEqual(set(S.KB_BACKENDS), set(S.DEFAULT_SOURCES) | {"datacite", "openaire", "europepmc", "zenodo", "ror",
-                                                                       "doaj", "npm", "crates", "cinii"})
+                                                                       "doaj", "npm", "crates", "cinii",
+                                                                       "osv", "ietf", "uniprot", "chembl", "pdb",
+                                                                       "quickgo", "reactome", "clinicaltrials",
+                                                                       "openfda", "inspirehep", "oeis", "gbif",
+                                                                       "hfhub"})
         self.assertEqual(set(S.SOURCES), set(S.KB_BACKENDS))
 
     def test_arxiv_uses_https(self):
