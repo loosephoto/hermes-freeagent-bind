@@ -110,7 +110,9 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     **空振りのまま「設定した」気にさせる**。加えて **`cache/mcp_schema_cache.json` は不完全**（実測 18 件。
     実在する `panel` / `consensus` / `consensus-step` が欠けており、キャッシュで照合すると「存在しない」と
     誤判定する）ので、照合は `hermes mcp test <server>` のライブ一覧で行う。`apply_proactive.py --check` が
-    設定済みの除外の空振りを exit 1 で検出する。
+    設定済みの除外の空振りを exit 1 で検出する。**除外の読み取りはサーバー節で区切る**（`mcp_servers` の下は
+    すべてインデントされるので、終端を「インデント無し行」で判定すると後方の別サーバーの `exclude` を
+    混入し、`--check` が偽陽性で exit 1 になる — 実測）。
     **SOUL.md の判断規則はマーカーで囲んだブロックとして差し替える**（`--write-snippet` は最新の文面へ
     差し替え、`--remove-snippet` で外す）。「入っていれば何もしない」にすると、文面を更新しても古い規則が
     残り続ける。ブロック外の利用者の記述と**元の改行コード**（CRLF / LF）は変えない。
@@ -208,6 +210,15 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     Homebrew・Go module index（一括ダンプ）/ Zenn（非公式 API）は登録しない。Artifact Hub / MetaCPAN /
     RubyGems / Packagist / pub.dev / Hex / NuGet / Debian Sources は将来候補（集約の librariesio を採る
     場合は schema コストに見合わない）。
+
+34. **無料一覧の非チャットモデルは自動選抜から外す**（§3.2）。無料一覧には埋め込み・ガード/安全分類器・
+    画像/音声生成・OCR が混ざる（実測: Free 102 件中 29 件＝約 28%。`openrouter/google/lyria-3-*` は音楽生成、
+    NVIDIA の `embed` / `guard` / `vision` / `parse` / `reward` / `riva-translate` 等）。これらは選抜されると
+    1 回失敗して降格するまで枠と時間を浪費する（実測: `ok=0` のまま選ばれ続けた）。判定は**提供元が出力
+    モダリティを宣言していればそれを優先**し（OpenRouter の `architecture.output_modalities`）、宣言が無ければ
+    ID の**区切りに囲まれた語**だけで保守的に外す（`someembeddedmodel` のような部分一致で誤除外しない）。
+    **明示指定は在庫の全 Free で確認する**ので名指ししたモデルはこれまでどおり試す。`freeagent_models` は
+    `non_chat_candidates` に件数を出し、一覧では見えるままにする（黙って消さない）。
 
 ## ライセンス
 

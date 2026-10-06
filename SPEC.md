@@ -130,6 +130,12 @@
   `huggingface/…`）。プロバイダ順は最良モデルの順位で決めるので品質順は捨てない。
 - **認証で失敗中のプロバイダは自動選抜から外す**（`provider_auth.json`、既定 15 分）。明示 `requested`
   は常に試す＝キーを直せば即復帰する。除外は `notes` に出す（黙って隠さない）。
+- **非チャットモデルは自動選抜とフォールバックから外す**（§3.2）。無料一覧には埋め込み・ガード/安全
+  分類器・画像/音声生成・OCR が混ざる（実測: Free 102 件中 29 件＝約 28%）。**提供元が出力
+  モダリティを宣言していればそれで判定**し（OpenRouter の `architecture.output_modalities`。音声・
+  画像を出力するものは対話に使えない）、宣言が無い一覧は ID の**区切りに囲まれた語**だけで保守的に
+  外す。**明示指定は在庫の全 Free で確認する**ので名指ししたモデルはこれまでどおり試す。
+  `freeagent_models` は `non_chat_candidates` に件数を出し、一覧では見えるままにする。
 
 ## 5. 呼び出し（§4）
 
@@ -642,6 +648,11 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   `ask_*`（アンダースコア）は実名（`ask-all` / `consensus-step` …）に一致しない。**schema キャッシュは
   不完全**（実測 18 件 < ライブ 21 件）なので照合に使わない（`hermes mcp test` を優先）。
   `apply_proactive.py` は照合結果を表示し、設定済みの除外が空振りなら exit 1 にする。
+- **除外の読み取りはサーバー節で区切る**。`mcp_servers` の下は**すべてインデントされる**ため、節の
+  終端を「インデント無しの行」で判定すると節が終わらず、**後方の別サーバー（`gitlab` 等）の
+  `exclude` を混入**させる（実測: `get_mcp_server_version` / `list_duo_sessions` を対象サーバーの
+  設定と誤認し、`--check` が偽陽性で exit 1）。境界は `server_block()` と同じ（インデント 2 の
+  次のサーバー名まで）。
 - 測定は回答本文ではなく **`state.db` の `messages.tool_calls`** で行う（`scripts/measure_adoption.py`）。
   遅延カタログ経由の呼び出しは `tool_call` として記録され、実名は `arguments.calls[].name` に入る。
 - **思考台帳の常用**: 判断規則（`SNIPPET`）・`freeagent_think` の description 先頭【常用】・

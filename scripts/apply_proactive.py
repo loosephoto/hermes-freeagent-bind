@@ -231,23 +231,22 @@ def configured_marker(cfg: str, server: str) -> str:
 
 
 def configured_exclude(server: str) -> list[str]:
-    """設定済みの `tools.exclude` を取り出す（その節だけを見る。YAML 全体は解析しない）。
+    """設定済みの `tools.exclude` を取り出す（**そのサーバーの節だけ**を見る。YAML 全体は解析しない）。
 
     実測（踏んだ不具合）: `hermes config set` が書くリストは**項目が 8 スペース**で、
     6 スペースを期待した実装は**空リストを返していた**（＝壊れた除外を見逃し、空振りを検出できない）。
     ブロック形式（`- item` 行）と 1 行形式（`['a', 'b']`）の両方を受ける。
+
+    実測（踏んだ不具合・2）: 節の終わりを「インデントの無い行」だけで判定すると、`mcp_servers` の下は
+    **すべてインデントされている**ため節が終わらず、**後ろの別サーバー（`gitlab` 等）の `exclude` を
+    混入**していた（＝対象サーバーに無いパターンを『設定済みの空振り』と誤判定し、`--check` が
+    偽陽性で exit 1 になった）。境界は `server_block()` と同じ（インデント 2 の次のサーバー名まで）に
+    する。
     """
     out: list[str] = []
-    inside_server = inside_exclude = False
+    inside_exclude = False
     exclude_indent = 0
-    for line in read_config().splitlines():
-        if re.match(r"^  " + re.escape(server) + r":\s*$", line):
-            inside_server = True
-            continue
-        if not inside_server:
-            continue
-        if line.strip() and not line.startswith(" "):
-            break                                   # 次のトップレベルキー＝節の終わり
+    for line in server_block(read_config(), server).splitlines():
         if not inside_exclude:
             m = re.match(r"^(\s+)exclude:\s*(.*)$", line)
             if m:

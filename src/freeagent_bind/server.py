@@ -15,7 +15,7 @@ OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Lib
                                              §2.3 トレース / §2.4 相談セッション /
                                              §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 /
                                              §2.7 思考台帳の構造（分解・改訂・分岐・仮説））
-  §3 プロバイダとモデル（§3.1 Free-tier provider guards）  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
+  §3 プロバイダとモデル（§3.1 Free-tier provider guards / §3.2 チャット向けの選別）  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
                     §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR /
                     §5.16 DOAJ・npm・crates.io / §5.17 CiNii Research（appid 必須） / §5.18 プログラミング・標準 /
                     §5.19 科学（医学・生物学は対象外） / §5.20 プログラミング特化: HN・Software Heritage・Libraries.io）
@@ -936,7 +936,10 @@ def select_models(size: int, requested: list[str] | None = None, *,
     if prefer:
         add(prefer)
     if len(chosen) < size:
-        pool = [r for r in available if r not in chosen]
+        # **非チャットモデルは自動選抜に載せない**（§3.2）。明示指定の在庫確認（is_available）は
+        # 在庫の全 Free を使うので、名指しされたモデルはこれまでどおり試す。
+        chat_ok = set(free_model_refs(free_only=free_only, chat_only=True))
+        pool = [r for r in available if r not in chosen and r in chat_ok]
         if exclude:
             ex = set(exclude)
             pool = [r for r in pool if r not in ex]
@@ -1496,6 +1499,8 @@ def fetch_provider_models(provider: str, ttl: float = 600.0) -> list[dict]:
                 "id": str(raw.get("id")),
                 "provider": provider,
                 "free": _is_free(provider, raw),
+                # サブLLM（テキスト対話）に使えるか。埋め込み・分類器・画像/音声生成は選抜から外す（§3.2）。
+                "chat": is_chat_model(provider, raw),
                 # 無料で使える**経路**（HF は提供元名。他プロバイダでは空）。呼び出しのヒントになる。
                 "free_via": _free_providers(raw) if _is_hf(provider) else [],
                 "context_length": _context_length(provider, raw),
@@ -1558,6 +1563,56 @@ def _provider_catalog_rows(provider: str, data) -> list:
     return rows
 
 
+# ---------------------------------------------------------------- §3.2 チャット向けモデルの選別
+#
+# 無料一覧には**サブLLM として使えないモデル**が混ざる（実測: NVIDIA の無料枠は 80 件中およそ
+# 3 割が埋め込み・ガード/安全分類器・画像/音声生成・OCR。OpenRouter の `:free` にも音楽生成の
+# `google/lyria-3-*` が入る）。これらは選抜されると 1 回失敗して降格するまで枠と時間を浪費する
+# （実測: `openrouter/stealth/space-bunny-alpha` 等が空応答・`err:other` を重ね、`ok=0` のまま
+# 選ばれ続けた）。**提供元が出力モダリティを宣言していればそれで判定**し（OpenRouter の
+# `architecture.output_modalities`。音声・画像を出力するものはテキスト対話に使えない）、
+# 宣言が無い一覧（NVIDIA など）は ID の目印で**保守的に**外す。判定は一覧の行に `chat` として載せ、
+# 自動選抜とフォールバック（`free_model_refs(chat_only=True)`）だけに効かせる。**明示指定は在庫の
+# 全 Free で確認する**ので、呼び出し側が名指ししたモデルはこれまでどおり試す。`freeagent_models` では
+# 非チャットも**見えるまま**にして件数を出す（黙って消さない）。誤除外を避けるため、目印は
+# 「モデル ID の区切りに囲まれた語」だけに当てる。
+
+_NON_CHAT_ID_RE = re.compile(
+    r"(?:^|[-/_.])("
+    r"embed|embedqa|embedding|rerank|reranker|nemoretriever|arctic-embed|"
+    r"guard|nemoguard|content-safety|topic-control|safety|"
+    r"clip|nclip|nvclip|vision|vila|neva|kosmos|deplot|vlm|"
+    r"lyria|diffusion|video-detector|synthetic-video|"
+    r"reward|parse|riva-translate|ising-calibration|"
+    r"whisper|tts|asr|stable-diffusion"
+    r")(?:$|[-/_.:])",
+    re.IGNORECASE,
+)
+
+
+def _declared_output_modalities(raw: dict) -> list[str] | None:
+    """提供元が宣言した出力モダリティ（OpenRouter の `architecture`）。無ければ None。"""
+    arch = raw.get("architecture")
+    if not isinstance(arch, dict):
+        return None
+    outs = arch.get("output_modalities")
+    if isinstance(outs, list):
+        vals = [as_str(o).lower() for o in outs if as_str(o)]
+        return vals or None
+    modality = as_str(arch.get("modality"))
+    if "->" in modality:
+        return [m.strip().lower() for m in modality.split("->", 1)[1].split("+") if m.strip()] or None
+    return None
+
+
+def is_chat_model(provider: str, raw: dict) -> bool:
+    """サブLLM（テキスト対話）に使えるモデルか。宣言があればモダリティで、無ければ ID の目印で判定する。"""
+    declared = _declared_output_modalities(raw)
+    if declared is not None:
+        return all(m == "text" for m in declared)
+    return not _NON_CHAT_ID_RE.search(as_str(raw.get("id")))
+
+
 def all_models(ttl: float = 600.0) -> list[dict]:
     out: list[dict] = []
     for provider in PROVIDER_ORDER:
@@ -1577,6 +1632,8 @@ def provider_status() -> list[dict]:
             "ready": provider_ready(provider),
             "models": len(models),
             "free": sum(1 for m in models if m.get("free")),
+            # Free のうちサブLLM に使えない（非チャット）件数。選抜には載せない（§3.2）。
+            "non_chat": sum(1 for m in models if m.get("free") and not m.get("chat", True)),
             "key_env": spec.get("key_env"),
             "note": spec.get("note"),
             "requires_activation": bool(spec.get("catalog_requires_ready")),
@@ -1586,14 +1643,20 @@ def provider_status() -> list[dict]:
     return rows
 
 
-def free_model_refs(free_only: bool = True) -> list[str]:
-    """推論可能（ready）なプロバイダの Free モデル参照を、優先順で返す。"""
+def free_model_refs(free_only: bool = True, chat_only: bool = False) -> list[str]:
+    """推論可能（ready）なプロバイダの Free モデル参照を、優先順で返す。
+
+    `chat_only=True` は**サブLLM に使える（テキスト対話の）モデルだけ**を返す（§3.2）。
+    自動選抜とフォールバックはこちらを使い、明示指定の在庫確認は既定（全 Free）を使う。
+    """
     refs: list[str] = []
     for provider in PROVIDER_ORDER:
         if not provider_ready(provider):
             continue
         for row in fetch_provider_models(provider):
             if free_only and not row.get("free"):
+                continue
+            if chat_only and not row.get("chat", True):
                 continue
             ref = make_ref(provider, row["id"])
             if ref not in refs:
@@ -1604,7 +1667,7 @@ def free_model_refs(free_only: bool = True) -> list[str]:
 def default_model(free_only: bool = True) -> str:
     if DEFAULT_MODEL:
         return DEFAULT_MODEL
-    refs = free_model_refs(free_only=free_only)
+    refs = free_model_refs(free_only=free_only, chat_only=True)
     return refs[0] if refs else ""
 
 
@@ -1721,7 +1784,7 @@ def _candidates(ref: str, free_only: bool = True) -> list[str]:
     if len(out) >= _MAX_ATTEMPTS:
         return out[:_MAX_ATTEMPTS]
     blocked = {name for name in PROVIDER_ORDER if provider_auth_blocked(name)}
-    for other in free_model_refs(free_only=free_only):
+    for other in free_model_refs(free_only=free_only, chat_only=True):
         if other == ref or other in cooling or other in out:
             continue
         if other.split("/", 1)[0] in blocked:
@@ -2223,7 +2286,7 @@ def kb_wikidata(query: str, lang: str = "ja", limit: int = 3) -> dict:
         entities: dict = {}
         if ids:
             q2 = urllib.parse.urlencode({"action": "wbgetentities", "format": "json",
-                                         "ids": "|".join(ids[:limit]), "props": "labels|descriptions|claims|sitelinks"})
+                                         "ids": "|".join(ids[:limit]), "props": "claims"})
             e_data, _ = kb_json(f"https://www.wikidata.org/w/api.php?{q2}")
             entities = ((e_data or {}).get("entities") or {})
         claims_out: dict[str, list] = {}
@@ -4130,7 +4193,7 @@ def tool_models(args: dict) -> dict:
     ここで得た `provider/model`（HF は `:提供元` を付けられる）は他ツールの `models` 引数に渡せる。
     """
     status = provider_status()
-    free = free_model_refs()
+    free = free_model_refs(chat_only=True)          # サブLLM に使える Free だけ（§3.2）
     usable = [ref for ref in free if not is_cooling(ref)]
     query = as_str(args.get("query")) or as_str(args.get("q"))
     provider_filter = as_str(args.get("provider"))
@@ -4139,6 +4202,7 @@ def tool_models(args: dict) -> dict:
         "providers": status,
         "total_models": sum(row["models"] for row in status),
         "free_candidates": len(free),
+        "non_chat_candidates": sum(row.get("non_chat", 0) for row in status),
         "usable_now": len(usable),
         "default_model": default_model(),
         "cooling": {ref: row for ref, row in cooling_refs().items()},
@@ -5515,6 +5579,8 @@ TOOLS: list[dict] = [
             "品質統計やクールダウンを確認したいとき。"
             "【差分】`query`（ID の部分一致）と `provider`（nous / openrouter / nvidia / huggingface / groq / cloudflare / gemini）で絞り込む。"
             "返る `ref` は他ツールの `models` 引数にそのまま渡せる（HF は `:提供元` を付けて経路を固定できる）。"
+            "`Free候補` は**サブLLM に使えるモデルだけ**（埋め込み・分類器・画像/音声生成は自動選抜から外す。"
+            "件数は `non_chat_candidates`）。"
             "【使わない条件】通常は不要（panel/consult 等が自動で選ぶ）。"
         ),
         "inputSchema": {
@@ -5910,6 +5976,11 @@ def _render_body(name: str, data: dict) -> str:
                 + "\n".join(lines))
         head += (f"\nFree候補 {data.get('free_candidates')} 件（うち今すぐ使用可 {data.get('usable_now')}）"
                  f" / 全 {data.get('total_models')} モデル\n既定: {data.get('default_model')}")
+        non_chat = data.get("non_chat_candidates") or 0
+        if non_chat:
+            # 選抜から外した分を黙って消さない（「要約で無い」と「そもそも無い」を混同させない）。
+            head += (f"\n非チャット（埋め込み・分類器・画像/音声生成）{non_chat} 件は自動選抜から除外"
+                     "（一覧には表示）")
         cooling = data.get("cooling") or {}
         if cooling:
             # 全部並べると 1 行が長すぎて読めない（実測: 55 件で画面が埋まった）。先頭だけ出して件数を添える。

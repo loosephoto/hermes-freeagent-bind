@@ -932,7 +932,7 @@ class TestMeasuredRegressions(unittest.TestCase):
     def test_select_prefers_non_cooling(self):
         """クールダウン中は除外せず後回し（空きが足りないときだけ補充）。"""
         free = ["p/ready1", "p/cool", "p/ready2"]
-        with unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: list(free)), \
+        with unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: list(free)), \
              unittest.mock.patch.object(S, "cooling_refs", lambda: {"p/cool": {"until": 9e9}}), \
              unittest.mock.patch.object(S, "rank_models", lambda refs: list(refs)):
             chosen, info = S.select_models(2)
@@ -943,12 +943,74 @@ class TestMeasuredRegressions(unittest.TestCase):
             self.assertTrue(any("補充" in n for n in info["notes"]) or True)
 
     def test_select_keeps_explicitly_requested_cooling_model(self):
-        with unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: ["p/cool"]), \
+        with unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: ["p/cool"]), \
              unittest.mock.patch.object(S, "cooling_refs", lambda: {"p/cool": {"until": 9e9}}), \
              unittest.mock.patch.object(S, "rank_models", lambda refs: list(refs)):
             chosen, info = S.select_models(1, ["p/cool"])
             self.assertEqual(chosen, ["p/cool"])
             self.assertTrue(any("クールダウン中" in n for n in info["notes"]))
+
+
+class TestChatModelSelection(unittest.TestCase):
+    """非チャットモデル（埋め込み・分類器・画像/音声生成）を自動選抜から外す契約（§3.2）。"""
+
+    def test_declared_output_modalities_decide(self):
+        # 提供元が出力モダリティを宣言していればそれで判定する（音声・画像出力は対話に使えない）。
+        self.assertTrue(S.is_chat_model("openrouter", {"id": "x/y", "architecture": {"output_modalities": ["text"]}}))
+        self.assertFalse(S.is_chat_model("openrouter", {"id": "google/lyria-3-pro-preview",
+                                                        "architecture": {"output_modalities": ["text", "audio"]}}))
+        self.assertFalse(S.is_chat_model("openrouter", {"id": "a/img", "architecture": {"modality": "text->image"}}))
+        self.assertTrue(S.is_chat_model("openrouter", {"id": "a/vlm", "architecture": {"modality": "text+image->text"}}))
+
+    def test_id_markers_when_no_declaration(self):
+        for model in ("nvidia/nvidia/embed-qa-4", "meta/llama-guard-4-12b", "nvidia/nvidia/nvclip",
+                      "microsoft/kosmos-2", "nvidia/nvidia/nemotron-parse",
+                      "nvidia/nvidia/nemotron-4-340b-reward", "microsoft/phi-3-vision-128k-instruct"):
+            self.assertFalse(S.is_chat_model("nvidia", {"id": model}), model)
+        for model in ("meta/llama-3.1-8b-instruct", "nvidia/nvidia/nemotron-3-super-120b-a12b",
+                      "google/gemma-3-4b-it", "mistralai/mistral-7b-instruct-v0.3"):
+            self.assertTrue(S.is_chat_model("nvidia", {"id": model}), model)
+
+    def test_markers_only_match_delimited_words(self):
+        # 目印は「区切りに囲まれた語」だけに当てる（部分文字列の誤除外を避ける）。
+        self.assertTrue(S.is_chat_model("nvidia", {"id": "org/someembeddedmodel"}))
+
+    def test_auto_pool_excludes_non_chat_but_explicit_kept(self):
+        full = ["p/chat1", "p/embed-x", "p/chat2"]
+        chatty = ["p/chat1", "p/chat2"]
+        with unittest.mock.patch.object(S, "free_model_refs",
+                                        lambda free_only=True, chat_only=False: list(chatty if chat_only else full)), \
+             unittest.mock.patch.object(S, "cooling_refs", lambda: {}), \
+             unittest.mock.patch.object(S, "rank_models", lambda refs: list(refs)):
+            chosen, _ = S.select_models(2)
+            self.assertEqual(chosen, ["p/chat1", "p/chat2"])
+            # 明示指定はこれまでどおり試す（在庫は全 Free で確認する）。
+            chosen_exp, info = S.select_models(1, ["p/embed-x"])
+            self.assertEqual(chosen_exp, ["p/embed-x"])
+            self.assertEqual(info["notes"], [])
+
+    def test_candidates_skip_non_chat(self):
+        with unittest.mock.patch.object(S, "free_model_refs",
+                                        lambda free_only=True, chat_only=False: (["p/chat2"] if chat_only else ["p/embed-x", "p/chat2"])), \
+             unittest.mock.patch.object(S, "cooling_refs", lambda: {}), \
+             unittest.mock.patch.object(S, "provider_auth_blocked", lambda provider: False):
+            cands = S._candidates("p/chat1")
+            self.assertNotIn("p/embed-x", cands)
+            self.assertIn("p/chat2", cands)
+
+    def test_freeagent_models_reports_non_chat_count(self):
+        # 非チャットは選抜から外すが、一覧では件数として見える（黙って消さない）。
+        rows = [{"provider": "p", "ready": True, "models": 3, "free": 3, "non_chat": 2,
+                 "key_env": None, "note": "", "requires_activation": False,
+                 "missing_settings": [], "error": ""}]
+        with unittest.mock.patch.object(S, "provider_status", lambda: rows), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: ["p/a"]), \
+             unittest.mock.patch.object(S, "default_model", lambda free_only=True: "p/a"), \
+             unittest.mock.patch.object(S, "cooling_refs", lambda: {}):
+            res = S.handle_tool_call({"name": "freeagent_models", "arguments": {}})
+        data = res.get("structuredContent") or {}
+        self.assertEqual(data.get("non_chat_candidates"), 2)
+        self.assertEqual(data.get("free_candidates"), 1)
 
 
 class TestMultiProvider(unittest.TestCase):
@@ -1008,7 +1070,7 @@ class TestMultiProvider(unittest.TestCase):
         ]
         with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
-             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: []), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []), \
              unittest.mock.patch.object(S, "provider_ready", lambda p: True):
             got = S.tool_models({"query": "qwen"})
             self.assertEqual(got["query"]["matched"], 3, "ID の部分一致で絞る（大文字小文字を問わない）")
@@ -1108,7 +1170,7 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              unittest.mock.patch.dict(os.environ, {"FREEAGENT_AUTH_PATH": os.path.join(tmp, "a.json")}), \
              unittest.mock.patch.object(S, "free_model_refs",
-                                        lambda free_only=True: ["huggingface/hf-1", "openrouter/or-1"]), \
+                                        lambda free_only=True, chat_only=False: ["huggingface/hf-1", "openrouter/or-1"]), \
              unittest.mock.patch.object(S, "cooling_refs", lambda: {}):
             S._AUTH.clear()
             S._AUTH_LOADED = False
@@ -1132,7 +1194,7 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
         ]
         with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
-             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: []):
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []):
             got = S.tool_models({"provider": "openrouter", "all": True, "free_only": True})
             self.assertEqual([m["id"] for m in got["models"]], ["free-a", "free-b"])
             self.assertEqual(got["query"]["matched"], 2)
@@ -1165,7 +1227,7 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
 
         with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
-             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: []), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []), \
              unittest.mock.patch.object(S, "call_model", fake_call):
             got = S.tool_models({"all": True, "probe": True, "probe_limit": 10, "limit": 10})
             refs = [m["ref"] for m in got["models"]]
@@ -1201,7 +1263,7 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
 
         with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
-             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: []), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []), \
              unittest.mock.patch.object(S, "call_model", fake_call):
             got = S.tool_models({"all": True, "probe": True, "probe_limit": 3, "limit": 3})
             self.assertEqual([m["ref"] for m in got["models"]], ["huggingface/cdn-1"])
@@ -1215,7 +1277,7 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
         依頼 4 体が 3 体で走る（実測）。除外するなら理由を出さなければならない。
         """
         free = ["huggingface/inclusionAI/Ling-3.0-flash-Fin", "openrouter/x/y:free"]
-        with unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: list(free)), \
+        with unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: list(free)), \
              unittest.mock.patch.object(S, "cooling_refs", lambda: {}):
             chosen, info = S.select_models(2, ["huggingface/inclusionAI/Ling-3.0-flash-Fin:novita",
                                                "openrouter/x/y:free"])
@@ -1243,7 +1305,7 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
     def test_models_probe_off_by_default(self):
         with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: []), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
-             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: []), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []), \
              unittest.mock.patch.object(S, "call_model",
                                         lambda *a, **k: self.fail("probe 無しで呼んではいけない")):
             got = S.tool_models({"all": True})
@@ -1253,7 +1315,7 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
         """検索時は free_models を返さない（出力が二重になる）。"""
         with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: []), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
-             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: ["a/b"]):
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: ["a/b"]):
             self.assertNotIn("free_models", S.tool_models({"query": "x"}))
             self.assertIn("free_models", S.tool_models({}))
 
@@ -1540,6 +1602,39 @@ class TestProactivePatternMatching(unittest.TestCase):
                 self.assertEqual(self.mod.configured_exclude("deliberation"), expected, body)
                 self.assertEqual(self.mod.configured_exclude("other"), [])
 
+    def test_configured_exclude_stops_at_server_boundary(self):
+        """節の終わりを越えて**後ろの別サーバーの exclude を混入させない**。
+
+        実測: 終端を「インデントの無い行」で判定していたため、`mcp_servers` の下はすべてインデントされ、
+        節が終わらずに後方の `gitlab` の exclude（`get_mcp_server_version` / `list_duo_sessions`）を
+        拾っていた。対象サーバーに無いパターンを「設定済みの空振り」と誤判定し、`--check` が偽陽性で
+        exit 1 になった。
+        """
+        home = tempfile.mkdtemp(prefix="fa-home-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, ignore_errors=True))
+        body = (
+            "mcp_servers:\n"
+            "  deliberation:\n"
+            "    command: npx\n"
+            "    tools:\n"
+            "      exclude:\n"
+            "        - ask-*\n"
+            "        - panel\n"
+            "  gitlab:\n"
+            "    url: https://gitlab.com/api/v4/mcp\n"
+            "    tools:\n"
+            "      exclude:\n"
+            "        - get_mcp_server_version\n"
+            "        - list_duo_sessions\n"
+            "    enabled: false\n"
+        )
+        with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as fh:
+            fh.write(body)
+        with unittest.mock.patch.dict(os.environ, {"HERMES_HOME": home}):
+            self.assertEqual(self.mod.configured_exclude("deliberation"), ["ask-*", "panel"])
+            self.assertEqual(self.mod.configured_exclude("gitlab"),
+                             ["get_mcp_server_version", "list_duo_sessions"])
+
     def test_check_reports_configured_but_stale_patterns(self):
         """設定済みの除外が実名に一致しない＝**本当の空振り**を検出できること。"""
         names = self.REAL
@@ -1668,7 +1763,7 @@ class TestHarnessDetection(unittest.TestCase):
     def test_models_reports_harness(self):
         self._init("claude-code")
         with unittest.mock.patch.object(S, "provider_status", lambda: []), \
-             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True: []), \
+             unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []), \
              unittest.mock.patch.object(S, "cooling_refs", lambda: {}):
             try:
                 data = S.tool_models({})
