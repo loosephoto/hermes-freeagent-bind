@@ -565,10 +565,8 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 - **第3段階：Zenodo / ROR** — 「Zenodoでグラフェンの研究データを探して」「RORでCERNの機関候補を探して」。公開メタデータだけを使います。
 - **第4段階：DOAJ / npm / crates.io** — 「DOAJでオープンアクセス論文を探して」「npmでJSONスキーマ検証のパッケージを探して」「crates.ioで非同期HTTPクライアントを探して」。DOAJは科学系、npm / crates.ioはプログラミング系の検索を広げます。
 - **第5段階：CiNii Research（appid 必須）** — 「CiNiiで日本語の論文を探して」。日本語文献の書誌を引きます。**利用者自身が取得したアプリケーションID**を `FREEAGENT_CINII_APPID` に設定したときだけ動きます（取得: [CiNiiウェブAPI デベロッパー登録](https://support.nii.ac.jp/ja/cinii/api/developer)）。未設定なら HTTP を出さずに案内を返します。**抄録は返らない**ので書誌のみです。利用目的に当たるかの判断は利用者に委ねます（[ウェブAPI利用細則](https://support.nii.ac.jp/sites/default/files/cinii/webapi-term.pdf) 第3条は利用目的を学術研究／非営利の情報利活用に限定し、第5条は appid の第三者貸与・譲渡を禁じています）。
-- **第6段階：プログラミング・標準 / 科学（5ソース）** — 「log4j-core の脆弱性を調べて」（osv）／「RFC 9110 の概要を教えて」（ietf）／「ヒッグス粒子の論文を INSPIRE-HEP で探して」（inspirehep）／「Fibonacci 数列を OEIS で調べて」（oeis）／「Llama のモデルを Hugging Face で探して」（hfhub）。すべて既定 off の明示指定で、キーは不要です。**2026-10-05 の方針変更で、対象を科学（物理・数学・計算機）とプログラミングまでに絞り、医学・生物学は対象外としました**（第6段階で採った生命・医学系 9 ソース＝europepmc / uniprot / chembl / pdb / quickgo / reactome / clinicaltrials / openfda / gbif は削除。SPEC §6.9）。
+- **第6段階：プログラミング・標準 / 科学（5ソース）** — 「log4j-core の脆弱性を調べて」（osv）／「RFC 9110 の概要を教えて」（ietf）／「ヒッグス粒子の論文を INSPIRE-HEP で探して」（inspirehep）／「Fibonacci 数列を OEIS で調べて」（oeis）／「Llama のモデルを Hugging Face で探して」（hfhub）。すべて既定 off の明示指定で、キーは不要です。対象は科学（物理・数学・計算機）とプログラミングまでです（医学・生物学は対象外）。
 - **第7段階：プログラミング特化（3ソース）** — 「Rust の所有権について Hacker News の議論を探して」（hn）／「cargo が Software Heritage に保存されているか調べて」（swh）／「JSON スキーマ検証のパッケージを横断検索して」（librariesio）。hn / swh はキー不要、librariesio は**利用者自身の無料 API キー**（`FREEAGENT_LIBRARIESIO_KEY`）が必要です。SPEC §6.10。
-- **保留中の候補（2026-10-04 に公式文書で再確認。いずれも登録しません）** — J-STAGE（非営利は申請不要だが「Powered by J-STAGE」表示・24時間以上のキャッシュ禁止・利用者への規約表示が義務。応答は書誌のみで Crossref と重複）、CORE（T&C §3 が検索・探索・API 機能に関わる製品は連絡が必要と明記）、Stack Exchange（AUP が AI 開発/テスト向けの自動取得に事前の書面許諾を要求）、HAL（非商用条項が曖昧）、Semantic Scholar（匿名は429頻発。キーの利用条件が明示された文書を確認できない）。既定offだけでは利用許諾にならないため、まだ登録しません。条項レベルの根拠は SPEC §6.6。CiNii は**利用者自身の appid がある場合だけ動く明示ソース**として実装済みです（第5段階・SPEC §6.7）。
-- **日本のオープンデータ系（2026-10-04 に評価。未実装）** — **採用候補**: e-Gov データポータル（= DATA GO JP。キー不要・実測 0.46 秒・PDL1.0）、データカタログ横断検索システム search.ckan.jp（NII・自治体を横断。実測 0.1 秒・規約は要確認）、e-Stat（appid 必須・統計表メタデータに限定）。**見送り**: 東京都オープンデータAPI（apiId 直引きのみで検索 API が無い）、opendataapi.jp（非公認・α版・小規模）、BODIK ODCS / odp.jig.jp / data eye / Open data stack / LinkData（有償・非公認・API 非公開）。根拠は SPEC §6.8。
 
 ツールへ渡す引数の例（端末コマンドではありません）:
 
@@ -577,7 +575,7 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 {"query":"language model hallucination","sources":["datacite"],"datacite_kind":"arxiv","limit":2}
 // 研究データを検索（Dataset型でも品質を保証しません）
 {"query":"graphene","sources":["datacite"],"datacite_kind":"dataset","limit":2}
-// 分野横断検索（生命科学系 europepmc は 2026-10-05 の方針変更で削除）
+// 分野横断検索
 {"query":"CRISPR gene editing","sources":["openaire"],"limit":2}
 // 公開研究成果のメタデータ（ファイルは取得しません）
 {"query":"graphene","sources":["zenodo"],"limit":2}
@@ -654,24 +652,22 @@ agentは後のステップで未注入の出典を読ませた場合だけ、そ
 機関候補が2件出ても、両者を同じ機関と決める結果ではありません。
 Zenodoも説明のない結果には、ファイルを読んだかのような本文を補いません。
 
-実stdio経路での第1/第2段階の出力（2026-10-01、`CRISPR gene editing`・各2件、題名の行は省略。
-**europepmc は 2026-10-05 の方針変更で削除済み**。下記は当時の実測のまま残す）:
+実stdio経路での第1/第2段階の出力（2026-10-06、`large language model`・各2件、題名の行は省略）:
 
 ```text
-出典 6 件（datacite, openaire, europepmc）   ← 当時の実測
-  ✓ datacite (2 件・1.4 秒)
-  ✓ openaire (2 件・1.8 秒)
+出典 4 件（datacite, openaire）
+  ✓ datacite (2 件・1.7 秒)
+  ✓ openaire (2 件・1.9 秒)
       データ提供: OpenAIRE（CC-BY） https://graph.openaire.eu/
-  ✓ europepmc (2 件・3.0 秒)   ← 現在は削除済み
 ```
 
-この回は取得6件中5件に本文があり、締切脱落・代替切替は発生しませんでした。
+この回は取得4件中3件に本文があり、締切脱落・代替切替は発生しませんでした。
 データセット検索も実stdioで2件・1.59秒、本文2件を確認しました。
 第3段階の実stdio検証（同日、`CERN`、各2件）ではZenodoが2.33秒、RORが0.87秒、取得4件中3件に根拠テキストがありました。
 これは第1/第2段階の速度とは異なる問いのスポット計測です。
 第4段階の実stdio検証（2026-10-02）: DOAJ 0.38秒（`transformer attention mechanism`・抄録2件）、
 npm 0.34秒（`json schema validator`・説明2件）、crates.io 0.78秒（`async http client`・説明2件）。
-第6段階の実stdio検証（2026-10-05、各2件。生命・医学系は同日の方針変更で削除）: osv 0.92秒 /
+第6段階の実stdio検証（2026-10-05、各2件）: osv 0.92秒 /
 ietf 0.63秒（`RFC 9110`）/ inspirehep 0.86秒 / oeis 1.29秒 / hfhub 0.28秒。
 第7段階の実stdio検証（2026-10-05、各2件）: hn 0.47〜0.5秒（`rust ownership`）/ swh 1.2秒（`kubernetes`）。
 librariesio はキー未設定なら検査・計測せずに外します。脱落したソースは取得が裏で続き、
@@ -731,11 +727,6 @@ python scripts/measure_kb.py --report
 [Libraries.io](https://libraries.io/terms)（**利用者自身の無料APIキーが必要**・60 req/min。§6.10）。
 
 リンク先全文・パッケージ本体の利用条件はメタデータの条件とは別です。
-元候補の保留根拠（条項レベルは SPEC §6.6）:
-[J-STAGE WebAPI 利用規約](https://www.jstage.jst.go.jp/static/pages/WebAPI/-char/ja)（第3条1・5、第9条） /
-[CiNii ウェブAPI利用細則](https://support.nii.ac.jp/sites/default/files/cinii/webapi-term.pdf)（第3〜5条） /
-[CORE T&C](https://core.ac.uk/terms)（§3） /
-[Stack Exchange AUP](https://stackoverflow.com/legal/acceptable-use-policy)（AI開発/テスト向け自動取得の事前書面許諾）。
 
 ### 遅いソースは締め切りで区切る
 
