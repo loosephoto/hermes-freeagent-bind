@@ -212,13 +212,18 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     場合は schema コストに見合わない）。
 
 34. **無料一覧の非チャットモデルは自動選抜から外す**（§3.2）。無料一覧には埋め込み・ガード/安全分類器・
-    画像/音声生成・OCR が混ざる（実測: Free 102 件中 29 件＝約 28%。`openrouter/google/lyria-3-*` は音楽生成、
+    画像/音声生成・OCR が混ざる（実測: Free 102 件中 30 件＝約 29%。`openrouter/google/lyria-3-*` は音楽生成、
     NVIDIA の `embed` / `guard` / `vision` / `parse` / `reward` / `riva-translate` 等）。これらは選抜されると
-    1 回失敗して降格するまで枠と時間を浪費する（実測: `ok=0` のまま選ばれ続けた）。判定は**提供元が出力
-    モダリティを宣言していればそれを優先**し（OpenRouter の `architecture.output_modalities`）、宣言が無ければ
-    ID の**区切りに囲まれた語**だけで保守的に外す（`someembeddedmodel` のような部分一致で誤除外しない）。
-    **明示指定は在庫の全 Free で確認する**ので名指ししたモデルはこれまでどおり試す。`freeagent_models` は
-    `non_chat_candidates` に件数を出し、一覧では見えるままにする（黙って消さない）。
+    1 回失敗して降格するまで枠と時間を浪費する（実測: `ok=0` のまま選ばれ続けた）。目印は**2 群に分ける**。
+    **A 群（用途が対話でない: 埋め込み・再ランク・ガード/分類器・報酬・OCR/パース・音声認識）は出力
+    モダリティの宣言より優先**する — 宣言が答えるのは「テキストを出力するか」だけなので、宣言を優先すると
+    生きたガード/分類器が選抜に残り続ける（実測: `nvidia/nemotron-3.5-content-safety:free` は
+    `output_modalities: ["text"]` と宣言されるが、返るのは "User Safety: safe" という分類結果で、`think` の
+    検証者に選ばれて判定不能になった）。**B 群（視覚入出力・生成: `vision` / `vlm` / `lyria` / `diffusion` 等）は
+    宣言があればそちらを優先**する（`...-vision-instruct` は視覚入力の対話モデル）。宣言が無い一覧
+    （NVIDIA など）は両群の ID の**区切りに囲まれた語**だけで保守的に外す（`someembeddedmodel` のような
+    部分一致で誤除外しない）。**明示指定は在庫の全 Free で確認する**ので名指ししたモデルはこれまでどおり
+    試す。`freeagent_models` は `non_chat_candidates` に件数を出し、一覧では見えるままにする（黙って消さない）。
 
 ## ライセンス
 

@@ -6,12 +6,21 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud の 9 プロバイダ、検索は **15 ソース（既定6＋明示指定9）** に対応します。
+- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud の 9 プロバイダ、検索は **22 ソース（既定6＋明示指定16）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
+
+**対象分野は科学（物理・数学・計算機）とプログラミングです。医学・生物学は対象外です。**
 
 > **まず試すなら**：「出典つきで調べて」は知識検索、「この設計の弱点を別の AI にも聞いて」は相談です。
 > 検索や思考ノートの記録は、推論バックエンドがなくても使えます。別の AI に答えさせるには、
 > プロキシへの接続、または推論用 API キーが必要です。
+
+## この README の読み進め方
+
+- **初めて使う**：[できること](#できることできないこと) → [設定の4ステップ](#はじめに設定する) → [会話の例](#会話での頼み方)。
+- **検索先を選びたい**：[知識バックエンド](#知識バックエンド)。追加ソースは使いたいものだけ指定します。
+- **動かない・回答が少ない**：[つまずいたとき](#つまずいたとき) → [出力の読み方](#出力の読み方)。
+- **設定を調整したい**：[API キー](#api-キーの設定)・[環境変数](#環境変数)。詳細な引数や計測記録は折りたたんであります。
 
 ## 目次
 
@@ -34,6 +43,15 @@
 
 ## できること・できないこと
 
+このサーバーは **MCP（AI に外部の道具を追加する仕組み）**で Hermes に接続します。
+利用者が各ツールを直接操作するのではなく、会話を担当する AI が必要に応じて呼び出します。
+
+| この README での呼び方 | 意味 |
+|---|---|
+| メイン LLM | あなたと会話し、ツールを選び、最終回答をまとめる AI |
+| サブ LLM | メインから依頼を受けて答える別の AI モデル |
+| 知識検索 | 論文・百科事典・コード登録簿などから出典を取得する機能。検索自体にサブ LLM は使いません |
+
 | やりたいこと | できること | 注意点 |
 |---|---|---|
 | 設計案の見落としを探す | 同じ問いを複数のモデルに聞き、一致点・対立点を返す | 同じ誤りに賛成することもあります。多数決は正しさの保証ではありません |
@@ -48,6 +66,7 @@
 ## はじめに設定する
 
 必要なものは **Python 3.11 以上・Hermes Agent・このリポジトリのファイル**です。
+Hermes の準備がまだなら、先に[公式ドキュメント](https://hermes-agent.nousresearch.com/docs/)でインストールしてください。
 以下は **Bash / Git Bash 用**のコマンドです。`<…>` は自分の環境の値に置き換えてください。
 
 ### 1. リポジトリを取得する
@@ -77,13 +96,13 @@ hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_HARNESS hermes
 `FREEAGENT_HARNESS` は「Hermes から起動した」という目印です。なくても動きますが、判別不能のログが出ます。
 `hermes mcp add` は対話式なので、対話できない環境では上の `config set` を使ってください。
 
-### 3. 別の AI に相談するための接続を用意する
+### 3. 相談も使うなら、推論の接続を用意する
 
 **知識検索と、サブを呼ばない思考ノートだけなら、この手順は不要です。** 相談も使うなら、次のどちらかを用意します。
 
 - **Nous**：Hermes 側で Portal にログイン済みであることを確認し、別のターミナルで `hermes proxy start`。
   未ログインなら `hermes portal` でログインします。プロキシは動かしたままにします。
-- **OpenRouter / NVIDIA / Hugging Face**：使いたい提供元の API キーを設定します。
+- **API キーを使う方法**：OpenRouter / NVIDIA / Hugging Face など、使いたい提供元のキーを設定します。
   全部のキーを用意する必要はありません（[入手先と設定方法](#api-キーの設定)）。
 
 **別の提供元を使うなら、Nous プロキシの起動は必須ではありません。**
@@ -97,9 +116,16 @@ hermes mcp test freeagent-bind
 `Connected` と **11 tools** が出れば、サーバーの登録・接続は成功です。
 **これだけではモデルが回答できることまでは確認していません。** Hermes を再起動してから、会話で次を試してください。
 
+**まず検索を確認します（推論の接続は不要）。**
+
 ```text
 freeagent_lookup で「大規模言語モデル」を wikipedia と wikidata から調べて。
-次に freeagent_ask で「接続できました」と一言だけ答えさせて。
+```
+
+**手順3で相談用の接続を用意した場合だけ、モデルの実応答も確認します。**
+
+```text
+freeagent_ask で「接続できました」と一言だけ答えさせて。
 ```
 
 検索は成功するのに相談だけ失敗する場合は、プロキシ・キー・利用枠を確認します。
@@ -140,6 +166,9 @@ freeagent_think で、この設計案を手順に分解してから検討して�
 ```
 
 ## どのツールを使うか
+
+**まずは4つだけ覚えれば十分です。** 検索結果なら `lookup`、第二意見なら `ask`、
+複数の意見なら `panel`、検討の記録なら `think`。出典を渡して回答まで頼むなら `grounded` を使います。
 
 | 目的 | ツール | 使い分け |
 |---|---|---|
@@ -279,6 +308,11 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 
 ### 引数の一覧
 
+<details>
+<summary>上級者向け：思考ノートの引数を開く</summary>
+
+閲覧（`view=true`）以外では `thought` が必要です。通常はメイン LLM が設定します。
+
 | 目的 | 引数 |
 |---|---|
 | 基本 | `thought`（ステップの内容・必須）、`session_id`（続けるノート。省略すると新規）、`question`（解いている問い） |
@@ -294,11 +328,17 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 次の一手の提案（「未検証の仮説があります」「未決着の分岐が 2 本あります」など）は、画面の表示ではなく
 メイン LLM 向けの `structuredContent.suggestions` に入ります。
 
+</details>
+
 ---
 
 ## 出力の読み方
 
+**最初は「実際に答えた数」「失敗したモデルやソース」「出典 URL」を確認してください。**
+合意度や確信度が高くても、正しいと確認できたわけではありません。
+
 画面用の日本語は `content`、AI が読み取る詳細データは `structuredContent` に入ります。
+以下の項目名は、詳細なツール結果を確認するときの手引きです。
 
 ### モデル一覧は「利用候補」であって「生存保証」ではない
 
@@ -308,7 +348,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | `未設定 → 検索のみ` | 一覧は取れるが、推論用のキーがない | キーを入れた後に実際に回答できるか |
 | `到達不可` | 一覧を取得できない。理由を表示する | 「モデルが存在しない」とは限らない |
 | `Free候補` / `usable_now`（今すぐ使用可） | キーなどの条件を満たす**サブLLM に使える**候補数。`usable_now` はクールダウン中を除いた数 | **未検証モデルを含むため、実際に答えられる数ではない** |
-| `non_chat_candidates` | 埋め込み・ガード/安全分類器・画像/音声生成など、サブLLM に使えないモデルの件数 | 自動選抜からは外れるが、一覧には表示する（実測: Free 102 件中 29 件） |
+| `non_chat_candidates` | 埋め込み・ガード/安全分類器・画像/音声生成など、サブLLM に使えないモデルの件数 | 自動選抜からは外れるが、一覧には表示する（実測: Free 102 件中 30 件） |
 | `probe=alive` | 生存確認で実際に回答した | 次の呼び出しでも成功するとは限らない |
 
 生存確認は会話で「Free 候補を少数だけ `probe=true` で確認して」と頼めます。
@@ -380,9 +420,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
   `FREEAGENT_READ_TIMEOUT` を上げてください。
 - **`connect_timeout`（MCP 起動時の上限）とは別の設定です。**
 
-回帰テスト（`tests/test_audit_regressions.py` の `TestHttpTimeoutSeparation`）が localhost の遅延サーバで、
-接続上限 0.25 秒でもヘッダ遅延 0.8 秒の応答を取得できること・読み取り上限では打ち切られること・
-接続できないホストは接続上限内で失敗すること・302 を追うこと・4xx が `HTTPError` になることを検査します。
+実装と回帰テストの詳細は [SPEC.md](SPEC.md) の「5. 呼び出し」にあります。
 
 ### 失敗の後に同じ呼び出しを繰り返さない
 
@@ -410,6 +448,9 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 反論＋別案を付けた回は約 24 秒で、提案者 2 体のうち 1 体がタイムアウトしました。
 速度の保証や、現在のモデル全体の性能評価ではありません。
 
+<details>
+<summary>開発者向け：過去の起動時間・ツール定義サイズの計測記録</summary>
+
 バックエンド拡張時のローカル実測（2026-10-02、同一Python、各7回の中央値。
 起動〜initialize〜tools/list〜終了を含むため、起動単体の保証値ではありません）:
 
@@ -434,12 +475,16 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 
 検索APIの追加は推論モデルの能力を増やしません。ツールスキーマの増加もメインLLMの入力負担になります。
 
+</details>
+
 ## API キーの設定
 
 **キーは「推論（サブ LLM）用」と「知識検索用」の 2 系統に分かれます。** 使う提供元だけ設定してください。
 キーがあること、モデル一覧が見えること、実際に推論できることは別です。
 
 ### 推論バックエンド（サブ LLM）の接続
+
+**全社の設定は不要です。** Nous のプロキシか、既に利用できる提供元を1つ選んで始めてください。
 
 別の AI に答えさせる機能（`ask` / `panel` / `consult` / `grounded` / `agent` / `map` / `fanout`、
 `think` の `verify` / `propose_alternatives`）で使います。**9 プロバイダのうち、使うものを 1 つ以上**用意します。
@@ -450,6 +495,14 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | **OpenRouter** | `OPENROUTER_API_KEY` | [API Keys](https://openrouter.ai/settings/keys)。`:free` モデルでもキーは必須。レート制限・モデル単位の拒否があります |
 | **NVIDIA NIM** | `NVIDIA_API_KEY` | [NVIDIA Build](https://build.nvidia.com)。一覧に未有効・廃止モデルが混じるため生存確認を推奨 |
 | **Hugging Face** | `HF_TOKEN` | [Access Tokens](https://huggingface.co/settings/tokens)。**Make calls to Inference Providers** 権限と月次クレジット残が必要 |
+
+<details>
+<summary>追加の5プロバイダ：無料プランの確認が必要な接続先</summary>
+
+API キーに加えて、契約プランやデータの扱いを確認したことを示す環境変数が必要です。
+
+| プロバイダ | 必要なもの | 入手先・注意点 |
+|---|---|---|
 | **Groq** | `GROQ_API_KEY` と `FREEAGENT_GROQ_FREE_TIER=1` | [API Keys](https://console.groq.com/keys)。Free tier契約を利用者が確認した場合だけ有効。Free対象モデルIDを限定し、Developer tierは従量課金なのでプラン変更時は確認変数を解除してください |
 | **Cloudflare Workers AI** | `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`、`FREEAGENT_CLOUDFLARE_FREE_PLAN=1` | [API Tokens](https://dash.cloudflare.com/profile/api-tokens)。Workers **Free** planの利用者向け。10,000 Neurons/日の共有枠を超えるとFreeでは停止しますが、Workers Paidでは超過分が課金されます。CloudflareはCustomer Contentをモデル学習・サービス改善に使わないとしています（別途ストレージ連携時は保存の可能性あり）。Paid planなら確認変数を設定しないでください |
 | **Gemini Developer API** | `GEMINI_API_KEY`（別名 `GOOGLE_API_KEY`）と2つの確認変数 | [Google AI Studio API key](https://aistudio.google.com/apikey)。Free/unpaid tierの入力・出力は製品改善や人手レビューに使われる場合があります。**機密・個人情報は送らず**、Free tierとデータ用途を確認した場合だけ有効にしてください |
@@ -459,19 +512,22 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 - Groq / Cloudflare / Gemini / Vercel / Ollama は、確認変数がそろうまでモデル一覧取得も推論も行いません。これは契約プランをAPIから検証する仕組みではなく、利用者の明示確認です。プランやBilling設定を変更したら、確認変数を解除して再確認してください。
 - Groq / Cloudflare / Gemini / Vercel はコード側のFreeモデル許可リストに含まれるIDだけを呼び出し、明示指定でも有料・未許可モデルを拒否します。
 - Ollama は無料対象の範囲が非公開でAPIから判定できないため許可リストを作らず、クレジット枠として扱います。**対象外のモデルは提供元が 402 を返し**、フォールバックします（モデルの失敗としては記録しません）。Vercel も同様に、無料対象はカタログのごく一部です。Free枠・モデルの提供条件は変更されるため、最新の提供元ページも確認してください。
-- 全プロバイダ未設定でも、知識検索と思考ノート（サブを呼ばない範囲）は使えます。
+</details>
+
+全プロバイダ未設定でも、知識検索と思考ノート（サブを呼ばない範囲）は使えます。
 
 ### 知識検索（検索ソース）のキー
 
-検索は**基本的にキー不要**です。以下は任意ですが、設定すると安定・高速になります。
+検索は**基本的にキー不要**です。OpenAlex と GitHub は設定を推奨し、
+**CiNii と Libraries.io は利用者自身のキーが必須**です。GitHub のコード検索にもトークンが必要です。
 
 | 変数 | 対象ソース | 効果・注意点 |
 |---|---|---|
 | `OPENALEX_API_KEY` | openalex | 匿名検索が提供元側で止められることがあり（実測 503/429）、キーで回避。[API 設定](https://openalex.org/settings/api) |
 | `GITHUB_TOKEN` / `GH_TOKEN` | github | コード検索は必須。枠はエンドポイント別（認証あり: リポジトリ / Issue 30 req/分・コード 10 req/分。未認証はどちらも 10 req/分） |
 | `FREEAGENT_MAILTO` | crossref / openalex / datacite | キーではなく連絡先。polite pool に入り安定します |
-| `FREEAGENT_CINII_APPID` | cinii | **このソースだけは必須**。CiNii Research の[利用登録](https://support.nii.ac.jp/ja/cinii/api/developer)で取得したアプリケーションID。未設定なら cinii は HTTP を出さず、登録先を案内します |
-| `FREEAGENT_LIBRARIESIO_KEY` | librariesio | **このソースだけは必須**。[Libraries.io](https://libraries.io/account)の無料アカウントで取得する API キー。未設定なら librariesio は HTTP を出さず、登録先を案内します（60 req/分） |
+| `FREEAGENT_CINII_APPID` | cinii | **このソースを使う場合は必須**。CiNii Research の[利用登録](https://support.nii.ac.jp/ja/cinii/api/developer)で取得したアプリケーションID。未設定なら cinii は HTTP を出さず、登録先を案内します |
+| `FREEAGENT_LIBRARIESIO_KEY` | librariesio | **このソースを使う場合は必須**。[Libraries.io](https://libraries.io/account)の無料アカウントで取得する API キー。未設定なら librariesio は HTTP を出さず、登録先を案内します（60 req/分） |
 
 wikipedia / wikidata / arxiv / doaj / npm / crates / openaire / zenodo / ror /
 osv / ietf / inspirehep / oeis / hfhub / hn / swh はキー不要・匿名で使えます。
@@ -490,7 +546,16 @@ osv / ietf / inspirehep / oeis / hfhub / hn / swh はキー不要・匿名で使
 hermes config set mcp_servers.freeagent-bind.env.OPENROUTER_API_KEY '${OPENROUTER_API_KEY}'
 hermes config set mcp_servers.freeagent-bind.env.NVIDIA_API_KEY '${NVIDIA_API_KEY}'
 hermes config set mcp_servers.freeagent-bind.env.HF_TOKEN '${HF_TOKEN}'
-# 以下は任意。キーだけでは有効化されず、プラン/データ条件の確認後に確認変数を設定します。
+```
+
+<details>
+<summary>追加プロバイダと検索キーの設定例を開く</summary>
+
+**使う提供元の行だけ設定してください。** 以下の `1` は利用者による条件確認です。
+確認していないプランやデータ条件を、例のまま有効化しないでください。
+
+```bash
+# キーだけでは有効化されず、プラン/データ条件の確認後に確認変数を設定します。
 hermes config set mcp_servers.freeagent-bind.env.GROQ_API_KEY '${GROQ_API_KEY}'
 hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_GROQ_FREE_TIER '1'
 hermes config set mcp_servers.freeagent-bind.env.CLOUDFLARE_API_TOKEN '${CLOUDFLARE_API_TOKEN}'
@@ -499,12 +564,19 @@ hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_CLOUDFLARE_FREE_PLAN 
 hermes config set mcp_servers.freeagent-bind.env.GEMINI_API_KEY '${GEMINI_API_KEY}'
 hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_GEMINI_FREE_TIER '1'
 hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_GEMINI_UNPAID_DATA_ACK '1'
+hermes config set mcp_servers.freeagent-bind.env.AI_GATEWAY_API_KEY '${AI_GATEWAY_API_KEY}'
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_VERCEL_FREE_TIER '1'
+hermes config set mcp_servers.freeagent-bind.env.OLLAMA_API_KEY '${OLLAMA_API_KEY}'
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_OLLAMA_FREE_PLAN '1'
 hermes config set mcp_servers.freeagent-bind.env.OPENALEX_API_KEY '${OPENALEX_API_KEY}'
 hermes config set mcp_servers.freeagent-bind.env.GITHUB_TOKEN '${GITHUB_TOKEN}'
 hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_MAILTO 'you@example.com'
 # CiNii を使う場合のみ。値は自分の appid（他人と共有しない）
 hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_CINII_APPID '<appid>'
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_LIBRARIESIO_KEY '${FREEAGENT_LIBRARIESIO_KEY}'
 ```
+
+</details>
 
 キーを直接 `env` に設定する方法もありますが、設定ファイルとシェル履歴に残る可能性があります。
 **キーをチャットに貼ったり、リポジトリへコミットしたりしないでください。** 変更後は Hermes を再起動します。
@@ -528,6 +600,19 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 
 ## 知識バックエンド
 
+**検索先は22ソースです。何も指定しなければ既定の6ソースだけを使います。**
+`sources` を指定すると、指定したソースだけを検索します（既定の6ソースに追加されるのではありません）。
+
+- **論文を探す**：arxiv / crossref / openalex。日本語文献の書誌なら cinii。
+- **パッケージを探す**：npm / crates / librariesio。脆弱性なら osv。
+- **標準・専門情報を調べる**：ietf（RFC）、inspirehep（素粒子物理）、oeis（整数列）、hfhub（MLモデル）。
+- **研究データや機関を探す**：datacite / zenodo / ror。
+- **開発者の議論・アーカイブを探す**：hn / swh。
+
+本文ではなく書誌情報だけの結果もあります。**取得した説明や抄録を読む機能であり、原典の全文を取得する機能ではありません。**
+
+### 既定の6ソース
+
 | ソース名 | 取得するもの | 注意点 |
 |---|---|---|
 | `wikipedia` | 検索結果と記事の導入部 | `lang` は既定 `ja`。英語記事なら `en` を指定 |
@@ -536,6 +621,13 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `crossref` | DOI・論文のメタデータ・公開されているアブストラクト | アブストラクトがない論文もあります |
 | `openalex` | 論文のメタデータ・被引用数・アブストラクト | 匿名検索の制限あり。API キーを推奨 |
 | `github` | リポジトリ / Issue / コードの検索結果。コード検索は一致箇所の**断片**（`snippet`）も返す | コード検索はトークン必須（10 req/分）。**ライセンス情報を含まない**ので取り込み前に確認 |
+
+### 明示指定で使う16ソース
+
+通常の検索には自動で追加されません。表の名前を会話で指定してください。
+
+| ソース名 | 取得するもの | 注意点 |
+|---|---|---|
 | `datacite`（明示指定） | DOIメタデータ・抄録、研究データ | `datacite_kind`: `all` / `arxiv` / `dataset`。各語を引用したAND検索＋関連度順 |
 | `openaire`（明示指定） | Graph V3の論文書誌・抄録・掲載先 | 匿名API。60.1秒間隔で制御。抄録欠落あり、OpenAIREのクレジットを表示 |
 | `zenodo`（明示指定） | 研究データ・ソフトウェア・論文等の公開メタデータ | 説明・注記を取得。全文/ファイルは取得しない。メタデータCC0とファイル条件を分離 |
@@ -558,15 +650,32 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 `limit` は**各ソースの上限**です。全体の結果は重複除去などで減るので、合計件数を保証する値ではありません。
 本文という場合も、取得できた説明・導入部・アブストラクトを指します。原典の全文とは限りません。
 
-### 段階的に追加した検索を使う
+### 目的別の頼み方
 
-- **第1段階：DataCite** — 「arXiv論文をDataCiteから探して」「その研究に使えるデータセットを探して」。
-- **第2段階：OpenAIRE** — 「OpenAIREでも論文を探して」。分野横断の論文メタデータを引きます。
-- **第3段階：Zenodo / ROR** — 「Zenodoでグラフェンの研究データを探して」「RORでCERNの機関候補を探して」。公開メタデータだけを使います。
-- **第4段階：DOAJ / npm / crates.io** — 「DOAJでオープンアクセス論文を探して」「npmでJSONスキーマ検証のパッケージを探して」「crates.ioで非同期HTTPクライアントを探して」。DOAJは科学系、npm / crates.ioはプログラミング系の検索を広げます。
-- **第5段階：CiNii Research（appid 必須）** — 「CiNiiで日本語の論文を探して」。日本語文献の書誌を引きます。**利用者自身が取得したアプリケーションID**を `FREEAGENT_CINII_APPID` に設定したときだけ動きます（取得: [CiNiiウェブAPI デベロッパー登録](https://support.nii.ac.jp/ja/cinii/api/developer)）。未設定なら HTTP を出さずに案内を返します。**抄録は返らない**ので書誌のみです。利用目的に当たるかの判断は利用者に委ねます（[ウェブAPI利用細則](https://support.nii.ac.jp/sites/default/files/cinii/webapi-term.pdf) 第3条は利用目的を学術研究／非営利の情報利活用に限定し、第5条は appid の第三者貸与・譲渡を禁じています）。
-- **第6段階：プログラミング・標準 / 科学（5ソース）** — 「log4j-core の脆弱性を調べて」（osv）／「RFC 9110 の概要を教えて」（ietf）／「ヒッグス粒子の論文を INSPIRE-HEP で探して」（inspirehep）／「Fibonacci 数列を OEIS で調べて」（oeis）／「Llama のモデルを Hugging Face で探して」（hfhub）。すべて既定 off の明示指定で、キーは不要です。対象は科学（物理・数学・計算機）とプログラミングまでです（医学・生物学は対象外）。
-- **第7段階：プログラミング特化（3ソース）** — 「Rust の所有権について Hacker News の議論を探して」（hn）／「cargo が Software Heritage に保存されているか調べて」（swh）／「JSON スキーマ検証のパッケージを横断検索して」（librariesio）。hn / swh はキー不要、librariesio は**利用者自身の無料 API キー**（`FREEAGENT_LIBRARIESIO_KEY`）が必要です。SPEC §6.10。
+以下は会話へ入力する例です。最初に「`freeagent_lookup` で」と添えると、検索だけを頼めます。
+
+| 目的 | 頼み方の例 | ソース名 |
+|---|---|---|
+| 論文検索を広げる | 「量子計算の論文を DataCite と OpenAIRE から探して」 | `datacite`, `openaire` |
+| オープンアクセス論文を探す | 「DOAJ で Transformer の論文を探して」 | `doaj` |
+| 研究データを探す | 「DataCite の dataset モードと Zenodo でグラフェンの研究データを探して」 | `datacite`, `zenodo` |
+| 研究機関を調べる | 「ROR で CERN の機関候補を探して」 | `ror` |
+| 日本語文献を探す | 「CiNii で圧電材料の文献を探して。書誌情報だけでよい」 | `cinii`（appid 必須） |
+| パッケージを探す | 「npm と crates.io で JSON スキーマ検証のパッケージを探して」 | `npm`, `crates` |
+| 登録簿を横断検索する | 「Libraries.io で JSON スキーマ検証のパッケージを探して」 | `librariesio`（キー必須） |
+| 既知の脆弱性を調べる | 「OSV で jinja2 の既知脆弱性を調べて」 | `osv` |
+| 標準文書を調べる | 「IETF で RFC 9110 の概要を調べて」 | `ietf` |
+| 物理・数学・ML を調べる | 「INSPIRE-HEP でヒッグス粒子の論文を」「OEIS で Fibonacci 数列を」「HF Hub で Llama を探して」 | `inspirehep`, `oeis`, `hfhub` |
+| 開発者の議論を探す | 「Hacker News で Rust の所有権についての議論を探して」 | `hn` |
+| アーカイブの存在を調べる | 「Software Heritage に cargo のリポジトリがあるか調べて」 | `swh` |
+
+**CiNii の利用目的は学術研究／非営利の情報利活用に限定され、appid の貸与・譲渡は禁止です。**
+自分の利用が条件を満たすか確認してから設定してください
+（[利用細則](https://support.nii.ac.jp/sites/default/files/cinii/webapi-term.pdf)・[登録先](https://support.nii.ac.jp/ja/cinii/api/developer)）。
+Zenodo は非軍事用途に限ります。各ソースの帰属表示と利用条件も守ってください。
+
+<details>
+<summary>上級者向け：検索引数・代替取得・引用の扱い</summary>
 
 ツールへ渡す引数の例（端末コマンドではありません）:
 
@@ -576,7 +685,7 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 // 研究データを検索（Dataset型でも品質を保証しません）
 {"query":"graphene","sources":["datacite"],"datacite_kind":"dataset","limit":2}
 // 分野横断検索
-{"query":"CRISPR gene editing","sources":["openaire"],"limit":2}
+{"query":"quantum computing","sources":["openaire"],"limit":2}
 // 公開研究成果のメタデータ（ファイルは取得しません）
 {"query":"graphene","sources":["zenodo"],"limit":2}
 // 研究機関の候補（論文抄録ではありません）
@@ -633,6 +742,11 @@ agentの番号登録・返却でもDOIを優先し、同じURLの異なる版を
 `injected_citations`が注入済み番号、groundedの`evidence_citation_count`が実際の本文根拠数です。
 agentは後のステップで未注入の出典を読ませた場合だけ、その番号を有効にします。
 **同じ論文の別配信元は独立した裏付けではありません**。版の異なるDOIは勝手に統合しません。
+
+</details>
+
+<details>
+<summary>検索の実出力・過去の速度計測・API利用条件を確認する</summary>
 
 第3段階の実stdio出力（2026-10-01、`CERN`・各2件。下記は実取得の表示）:
 
@@ -727,6 +841,8 @@ python scripts/measure_kb.py --report
 [Libraries.io](https://libraries.io/terms)（**利用者自身の無料APIキーが必要**・60 req/min。§6.10）。
 
 リンク先全文・パッケージ本体の利用条件はメタデータの条件とは別です。
+
+</details>
 
 ### 遅いソースは締め切りで区切る
 
@@ -885,6 +1001,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `OPENALEX_API_KEY` | 空 | OpenAlex の検索。無いと匿名検索が停止されうる |
 | `GITHUB_TOKEN` / `GH_TOKEN` | 空 | GitHub のレート制限緩和（コード検索は必須） |
 | `FREEAGENT_MAILTO` | 空 | Crossref / OpenAlex / DataCite の polite pool 用メールアドレス（キーではない） |
+| `FREEAGENT_LIBRARIESIO_KEY` | 空 | Libraries.io の検索。利用者自身の API キーが必須 |
 
 **接続先の上書き（通常は触らない）**
 
@@ -917,7 +1034,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 ## Hermes 以外で使うとき
 
 Claude Code などの MCP クライアントからも stdio で使えます。ただし既定の `nous` は Hermes のプロキシが必要です。
-Hermes がない環境では OpenRouter / NVIDIA / Hugging Face のキーを使います。
+Hermes がない環境では API キーを使う提供元を選びます（[必要なキー・条件](#api-キーの設定)）。
 `SOUL.md`・`apply_proactive.py` による自動利用設定は Hermes 専用です。
 
 起動元は `FREEAGENT_HARNESS` とクライアントの名乗りから判定します。

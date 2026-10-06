@@ -975,6 +975,18 @@ class TestChatModelSelection(unittest.TestCase):
         # 目印は「区切りに囲まれた語」だけに当てる（部分文字列の誤除外を避ける）。
         self.assertTrue(S.is_chat_model("nvidia", {"id": "org/someembeddedmodel"}))
 
+    def test_purpose_markers_beat_a_text_declaration(self):
+        # 実測: OpenRouter は `nvidia/nemotron-3.5-content-safety:free` を output_modalities: ["text"]
+        # と宣言する（テキストを返すため）が、実際に返るのは "User Safety: safe" という分類結果で、
+        # think の検証者に選ばれると判定不能になった。用途が対話でない目印は宣言より優先する。
+        for model in ("nvidia/nemotron-3.5-content-safety:free", "nvidia/nemotron-3.5-content-safety",
+                      "meta-llama/llama-guard-4-12b", "nvidia/nemotron-parse",
+                      "openai/whisper-large-v3", "nvidia/nemotron-4-340b-reward"):
+            self.assertFalse(S.is_chat_model("openrouter", {"id": model, "architecture": {"output_modalities": ["text"]}}), model)
+        # 視覚入力の対話モデルは宣言どおり残す（宣言が勝つ目印は B 群に分けてある）。
+        for model in ("meta/llama-3.2-11b-vision-instruct", "qwen/qwen2.5-vl-72b-instruct"):
+            self.assertTrue(S.is_chat_model("openrouter", {"id": model, "architecture": {"output_modalities": ["text"]}}), model)
+
     def test_auto_pool_excludes_non_chat_but_explicit_kept(self):
         full = ["p/chat1", "p/embed-x", "p/chat2"]
         chatty = ["p/chat1", "p/chat2"]

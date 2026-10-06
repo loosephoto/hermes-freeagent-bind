@@ -1569,22 +1569,38 @@ def _provider_catalog_rows(provider: str, data) -> list:
 # 3 割が埋め込み・ガード/安全分類器・画像/音声生成・OCR。OpenRouter の `:free` にも音楽生成の
 # `google/lyria-3-*` が入る）。これらは選抜されると 1 回失敗して降格するまで枠と時間を浪費する
 # （実測: `openrouter/stealth/space-bunny-alpha` 等が空応答・`err:other` を重ね、`ok=0` のまま
-# 選ばれ続けた）。**提供元が出力モダリティを宣言していればそれで判定**し（OpenRouter の
-# `architecture.output_modalities`。音声・画像を出力するものはテキスト対話に使えない）、
-# 宣言が無い一覧（NVIDIA など）は ID の目印で**保守的に**外す。判定は一覧の行に `chat` として載せ、
-# 自動選抜とフォールバック（`free_model_refs(chat_only=True)`）だけに効かせる。**明示指定は在庫の
-# 全 Free で確認する**ので、呼び出し側が名指ししたモデルはこれまでどおり試す。`freeagent_models` では
-# 非チャットも**見えるまま**にして件数を出す（黙って消さない）。誤除外を避けるため、目印は
+# 選ばれ続けた）。判定は一覧の行に `chat` として載せ、自動選抜とフォールバック
+# （`free_model_refs(chat_only=True)`）だけに効かせる。**明示指定は在庫の全 Free で確認する**ので、
+# 呼び出し側が名指ししたモデルはこれまでどおり試す。`freeagent_models` では非チャットも
+# **見えるまま**にして件数を出す（黙って消さない）。誤除外を避けるため、目印は
 # 「モデル ID の区切りに囲まれた語」だけに当てる。
+#
+# 目印は**2 群に分ける**。提供元の出力モダリティ宣言（OpenRouter の `architecture.output_modalities`）
+# は**テキストを出力するか**しか答えないので、A 群（用途が対話でない）には効かない。
+#   実測: OpenRouter は `nvidia/nemotron-3.5-content-safety:free` を `output_modalities: ["text"]` と
+#   宣言する（実際テキストを返すため）が、返るのは "User Safety: safe" という**分類結果**で、
+#   `freeagent_think` の検証者に選ばれると判定不能になった（もう 1 体も空応答で脱落し、
+#   反証が 1 件も得られなかった）。宣言を優先すると、生きたガード/分類器が選抜に残り続ける。
 
-_NON_CHAT_ID_RE = re.compile(
+# A: **用途が対話でないと確定する**目印。出力モダリティが `["text"]` と宣言されていても外す
+#    （埋め込み・再ランク・ガード/安全分類器・報酬・OCR/パース・音声認識は、テキストを出力しても
+#    テキスト対話の相手にはならない）。
+_NON_CHAT_PURPOSE_RE = re.compile(
     r"(?:^|[-/_.])("
-    r"embed|embedqa|embedding|rerank|reranker|nemoretriever|arctic-embed|"
+    r"embed|embedqa|embedding|arctic-embed|rerank|reranker|nemoretriever|"
     r"guard|nemoguard|content-safety|topic-control|safety|"
-    r"clip|nclip|nvclip|vision|vila|neva|kosmos|deplot|vlm|"
-    r"lyria|diffusion|video-detector|synthetic-video|"
     r"reward|parse|riva-translate|ising-calibration|"
-    r"whisper|tts|asr|stable-diffusion"
+    r"whisper|tts|asr"
+    r")(?:$|[-/_.:])",
+    re.IGNORECASE,
+)
+
+# B: **視覚入出力・生成**の目印。対話モデルにも付きうる（`...-vision-instruct` は視覚**入力**の
+#    対話モデル）ので、提供元が出力モダリティを宣言していればそちらを優先する。
+_NON_CHAT_OUTPUT_RE = re.compile(
+    r"(?:^|[-/_.])("
+    r"clip|nclip|nvclip|vision|vila|neva|kosmos|deplot|vlm|"
+    r"lyria|diffusion|video-detector|synthetic-video|stable-diffusion"
     r")(?:$|[-/_.:])",
     re.IGNORECASE,
 )
@@ -1606,11 +1622,18 @@ def _declared_output_modalities(raw: dict) -> list[str] | None:
 
 
 def is_chat_model(provider: str, raw: dict) -> bool:
-    """サブLLM（テキスト対話）に使えるモデルか。宣言があればモダリティで、無ければ ID の目印で判定する。"""
+    """サブLLM（テキスト対話）に使えるモデルか。
+
+    用途の目印（A 群）は出力モダリティの宣言より優先し、出力の形の目印（B 群）は提供元の宣言が
+    あればそれに従う。宣言が無い一覧（NVIDIA など）は両群の ID 目印で保守的に外す。
+    """
+    model_id = as_str(raw.get("id"))
+    if _NON_CHAT_PURPOSE_RE.search(model_id):
+        return False
     declared = _declared_output_modalities(raw)
     if declared is not None:
         return all(m == "text" for m in declared)
-    return not _NON_CHAT_ID_RE.search(as_str(raw.get("id")))
+    return not _NON_CHAT_OUTPUT_RE.search(model_id)
 
 
 def all_models(ttl: float = 600.0) -> list[dict]:
