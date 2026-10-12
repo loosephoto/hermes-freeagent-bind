@@ -225,6 +225,8 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     部分一致で誤除外しない）。**明示指定は在庫の全 Free で確認する**ので名指ししたモデルはこれまでどおり
     試す。`freeagent_models` は `non_chat_candidates` に件数を出し、一覧では見えるままにする（黙って消さない）。
 
+35. **変更内容（直近の更新内容）は README に書かず、リリース時に GitHub Releases へ記載する** — `README.md` / `SPEC.md` / `AGENTS.md` は「現行の仕様」を書く場所で、履歴は持たない。`pyproject.toml` の `version` を上げ、`vX.Y.Z` タグを打って同じ本文の Release を作成する（本文＝要約・変更点の箇条書き・検証行・`**Full Changelog**` リンク）。
+
 ## ライセンス
 
 MIT。データは各提供元の条件に従い、回答には出典を表示すること。
