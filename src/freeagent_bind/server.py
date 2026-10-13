@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """hermes-freeagent-bind — Hermes Agent の Free モデルをサブLLMとして並列に走らせ、
 外部知識（既定6ソース＋DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates / CiNii /
-OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Libraries.io）で
+OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Libraries.io /
+Internet Archive）で
 根拠づける MCP サーバー。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は
 対象外**（第6段階で採った生命・医学系ソースは 2026-10-05 に方針変更で削除。§5.19 に記録）。
 
@@ -18,7 +19,8 @@ OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Lib
   §3 プロバイダとモデル（§3.1 Free-tier provider guards / §3.2 チャット向けの選別）  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
                     §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR /
                     §5.16 DOAJ・npm・crates.io / §5.17 CiNii Research（appid 必須） / §5.18 プログラミング・標準 /
-                    §5.19 科学（医学・生物学は対象外） / §5.20 プログラミング特化: HN・Software Heritage・Libraries.io）
+                    §5.19 科学（医学・生物学は対象外） / §5.20 プログラミング特化: HN・Software Heritage・Libraries.io /
+                    §5.21 Internet Archive（明示指定のみ））
   §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号）
   §7 ツール定義         §8 表示（content）
   §8.5 失敗時の「次の一手」（structuredContent.next_action）
@@ -59,7 +61,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -4028,6 +4030,110 @@ KB_BACKENDS.update({"hn": lambda q, limit, opts: kb_hn(q, limit),
                     "swh": lambda q, limit, opts: kb_swh(q, limit),
                     "librariesio": lambda q, limit, opts: kb_librariesio(q, limit)})
 
+# ---------------------------------------------------------------- §5.21 第8段階: Internet Archive（明示指定のみ）
+#
+# 採用根拠（2026-10-13 の実測。科学・プログラミングの範囲を変えずに「当時の一次資料」を補う）:
+#   * メタデータ検索（`advancedsearch.php`）はキー不要で実測 0.44〜0.70 秒（5 回）。既存ソースと同じ
+#     「検索→引用」の形に収まり、8 秒の締め切りに余裕で載る。bitsavers（計算機マニュアル 91,403 件）や
+#     softwarelibrary のような**歴史的な計算機資料**を引ける（`title:(COBOL)` が IBM 360 のマニュアルを返す）。
+#   * **クエリは `title:(語 AND 語)` に組み直す**。実測で素の `q=FORTRAN manual` の 1 位は無関係な GitHub
+#     ミラーで、`sort[]=downloads desc` 単独も話題と無関係な人気作を混ぜた。フィールドを絞ると当たりが
+#     出る（CENFOR / DEC の FORTRAN IV マニュアル / TRS-80 Fortran-80 など）。
+#   * **CJK クエリは HTTP を出さずに断る**。実測で `日本語` / `京都` / `量子力学` / `title:日本語` /
+#     `日本 AND 歴史` は 10/10 で `{"error": "... [QUERY_NOT_READY] Query has not been finalized"}` を返し、
+#     同じ 10 回で英語クエリは 10/10 成功した（1 回だけ成功した観測もあるので恒久的な不可とは断定しない）。
+#     翻訳は**サーバーでやらない**（依存ゼロ・LLM 非介在が崩れる）。英語の語に直すのは呼び出し側の仕事で、
+#     その旨を `sources` の説明に書く（規約 5）。
+#   * **証拠の種類は `structured_record`**。IA の `description` は目録・アップロード者の注記であって
+#     抄録ではない（実測: 「Cover title Includes bibliographical references 31」）。本文は取得しない。
+#   * **見送り（実測）**: 全文検索 `be-api.us.archive.org/ia-pub-fts-api` は集計を毎回計算するため
+#     5.9〜25.1 秒（8 件中 3 件が 8 秒超）で、日本語は `total=0`。CDX は 5.4〜30 秒で URL 起点の API。
+#     SPN2（Save Page Now）と S3 アップロードは書き込みで利用者キーが前提。`inside.php` は OCR を持つ
+#     アイテムに限られ（`_abbyy.gz` を持つアイテムでも 0 件だった）、主要経路にはできない。
+#   * 利用条件: `robots.txt` の Disallow は `/control/` と `/report/` のみで `/advancedsearch.php` は許可。
+#     IA 自身が「Bots, LLMs, and Automated Access」で AI エージェントを含む自動アクセスに説明的な
+#     User-Agent と間隔・429 の尊重を求めている（数値レートは非公表 → 1 req/s で自粛する）。
+
+_IA_CJK = re.compile(r"[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]")
+IA_INTERVAL = 1.0                                  # IA は数値レートを公表していない（自粛の間隔）
+IA_SEARCH_BUDGET = "archive.org/advancedsearch"    # 同一ホストの metadata API と予算を分ける（規約 32）
+_IA_SORTS = ("downloads desc", "week desc", "publicdate desc", "title asc")
+
+
+def _ia_query(query: str) -> str:
+    """自然語を `title:(語 AND 語)` に組み直す。素の語だと順位が崩れる（実測）。"""
+    words = [word for word in re.split(r"\s+", query.strip()) if word]
+    if len(words) == 1:
+        return f"title:({words[0]})"
+    return "title:(" + " AND ".join(words) + ")"
+
+
+def kb_internetarchive(query: str, limit: int = 5, sort: str = "downloads desc") -> dict:
+    """Internet Archive のアイテム検索（メタデータのみ）。query は**英語の語**で指定する。"""
+    query = as_str(query)
+    limit = as_int(limit, 5, 1, 20)
+    sort = as_str(sort, "downloads desc")
+    if not query:
+        return {"source": "ia", "error": "query は必須です"}
+    if _IA_CJK.search(query):
+        return {"source": "ia", "items": [], "citations": [],
+                "error": "Internet Archive のメタデータ検索は日本語（CJK）クエリを受け付けません"
+                         "（実測 10/10 が QUERY_NOT_READY）。英語の語に直して指定してください"}
+    attribution = "データ提供: Internet Archive https://archive.org/（各アイテムの条件に従う）"
+
+    def produce() -> dict:
+        params = [("q", _ia_query(query)), ("rows", limit), ("page", 1), ("output", "json")]
+        for field in ("identifier", "title", "creator", "year", "mediatype", "description",
+                      "downloads", "licenseurl"):
+            params.append(("fl[]", field))
+        if sort in _IA_SORTS:
+            params.append(("sort[]", sort))
+        data, err = _kb_new_json("https://archive.org/advancedsearch.php?"
+                                 + urllib.parse.urlencode(params), IA_INTERVAL,
+                                 budget_key=IA_SEARCH_BUDGET)
+        if err:
+            return {"source": "ia", "error": err}
+        # 上流は構文エラーも QUERY_NOT_READY も **HTTP 200 で** {"error": "..."} として返す。
+        # 状態コードではなく応答の形で判定する（実測）。
+        if not isinstance(data, dict) or "response" not in data:
+            detail = as_str(data.get("error"))[:200] if isinstance(data, dict) else ""
+            return {"source": "ia", "items": [], "citations": [],
+                    "error": "Internet Archive の検索が失敗しました: " + (detail or "応答形式が不正です")}
+        response = data.get("response")
+        rows = response.get("docs") if isinstance(response, dict) else None
+        if not isinstance(rows, list):
+            return {"source": "ia", "error": "Internet Archive の応答形式が不正です"}
+        items = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                raise ValueError("Internet Archive の doc はオブジェクトではありません")
+            identifier, title = as_str(row.get("identifier")), as_str(row.get("title"))
+            if not identifier or not title:
+                continue
+            description = row.get("description")
+            if isinstance(description, list):
+                description = " ".join(as_str(part) for part in description)
+            creator = row.get("creator")
+            if isinstance(creator, list):
+                creator = ", ".join(as_str(part) for part in creator if as_str(part))
+            downloads = row.get("downloads")
+            mediatype, year = as_str(row.get("mediatype")), as_str(row.get("year"))
+            items.append({"title": _plain_text(title, 300),
+                          "url": "https://archive.org/details/" + urllib.parse.quote(identifier, safe=""),
+                          "summary": _plain_text(as_str(description), 600),
+                          "identifier": identifier, "kind": "archive-item",
+                          "summary_kind": "structured_record", "year": year, "container": mediatype,
+                          "extra": {"mediatype": mediatype, "creator": as_str(creator),
+                                    "downloads": downloads if type(downloads) is int else None,
+                                    "licenseurl": as_str(row.get("licenseurl"))}})
+        return _kb_generic_result("ia", items, attribution)
+
+    return _kb_new_cached(f"ia:{_ia_query(query)}:{limit}:{sort}", "ia", produce)
+
+
+SOURCES = (*SOURCES, "ia")
+KB_BACKENDS.update({"ia": lambda q, limit, opts: kb_internetarchive(q, limit)})
+
 
 # ================================================================ §6 ツール実装
 #
@@ -4057,7 +4163,7 @@ AGENT_SYSTEM = (
     "あなたは調査補佐です。次のいずれか**1つだけ**を JSON で出力してください。\n"
     '  ツールを使う: {"tool": "lookup", "query": "<検索語>", "sources": ["arxiv","crossref",...]}\n'
     '  使える source: wikipedia, wikidata, arxiv, crossref, openalex, github, datacite, openaire, zenodo, ror, doaj, npm, crates, cinii\n'
-    '  追加（明示指定のみ）: osv, ietf, inspirehep, oeis, hfhub, hn, swh, librariesio\n'
+    '  追加（明示指定のみ）: osv, ietf, inspirehep, oeis, hfhub, hn, swh, librariesio, ia\n'
     '  追加sourceは明示指定のみ。datacite_kind: all / arxiv / dataset。fallback: trueでarXivのDataCite代替を許可。\n'
     '  回答する:     {"answer": "<回答。使った根拠の番号 [n] を本文に書く>"}\n'
     "ツール結果は [1] [2] … の番号つきで返ります。回答では使った根拠の番号を本文に書き、"
@@ -5694,7 +5800,7 @@ TOOLS: list[dict] = [
             "（百科・構造化）／GitHub（コード）を並列に引く。追加の datacite / openaire / zenodo / ror / "
             "doaj（OA論文）/ npm / crates / librariesio（パッケージ検索）／osv・ietf（脆弱性・標準）／"
             "inspirehep・oeis・hfhub（物理・数学・ML）／hn（Hacker News の議論）／swh（Software Heritage の"
-            "コードアーカイブ）は sources で明示指定する。"
+            "コードアーカイブ）／ia（Internet Archive のアイテム検索。**query は英語の語で**）は sources で明示指定する。"
             "DataCite は自然語の各語を AND 検索、datacite_kind=dataset で研究データ。"
             "fallback=true のときだけ自然語 arXiv検索の失敗/遅延を DataCite で代替する（取得元を明示）。"
             "【使わない条件】単一の事実だけなら web_search が速い。"
@@ -5704,7 +5810,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "query": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）。対象は科学とプログラミングまでで医学・生物学は含まない"},
+                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）。対象は科学とプログラミングまでで医学・生物学は含まない"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
                 "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語（既定 ja）"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須・10 req/分）。code はファイルへのポインタと一致箇所の断片を返し、ライセンス情報を含まない（取り込む前に repo 検索で確認する）。repo: owner/name・path:・language:・filename:・in:file の修飾子を付けると精度が上がる"},
@@ -5729,7 +5835,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "question": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6種。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。医学・生物学は対象外"},
+                            "description": "既定6種。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。医学・生物学は対象外"},
                 "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
                 "limit": {"type": "integer"},

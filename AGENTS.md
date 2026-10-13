@@ -3,7 +3,8 @@
 Hermes Agent の **Free モデルをサブ LLM として並列に走らせる** MCP サーバー（Python 3.11+ / 実行時依存ゼロ /
 単一ファイルのモノリス）。メイン LLM の知識補助として **arXiv / Crossref / OpenAlex / Wikipedia /
 Wikidata / GitHub** を既定で引き、**DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates / CiNii /
-OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Libraries.io** は
+OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Libraries.io /
+Internet Archive** は
 明示指定で追加する。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は対象外**。
 
 - 全体像は `README.md`、**実装の契約は `SPEC.md`**（変更時は両方を同一変更内で更新する）。
@@ -226,6 +227,14 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     試す。`freeagent_models` は `non_chat_candidates` に件数を出し、一覧では見えるままにする（黙って消さない）。
 
 35. **変更内容（直近の更新内容）は README に書かず、リリース時に GitHub Releases へ記載する** — `README.md` / `SPEC.md` / `AGENTS.md` は「現行の仕様」を書く場所で、履歴は持たない。`pyproject.toml` の `version` を上げ、`vX.Y.Z` タグを打って同じ本文の Release を作成する（本文＝要約・変更点の箇条書き・検証行・`**Full Changelog**` リンク）。
+
+36. **第8段階は Internet Archive のメタデータ検索だけ**（§5.21 / §6.11）。`advancedsearch.php` は実測
+    0.44〜0.70 秒でキー不要だが、**素のクエリは順位が壊れる**（`q=FORTRAN manual` の 1 位が無関係な GitHub
+    ミラー）ので `title:(語 AND 語)` に組み直す。**CJK クエリは HTTP を出さずに断る**（実測 10/10 が
+    `QUERY_NOT_READY`。翻訳はサーバーでやらず、英語の語で引くのは呼び出し側の仕事として `sources` の
+    説明に書く）。証拠は目録の注記なので `summary_kind=structured_record`。**全文検索 API は採らない**
+    （5.9〜25.1 秒で 8 秒の締め切りに 3/8 超過・日本語 `total=0`）。CDX は 5.4〜30 秒、SPN2 と S3 は
+    書き込みで利用者キーが前提。`inside.php` は OCR のあるアイテムに限られ主要経路にできない。
 
 ## ライセンス
 

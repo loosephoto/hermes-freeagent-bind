@@ -864,7 +864,7 @@ class TestKnowledgeBackendRegistry(unittest.TestCase):
         self.assertEqual(set(S.KB_BACKENDS), set(S.DEFAULT_SOURCES) | {"datacite", "openaire", "zenodo", "ror",
                                                                        "doaj", "npm", "crates", "cinii",
                                                                        "osv", "ietf", "inspirehep", "oeis",
-                                                                       "hfhub", "hn", "swh", "librariesio"})
+                                                                       "hfhub", "hn", "swh", "librariesio", "ia"})
         self.assertEqual(set(S.SOURCES), set(S.KB_BACKENDS))
 
     def test_arxiv_uses_https(self):

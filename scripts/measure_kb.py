@@ -86,6 +86,8 @@ SOURCE_QUERIES = {
     "hn": ["rust ownership", "python asyncio", "database index", "docker networking",
            "typescript generics", "postgres performance"],
     "swh": ["kubernetes", "linux", "vscode", "tensorflow", "redis", "react"],
+    "ia": ["FORTRAN manual", "COBOL compiler", "PDP-11 handbook", "UNIX manual",
+           "IBM 360", "Lisp machine"],
     "inspirehep": ["higgs boson", "dark matter", "neutrino", "supersymmetry", "black hole", "QCD"],
     "oeis": ["Fibonacci", "prime", "Catalan", "factorial", "partition", "1,2,3,5,7,11"],
     "hfhub": ["llama", "bert", "whisper", "diffusion", "mistral", "embedding"],
@@ -290,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rounds", type=int, default=1)
     ap.add_argument("--interval", type=float, default=600.0)
     ap.add_argument("--report", action="store_true")
-    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help="計測対象（既定は対応22ソース）")
+    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help="計測対象（既定は対応23ソース）")
     ap.add_argument("--datacite-kind", choices=("all", "arxiv", "dataset"), default="all")
     ap.add_argument("--schedule", type=int, metavar="HOURS")
     ap.add_argument("--unschedule", action="store_true")

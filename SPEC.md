@@ -21,7 +21,7 @@
 | §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳） |
 | §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
-| §5 | 知識バックエンド22種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須）） |
+| §5 | 知識バックエンド23種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須） / §5.21 Internet Archive（明示指定のみ）） |
 | §6 | ツール実装（11本、§6.11 本文の注入番号・引用認定） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
@@ -192,6 +192,7 @@
 | hn | `hn.algolia.com/api/v1/search` | 不要 | 帰属表示必須（Algolia）。10,000 req/h/IP。リンク投稿は本文が無く metadata_only |
 | swh | `archive.softwareheritage.org/api/1/origin/search/{pattern}/` | 不要 | API利用規約: ポイントアクセス可・大量抽出不可。origin を `structured_record` で返す |
 | librariesio | `libraries.io/api/search` | **FREEAGENT_LIBRARIESIO_KEY 必須** | 19+ 登録簿の横断検索。60 req/min。説明は登録者の自己申告 |
+| ia | `archive.org/advancedsearch.php` | 不要 | `title:(語 AND 語)` に組み直して引く。**CJK クエリは HTTP を出さずに断る**（実測 10/10）。summary は目録の注記で `summary_kind=structured_record` |
 
 - 結果は**必ず `citation`（source / title / url / year / summary）に正規化**する。表示も注入もこの形だけを使う。
 - 取得はメモリ TTL キャッシュ + ホスト単位の遮断記憶。**同一キーは single-flight** で同時取得を 1 回にまとめ、エラー応答はキャッシュしない（回復後の再取得を妨げない）。キャッシュ値は複製して返し、呼び出し側の変更が共有状態に伝播しない。**LLM を介さない**（＝幻覚が入らない経路）。
@@ -203,7 +204,7 @@
 - 注入する本文は 1 件あたり `FREEAGENT_EVIDENCE_ITEM_CHARS`（既定 360）、全体で
   `FREEAGENT_EVIDENCE_TOTAL_CHARS`（既定 3200）に収める。入れすぎると小型 Free モデルが予算を
   使い切って空応答・切断になる（逆効果）。
-- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加16種（datacite / openaire / zenodo / ror / doaj / npm / crates / cinii / osv / ietf / inspirehep / oeis / hfhub / hn / swh / librariesio）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。ciniiは`FREEAGENT_CINII_APPID`、librariesioは`FREEAGENT_LIBRARIESIO_KEY`が前提で、未設定ならHTTPを出さずに案内を返す（§6.7 / §6.10）。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は含まない**（§6.9）。
+- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加17種（datacite / openaire / zenodo / ror / doaj / npm / crates / cinii / osv / ietf / inspirehep / oeis / hfhub / hn / swh / librariesio / ia）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。ciniiは`FREEAGENT_CINII_APPID`、librariesioは`FREEAGENT_LIBRARIESIO_KEY`が前提で、未設定ならHTTPを出さずに案内を返す（§6.7 / §6.10）。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は含まない**（§6.9）。
 - `fallback=true`のJSON真偽値だけが、自然語arXiv検索をDataCiteへ追加送信する明示許可。文字列`"true"`等は許可にしない。
 - 1 ソースの失敗で全体を落とさない（`errors` に集約し、成功分だけ返す）。
 
@@ -231,7 +232,7 @@
   `FREEAGENT_STATE_DIR/kb_latency.jsonl`・最大 20,000 行・超えたら古い行から tmp + `os.replace` で捨てる）へ追記。
   記録は `ts` / `hour`（日本時間）/ `source` / `elapsed_s` / `ok` / `items` / `error`（160 字）/ `mailto` /
   `openalex_key` / `cinii_appid` / `env_failure` に加え `datacite_kind` / `summaries`（本文がある件数）を記録し、**タイトル・本文は残さない**。
-  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応22ソースを測る（cinii / librariesio はキー未設定なら外す・§6.7 / §6.10）。論文キーワードだと空振りするソース（ror / npm / crates / librariesio / osv / ietf / hn / swh / inspirehep / oeis / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
+  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応23ソースを測る（cinii / librariesio はキー未設定なら外す・§6.7 / §6.10）。論文キーワードだと空振りするソース（ror / npm / crates / librariesio / osv / ietf / hn / swh / ia / inspirehep / oeis / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
 - 全ソースが接続系の失敗なら `env_failure=true`（こちらのネットワーク障害）とし、`--report` の集計から外す。
 - `--schedule N` は Windows のタスク（`pythonw`＝窓を出さない）を 1 時間おきに登録し、残り回数を
   `kb_latency.jsonl.schedule.json` で数えて、最後の 1 回でタスクを自分で消す（`/ED` `/ET` は HOURLY との
@@ -472,6 +473,34 @@ quickgo / reactome / clinicaltrials / openfda / gbif）は**削除**した（実
 - **実測（2026-10-05・実 stdio 経路・各 2 件）**: hn 0.47〜0.5 秒 / swh 1.2 秒。librariesio はキー未設定
   なら検査・計測せずに外す（`probe_knowledge_stdio.py` / `measure_kb.py`）。
 
+### 6.11 第8段階ソースの採用根拠（§5.21・2026-10-13）
+
+Internet Archive を**メタデータ検索だけ**明示指定ソースとして採った。既定6は不変で、対象範囲
+（§6.9 の科学・プログラミング）も変えず、「当時の一次資料（計算機マニュアル・書籍・ソフト）」を補う。
+
+- **採った理由（実測）**: `advancedsearch.php` はキー不要で 0.44〜0.70 秒（5 回）。bitsavers（計算機
+  マニュアル 91,403 件）や softwarelibrary を引ける。`title:(COBOL)` は IBM 360 の COBOL マニュアルを、
+  `title:(FORTRAN AND manual)` は CENFOR / DEC FORTRAN IV / TRS-80 Fortran-80 を返した。
+- **クエリの組み直しが必須**: 素の `q=FORTRAN manual` の 1 位は無関係な GitHub ミラーで、
+  `sort[]=downloads desc` 単独も話題と無関係な人気作を混ぜた（実測）。よって `title:(語 AND 語)` に組み直す。
+- **CJK クエリは HTTP を出さずに断る**: `日本語` / `京都` / `量子力学` / `title:日本語` / `日本 AND 歴史` は
+  10/10 で `{"error": "... [QUERY_NOT_READY] Query has not been finalized"}` を返し、同じ 10 回で英語は
+  10/10 成功した。1 回だけ成功した観測があるため恒久的な不可とは断定せず、**翻訳はサーバーでやらない**
+  （依存ゼロ・LLM 非介在を守る）。英語の語に直すのは呼び出し側の仕事で、`sources` の説明に明記する（規約 5）。
+- **証拠の種類**: `summary_kind=structured_record`。IA の `description` は目録・アップロード者の注記で
+  抄録ではない（実測: 「Cover title Includes bibliographical references 31」）。本文・ファイルは取得しない。
+- **見送り（実測）**: 全文検索 `be-api.us.archive.org/ia-pub-fts-api` は集計を毎回計算するため
+  5.9〜25.1 秒（8 件中 3 件が 8 秒超）で日本語は `total=0`（§6.1 の締め切りに載らない）。CDX は 5.4〜30 秒で
+  URL 起点の API。SPN2 / S3 アップロードは書き込みで利用者キーが前提（読み取り専用の性格を崩さない）。
+  `inside.php`（本の中検索）は 1.5 秒だが OCR を持つアイテムに限られ、`_abbyy.gz` を持つアイテムでも
+  0 件だったため主要経路にしない。
+- **利用条件**: `robots.txt` の Disallow は `/control/` と `/report/` のみで `/advancedsearch.php` と
+  `/metadata/` は許可。IA 自身が「Bots, LLMs, and Automated Access」で、AI エージェントを含む自動アクセスに
+  説明的な User-Agent・間隔・429/`Retry-After` の尊重を求めている。**検索系の数値レートは非公表**なので
+  1 req/s で自粛し、`archive.org/advancedsearch` は metadata API と別の予算キーにする（規約 32）。
+- **実測（2026-10-13・実 stdio 経路・2 件）**: ia 0.8 秒（`FORTRAN manual`）。ツール一覧JSONは
+  14,399 → **14,654 文字**（+255・ツール数は 11 のまま）。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。
@@ -558,7 +587,7 @@ quickgo / reactome / clinicaltrials / openfda / gbif）は**削除**した（実
 ## 7.6 利用者向け説明と実装の境界
 
 README は利用開始・結果の読み方・障害時の対処を先に置き、実装上の設計理由はこの SPEC に置く。
-利用者が用途から選べる導線を設け、既定6ソースと明示指定16ソースを区別する。
+利用者が用途から選べる導線を設け、既定6ソースと明示指定17ソースを区別する。
 引数一覧・追加プロバイダの確認設定・過去の計測記録は折りたたみ、
 無料枠・データ送信・保存・引用の限界は利用者が確認できる形で残す。
 次の既存挙動を、保証されている機能として過大に説明しない。

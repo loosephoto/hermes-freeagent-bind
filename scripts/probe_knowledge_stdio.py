@@ -8,6 +8,7 @@ python scripts/probe_knowledge_stdio.py --sources ietf --query "RFC 9110"
 python scripts/probe_knowledge_stdio.py --sources hn --query "rust ownership"
 python scripts/probe_knowledge_stdio.py --sources swh --query kubernetes
 python scripts/probe_knowledge_stdio.py --sources librariesio --query "json schema"
+python scripts/probe_knowledge_stdio.py --sources ia --query "FORTRAN manual"
 python scripts/probe_knowledge_stdio.py --sources oeis --query Fibonacci
 
 各指定ソースの有効応答・出典・両チャネルを検査。失敗はexit 1（成功を捏造しない）。
@@ -86,6 +87,9 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
         if cite["source"] in ("hfhub", "swh"):
             if cite.get("summary_kind") != "structured_record" or not cite.get("summary"):
                 raise ValueError("structured record evidence kind mismatch")
+        if cite["source"] == "ia":
+            if cite.get("summary_kind") != "structured_record" or not cite.get("identifier"):
+                raise ValueError("Internet Archive citation must carry an id and a structured record")
         if cite["source"] == "osv" and not cite.get("identifier"):
             raise ValueError("OSV citation must carry an id")
         if cite["source"] == "ietf" and not cite.get("identifier"):
