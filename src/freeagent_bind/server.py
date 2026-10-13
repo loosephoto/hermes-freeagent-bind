@@ -49,6 +49,8 @@ import math
 import os
 import re
 import shutil
+import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -61,7 +63,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.5.1"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -754,7 +756,7 @@ def classify_error(err: str) -> str:
         return "rate_limited"
     if "timeout" in t or "timed out" in t:
         return "timeout"
-    if "404" in t or "410" in t or "not found" in t or "gone" in t:
+    if "404" in t or "410" in t or "gone" in t:
         return "gone"
     if "401" in t or "403" in t or "unauthor" in t or "forbidden" in t:
         return "auth"
@@ -764,6 +766,9 @@ def classify_error(err: str) -> str:
     # classify_error("HTTP 503") が other に落ち、5xx が統計上「その他」に混ざっていた）。
     if "http" in t and re.search(r"\b5\d\d\b", t):
         return "server"
+    # "HTTP 500: ... Authorization<Bearer> was not found" 等が gone に化けないよう 5xx/auth 判定の後で見る。
+    if "not found" in t:
+        return "gone"
     return "other"
 
 
@@ -786,7 +791,11 @@ def is_env_failure(err: str) -> bool:
     if any(sign in low for sign in _ENV_FAILURE_SIGNS):
         return True
     # 「モデルが解決できませんでした（Free モデルが 0 件の可能性）」「推論可能な Free モデルが 0 件です」
-    return "モデルが 0 件" in err or "モデルが解決できませんでした" in err
+    # または未設定プロバイダ・有料モデル拒否（呼び出し前の設定ガード＝モデルの成績ではない）
+    return ("モデルが 0 件" in err or "モデルが解決できませんでした" in err
+            or "未設定/未確認です" in err
+            or "このFree-tier設定で許可されていない" in err
+            or "有料モデルのため呼び出しを拒否" in err)
 
 
 def note_observation(ref: str, kind: str, *, error: str = "", leak: bool = False,
@@ -1393,16 +1402,48 @@ class _HTTPSHandler(urllib.request.HTTPSHandler):
 # build_opener はサブクラスを既定ハンドラの置換と見なすので、リダイレクト（HTTPRedirectHandler）・
 # プロキシ（ProxyHandler）・HTTPError の既定挙動はそのまま残る（標準ライブラリのみ・依存ゼロ）。
 _OPENER = urllib.request.build_opener(_HTTPHandler, _HTTPSHandler)
+_SSL_REFRESH_LOCK = threading.Lock()
+
+
+def _refresh_ssl_context(url: str) -> None:
+    """Windows で未訪問のルート CA（例: Starfield Root G2 → export.arxiv.org）がストアに無く
+    `CERTIFICATE_VERIFY_FAILED` になったとき、Schannel 経由の HEAD で Windows CryptoAPI の
+    自動ルート証明書取得を促し、共有 `_OPENER` の `SSLContext` を作り直す（検証は無効化しない）。
+    """
+    with _SSL_REFRESH_LOCK:
+        if os.name == "nt" and isinstance(url, str) and url.startswith("https://"):
+            curl_bin = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows",
+                                    "System32", "curl.exe")
+            if os.path.exists(curl_bin):
+                try:
+                    subprocess.run([curl_bin, "-sI", "--max-time", "5", url],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=6, check=False)
+                except Exception:
+                    pass
+        ctx = ssl.create_default_context()
+        for handler in getattr(_OPENER, "handlers", ()):
+            if isinstance(handler, _HTTPSHandler):
+                handler._context = ctx
 
 
 def _urlopen(req: urllib.request.Request, timeout: float):
     """接続は短い上限で、接続後のヘッダ待ちと本文読取は `timeout` で打ち切る。"""
-    return _OPENER.open(req, timeout=timeout)
+    try:
+        return _OPENER.open(req, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+            _refresh_ssl_context(getattr(req, "full_url", ""))
+            return _OPENER.open(req, timeout=timeout)
+        raise
 
 
 def provider_http(path: str, provider: str = "nous", payload: dict | None = None,
                   timeout: float | None = None) -> dict:
     spec = PROVIDER_SPECS[provider]
+    if payload is not None and not provider_ready(provider):
+        missing = _provider_missing_settings(spec)
+        raise RuntimeError(f"{provider} は未設定/未確認です。必要なenv設定: {', '.join(missing)}")
     url = f"{spec['base_url'].rstrip('/')}{path}"
     headers = {"Authorization": f"Bearer {spec['key']}", "Accept": "application/json"}
     data = None
@@ -1765,6 +1806,24 @@ def _extract_text(data: dict) -> str:
     return text if isinstance(text, str) else ""
 
 
+def _is_known_paid_model(provider: str, model: str) -> bool:
+    """キャッシュ済み一覧で明確に `free=False` と判明している有料モデルか。"""
+    target = as_str(model)
+    if not provider or not target:
+        return False
+    with _MODELS_LOCK:
+        rows = (_MODELS_CACHE.get(provider) or {}).get("rows") or []
+    for row in rows:
+        if isinstance(row, dict) and row.get("id") == target:
+            return not bool(row.get("free"))
+    if _is_hf(provider) and ":" in target:
+        base = target.rsplit(":", 1)[0]
+        for row in rows:
+            if isinstance(row, dict) and row.get("id") == base:
+                return not bool(row.get("free"))
+    return False
+
+
 def _call_once(provider: str, model: str, prompt: str, system: str,
                max_tokens: int, temperature: float | None,
                timeout: float | None = None) -> dict:
@@ -1912,6 +1971,9 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
     if spec.get("free_model_ids") is not None and not provider_model_allowed(provider, model):
         return {"error": f"{provider}/{model} はこのFree-tier設定で許可されていないモデルです",
                 "ref": ref, "kind": kind}
+    if free_only and _is_known_paid_model(provider, model):
+        return {"error": f"{provider}/{model} は有料モデルのため呼び出しを拒否しました（Free モデルのみ許可）",
+                "ref": ref, "kind": kind}
     if spec.get("catalog_requires_ready") and not provider_ready(provider):
         missing = _provider_missing_settings(spec)
         return {"error": f"{provider} は未設定/未確認です。必要なenv設定: {', '.join(missing)}",
@@ -1921,7 +1983,9 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
     attempts = _candidates(ref, free_only=free_only) if allow_fallback else (
         [ref] if ref not in cooling else [])
     if not attempts:
+        cool_reason = as_str((cooling.get(ref) or {}).get("reason"))
         return {"error": f"全候補がクールダウン中です（{ref}）", "ref": ref, "kind": kind,
+                "cooling_reason": cool_reason or None,
                 "skipped_cooling": [ref], "rate_limited": bool(ref in cooling)}
 
     last_error = ""
@@ -4342,7 +4406,8 @@ def tool_models(args: dict) -> dict:
         data["harness"] = harness
 
     searching = bool(query or provider_filter or args.get("all") or args.get("probe"))
-    free_only = as_flag(args.get("free_only"))
+    # probe は実際にモデルを呼ぶため、free_only 省略時でも有料モデルは対象にしない。
+    free_only = as_flag(args.get("free_only")) or bool(args.get("probe"))
     if searching:
         rows = all_models()
         needle = query.lower()
@@ -4350,7 +4415,13 @@ def tool_models(args: dict) -> dict:
                    if (not provider_filter or r.get("provider") == provider_filter)
                    and (not free_only or r.get("free"))
                    and (not needle or needle in str(r.get("id", "")).lower())]
-        matched.sort(key=lambda r: (not r.get("free"), str(r.get("id", ""))))
+        if args.get("probe") and not provider_filter:
+            ready_rows = [r for r in matched if provider_ready(as_str(r.get("provider")))]
+            if ready_rows:
+                matched = ready_rows
+        matched.sort(key=lambda r: (not r.get("free"),
+                                    not provider_ready(as_str(r.get("provider"))),
+                                    str(r.get("id", ""))))
         matched_free = sum(1 for r in matched if r.get("free"))   # ページ前の総数（offset で減らさない）
         offset = as_int(args.get("offset"), 0, 0, 5000)
         matched = matched[offset:]
@@ -4368,7 +4439,7 @@ def tool_models(args: dict) -> dict:
             # 一覧は実態と乖離する（実測: NVIDIA の一覧 82 件の大半が 410 EOL、HF は権限で 403）。
             # 実際に 1 回だけ呼んで**呼べるものだけ**を残す。件数は絞る（呼び出しは課金・レートに触れる）。
             probe_limit = as_int(args.get("probe_limit"), min(len(shown), 12), 1, 40)
-            shown = shown[:probe_limit]
+            shown = [r for r in shown if r.get("free")][:probe_limit]
             probe_prompt = as_str(args.get("probe_prompt")) or "1+1=? 数字1つだけ。"
             probe_tokens = as_int(args.get("probe_max_tokens"), 16, 1, 64)
             probe_timeout = _env_float("FREEAGENT_PROBE_TIMEOUT", 25.0)
@@ -4386,6 +4457,8 @@ def tool_models(args: dict) -> dict:
                                  max_tokens=probe_tokens, kind="probe", allow_fallback=False,
                                  timeout=probe_timeout)
                 err = res.get("error") or ""
+                if res.get("cooling_reason"):
+                    err = f"{err} / {res['cooling_reason']}"
                 err_l = err.lower()
                 if not err:
                     verdict = "alive"
@@ -4395,14 +4468,16 @@ def tool_models(args: dict) -> dict:
                 elif "空応答" in err:
                     # 応答自体は返っている（思考トークンで probe の予算を使い切った）。生存側に倒す。
                     verdict = "slow"
-                elif "http 404" in err_l or "http 410" in err_l or "not found" in err_l:
+                elif "http 404" in err_l or "http 410" in err_l or (
+                    "not found" in err_l and not re.search(r"\bhttp\s+[45]\d\d\b", err_l)
+                ):
                     verdict = "gone"
                 elif "http 403" in err_l:
                     # 403 は**署名があるときだけ**権限なし扱い。Cloudflare のブロック（Error 1010 等）や
                     # 提供元の障害・モデル単位の制限は、プロバイダ全体の問題ではないので `error`（残す）。
                     # 401 より先に見る（"HTTP 401/403" のような表記が 401 に誤マッチしていた実測がある）。
                     verdict = "auth" if _is_auth_error(403, err) else "error"
-                elif "http 401" in err_l:
+                elif "http 401" in err_l or "未設定/未確認です" in err:
                     verdict = "auth"
                 else:
                     # 429（提供元が一時制限）や 5xx。**除外しない**（生きているが今は応えない）。

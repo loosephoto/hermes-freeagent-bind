@@ -62,7 +62,7 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
 8. **失敗を content に出して隠さない**。討論ラウンドの脱落は `failed` / `debate_summary.dropped` に残し、
    表示は1行に集約する（LLM へは全ラウンドを返し、人間には重複なく見せる）。
 9. 外部 HTTP は **(connect, read) のタイムアウト必須**。`urllib` の `timeout` は**応答ヘッダ待ちにも掛かる**ので、
-   §3 の共有 `_OPENER`（接続の間だけ接続上限、接続後は読み取り上限）を使う。遮断はホスト単位で記憶して fail fast。
+   §3 の共有 `_OPENER`（接続の間だけ接続上限、接続後は読み取り上限）を使う。Windows で未キャッシュの公開ルート CA（`export.arxiv.org` の Starfield Root G2 等）により `CERTIFICATE_VERIFY_FAILED` が出た場合は、Schannel 経由の HEAD でストア更新を促し `_HTTPSHandler._context` を再生成して 1 回再試行する（検証は無効化しない）。遮断はホスト単位で記憶して fail fast。
 10. arXiv は **https**（http は 301 の先で 406）かつ **3 秒間隔で直列化**する。
 11. 「結論/確信度/確認したい点」の解析は**1 行 1 ラベルと決め打たない**（同一行に複数ラベルが来る）。
 12. サブエージェントは**最終ステップでツールを封じて回答を要求する**。到達しなかったら推測で埋めず
@@ -74,7 +74,9 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
 16. **モデル一覧を信じない**。実測: NVIDIA は 82 件中 55 件が 404（EOL）、HF の無料 3 件は権限不足で 403、
     OpenRouter の `:free` にも提供元都合の 403 がある。`freeagent_models` の `probe: true` で生存確認し、
     **404/410 と 401/403 だけ除外**する。**timeout・空応答・429・5xx は残す**（生きているが今は応えない
-    ものを永久に隠さない）。生存確認は `allow_fallback=False`（有効だと他プロバイダの応答が「生存」に化ける）。
+    ものを永久に隠さない）。生存確認は `allow_fallback=False`（有効だと他プロバイダの応答が「生存」に化ける）、
+    かつ `free_only` 省略時でも有料モデルは呼ばず、`provider` 未指定時は `provider_ready` なプロバイダを対象にする。
+    HTTP 500 本文中の `not found`（NVIDIA NIM の Authorization 欠落等）を `gone` に誤分類しないよう、5xx/auth 判定を先に置く。
 17. **認証失敗はプロバイダ単位で覚える**（`provider_auth.json`・既定 15 分）。覚えないと毎回同じ
     プロバイダを引き当てて空振りする（実測: 4 体選抜のうち 3 体が HF）。**自動選抜からだけ外し、明示指定は
     試す**（キーを直せば即復帰）。除外は必ず `notes` に出す。

@@ -437,11 +437,14 @@ class _HeaderDelayHandler(http.server.BaseHTTPRequestHandler):
             self._respond(200, b'{"ok": true}')
 
     def _respond(self, status, body):
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+            pass
 
     def log_message(self, *args):
         pass
@@ -658,6 +661,72 @@ class TestMeasureAdoptionScenes(unittest.TestCase):
                 self.assertEqual(self.mod.main(), 0)
         self.assertIn("対象セッション: 4 件", buf.getvalue())
         self.assertIn("ツール未使用も含む", buf.getvalue())
+
+
+class TestLiveAuditFixes(unittest.TestCase):
+    """実稼働監査で検出した 5 点の回帰テスト。"""
+
+    def test_http_500_with_not_found_in_body_is_server_not_gone(self):
+        # NVIDIA NIM の未認証応答 `HTTP 500: ... Authorization<Bearer> was not found` が gone に化けない。
+        err = ("HTTP 500: Missing request extension: Extension of type "
+               "`headers::common::authorization::Authorization<Bearer>` was not found.")
+        self.assertEqual(S.classify_error(err), "server")
+        self.assertEqual(S.classify_error("HTTP 404: 404 page not found"), "gone")
+        self.assertEqual(S.classify_error("model not found"), "gone")
+
+    def test_probe_forces_free_only_and_prioritizes_ready_providers(self):
+        rows = [
+            {"id": "01-ai/yi-large", "provider": "nvidia", "free": True},
+            {"id": "aion-labs/aion-2.0", "provider": "nous", "free": False},
+            {"id": "inclusionai/ling-3.1-flash", "provider": "nous", "free": True},
+        ]
+        called = []
+
+        def fake_call(ref, prompt, **kw):
+            called.append(ref)
+            return {"text": "2", "served_by": ref}
+
+        with mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
+             mock.patch.object(S, "provider_status", lambda: []), \
+             mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []), \
+             mock.patch.object(S, "provider_ready", lambda p: p == "nous"), \
+             mock.patch.object(S, "call_model", fake_call):
+            got = S.tool_models({"probe": True, "probe_limit": 10})
+        self.assertEqual(called, ["nous/inclusionai/ling-3.1-flash"],
+                         "未設定の nvidia や有料の aion-2.0 を probe で呼んではいけない")
+        self.assertTrue(got["query"]["free_only"])
+
+    def test_call_model_rejects_known_paid_and_unready_provider_without_state_pollution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "FREEAGENT_STATS_PATH": os.path.join(tmp, "model_stats.json"),
+                "FREEAGENT_TRACE_PATH": os.path.join(tmp, "traces.jsonl"),
+                "FREEAGENT_COOLDOWN_PATH": os.path.join(tmp, "cooldowns.json"),
+            }
+            with mock.patch.dict(os.environ, env), \
+                 mock.patch.dict(S._MODELS_CACHE, {"nous": {"at": S.now_ts(), "rows": [
+                     {"id": "aion-labs/aion-2.0", "provider": "nous", "free": False},
+                     {"id": "meituan/longcat-2.0", "provider": "nous", "free": False},
+                     {"id": "meituan/longcat-2.0:free", "provider": "nous", "free": True},
+                 ], "error": ""}}):
+                paid = S.call_model("nous/aion-labs/aion-2.0", "hi", allow_fallback=False)
+                self.assertIn("有料モデルのため呼び出しを拒否", paid["error"])
+                self.assertFalse(S._is_known_paid_model("nous", "meituan/longcat-2.0:free"),
+                                 ":free 付き ID をコロン分割で有料版と取り違えてはいけない")
+                with mock.patch.object(S, "provider_ready", lambda p: False):
+                    unready = S.call_model("nvidia/01-ai/yi-large", "hi", allow_fallback=False)
+                self.assertIn("未設定/未確認です", unready["error"])
+                self.assertEqual(os.listdir(tmp), [], "設定ガードで状態ファイルを汚してはいけない")
+
+    def test_urlopen_refreshes_ssl_context_once_on_certificate_verify_failed(self):
+        cert_err = urllib.error.URLError("[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate")
+        sentinel = object()
+        with mock.patch.object(S._OPENER, "open", side_effect=[cert_err, sentinel]) as open_mock, \
+             mock.patch.object(S, "_refresh_ssl_context") as refresh_mock:
+            got = S._urlopen(urllib.request.Request("https://export.arxiv.org/api/query"), 10.0)
+        self.assertIs(got, sentinel)
+        self.assertEqual(open_mock.call_count, 2)
+        refresh_mock.assert_called_once_with("https://export.arxiv.org/api/query")
 
 
 if __name__ == "__main__":

@@ -110,6 +110,13 @@
 - 生存確認は **`allow_fallback=False`** で行う。フォールバックを有効にすると他プロバイダの応答が
   「生存」と誤判定する（実測: HF の 403 が OpenRouter の応答で隠れた）。
 - 生存確認のタイムアウトは短く（既定 25 秒）。モデル既定の 180 秒だと 1 件の遅いモデルが探索全体を止める。
+- `probe: true` は実際にモデルを呼ぶため、`free_only` 省略時でも自動的に Free モデルのみを対象とし、
+  `provider` 未指定時は資格情報が揃った（`provider_ready`）プロバイダを優先する。また `call_model(..., free_only=True)`
+  はキャッシュ済み一覧で `free=False` と判明している有料モデルを拒否し（`:free` 付き ID は完全一致を先に見る）、
+  `provider_http` の推論 POST は `not provider_ready(provider)` なら空 Bearer を送らず即座に未設定エラーを返す。
+- HTTP 500 等の本文中に `not found` を含む応答（実測: NVIDIA NIM の未認証応答 `HTTP 500: ... Authorization<Bearer> was not found`）が
+  `gone`（404 廃止）に化けないよう、`classify_error` と `probe` 判定では 5xx / 401 / 403 のステータス判定を `not found` 部分一致より優先する。
+  既に 404/410 でクールダウン中のモデルを再度 `probe` した場合は `cooling_reason` を引き継いで `gone` として除外する。
 - 結果は通常のストアへ流れる（`gone` はクールダウン 1 時間、`auth` はプロバイダ記憶 15 分）。
   `scripts/warmup_models.py` が全プロバイダを一巡して定着させる。
 
@@ -149,6 +156,7 @@
   - **実測（修正前）**: `urlopen(timeout=CONNECT_TIMEOUT)` の上限は**応答ヘッダの待ち時間にも掛かった**。ローカルプロキシは上流の生成が終わるまで本文もヘッダも返さないため（実測: TTFB 6.13 秒 = total 6.13 秒）、生成が `CONNECT_TIMEOUT`（10 秒）を超えると `TimeoutError` になり、読み取り 180 秒は使われなかった（実測: 1200 トークンの要求が 10.0 秒で timeout）。この失敗は `is_env_failure` に該当するため**統計にも残らない**。
   - **修正後の契約**: ヘッダ待ちと本文読取は `READ_TIMEOUT` まで待てる。接続できないホストへの fail fast は接続上限のまま。`tests/test_audit_regressions.py` の `TestHttpTimeoutSeparation` が localhost の遅延サーバで 5 点（接続上限 < ヘッダ遅延 < 読み取り上限 → 成功 / 読み取り上限で打ち切り / 不通ホストは接続上限内で失敗 / 302 追従 / 4xx は `HTTPError`）を検査する。実サーバーでも確認（https://httpbin.org/delay/12 = 12 秒遅延: 旧方式 10.58 秒で `TimeoutError` → 新方式 10.76 秒で成功）。
   - **版差の吸収**: 3.13 以前の `HTTPSHandler` は `check_hostname` を保持して `do_open` へ渡すが、**3.14 以降は渡さない**（`HTTPSConnection` も `check_hostname` を受け付けない）。`getattr(self, "_check_hostname", None)` で吸収する。実バックエンド検証で `AttributeError` を検出して修正した（localhost の http テストだけでは通ってしまうので、`_HTTPSHandler` を直接検査する回帰テストを併置している）。
+  - **Windows のオンデマンド ルート CA と `SSLContext` 再読込**: Windows は未訪問のルート CA（実測: `export.arxiv.org` の `Starfield Root Certificate Authority - G2`）を Schannel 接続時にオンデマンドで取得するため、Python 同梱 OpenSSL の初回接続や起動時生成の `_HTTPSHandler._context` では `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate` になることがある。`_urlopen` は `CERTIFICATE_VERIFY_FAILED` 発生時に Windows 標準の `System32\curl.exe -sI`（Schannel）でルート CA 登録を促したうえで `ssl.create_default_context()` を再生成して 1 回だけ再試行する（証明書検証は無効化しない）。
   - これにより、`think` の代替案の `max_tokens` 既定 400 を縛っていた「proxy 経由の 10 秒制約」も解消した（既定値は待ち時間と利用枠の理由で据え置き）。
 - 429 は `Retry-After` を尊重してクールダウンへ記録。404/410 は長め（1 時間）、429 は既定 60 秒
   （上限 900 秒）。402（クレジット枯渇）はプロバイダ全体の認証障害として記憶せず、該当モデルだけ既定 60 秒間クールダウンする。
