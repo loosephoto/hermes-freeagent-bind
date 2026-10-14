@@ -9,12 +9,15 @@ python scripts/probe_knowledge_stdio.py --sources hn --query "rust ownership"
 python scripts/probe_knowledge_stdio.py --sources swh --query kubernetes
 python scripts/probe_knowledge_stdio.py --sources librariesio --query "json schema"
 python scripts/probe_knowledge_stdio.py --sources ia --query "FORTRAN manual"
+python scripts/probe_knowledge_stdio.py --sources qiita --query "tag:Python"
 python scripts/probe_knowledge_stdio.py --sources oeis --query Fibonacci
 
 各指定ソースの有効応答・出典・両チャネルを検査。失敗はexit 1（成功を捏造しない）。
 OpenAIREは匿名60/h。同一IP上の他プロセスも含め、連続実行には60秒以上の間隔を空ける。
 cinii は利用者自身の appid（FREEAGENT_CINII_APPID）が要る。未設定なら**検査せずに外す**
 （未設定は失敗ではない。登録: https://support.nii.ac.jp/ja/cinii/api/developer）。
+qiita は未認証だと 60 回/時（ローカル間隔 60 秒）なので、連続で回すと 2 回目以降は
+「ローカルのアクセス間隔制御」で落ちる（記録としては正しい。間隔は FREEAGENT_QIITA_TOKEN で 3.6 秒になる）。
 """
 from __future__ import annotations
 
@@ -94,6 +97,9 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
             raise ValueError("OSV citation must carry an id")
         if cite["source"] == "ietf" and not cite.get("identifier"):
             raise ValueError("IETF citation must carry a document name or RFC number")
+        if cite["source"] == "qiita" and (not cite.get("identifier")
+                                          or cite.get("summary_kind") != "discussion"):
+            raise ValueError("Qiita citation must carry an item id and a discussion summary")
         if cite["source"] == "cinii" and not cite.get("metadata_only"):
             raise ValueError("CiNii は書誌のみ（抄録を返さない）ので metadata_only であること")
         S._kb_http_url(cite["url"])

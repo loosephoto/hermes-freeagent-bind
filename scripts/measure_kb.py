@@ -88,6 +88,10 @@ SOURCE_QUERIES = {
     "swh": ["kubernetes", "linux", "vscode", "tensorflow", "redis", "react"],
     "ia": ["FORTRAN manual", "COBOL compiler", "PDP-11 handbook", "UNIX manual",
            "IBM 360", "Lisp machine"],
+    # qiita は未認証だとローカル間隔が 60 秒なので、同じプロセスで連続ラウンドを回すと 2 回目以降は
+    # 「ローカルのアクセス間隔制御」で落ちる（記録として正しい。トークンで 3.6 秒になる）。
+    "qiita": ["tag:Python", "tag:Rust", "tag:セキュリティ", "tag:Docker",
+              "created:>2026-01-01", "tag:Go"],
     "inspirehep": ["higgs boson", "dark matter", "neutrino", "supersymmetry", "black hole", "QCD"],
     "oeis": ["Fibonacci", "prime", "Catalan", "factorial", "partition", "1,2,3,5,7,11"],
     "hfhub": ["llama", "bert", "whisper", "diffusion", "mistral", "embedding"],
@@ -292,7 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rounds", type=int, default=1)
     ap.add_argument("--interval", type=float, default=600.0)
     ap.add_argument("--report", action="store_true")
-    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help="計測対象（既定は対応23ソース）")
+    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help="計測対象（既定は対応24ソース）")
     ap.add_argument("--datacite-kind", choices=("all", "arxiv", "dataset"), default="all")
     ap.add_argument("--schedule", type=int, metavar="HOURS")
     ap.add_argument("--unschedule", action="store_true")

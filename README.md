@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud の 9 プロバイダ、検索は **22 ソース（既定6＋明示指定16）** に対応します。
+- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud の 9 プロバイダ、検索は **24 ソース（既定6＋明示指定18）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 **対象分野は科学（物理・数学・計算機）とプログラミングです。医学・生物学は対象外です。**
@@ -443,6 +443,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | 思考ノートが自動で考えてくれる | 中身を書くのはメイン LLM。ノートは保存と参照を担当します |
 | 登録すれば必ず自動的に使う | ツール選択はメイン LLM と設定に依存します |
 | Internet Archive で日本語を検索できる | IA のメタデータ検索は日本語（CJK）クエリを拒否します（実測 10/10 が `QUERY_NOT_READY`）。英語の語で指定してください |
+| Qiita を未認証で連続検索できる | 未認証は 60 回/時です。同じ問いはキャッシュで即返りますが、別の問いは 1 分待ちます（`FREEAGENT_QIITA_TOKEN` で 1,000 回/時・3.6 秒間隔） |
 
 **過去の実測例（環境・モデル・時間帯で変動します）**：4 体の panel は 14〜20 秒、
 多段討議を含む 1 ターンは 3 分 52 秒でした。思考ノートの記録だけならサブ呼び出しは 0 回、
@@ -455,11 +456,11 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 バックエンド拡張時のローカル実測（2026-10-02、同一Python、各7回の中央値。
 起動〜initialize〜tools/list〜終了を含むため、起動単体の保証値ではありません）:
 
-| 測定 | 第3段階HEAD（28f89d1） | 第4段階追加後 | 推論プロバイダ追加後 | CiNii追加後（1f653b6） | 第6段階追加後 | GitHubコード検索の改良後 | 第7段階（医学・生物を外しHN/SWH/Libraries.io追加）後 | 非チャット除外後 | 第8段階（Internet Archive追加）後 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ツール数 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
-| ツール一覧JSON文字数（ensure_ascii=false・compact） | 13,116 | 13,220 | 13,278 | 13,513 | 14,092 | 14,230 | 14,316 | 14,399 | 14,654 |
-| stdioプロセス往復・終了（7回中央値） | 0.2216秒 | 0.2267秒 | 0.2181秒 | 0.1652秒 | 0.1664秒 | 0.1611秒 | 0.2305秒 | 0.0281秒 | 0.2444秒 |
+| 測定 | 第3段階HEAD（28f89d1） | 第4段階追加後 | 推論プロバイダ追加後 | CiNii追加後（1f653b6） | 第6段階追加後 | GitHubコード検索の改良後 | 第7段階（医学・生物を外しHN/SWH/Libraries.io追加）後 | 非チャット除外後 | 第8段階（Internet Archive追加）後 | 第9段階（Qiita追加）後 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ツール数 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
+| ツール一覧JSON文字数（ensure_ascii=false・compact） | 13,116 | 13,220 | 13,278 | 13,513 | 14,092 | 14,230 | 14,316 | 14,399 | 14,654 | 14,882 |
+| stdioプロセス往復・終了（7回中央値） | 0.2216秒 | 0.2267秒 | 0.2181秒 | 0.1652秒 | 0.1664秒 | 0.1611秒 | 0.2305秒 | 0.0281秒 | 0.2444秒 | 0.2605秒 |
 
 文字数の列は同じ方法で測り直した値です（`8f0df1e` で 13,278 を再現して方法を確認）。
 往復時間は実行環境の負荷で変わり、同じコミットでも 0.22 秒 → 0.17 秒の差が出ます。
@@ -476,6 +477,9 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 列どうしを比較できますが、往復時間は実行環境の負荷で
 大きく変わるため、今回の 0.0281 秒は実行環境が空いていた値で、上の列とは直接比較できません。
 第8段階の 0.2444 秒は第7段階（0.2305 秒）と同じ計測方法で測った値です。
+第9段階では `sources` の説明に `qiita`（Qiita の日本語技術記事）を足したため
+**+228 文字（+1.6%）** の 14,882 になりました（ツール数は 11 のまま）。第9段階の 0.2605 秒も
+第8段階（0.2444 秒）と同じ計測方法で測った値です（HEAD の 14,654 文字は同じ方法で再現して確認）。
 
 検索APIの追加は推論モデルの能力を増やしません。ツールスキーマの増加もメインLLMの入力負担になります。
 
@@ -532,9 +536,10 @@ API キーに加えて、契約プランやデータの扱いを確認したこ�
 | `FREEAGENT_MAILTO` | crossref / openalex / datacite | キーではなく連絡先。polite pool に入り安定します |
 | `FREEAGENT_CINII_APPID` | cinii | **このソースを使う場合は必須**。CiNii Research の[利用登録](https://support.nii.ac.jp/ja/cinii/api/developer)で取得したアプリケーションID。未設定なら cinii は HTTP を出さず、登録先を案内します |
 | `FREEAGENT_LIBRARIESIO_KEY` | librariesio | **このソースを使う場合は必須**。[Libraries.io](https://libraries.io/account)の無料アカウントで取得する API キー。未設定なら librariesio は HTTP を出さず、登録先を案内します（60 req/分） |
+| `FREEAGENT_QIITA_TOKEN` | qiita | **任意**（キーが無くても 60 回/時で動きます）。[個人用アクセストークン](https://qiita.com/settings/tokens/new)を設定すると 1,000 回/時に上がり、アクセス間隔が 60 秒 → 3.6 秒になります |
 
 wikipedia / wikidata / arxiv / doaj / npm / crates / openaire / zenodo / ror /
-osv / ietf / inspirehep / oeis / hfhub / hn / swh / ia はキー不要・匿名で使えます。
+osv / ietf / inspirehep / oeis / hfhub / hn / swh / ia / qiita はキー不要・匿名で使えます。
 **cinii と librariesio だけは例外**で、利用者自身の appid / API キーが必要です
 （利用目的に当たるかの判断は利用者。SPEC §6.7 / §6.10）。
 
@@ -578,6 +583,8 @@ hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_MAILTO 'you@example.c
 # CiNii を使う場合のみ。値は自分の appid（他人と共有しない）
 hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_CINII_APPID '<appid>'
 hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_LIBRARIESIO_KEY '${FREEAGENT_LIBRARIESIO_KEY}'
+# Qiita のトークン（任意。未認証でも 60 回/時で動くが、入れると 1,000 回/時）
+hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_QIITA_TOKEN '${FREEAGENT_QIITA_TOKEN}'
 ```
 
 </details>
@@ -604,7 +611,7 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 
 ## 📚 知識バックエンド
 
-**検索先は23ソースです。何も指定しなければ既定の6ソースだけを使います。**
+**検索先は24ソースです。何も指定しなければ既定の6ソースだけを使います。**
 `sources` を指定すると、指定したソースだけを検索します（既定の6ソースに追加されるのではありません）。
 
 - **論文を探す**：arxiv / crossref / openalex。日本語文献の書誌なら cinii。
@@ -627,7 +634,7 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `openalex` | 論文のメタデータ・被引用数・アブストラクト | 匿名検索の制限あり。API キーを推奨 |
 | `github` | リポジトリ / Issue / コードの検索結果。コード検索は一致箇所の**断片**（`snippet`）も返す | コード検索はトークン必須（10 req/分）。**ライセンス情報を含まない**ので取り込み前に確認 |
 
-### 📘 明示指定で使う17ソース
+### 📘 明示指定で使う18ソース
 
 通常の検索には自動で追加されません。表の名前を会話で指定してください。
 
@@ -650,9 +657,10 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `swh`（明示指定） | Software Heritage のリポジトリ（origin）の URL・取得方式 | 公開コードの長期アーカイブ。**コード本文は取得しません**。summary は `structured_record`。API 利用規約はポイントアクセス可・大量抽出不可 |
 | `librariesio`（明示指定・**キー必須**） | 19+ のパッケージ登録簿を横断した検索（名前・説明・版・DL数・ライセンス） | **利用者自身の無料 API キー**を `FREEAGENT_LIBRARIESIO_KEY` に設定したときだけ動きます（未設定なら登録先を案内して HTTP を出しません）。説明は登録者の自己申告 |
 | `ia`（明示指定） | Internet Archive のアイテム（歴史的な計算機マニュアル・書籍・ソフト等のタイトル・作成者・年・メディア種別・DL数） | **query は英語の語で指定**します。日本語（CJK）クエリは IA 側が拒否するため、HTTP を出さずにエラーを返します（実測 10/10）。`title:(語 AND 語)` に組み直して引きます。summary は**目録・アップロード者の注記**で抄録ではありません。本文は取得しません |
+| `qiita`（明示指定） | Qiita の技術記事（タイトル・本文の抜粋・タグ・Likes・Stock・コメント数・投稿者・更新日時） | キー不要。検索構文（`tag:Python` / `user:foo` / `created:>2026-01-01` / `stocks:>50`）が使えます。**未認証は 60 回/時**なので、同じ問いはキャッシュで即返りますが**別の問いは 1 分待ち**ます。`FREEAGENT_QIITA_TOKEN` を設定すると 1,000 回/時・間隔 3.6 秒。記事の著作権は投稿者に帰属します |
 
 `sources` を省略すると**従来の6ソースのみ**、指定すると指定したソースだけを検索します。
-追加17ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
+追加18ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
 `limit` は**各ソースの上限**です。全体の結果は重複除去などで減るので、合計件数を保証する値ではありません。
 本文という場合も、取得できた説明・導入部・アブストラクトを指します。原典の全文とは限りません。
 
@@ -675,6 +683,7 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | 開発者の議論を探す | 「Hacker News で Rust の所有権についての議論を探して」 | `hn` |
 | アーカイブの存在を調べる | 「Software Heritage に cargo のリポジトリがあるか調べて」 | `swh` |
 | 当時の一次資料を探す | 「Internet Archive で FORTRAN のマニュアルを探して」 | `ia`（**英語の語で**） |
+| 日本語の技術記事を探す | 「Qiita で Python の非同期処理の記事を探して」 | `qiita` |
 
 **CiNii の利用目的は学術研究／非営利の情報利活用に限定され、appid の貸与・譲渡は禁止です。**
 自分の利用が条件を満たすか確認してから設定してください
@@ -1015,6 +1024,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `GITHUB_TOKEN` / `GH_TOKEN` | 空 | GitHub のレート制限緩和（コード検索は必須） |
 | `FREEAGENT_MAILTO` | 空 | Crossref / OpenAlex / DataCite の polite pool 用メールアドレス（キーではない） |
 | `FREEAGENT_LIBRARIESIO_KEY` | 空 | Libraries.io の検索。利用者自身の API キーが必須 |
+| `FREEAGENT_QIITA_TOKEN` | 空 | Qiita の検索枠を 60 回/時 → 1,000 回/時に上げる（任意） |
 
 **接続先の上書き（通常は触らない）**
 

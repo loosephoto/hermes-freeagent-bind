@@ -4,7 +4,7 @@ Hermes Agent の **Free モデルをサブ LLM として並列に走らせる** 
 単一ファイルのモノリス）。メイン LLM の知識補助として **arXiv / Crossref / OpenAlex / Wikipedia /
 Wikidata / GitHub** を既定で引き、**DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates / CiNii /
 OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Libraries.io /
-Internet Archive** は
+Internet Archive / Qiita** は
 明示指定で追加する。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は対象外**。
 
 - 全体像は `README.md`、**実装の契約は `SPEC.md`**（変更時は両方を同一変更内で更新する）。
@@ -237,6 +237,16 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     説明に書く）。証拠は目録の注記なので `summary_kind=structured_record`。**全文検索 API は採らない**
     （5.9〜25.1 秒で 8 秒の締め切りに 3/8 超過・日本語 `total=0`）。CDX は 5.4〜30 秒、SPN2 と S3 は
     書き込みで利用者キーが前提。`inside.php` は OCR のあるアイテムに限られ主要経路にできない。
+
+37. **第9段階は日本語の技術記事（Qiita）だけ**（§5.22 / §6.12）。`/api/v2/items?query=` はキー不要で
+    実測 0.18〜0.36 秒。**間隔はトークンの有無で 2 定数**（github と同じ型）: 認証 1,000 回/時 → 3.6 秒、
+    未認証 60 回/時 → 60.0 秒。未認証では同じ問いの再実行だけがキャッシュで即返り、別の問いは
+    **ローカルの 429 として見える**（隠さない・規約 8）。**引用文は `rendered_body`（HTML）から作り、
+    `body`（Markdown）を使わない** — `_plain_text` は `<[^>]+>` しか落とさないので画像記法が残る（実測）。
+    証拠は `summary_kind=discussion`。**キー不要のソースなので、未設定でも HTTP を出して動かす**
+    （規約 29 の「キー必須ソースは未設定なら HTTP を出さない」とは型が違う）。見送り（実測）: Reddit
+    （未認証は 403 で遮断・事前審査必須）/ openBD（キーワード検索 API 無し）/ Botipedia（公開 API 無し）/
+    Free Dictionary API（停止）。
 
 ## ライセンス
 

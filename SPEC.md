@@ -21,7 +21,7 @@
 | §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳） |
 | §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
-| §5 | 知識バックエンド23種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須） / §5.21 Internet Archive（明示指定のみ）） |
+| §5 | 知識バックエンド24種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須） / §5.21 Internet Archive（明示指定のみ） / §5.22 Qiita（明示指定のみ）） |
 | §6 | ツール実装（11本、§6.11 本文の注入番号・引用認定） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
@@ -212,7 +212,7 @@
 - 注入する本文は 1 件あたり `FREEAGENT_EVIDENCE_ITEM_CHARS`（既定 360）、全体で
   `FREEAGENT_EVIDENCE_TOTAL_CHARS`（既定 3200）に収める。入れすぎると小型 Free モデルが予算を
   使い切って空応答・切断になる（逆効果）。
-- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加17種（datacite / openaire / zenodo / ror / doaj / npm / crates / cinii / osv / ietf / inspirehep / oeis / hfhub / hn / swh / librariesio / ia）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。ciniiは`FREEAGENT_CINII_APPID`、librariesioは`FREEAGENT_LIBRARIESIO_KEY`が前提で、未設定ならHTTPを出さずに案内を返す（§6.7 / §6.10）。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は含まない**（§6.9）。
+- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加18種（datacite / openaire / zenodo / ror / doaj / npm / crates / cinii / osv / ietf / inspirehep / oeis / hfhub / hn / swh / librariesio / ia / qiita）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。ciniiは`FREEAGENT_CINII_APPID`、librariesioは`FREEAGENT_LIBRARIESIO_KEY`が前提で、未設定ならHTTPを出さずに案内を返す（§6.7 / §6.10）。qiitaは`FREEAGENT_QIITA_TOKEN`があれば1,000回/時（無くても60回/時で動く。未認証では別の問いが1分待ちになる）。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は含まない**（§6.9）。
 - `fallback=true`のJSON真偽値だけが、自然語arXiv検索をDataCiteへ追加送信する明示許可。文字列`"true"`等は許可にしない。
 - 1 ソースの失敗で全体を落とさない（`errors` に集約し、成功分だけ返す）。
 
@@ -240,7 +240,7 @@
   `FREEAGENT_STATE_DIR/kb_latency.jsonl`・最大 20,000 行・超えたら古い行から tmp + `os.replace` で捨てる）へ追記。
   記録は `ts` / `hour`（日本時間）/ `source` / `elapsed_s` / `ok` / `items` / `error`（160 字）/ `mailto` /
   `openalex_key` / `cinii_appid` / `env_failure` に加え `datacite_kind` / `summaries`（本文がある件数）を記録し、**タイトル・本文は残さない**。
-  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応23ソースを測る（cinii / librariesio はキー未設定なら外す・§6.7 / §6.10）。論文キーワードだと空振りするソース（ror / npm / crates / librariesio / osv / ietf / hn / swh / ia / inspirehep / oeis / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
+  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応24ソースを測る（cinii / librariesio はキー未設定なら外す・§6.7 / §6.10）。論文キーワードだと空振りするソース（ror / npm / crates / librariesio / osv / ietf / hn / swh / ia / qiita / inspirehep / oeis / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
 - 全ソースが接続系の失敗なら `env_failure=true`（こちらのネットワーク障害）とし、`--report` の集計から外す。
 - `--schedule N` は Windows のタスク（`pythonw`＝窓を出さない）を 1 時間おきに登録し、残り回数を
   `kb_latency.jsonl.schedule.json` で数えて、最後の 1 回でタスクを自分で消す（`/ED` `/ET` は HOURLY との
@@ -509,6 +509,30 @@ Internet Archive を**メタデータ検索だけ**明示指定ソースとし�
 - **実測（2026-10-13・実 stdio 経路・2 件）**: ia 0.8 秒（`FORTRAN manual`）。ツール一覧JSONは
   14,399 → **14,654 文字**（+255・ツール数は 11 のまま）。
 
+### 6.12 第9段階ソースの採用根拠（§5.22・2026-10-15）
+
+Qiita API v2 を**明示指定ソース**として採った。既定6は不変で、対象範囲（§6.9 の科学・プログラミング）も
+変えず、**23 ソース中に 1 つも無かった「日本語のプログラミング記事」**を補う（cinii は日本語だが学術文献）。
+
+- **採った理由（実測）**: `/api/v2/items?query=` はキー不要で 0.18〜0.36 秒（6 サンプル、8 秒の締め切りに
+  超過 0）。絞り込み構文がそのまま使える（`tag:Python` / `user:foo` / `created:>2026-10-01` / `stocks:>50`）。
+  日本語の語もそのまま引ける（実測 0.30 秒）。23 ソース中の空白を埋めるので既存ソースと重複しない。
+- **間隔はトークンの有無で 2 定数**（github と同じ型）: 公称レートは認証 1,000 回/時（≒16.7/分 → 3.6 秒）、
+  未認証 60 回/時（= 1/分 → 60.0 秒）。未認証では同じ問いの再実行だけがキャッシュで即返り（実測 0.000 秒）、
+  別の問いはローカルの `HTTP 429: ローカルのアクセス間隔制御` として見える（隠さない・規約 8）。これは
+  Qiita の実クォータそのもので、キー未設定を失敗として扱わない（規約 29 の「キー必須ソース」とは型が違う）。
+- **本文は `rendered_body`（HTML）を使い `_plain_text` に通す**: `body`（Markdown）だと `_plain_text` は
+  `<[^>]+>` しか落とさないので画像記法が引用文に残る（実測: `body` は画像 1・リンク 1 が残存、
+  `rendered_body` は 0/0 で本文だけ）。
+- **証拠の種類**: `summary_kind=discussion`（HN と同じユーザー生成の解説。査読論文ではない）。引用 URL は
+  記事 URL、`identifier` は記事 ID。タグ・Likes・Stock・コメント数・更新日時は `extra` に置く。
+- **見送り（実測）**: Reddit（未認証は全経路 403 `Blocked`。Responsible Builder Policy が事前承認と
+  AI 目的の利用を求める）/ openBD（キーワード検索 API が無く ISBN 直引きのみ。`isbn=abc` は `[null]`）/
+  Botipedia（公開 API が無い。`/api` 等はすべて同一 HTML の catch-all）/ Free Dictionary API（オリジン停止で
+  522。12 語中 5 語だけが古い CDN キャッシュで 200）。
+- **実測（2026-10-15・実 stdio 経路・2 件）**: qiita 0.3 秒（`tag:Python`）/ `measure_kb.py` 0.28 秒。
+  ツール一覧JSONは 14,654 → **14,882 文字**（+228・ツール数は 11 のまま）。stdio 往復は 0.2605 秒（7 回中央値）。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。
@@ -595,7 +619,7 @@ Internet Archive を**メタデータ検索だけ**明示指定ソースとし�
 ## 7.6 利用者向け説明と実装の境界
 
 README は利用開始・結果の読み方・障害時の対処を先に置き、実装上の設計理由はこの SPEC に置く。
-利用者が用途から選べる導線を設け、既定6ソースと明示指定17ソースを区別する。
+利用者が用途から選べる導線を設け、既定6ソースと明示指定18ソースを区別する。
 引数一覧・追加プロバイダの確認設定・過去の計測記録は折りたたみ、
 無料枠・データ送信・保存・引用の限界は利用者が確認できる形で残す。
 次の既存挙動を、保証されている機能として過大に説明しない。

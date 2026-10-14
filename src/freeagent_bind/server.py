@@ -2,7 +2,7 @@
 """hermes-freeagent-bind — Hermes Agent の Free モデルをサブLLMとして並列に走らせ、
 外部知識（既定6ソース＋DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates / CiNii /
 OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Libraries.io /
-Internet Archive）で
+Internet Archive / Qiita）で
 根拠づける MCP サーバー。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は
 対象外**（第6段階で採った生命・医学系ソースは 2026-10-05 に方針変更で削除。§5.19 に記録）。
 
@@ -20,7 +20,7 @@ Internet Archive）で
                     §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR /
                     §5.16 DOAJ・npm・crates.io / §5.17 CiNii Research（appid 必須） / §5.18 プログラミング・標準 /
                     §5.19 科学（医学・生物学は対象外） / §5.20 プログラミング特化: HN・Software Heritage・Libraries.io /
-                    §5.21 Internet Archive（明示指定のみ））
+                    §5.21 Internet Archive（明示指定のみ） / §5.22 日本語の技術記事: Qiita（明示指定のみ））
   §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号）
   §7 ツール定義         §8 表示（content）
   §8.5 失敗時の「次の一手」（structuredContent.next_action）
@@ -63,7 +63,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.5.1"
+SERVER_VERSION = "0.5.2"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -263,6 +263,8 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "
 # OpenAlex は匿名の検索を提供元側で一時停止することがある（実測: 503 + "Anonymous search is paused"）。
 # 無料 API キーを入れると止まらない。単一 work の取得はキー無しでも通る。
 OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "")
+# Qiita は未認証でも 60 回/時で動く（実測）。トークンを入れると 1,000 回/時になり、間隔が 60 秒→3.6 秒に縮む。
+QIITA_TOKEN = os.environ.get("FREEAGENT_QIITA_TOKEN", "").strip()
 
 _MODELS_CACHE: dict[str, dict] = {}   # provider -> {"at": float, "rows": [...], "error": str}
 _MODELS_LOCK = threading.Lock()
@@ -4199,6 +4201,78 @@ SOURCES = (*SOURCES, "ia")
 KB_BACKENDS.update({"ia": lambda q, limit, opts: kb_internetarchive(q, limit)})
 
 
+# ---------------------------------------------------------------- §5.22 第9段階: 日本語の技術記事（Qiita・明示指定のみ）
+#
+# Qiita API v2 の `/api/v2/items?query=` はキー不要で動くキーワード検索。実測 0.18〜0.36 秒（6 サンプル）で
+# 8 秒の締め切りに余裕で載る。**23 ソース中、日本語のプログラミング記事を返すものが 1 つも無い**
+# （cinii は日本語だが学術文献）ので、既存ソースと重複しない。
+#   * 絞り込み構文がそのまま使える（実測）: `tag:Python` / `user:foo` / `created:>2026-10-01` / `stocks:>50`。
+#     日本語の語もそのまま引ける（実測 0.30 秒）。
+#   * **間隔はトークンの有無で 2 定数**（github と同じ型）。公称レートは認証 1,000 回/時（≒16.7/分 → 3.6 秒）、
+#     未認証 60 回/時（= 1/分 → 60.0 秒）。未認証では**同じ問いの再実行だけがキャッシュで即返り**（実測 0.000 秒）、
+#     別の問いは 1 分待つ。これは Qiita の実クォータそのものなので隠さずエラーで見せる（規約 8）。
+#   * **本文は `rendered_body`（HTML）を使い `_plain_text` に通す**。`body`（Markdown）だと `_plain_text` は
+#     `<[^>]+>` しか落とさないので画像記法が引用文に残る（実測: `body` は画像 1・リンク 1 が残存、
+#     `rendered_body` は 0/0 で本文だけ）。
+#   * 証拠の種類は `discussion`（HN と同じユーザー生成の解説。査読論文ではない）。
+#   * 見送り（実測）: Reddit（未認証は全経路 403 で遮断。Responsible Builder Policy が事前承認と
+#     AI 目的の利用を要求）/ openBD（キーワード検索 API が無く ISBN 直引きのみ。実測 `isbn=abc` は `[null]`）/
+#     Botipedia（公開 API が無い。全パスが同一 HTML の catch-all）/ Free Dictionary API（オリジン停止で 522）。
+QIITA_INTERVAL = 3.6 if QIITA_TOKEN else 60.0     # 認証 1000/時 / 未認証 60/時（公称レートで割る）
+QIITA_BUDGET = "qiita.com/api/v2/items"           # 同一ホストの別エンドポイントと予算を分ける（規約 32）
+
+
+def kb_qiita(query: str, limit: int = 5) -> dict:
+    """Qiita の日本語技術記事。query は Qiita の検索構文（tag:Python user:foo created:>2026-01-01）。"""
+    query = as_str(query)
+    limit = as_int(limit, 5, 1, 20)
+    if not query:
+        return {"source": "qiita", "error": "query は必須です"}
+    attribution = "データ提供: Qiita（Qiita API v2。記事の著作権は投稿者に帰属） https://qiita.com/"
+
+    def produce() -> dict:
+        params = {"query": query, "per_page": limit}
+        headers = {"Authorization": f"Bearer {QIITA_TOKEN}"} if QIITA_TOKEN else None
+        data, err = _kb_new_json("https://qiita.com/api/v2/items?"
+                                 + urllib.parse.urlencode(params), QIITA_INTERVAL,
+                                 budget_key=QIITA_BUDGET, extra_headers=headers)
+        if err:
+            return {"source": "qiita", "error": err}
+        rows = _kb_array(data, "Qiita応答")
+        items = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                raise ValueError("Qiita の item はオブジェクトではありません")
+            title = _plain_text(as_str(row.get("title")), 300)
+            url = as_str(row.get("url"))
+            if not title or not url:
+                continue
+            user = row.get("user") if isinstance(row.get("user"), dict) else {}
+            tags = [as_str(tag.get("name")) for tag in _kb_array(row.get("tags"), "tags")
+                    if isinstance(tag, dict) and as_str(tag.get("name"))]
+            likes, stocks = row.get("likes_count"), row.get("stocks_count")
+            comments = row.get("comments_count")
+            items.append({"title": title, "url": url,
+                          # `body` は Markdown で、`_plain_text` は画像記法を落とせない（実測）。
+                          "summary": _plain_text(as_str(row.get("rendered_body")), 600),
+                          "identifier": as_str(row.get("id")), "kind": "qiita-item",
+                          "summary_kind": "discussion",
+                          "year": as_str(row.get("created_at"))[:4], "container": "Qiita",
+                          "authors": [as_str(user.get("id"))] if as_str(user.get("id")) else [],
+                          "extra": {"tags": tags[:8],
+                                    "likes_count": likes if type(likes) is int else None,
+                                    "stocks_count": stocks if type(stocks) is int else None,
+                                    "comments_count": comments if type(comments) is int else None,
+                                    "updated_at": as_str(row.get("updated_at"))}})
+        return _kb_generic_result("qiita", items, attribution)
+
+    return _kb_new_cached(f"qiita:{query}:{limit}", "qiita", produce)
+
+
+SOURCES = (*SOURCES, "qiita")
+KB_BACKENDS.update({"qiita": lambda q, limit, opts: kb_qiita(q, limit)})
+
+
 # ================================================================ §6 ツール実装
 #
 # どのツールも例外を外へ漏らさず、content（人間向け）と structuredContent（LLM向け純粋JSON）を
@@ -4227,7 +4301,7 @@ AGENT_SYSTEM = (
     "あなたは調査補佐です。次のいずれか**1つだけ**を JSON で出力してください。\n"
     '  ツールを使う: {"tool": "lookup", "query": "<検索語>", "sources": ["arxiv","crossref",...]}\n'
     '  使える source: wikipedia, wikidata, arxiv, crossref, openalex, github, datacite, openaire, zenodo, ror, doaj, npm, crates, cinii\n'
-    '  追加（明示指定のみ）: osv, ietf, inspirehep, oeis, hfhub, hn, swh, librariesio, ia\n'
+    '  追加（明示指定のみ）: osv, ietf, inspirehep, oeis, hfhub, hn, swh, librariesio, ia, qiita\n'
     '  追加sourceは明示指定のみ。datacite_kind: all / arxiv / dataset。fallback: trueでarXivのDataCite代替を許可。\n'
     '  回答する:     {"answer": "<回答。使った根拠の番号 [n] を本文に書く>"}\n'
     "ツール結果は [1] [2] … の番号つきで返ります。回答では使った根拠の番号を本文に書き、"
@@ -5875,7 +5949,7 @@ TOOLS: list[dict] = [
             "（百科・構造化）／GitHub（コード）を並列に引く。追加の datacite / openaire / zenodo / ror / "
             "doaj（OA論文）/ npm / crates / librariesio（パッケージ検索）／osv・ietf（脆弱性・標準）／"
             "inspirehep・oeis・hfhub（物理・数学・ML）／hn（Hacker News の議論）／swh（Software Heritage の"
-            "コードアーカイブ）／ia（Internet Archive のアイテム検索。**query は英語の語で**）は sources で明示指定する。"
+            "コードアーカイブ）／ia（Internet Archive のアイテム検索。**query は英語の語で**）／qiita（Qiita の日本語技術記事）は sources で明示指定する。"
             "DataCite は自然語の各語を AND 検索、datacite_kind=dataset で研究データ。"
             "fallback=true のときだけ自然語 arXiv検索の失敗/遅延を DataCite で代替する（取得元を明示）。"
             "【使わない条件】単一の事実だけなら web_search が速い。"
@@ -5885,7 +5959,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "query": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）。対象は科学とプログラミングまでで医学・生物学は含まない"},
+                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。検索構文 tag:Python user:foo created:>2026-01-01。**未認証は 60 回/時**で別の問いは 1 分待ち、FREEAGENT_QIITA_TOKEN を設定すると 1,000 回/時）。対象は科学とプログラミングまでで医学・生物学は含まない"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
                 "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語（既定 ja）"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須・10 req/分）。code はファイルへのポインタと一致箇所の断片を返し、ライセンス情報を含まない（取り込む前に repo 検索で確認する）。repo: owner/name・path:・language:・filename:・in:file の修飾子を付けると精度が上がる"},
@@ -5910,7 +5984,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "question": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6種。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。医学・生物学は対象外"},
+                            "description": "既定6種。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。**未認証は 60 回/時**、FREEAGENT_QIITA_TOKEN で 1,000 回/時）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。医学・生物学は対象外"},
                 "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
                 "limit": {"type": "integer"},

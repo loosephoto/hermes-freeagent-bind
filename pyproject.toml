@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-freeagent-bind"
-version = "0.5.1"
-description = "Hermes Agent の Free モデルをサブ LLM として並列に走らせ、外部知識（既定6＋明示指定17の23ソース）で根拠づける MCP サーバー"
+version = "0.5.2"
+description = "Hermes Agent の Free モデルをサブ LLM として並列に走らせ、外部知識（既定6＋明示指定18の24ソース）で根拠づける MCP サーバー"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "loosephoto", email = "loosephoto@users.noreply.github.com" }]
-keywords = ["mcp", "model-context-protocol", "hermes-agent", "llm", "sub-llm", "free-models", "orchestration", "ai-agents", "grounding", "arxiv", "crossref", "openalex", "wikidata", "internet-archive", "python"]
+keywords = ["mcp", "model-context-protocol", "hermes-agent", "llm", "sub-llm", "free-models", "orchestration", "ai-agents", "grounding", "arxiv", "crossref", "openalex", "wikidata", "internet-archive", "qiita", "python"]
 classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
