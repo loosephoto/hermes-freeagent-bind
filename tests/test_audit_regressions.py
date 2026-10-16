@@ -135,6 +135,65 @@ class TestAuditRegressions(unittest.TestCase):
         self.assertEqual(sum(1 for u in urls if "titles=" in u), 1)
         self.assertEqual(got["items"][0]["summary"], "Plain summary")
 
+    def test_auto_lang_picks_ja_for_cjk_and_en_for_ascii(self):
+        """実測（ASCII の問いを ja 索引に投げると無関係）に基づく規則。"""
+        for query, want in [("大規模言語モデル", "ja"), ("東京", "ja"), ("強化学習", "ja"),
+                            ("LLM 大規模言語モデル", "ja"), ("한국어", "ja"),
+                            ("Transformer", "en"), ("GRPO", "en"), ("diffusion model", "en"),
+                            ("!!!", "en"), ("", "en")]:
+            self.assertEqual(S._kb_auto_lang(query), want, query)
+        self.assertEqual(S._kb_auto_lang("Transformer", "ja"), "ja", "明示は尊重する")
+        self.assertEqual(S._kb_auto_lang("大規模言語モデル", "EN"), "en", "大文字も受ける")
+
+    def test_wikipedia_auto_lang_uses_en_host_for_ascii_query(self):
+        S._KB_CACHE.pop("wiki:en:transformer-auto:1", None)
+        urls = []
+        def fake(url, **kwargs):
+            urls.append(url)
+            return {"query": {"pages": {"1": {"title": "T", "index": 1, "extract": "b"}}}}, ""
+        with mock.patch.object(S, "kb_json", side_effect=fake):
+            got = S.kb_wikipedia("transformer-auto", limit=1)
+        self.assertTrue(urls, "HTTP が出ていない")
+        for url in urls:
+            self.assertIn("en.wikipedia.org", url, url)
+        self.assertEqual(got["lang"], "en", "使った言語を返す")
+
+    def test_wikipedia_explicit_lang_is_respected(self):
+        S._KB_CACHE.pop("wiki:ja:transformer-explicit:1", None)
+        urls = []
+        def fake(url, **kwargs):
+            urls.append(url)
+            return {"query": {"pages": {"1": {"title": "T", "index": 1, "extract": "b"}}}}, ""
+        with mock.patch.object(S, "kb_json", side_effect=fake):
+            got = S.kb_wikipedia("transformer-explicit", lang="ja", limit=1)
+        for url in urls:
+            self.assertIn("ja.wikipedia.org", url, url)
+        self.assertEqual(got["lang"], "ja")
+
+    def test_wikidata_keeps_ja_for_ascii_query(self):
+        """wikidata は ja のまま（実測: Transformer は ja の 2 件目に機械学習の項目が出る）。"""
+        S._KB_CACHE.pop("wd:ja:transformer-wd:1", None)
+        urls = []
+        def fake(url, **kwargs):
+            urls.append(url)
+            return {"search": []}, ""
+        with mock.patch.object(S, "kb_json", side_effect=fake):
+            S.KB_BACKENDS["wikidata"]("transformer-wd", 1, {"lang": ""})
+        self.assertTrue(urls)
+        self.assertIn("language=ja", urls[0], urls[0])
+
+    def test_wikipedia_backend_uses_auto_lang(self):
+        """KB_BACKENDS 経由（opts が空）でも自動判定が効く。"""
+        S._KB_CACHE.pop("wiki:en:backend-auto:1", None)
+        urls = []
+        def fake(url, **kwargs):
+            urls.append(url)
+            return {"query": {"pages": {"1": {"title": "T", "index": 1, "extract": "b"}}}}, ""
+        with mock.patch.object(S, "kb_json", side_effect=fake):
+            S.KB_BACKENDS["wikipedia"]("backend-auto", 1, {"lang": ""})
+        for url in urls:
+            self.assertIn("en.wikipedia.org", url, url)
+
     def test_wikipedia_promotes_exact_title_hit(self):
         """実測の再現: 素の検索が無関係な項目を返しても、完全一致があれば先頭に来る。"""
         S._KB_CACHE.pop("wiki:ja:exact-promote:2", None)

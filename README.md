@@ -485,6 +485,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | HTTP で複数マシンから共有できる | 単一ホスト前提です（ループバック）。複数マシン間の調整はしません |
 | サーバー起点の通知が必ず届く | SSE（`GET`）を張ったセッションにだけ届きます。張らないクライアントでは、警告は最初のツール結果に載ります（stdio と同じ） |
 | 正式名称で引けば必ずその記事が返る | ja.wikipedia の検索順位は語によって大きく崩れます（実測: 「大規模言語モデル」は記事があるのに 20 件中 19 位）。**タイトルが問いと完全一致する記事だけ**を先頭に昇格させる対策を入れてありますが、それ以外の並びは提供元の順位のままです |
+| 曖昧な語でも分野を当ててくれる | 分野が複数ある語は外れます（実測: wikidata の `Transformer` は 1 位が「変圧器」で、機械学習の項目は 2 位。**言語を en にしても電気機器が 1 位なので直りません**）。分野を指定したいときは問いに文脈語を足すか、openalex / crossref を使ってください |
 
 **過去の実測例（環境・モデル・時間帯で変動します）**：4 体の panel は 14〜20 秒、
 多段討議を含む 1 ターンは 3 分 52 秒でした。思考ノートの記録だけならサブ呼び出しは 0 回、
@@ -672,7 +673,7 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 
 | ソース名 | 取得するもの | 注意点 |
 |---|---|---|
-| `wikipedia` | 検索結果と記事の導入部 | `lang` は既定 `ja`。英語記事なら `en` を指定。**正式名称がそのままタイトルの記事は先頭に昇格**します（検索順位が低い日本語の複合語対策。SPEC §6.13） |
+| `wikipedia` | 検索結果と記事の導入部 | **言語は問いから自動**（日本語・中国語・韓国語なら `ja`、それ以外は `en`。`lang` で明示も可）。**正式名称がそのままタイトルの記事は先頭に昇格**します（日本語の複合語は検索順位が崩れるため。SPEC §6.13 / §6.14） |
 | `wikidata` | QID・ラベル・説明・構造化データ | ラベルがない項目もあります |
 | `arxiv` | プレプリントのメタデータ・アブストラクト | 3 秒間隔で直列化。プレプリントは査読済みとは限りません |
 | `crossref` | DOI・論文のメタデータ・公開されているアブストラクト | アブストラクトがない論文もあります |
@@ -884,7 +885,14 @@ python scripts/measure_kb.py --sources hn swh librariesio
 python scripts/measure_kb.py --sources ia
 python scripts/measure_kb.py --sources datacite --datacite-kind dataset
 python scripts/measure_kb.py --report
+python scripts/measure_relevance.py
+python scripts/measure_relevance.py --report
 ```
+
+`measure_relevance.py` は**関連性**（速さではなく中身）を測ります。固定のクエリ集合 ×「トップ 1 に含まれる
+べき語」で的中を数え、`relevance.jsonl` に追記します。**所要時間の計測では見つからない種類の不具合**
+（実測: ja.wikipedia は 0.6 秒で正常に見えていたが「大規模言語モデル」で無関係な記事を返していた）を
+見つけるためのもので、上流の順位は変わるため**外れても失敗にはしません**。
 
 計測はタイトル・本文を保存せず、時間・成否・件数・本文がある件数・モードだけを追記します。
 既存の時刻別計測も続けられます。OpenAIREを含む別プロセスの連続実行は60秒以上空けてください。
@@ -1016,6 +1024,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_MAX_CALLS_PER_RUN` | 40 | fanout の組合せ上限（map 全体の制限ではありません） |
 | `FREEAGENT_KB_DEADLINE` | 8 | 知識取得全体の締め切り（秒・1〜120）。遅れたソースは `⏱` で脱落表示 |
 | `FREEAGENT_KB_LATENCY_PATH` | `kb_latency.jsonl` | `measure_kb.py` の記録先 |
+| `FREEAGENT_RELEVANCE_PATH` | `relevance.jsonl` | `measure_relevance.py` の記録先 |
 | `FREEAGENT_HARNESS` | 空 | 起動元の目印。Hermes から使うなら `hermes`（[Hermes 以外で使うとき](#-hermes-以外で使うとき)） |
 | `FREEAGENT_HARNESS_WARN` | 1 | `0` で Hermes 以外のときの警告を止める（判定結果は `structuredContent.harness` に残る） |
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |

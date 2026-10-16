@@ -559,6 +559,34 @@ Qiita API v2 を**明示指定ソース**として採った。既定6は不変�
 - 回帰テスト: `tests/test_audit_regressions.py` の wikipedia 群（昇格・空 extract・演算子・lookup 失敗・
   リクエスト本数）。
 
+### 6.14 言語の自動選択と関連性の測定（2026-10-17・v0.6.2）
+
+**症状（実測）**: `lang` の既定が `ja` 固定だったため、**ASCII の問いを ja 索引に投げると無関係な記事が
+根拠になる**。`Transformer` は ja で「トランスフォーマー (曖昧さ回避) / ASUS Eee Pad TF101 / TF201」、
+en では「Transformer / Transformer (deep learning) / Generative pre-trained transformer」。
+`diffusion model` も ja は「フィジカル・レビュー / 拡散律速凝集」で en は「Diffusion model」。
+逆に日本語の問いは ja が正しい（`強化学習` は ja 1 位、en は「安倍晋三暗殺」）。
+
+**対処**: `_kb_auto_lang(query, lang)` — 明示があればそれを尊重し、無ければ**問いに CJK（かな・漢字・ハングル）
+を含む→ja、それ以外→en**。判定は正規表現 1 本（決定的・依存ゼロ）。`opts["lang"]` の既定を「空」にし、
+`kb_wikipedia` の既定も空にした（`KB_BACKENDS["wikipedia"]` は `opts.get("lang") or ""` を渡す）。
+
+- **wikidata には適用しない**（実測: `Transformer` は ja の 2 件目に「トランスフォーマー（機械学習アーキテクチャ）」
+  が出るが、en は変圧器とメディア作品。ja のままの方が当たる）。`KB_BACKENDS["wikidata"]` は `or "ja"` のまま。
+- **`lang` の description を更新**（規約 5: モデルの唯一の窓口）。「省略時は問いから自動。英語の語は自動で en」。
+- 未指定は「空文字」で伝える（`as_str(lang, "")`）。`as_str(None, "ja")` のままだと自動判定に到達しない。
+
+**測定器（なぜ必要か）**: `measure_kb.py` は**所要時間**、`measure_adoption.py` は**自発利用率**を測る。
+**「速いが無関係」はどちらにも映らない**（実測: ja.wikipedia は 0.6 秒で正常に見えていた）。
+`scripts/measure_relevance.py` は固定クエリ集合 ×「トップ 1 に含まれるべき語」で的中を数え、JSONL に追記する。
+
+- **同じ測定器を修正前後で回して差が出ることを確認**（HEAD を一時展開し、新しい測定器をそこへコピーして実行）:
+  wikipedia **3/6（60%）→ 5/5（100%）**、全体 8/10 → 10/10。
+- 外れても**失敗にしない**（上流の順位は変わる。実行する検証であってゲートではない）。
+- 期待を書かないケース（`GRPO`、wikidata の `Transformer`）は**記録のみ**にする。wikidata の `Transformer` は
+  1 位が変圧器で、**言語を変えても直らない**（en でも電気機器が 1 位）ため、曖昧語は既知の限界として記録する。
+- 記録先は `FREEAGENT_RELEVANCE_PATH`（既定 `<state_dir>/relevance.jsonl`）。モデルは呼ばない・キー不要のソースだけ。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。
@@ -817,6 +845,7 @@ python scripts/smoke_stdio.py                # 実クライアント経路（std
 python scripts/smoke_http.py                 # 実クライアント経路（HTTP: 通知 202 / batch / セッション / SSE）
 python scripts/check_offline.py              # 全滅時の縮退（例外漏れ・ハング・状態汚染なし）
 python scripts/measure_adoption.py           # 自発利用率（state.db を読むだけ）
+python scripts/measure_relevance.py --report # 知識ソースの関連性（トップ1 の的中率）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存
 env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py   # モデルの生存確認を定着
 ```

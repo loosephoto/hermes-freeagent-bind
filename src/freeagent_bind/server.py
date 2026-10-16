@@ -64,7 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.6.1"
+SERVER_VERSION = "0.6.2"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -2318,6 +2318,28 @@ def _cite(source: str, title: str, url: str, **extra) -> dict:
 
 # ---------------------------------------------------------------- §5.1 Wikipedia
 
+# CJK（かな・漢字・ハングル）を含むかどうかだけを見る。言語判定器は使わない（決定的・依存ゼロ）。
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+
+
+def _kb_auto_lang(query: str, lang: str = "") -> str:
+    """ソースの言語を決める。明示があればそれを尊重し、無ければ問いから決める（CJK を含む→ja、それ以外→en）。
+
+    実測（2026-10-17）: **ASCII の問いを ja 索引に投げると無関係な記事が返る**。
+    `Transformer` は ja で「トランスフォーマー (曖昧さ回避) / ASUS Eee Pad TF101 / TF201」、
+    en では「Transformer / Transformer (deep learning) / Generative pre-trained transformer」。
+    `diffusion model` も ja は「フィジカル・レビュー / 拡散律速凝集」で en は「Diffusion model」。
+    逆に日本語の問いは ja が正しい（`強化学習` は ja 1 位、en は「安倍晋三暗殺」）。混在（`LLM 大規模言語モデル`）は
+    CJK があるので ja。**wikidata は ja のままが良い**（実測: `Transformer` は ja の 2 件目に
+    「トランスフォーマー（機械学習アーキテクチャ）」が出るが、en は変圧器とメディア作品）ので、
+    この規則は wikipedia にだけ適用する。
+    """
+    explicit = as_str(lang).strip().lower()
+    if explicit:
+        return explicit
+    return "ja" if _CJK_RE.search(as_str(query)) else "en"
+
+
 def _wiki_exact_hit(data) -> dict | None:
     """`titles=` の応答から「存在し、中身のある」1 件を返す（無ければ None）。
 
@@ -2340,13 +2362,14 @@ def _wiki_exact_hit(data) -> dict | None:
     return None
 
 
-def kb_wikipedia(query: str, lang: str = "ja", limit: int = 3) -> dict:
+def kb_wikipedia(query: str, lang: str = "", limit: int = 3) -> dict:
     """本文の要約＋検索結果。出典 URL 付き（LLM 不使用）。
 
-    検索（`generator=search`）と**タイトル完全一致の lookup（`titles=`）を並列**に投げ、完全一致があれば
-    先頭に置く（§5.1 の順位対策）。演算子や引用符を含む問いでは lookup を投げない。
+    - 検索（`generator=search`）と**タイトル完全一致の lookup（`titles=`）を並列**に投げ、完全一致があれば
+      先頭に置く（§5.1 の順位対策）。演算子や引用符を含む問いでは lookup を投げない。
+    - `lang` 省略時は**問いから自動**（`_kb_auto_lang`: CJK→ja、それ以外→en）。明示すればそれを尊重する。
     """
-    lang = as_str(lang, "ja").lower()
+    lang = _kb_auto_lang(query, lang)
     if not re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", lang):
         return {"source": "wikipedia", "lang": lang, "items": [], "citations": [],
                 "error": "lang は有効な Wikipedia 言語コードで指定してください"}
@@ -2739,7 +2762,8 @@ def kb_github(query: str, kind: str = "repo", limit: int = 5) -> dict:
 # ---------------------------------------------------------------- §5.7 横断検索
 
 KB_BACKENDS = {
-    "wikipedia": lambda q, limit, opts: kb_wikipedia(q, lang=opts.get("lang") or "ja", limit=limit),
+    # wikipedia だけ「言語の自動判定」を使う（opts が空なら kb_wikipedia 側が問いから決める）。
+    "wikipedia": lambda q, limit, opts: kb_wikipedia(q, lang=opts.get("lang") or "", limit=limit),
     "wikidata": lambda q, limit, opts: kb_wikidata(q, lang=opts.get("lang") or "ja", limit=limit),
     "arxiv": lambda q, limit, opts: kb_arxiv(q, limit=limit),
     "crossref": lambda q, limit, opts: kb_crossref(q, limit=limit),
@@ -2824,7 +2848,8 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
                 "results": {}, "citations": [], "citation_count": 0,
                 "errors": {"sources": message}, "error": message, "llm_used": False}
     limit = as_int(limit, 3, 1, 10)
-    opts = {"lang": as_str(lang, "ja"), "kind": as_str(kind, "repo"),
+    # lang 未指定は「空」で渡す（wikipedia が問いから自動判定する。wikidata は or "ja" で従来どおり）。
+    opts = {"lang": as_str(lang, ""), "kind": as_str(kind, "repo"),
             "datacite_kind": as_str(datacite_kind, "all"), "fallback": fallback is True}
     by_source, timings = _kb_gather(picked, query, limit, opts, deadline)
     citations: list[dict] = []
@@ -4782,7 +4807,7 @@ def tool_lookup(args: dict) -> dict:
     return knowledge_lookup(query,
                             as_str_list(args.get("sources")) or None,
                             limit=as_int(args.get("limit"), 3, 1, 10),
-                            lang=as_str(args.get("lang"), "ja"),
+                            lang=as_str(args.get("lang"), ""),
                             kind=as_str(args.get("github_kind"), "repo"),
                             datacite_kind=as_str(args.get("datacite_kind"), "all"), fallback=args.get("fallback") is True)
 
@@ -4842,7 +4867,7 @@ def tool_grounded(args: dict) -> dict:
         return {"error": "question は必須です"}
     sources = as_str_list(args.get("sources")) or None
     kb = knowledge_lookup(question, sources, limit=as_int(args.get("limit"), 3, 1, 10),
-                          lang=as_str(args.get("lang"), "ja"),
+                          lang=as_str(args.get("lang"), ""),
                           kind=as_str(args.get("github_kind"), "repo"),
                           datacite_kind=as_str(args.get("datacite_kind"), "all"), fallback=args.get("fallback") is True)
     citations = [c for c in (kb.get("citations") or []) if _kb_has_evidence(c)]
@@ -6017,7 +6042,7 @@ TOOLS: list[dict] = [
                 "sources": {"type": "array", "items": {"type": "string"},
                             "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。検索構文 tag:Python user:foo created:>2026-01-01。**未認証は 60 回/時**で別の問いは 1 分待ち、FREEAGENT_QIITA_TOKEN を設定すると 1,000 回/時）。対象は科学とプログラミングまでで医学・生物学は含まない"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
-                "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語（既定 ja）"},
+                "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語。**省略時は問いから自動**（日本語・中国語・韓国語なら ja、それ以外は en）。英語の語（Transformer など）は自動で en になるので、通常は指定しない。明示するとその言語で引く"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須・10 req/分）。code はファイルへのポインタと一致箇所の断片を返し、ライセンス情報を含まない（取り込む前に repo 検索で確認する）。repo: owner/name・path:・language:・filename:・in:file の修飾子を付けると精度が上がる"},
                 "fallback": {"type": "boolean", "description": "既定 false。自然語 arXiv検索の失敗/遅延時に DataCite を許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"],
@@ -6044,7 +6069,7 @@ TOOLS: list[dict] = [
                 "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
                 "limit": {"type": "integer"},
-                "lang": {"type": "string"},
+                "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語。**省略時は問いから自動**（日本語・中国語・韓国語なら ja、それ以外は en）"},
                 "models": {"type": "array", "items": {"type": "string"}},
                 "size": {"type": "integer", "description": "参加モデル数（既定 2）"},
                 "max_tokens": {"type": "integer"},

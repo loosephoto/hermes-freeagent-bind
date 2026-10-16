@@ -36,6 +36,7 @@ python scripts/probe_knowledge_stdio.py      # 新規知識ソースの実API・
 python scripts/check_offline.py              # バックエンド全滅: 例外漏れ・ハング・状態汚染が無いこと
 python scripts/measure_adoption.py           # 自発利用率の測定（state.db を読むだけ・副作用なし。必要場面の近似判定も出す）
 python scripts/measure_kb.py --report         # 知識バックエンドの時間帯別の応答時間（記録を読むだけ）
+python scripts/measure_relevance.py           # 知識ソースの関連性（トップ1 の的中率。ネットワークあり）
 python scripts/apply_proactive.py            # 率先利用の設定（既定は表示のみ。--apply で適用）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存（プロキシが要る）
 env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py   # モデルの生存確認を定着（数分）
@@ -264,6 +265,15 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     並びは変えない（「タイトルに含む」での昇格は他を追い出す退行になる）。中身が空の extract は昇格させない。
     lookup は検索と**並列**に投げ（逐次 1.15 秒 → 並列 0.58 秒）、片方の失敗で全体を落とさない。演算子・
     引用符を含む問いと長すぎる問いでは投げない。
+
+40. **言語の既定は問いから決める（wikipedia だけ）**（§5.1 / §6.14）。`lang` の既定を `ja` に固定すると、
+    ASCII の問いが ja 索引に落ちて無関係な記事が根拠になる（実測: `Transformer` は ja で「ASUS Eee Pad TF101」、
+    en で「Transformer (deep learning)」）。`_kb_auto_lang` は CJK→ja / それ以外→en の決定的な規則で、
+    明示指定は尊重する。**wikidata には適用しない**（実測で ja の方が当たる）。未指定は `as_str(lang, "")` の
+    **空文字**で伝える（`"ja"` を既定にすると自動判定に到達しない）。`lang` の description も同時に更新する（規約 5）。
+    あわせて **`scripts/measure_relevance.py` で「速いが無関係」を測る** — `measure_kb.py`（時間）と
+    `measure_adoption.py`（自発率）では検出できないクラスなので、知識ソースの並びを変えたら回して
+    `--report` の的中率を見る（上流の順位変動があるので**失敗にはしない**）。
 
 ## ライセンス
 
