@@ -670,6 +670,23 @@ en では「Transformer / Transformer (deep learning) / Generative pre-trained t
 - 並列呼び出しで `branch_id` を省略した新しい分岐が同時に来ると、自動割当が同じ ID になり得る
   （割当はロック外）。明示の `branch_id` を推奨する。
 
+### 7.5.2 KANBAN のカードとの紐づけ（v0.7.0）
+
+KANBAN のワーカー（`hermes -p <profile> chat -q "work kanban task t_x"`）は、このサーバーの推論ツールを
+カードの作業中に呼ぶ。**思考がどのカードのものか**を後から辿れるように、`freeagent_think` に `card` を足した。
+
+- `card`（任意・64 文字に切り詰め）を渡すと台帳の行に `card` が載る。**渡された値が優先**で、未指定なら既存を保つ。
+- `view=true` + `card`（`session_id` 省略時）で、そのカードの台帳を**読み戻せる**（`thought_find_by_card` が
+  最後に更新された台帳を返す）。`session_id` を併せて渡した場合は **`session_id` が優先**（card は記録のみ）。
+- カードが未知なら**推測せずエラー**（`カード <id> に紐づく台帳はありません`）。
+- 応答に `card` を返し、`next_call.args.card` にも引き継ぐ（次の思考で落とさないため）。
+- **完了・ブロックはこのツールの仕事ではない**: カードの終端は `kanban_complete` / `kanban_block`（Hermes の
+  `kanban_*` ツール）で行う。MCP サーバーはボードを書かない（ワーカー系譜の MCP 子プロセスは書き込みフェンスで
+  `PermissionError` になる。§6.13 の調査で確認済み）。description にもその分担を書いてある（規約 5）。
+- 記録先は既存の台帳（`thoughts.json`）で、新しいストアは作らない。上限 `THOUGHT_MAX` / `THOUGHT_MAX_STEPS` は同じ。
+- 回帰テスト: `tests/test_freeagent_bind.py` の `TestThoughtLedgerStore`（記録・検索・未指定時の保持）と
+  `TestThinkCardLink`（ツール経由の記録・カードからの読み戻し・未知カード・session_id 優先）。
+
 ## 7.6 利用者向け説明と実装の境界
 
 README は利用開始・結果の読み方・障害時の対処を先に置き、実装上の設計理由はこの SPEC に置く。

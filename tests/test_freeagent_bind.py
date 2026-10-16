@@ -232,6 +232,25 @@ class TestThoughtLedgerStore(unittest.TestCase):
         S._THOUGHTS.clear()
         S._THOUGHTS_LOADED = False
 
+    def test_card_is_recorded_and_findable(self):
+        """KANBAN のカード ID で台帳を引ける（v0.7.0）。"""
+        sid = S.thought_merge("", {"n": 1, "text": "t"}, card="t_abc123")["session_id"]
+        self.assertEqual(S.thought_get(sid)["card"], "t_abc123")
+        self.assertEqual(S.thought_find_by_card("t_abc123"), sid)
+        self.assertEqual(S.thought_find_by_card("t_other"), "")
+        self.assertEqual(S.thought_find_by_card(""), "")
+        # 未指定なら既存を保ち、別カードを渡せば上書きされる（最後に書いた値が優先）
+        S.thought_merge(sid, {"n": 2, "text": "t2"})
+        self.assertEqual(S.thought_get(sid)["card"], "t_abc123", "未指定なら既存を保つ")
+        S.thought_merge(sid, {"n": 3, "text": "t3"}, card="t_def456")
+        self.assertEqual(S.thought_get(sid)["card"], "t_def456")
+        self.assertEqual(S.thought_find_by_card("t_abc123"), "")
+
+    def test_find_by_card_returns_newest(self):
+        S.thought_merge("", {"n": 1, "text": "a"}, card="t_same")
+        new = S.thought_merge("", {"n": 1, "text": "b"}, card="t_same")["session_id"]
+        self.assertEqual(S.thought_find_by_card("t_same"), new, "最後に更新された台帳を返す")
+
     def test_merge_get_drop(self):
         out = S.thought_merge("", {"n": 1, "text": "t"}, question="q")
         sid = out["session_id"]
@@ -319,6 +338,55 @@ class TestParseVerdict(unittest.TestCase):
     def test_junk_does_not_crash(self):
         for junk in [None, "", 123, [], {}]:
             self.assertEqual(S.parse_verdict(junk)["labels_found"], 0, f"junk={junk!r}")
+
+
+class TestThinkCardLink(unittest.TestCase):
+    """KANBAN のカードと思考台帳の紐づけ（v0.7.0・§6.9 の card 引数）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="fa-think-card-")
+        self._old = os.environ.get("FREEAGENT_THOUGHTS_PATH")
+        os.environ["FREEAGENT_THOUGHTS_PATH"] = os.path.join(self.tmp, "thoughts.json")
+        os.environ["FREEAGENT_THOUGHTS"] = "1"
+        S._THOUGHTS.clear()
+        S._THOUGHTS_LOADED = False
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("FREEAGENT_THOUGHTS_PATH", None)
+        else:
+            os.environ["FREEAGENT_THOUGHTS_PATH"] = self._old
+        S._THOUGHTS.clear()
+        S._THOUGHTS_LOADED = False
+
+    def test_think_records_card_and_returns_it(self):
+        out = S.tool_think({"thought": "カードに紐づく思考", "thought_number": 1, "card": "t_card1"})
+        self.assertEqual(out["card"], "t_card1")
+        self.assertEqual(out["next_call"]["args"]["card"], "t_card1", "次の呼び出しでも card を引き継ぐ")
+        self.assertEqual(S.thought_get(out["session_id"])["card"], "t_card1")
+
+    def test_view_by_card_reads_back(self):
+        out = S.tool_think({"thought": "1 手目", "thought_number": 1, "card": "t_card2"})
+        got = S.tool_think({"view": True, "card": "t_card2"})
+        self.assertEqual(got["session_id"], out["session_id"])
+        self.assertEqual(got["card"], "t_card2")
+        self.assertEqual(got["step"], 1)
+
+    def test_view_by_unknown_card_errors_without_guessing(self):
+        got = S.tool_think({"view": True, "card": "t_nope"})
+        self.assertIn("error", got)
+        self.assertEqual(got["card"], "t_nope")
+
+    def test_session_id_wins_over_card(self):
+        a = S.tool_think({"thought": "A", "thought_number": 1, "card": "t_cardA"})
+        b = S.tool_think({"thought": "B", "thought_number": 1, "card": "t_cardB"})
+        got = S.tool_think({"view": True, "session_id": a["session_id"], "card": "t_cardB"})
+        self.assertEqual(got["session_id"], a["session_id"], "session_id が優先（card は記録だけ）")
+        self.assertNotEqual(got["session_id"], b["session_id"])
+
+    def test_think_without_card_has_no_card_field(self):
+        out = S.tool_think({"thought": "card なし", "thought_number": 1})
+        self.assertNotIn("card", out)
 
 
 class TestThinkTool(unittest.TestCase):

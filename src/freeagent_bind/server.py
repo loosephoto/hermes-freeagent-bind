@@ -64,7 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.6.2"
+SERVER_VERSION = "0.7.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -1224,7 +1224,7 @@ def thought_get(sid: str) -> dict | None:
 
 
 def thought_merge(sid: str, step: dict, *, question: str = "", verifier_models: list | None = None,
-                  assign_number: bool = False, ops: dict | None = None) -> dict:
+                  assign_number: bool = False, ops: dict | None = None, card: str = "") -> dict:
     """台帳へ 1 ステップを**1 つのロック内で**統合する（読み・採番・書きを分けない）。
 
     読みと書きを分けると、並列に呼ばれた 2 つの思考が同じ番号を採番して**片方が上書きで消える**
@@ -1251,6 +1251,8 @@ def thought_merge(sid: str, step: dict, *, question: str = "", verifier_models: 
         _thought_apply_ops(row, steps, step, old, ops or {})   # §2.7
         row.update({
             "steps": steps,
+            # KANBAN のカード ID（任意）。渡された値が優先で、未指定なら既存を保つ（§6.9 の card 引数）。
+            "card": card or row.get("card") or "",
             "question": question or row.get("question") or "",
             "verifier_models": verifier_models or row.get("verifier_models") or [],
             "created_at": row.get("created_at") or now_ts(),
@@ -1260,6 +1262,24 @@ def thought_merge(sid: str, step: dict, *, question: str = "", verifier_models: 
         _thoughts_save()
     return {"session_id": target, "step": step, "steps_recorded": len(steps),
             "refused": False, "replaced": replaced}
+
+
+def thought_find_by_card(card: str) -> str:
+    """カード ID に紐づく台帳の `session_id` を返す（無ければ ""）。新しい順に 1 つだけ。
+
+    KANBAN のワーカーが `card` に自分のカード ID（t_xxxx）を渡すと、思考がカードに紐づく。台帳は
+    上限 `THOUGHT_MAX` 件しか持たないので線形走査で足りる。**複数のワーカーが同じカードを触っても
+    最後に更新された台帳を返す**（カード 1 枚 = 1 本の思考の道筋、という運用を想定）。
+    """
+    card = as_str(card).strip()
+    if not card:
+        return ""
+    _ensure_thoughts_loaded()
+    with _THOUGHTS_LOCK:
+        hits = [(as_float((row or {}).get("updated_at"), 0.0), sid)
+                for sid, row in _THOUGHTS.items()
+                if isinstance(row, dict) and as_str(row.get("card")).strip() == card]
+    return max(hits)[1] if hits else ""
 
 
 def thought_drop(sid: str) -> None:
@@ -5519,8 +5539,17 @@ def tool_think(args: dict) -> dict:
     if not THOUGHTS_ENABLED:
         return {"error": "思考台帳は無効です（FREEAGENT_THOUGHTS=0 で停止中）", "enabled": False}
     sid_in = as_str(args.get("session_id"))
+    card = truncate(as_str(args.get("card")).strip(), 64)
     stored = thought_get(sid_in) if sid_in else None
     if as_flag(args.get("view")):
+        # カードから読み戻す（KANBAN のワーカーが自分のカードの思考を引く経路）。session_id が優先。
+        if not sid_in and card:
+            sid_in = thought_find_by_card(card)
+            if not sid_in:
+                return {"error": f"カード {card} に紐づく台帳はありません"
+                                 "（同じ card を付けて思考を積むと紐づきます）",
+                        "view": True, "card": card}
+            stored = thought_get(sid_in)
         return _think_view(sid_in, stored, brief=as_flag(args.get("brief")))
     thought = as_str(args.get("thought"))
     if not thought:
@@ -5648,7 +5677,7 @@ def tool_think(args: dict) -> dict:
            "resolve_branch": st["resolve_branch"], "branch_status": st["branch_status"],
            "plan": st["plan"], "subgoal_done": st["subgoal_done"],
            "total": total, "total_auto": total_auto}
-    merged = thought_merge(sid_in, step, question=question, verifier_models=used,
+    merged = thought_merge(sid_in, step, question=question, verifier_models=used, card=card,
                            assign_number=not explicit_number, ops=ops)
     if merged.get("refused"):
         return {"error": f"思考数が上限（{THOUGHT_MAX_STEPS}）に達しています。新しい session_id で"
@@ -5684,9 +5713,12 @@ def tool_think(args: dict) -> dict:
         "next_call": {"tool": "freeagent_think",
                       "args": {"session_id": sid, "thought": "<次の思考>",
                                "thought_number": n + 1, "verify": bool(verification),
-                               **({"total_thoughts": max(total, n + 1)} if total else {})}},
+                               **({"total_thoughts": max(total, n + 1)} if total else {}),
+                               **({"card": card} if card else {})}},
         "privacy_note": "台帳は思考の記録です。判断と責任はメインLLMに残ります。",
     }
+    if card:
+        data["card"] = card          # KANBAN のカードへの紐づけ（引けたことを呼び出し側に見せる）
     data["suggestions"] = _think_suggestions(data, steps_out, needed)
     return data
 
@@ -5873,6 +5905,7 @@ def _think_view(sid: str, stored: dict | None, brief: bool = False) -> dict:
         "ledger": _think_ledger_view(steps, keep=THOUGHT_MAX_STEPS, row=stored, brief=brief),
         "verification": None, "verified": False, "alternatives": None,
         "verifier_models": [m for m in (stored.get("verifier_models") or []) if isinstance(m, str)],
+        "card": as_str(stored.get("card")),
         "notes": [],
         "next_call": {"tool": "freeagent_think",
                       "args": {"session_id": sid, "thought": "<次の思考>", "thought_number": last + 1}},
@@ -6138,6 +6171,9 @@ TOOLS: list[dict] = [
             "無ければ推測で繋がずエラー。verify / propose_alternatives のときだけ別の Free モデルを呼ぶ。"
             "view=true で書かずに台帳を読める（文脈圧縮後の復帰）。**台帳が大きいときは brief=true を併用**すると"
             "現行の道筋だけを軽く読める。"
+            "**KANBAN のカードで作業しているなら `card` にカード ID（t_xxxx）を入れる**と、思考がカードに"
+            "紐づき、後から `view=true` + `card` でそのカードの道筋を読み戻せる。**カードの完了・ブロックは"
+            "このツールではなく `kanban_complete` / `kanban_block` で行う**（この台帳は書き換えない）。"
             "【使わない条件】単発の問いは panel / consult が速い。思考の記録だけなら思考メモ帳系の軽量ツールで足りる。"
             "【注意】返る検証・代替案は仮説であり、合意は正しさの保証ではありません。判断はメインが行います。"
         ),
@@ -6147,7 +6183,10 @@ TOOLS: list[dict] = [
                 "thought": {"type": "string", "description": "今回の思考ステップ（view=true 以外は必須）"},
                 "session_id": {"type": "string",
                                "description": "継続する台帳のID（返り値の next_call に同梱。省略で新規）"},
-                "view": {"type": "boolean", "description": "台帳を読むだけ（書かない・session_id 必須）"},
+                "view": {"type": "boolean", "description": "台帳を読むだけ（書かない）。session_id か card が必要"},
+                "card": {"type": "string", "description": "KANBAN のカード ID（t_xxxx）。入れると思考がカードに"
+                                                          "紐づき、view=true + card で読み戻せる。カードの完了は "
+                                                          "kanban_complete で行う（このツールは書き換えない）"},
                 "brief": {"type": "boolean",
                           "description": "view と併用。現行の道筋（改訂済み・棄却済み分岐を除く）だけを返す"
                                          "（台帳が大きいときの読み戻し用。省いた件数は omitted に入る）"},
