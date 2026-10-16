@@ -64,7 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.7.1"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -5540,6 +5540,12 @@ def tool_think(args: dict) -> dict:
         return {"error": "思考台帳は無効です（FREEAGENT_THOUGHTS=0 で停止中）", "enabled": False}
     sid_in = as_str(args.get("session_id"))
     card = truncate(as_str(args.get("card")).strip(), 64)
+    # card だけでも同じ台帳を継続できる（KANBAN のワーカーはカード ID しか持たない。実測: session_id を
+    # 省略した 2 手目が新しい台帳になり、積んだ道筋が分断された）。明示の session_id が常に優先。
+    resumed_by_card = False
+    if not sid_in and card:
+        sid_in = thought_find_by_card(card)
+        resumed_by_card = bool(sid_in)
     stored = thought_get(sid_in) if sid_in else None
     if as_flag(args.get("view")):
         # カードから読み戻す（KANBAN のワーカーが自分のカードの思考を引く経路）。session_id が優先。
@@ -5557,6 +5563,8 @@ def tool_think(args: dict) -> dict:
 
     steps = [s for s in ((stored or {}).get("steps") or []) if isinstance(s, dict)]
     notes: list[str] = []
+    if resumed_by_card:
+        notes.append(f"card {card} に紐づく台帳を継続しました（session_id={sid_in}）。")
     if as_flag(args.get("brief")):
         notes.append("brief は view=true のときだけ効きます（思考の記録には影響しません）。")
     if sid_in and stored is None:
@@ -6171,9 +6179,10 @@ TOOLS: list[dict] = [
             "無ければ推測で繋がずエラー。verify / propose_alternatives のときだけ別の Free モデルを呼ぶ。"
             "view=true で書かずに台帳を読める（文脈圧縮後の復帰）。**台帳が大きいときは brief=true を併用**すると"
             "現行の道筋だけを軽く読める。"
-            "**KANBAN のカードで作業しているなら `card` にカード ID（t_xxxx）を入れる**と、思考がカードに"
-            "紐づき、後から `view=true` + `card` でそのカードの道筋を読み戻せる。**カードの完了・ブロックは"
-            "このツールではなく `kanban_complete` / `kanban_block` で行う**（この台帳は書き換えない）。"
+            "**KANBAN のカードで作業しているなら `card` にカード ID（t_xxxx）を入れる**。card は台帳の取っ手に"
+            "なり、**同じ card で呼び続ければ同じ台帳を継続する**（session_id を覚えていなくてよい）。"
+            "後から `view=true` + `card` でそのカードの道筋を読み戻せる。**カードの完了・ブロックはこのツールでは"
+            "なく `kanban_complete` / `kanban_block` で行う**（この台帳は書き換えない）。"
             "【使わない条件】単発の問いは panel / consult が速い。思考の記録だけなら思考メモ帳系の軽量ツールで足りる。"
             "【注意】返る検証・代替案は仮説であり、合意は正しさの保証ではありません。判断はメインが行います。"
         ),
@@ -6184,9 +6193,10 @@ TOOLS: list[dict] = [
                 "session_id": {"type": "string",
                                "description": "継続する台帳のID（返り値の next_call に同梱。省略で新規）"},
                 "view": {"type": "boolean", "description": "台帳を読むだけ（書かない）。session_id か card が必要"},
-                "card": {"type": "string", "description": "KANBAN のカード ID（t_xxxx）。入れると思考がカードに"
-                                                          "紐づき、view=true + card で読み戻せる。カードの完了は "
-                                                          "kanban_complete で行う（このツールは書き換えない）"},
+                "card": {"type": "string", "description": "KANBAN のカード ID（t_xxxx）。同じ card で呼び続けると"
+                                                          "同じ台帳を継続する（session_id を覚えていなくてよい）。"
+                                                          "view=true + card でそのカードの道筋を読み戻せる。"
+                                                          "カードの完了は kanban_complete で行う"},
                 "brief": {"type": "boolean",
                           "description": "view と併用。現行の道筋（改訂済み・棄却済み分岐を除く）だけを返す"
                                          "（台帳が大きいときの読み戻し用。省いた件数は omitted に入る）"},

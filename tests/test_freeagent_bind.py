@@ -365,6 +365,27 @@ class TestThinkCardLink(unittest.TestCase):
         self.assertEqual(out["next_call"]["args"]["card"], "t_card1", "次の呼び出しでも card を引き継ぐ")
         self.assertEqual(S.thought_get(out["session_id"])["card"], "t_card1")
 
+    def test_card_continues_existing_ledger(self):
+        """実ワーカーの実行で見つかった穴: session_id を省略しても card で同じ台帳を継続する（v0.7.1）。"""
+        first = S.tool_think({"thought": "1 手目", "thought_number": 1, "card": "t_cont"})
+        second = S.tool_think({"thought": "2 手目", "thought_number": 2, "card": "t_cont"})
+        self.assertEqual(second["session_id"], first["session_id"], "card で継続する")
+        self.assertEqual(second["ledger"]["steps_recorded"], 2, "道筋が分断されない")
+        self.assertTrue(any("継続しました" in n for n in second["notes"]), second["notes"])
+
+    def test_card_without_ledger_starts_new(self):
+        out = S.tool_think({"thought": "新しいカード", "thought_number": 1, "card": "t_fresh"})
+        self.assertEqual(out["card"], "t_fresh")
+        self.assertEqual(S.thought_get(out["session_id"])["card"], "t_fresh")
+
+    def test_explicit_session_id_wins_over_card_continuation(self):
+        a = S.tool_think({"thought": "A", "thought_number": 1, "card": "t_a"})
+        b = S.tool_think({"thought": "B", "thought_number": 1, "card": "t_b"})
+        out = S.tool_think({"thought": "C", "thought_number": 1, "session_id": a["session_id"],
+                            "card": "t_b"})
+        self.assertEqual(out["session_id"], a["session_id"])
+        self.assertNotEqual(out["session_id"], b["session_id"])
+
     def test_view_by_card_reads_back(self):
         out = S.tool_think({"thought": "1 手目", "thought_number": 1, "card": "t_card2"})
         got = S.tool_think({"view": True, "card": "t_card2"})
