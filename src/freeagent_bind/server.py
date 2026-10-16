@@ -64,7 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.7.2"
+SERVER_VERSION = "0.7.3"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -2976,6 +2976,10 @@ KB_BACKENDS["datacite"] = lambda q, limit, opts: kb_datacite(q, limit, opts.get(
 # ---------------------------------------------------------------- §5.10 明示許可した arXiv の代替取得（同じ締め切り内）
 
 KB_HEDGE_DELAY = max(0.05, min(30.0, as_float(os.environ.get("FREEAGENT_KB_HEDGE_DELAY"), 2.0)))
+# 代替取得を**始めるのに要る残り時間**。これ未満では始めない（締め切りに間に合わない取得を投げない）。
+# 副次効果として「呼び出しが返った後に代替が始まる」競合も消える（実測: 締め切り 0.005 秒で 20 回に 1 回、
+# `now >= end` の判定を数ミリ秒すり抜けて代替が走り出した。CI の windows-latest/3.12 で出ていた失敗と同じ経路）。
+KB_HEDGE_MIN_REMAINING = max(0.0, min(1.0, as_float(os.environ.get("FREEAGENT_KB_HEDGE_MIN_REMAINING"), 0.05)))
 
 
 def _kb_source_result(src: str, query: str, limit: int, opts: dict) -> dict:
@@ -2992,7 +2996,8 @@ def _kb_source_result(src: str, query: str, limit: int, opts: dict) -> dict:
 
     def invoke(key, fn, options):
         try:
-            if key == "alternate" and time.monotonic() >= options.get("deadline_at", float("inf")):
+            if (key == "alternate"
+                    and options.get("deadline_at", float("inf")) - time.monotonic() < KB_HEDGE_MIN_REMAINING):
                 res = {"error": "締め切り後の代替取得は開始しません", "timed_out": True}
             else:
                 res = fn(query, limit, options)
@@ -3016,7 +3021,7 @@ def _kb_source_result(src: str, query: str, limit: int, opts: dict) -> dict:
         primary = done.get("primary")
     if primary is not None and not retryable(primary):
         return primary
-    if time.monotonic() >= end:
+    if end - time.monotonic() < KB_HEDGE_MIN_REMAINING:
         return primary if primary is not None else {"error": "締め切りに間に合いませんでした",
                                                    "timed_out": True, "items": [], "citations": []}
     alternate_opts = {**opts, "datacite_kind": "arxiv", "fallback": False}

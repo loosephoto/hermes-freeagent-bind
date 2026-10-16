@@ -510,25 +510,90 @@ class TestKnowledgeIntegration(unittest.TestCase):
             self.assertEqual(lookup.call_args.kwargs["datacite_kind"], "dataset")
             self.assertTrue(lookup.call_args.kwargs["fallback"])
 
+    def test_alternate_is_not_started_without_enough_time_left(self):
+        """残り時間が `KB_HEDGE_MIN_REMAINING` 未満なら代替を始めない（v0.7.3 のレース修正）。
+
+        下限が無いと、ヘッジの待ちが締め切りと同刻に解けたときに判定を数ミリ秒すり抜けて
+        「呼び出しが返った後に代替が始まる」（実測: 締め切り 0.005 秒で 20 回に 1 回）。
+        """
+        stop = threading.Event()
+        done = threading.Event()
+
+        def slow(*a):
+            stop.wait(1)
+            done.set()
+            return {"error": "HTTP 429"}
+
+        alternate = mock.Mock(return_value={"items": [{"title": "late"}], "citations": []})
+        with mock.patch.dict(S.KB_BACKENDS, {"arxiv": slow, "datacite": alternate}, clear=True), \
+             mock.patch.object(S, "KB_HEDGE_DELAY", 0.01), \
+             mock.patch.object(S, "KB_HEDGE_MIN_REMAINING", 0.5):
+            try:
+                S.knowledge_lookup("q", ["arxiv"], deadline=0.05, fallback=True)
+                time.sleep(0.12)
+                alternate.assert_not_called()
+            finally:
+                stop.set()
+                done.wait(1)
+
+    def test_alternate_is_still_started_when_there_is_enough_time(self):
+        """下限を置いても、時間が残っていれば代替は始まる（締めすぎていないことの確認）。"""
+        stop = threading.Event()
+        done = threading.Event()
+
+        def slow(*a):
+            stop.wait(1)
+            done.set()
+            return {"error": "HTTP 429"}
+
+        alternate = mock.Mock(return_value={"items": [{"title": "ok"}], "citations": []})
+        with mock.patch.dict(S.KB_BACKENDS, {"arxiv": slow, "datacite": alternate}, clear=True), \
+             mock.patch.object(S, "KB_HEDGE_DELAY", 0.01), \
+             mock.patch.object(S, "KB_HEDGE_MIN_REMAINING", 0.01):
+            try:
+                S.knowledge_lookup("q", ["arxiv"], deadline=0.6, fallback=True)
+                limit_at = time.monotonic() + 1.0
+                while time.monotonic() < limit_at and alternate.call_count == 0:
+                    time.sleep(0.01)
+                self.assertGreaterEqual(alternate.call_count, 1, "時間が残っていれば代替を始める")
+            finally:
+                stop.set()
+                done.wait(1)
+
     def test_delayed_alternate_thread_start_rechecks_deadline_inside_worker(self):
+        """代替スレッドの起動を遅らせ、ワーカー内の再判定で実際の呼び出しが止まることを見る。
+
+        v0.7.3 の下限（`KB_HEDGE_MIN_REMAINING`）より締切が長いので**スレッドは起動され**、
+        起動が遅れた分だけワーカー内の再判定で止まる（下限の導入前は deadline=0.02 でも起動していた）。
+        """
         real_start = threading.Thread.start
         completed = threading.Event()
         def delayed_start(thread):
             if getattr(thread, "_args", ()) and thread._args[0] == "alternate":
-                time.sleep(0.07)
+                time.sleep(0.3)
                 real_start(thread)
                 thread.join(1)
                 completed.set()
             else:
                 real_start(thread)
+        release = threading.Event()
+
+        def slow_primary(*a):
+            release.wait(2)                    # 応答待ちのまま締切を迎える（代替の起動条件はこの状態）
+            return {"error": "HTTP 429"}
+
         alternate = mock.Mock(return_value={"items": [{"title": "Wrong late fetch"}], "citations": []})
-        with mock.patch.dict(S.KB_BACKENDS, {"arxiv": lambda *a: {"error": "HTTP 429"},
-                                           "datacite": alternate}, clear=True), \
-             mock.patch.object(threading.Thread, "start", delayed_start):
-            result = S.knowledge_lookup("q", ["arxiv"], deadline=0.02, fallback=True)
-            self.assertTrue(completed.wait(1))
-            alternate.assert_not_called()
-            self.assertEqual(result["timed_out"], ["arxiv"])
+        with mock.patch.dict(S.KB_BACKENDS, {"arxiv": slow_primary, "datacite": alternate}, clear=True), \
+             mock.patch.object(threading.Thread, "start", delayed_start), \
+             mock.patch.object(S, "KB_HEDGE_DELAY", 0.01), \
+             mock.patch.object(S, "KB_HEDGE_MIN_REMAINING", 0.2):
+            try:
+                result = S.knowledge_lookup("q", ["arxiv"], deadline=0.35, fallback=True)
+                self.assertTrue(completed.wait(2))
+                alternate.assert_not_called()
+                self.assertEqual(result["timed_out"], ["arxiv"])
+            finally:
+                release.set()
 
     def test_short_deadline_does_not_start_an_alternate_after_return(self):
         stop = threading.Event()
