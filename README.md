@@ -26,6 +26,7 @@
 
 - [🎯 できること・できないこと](#-できることできないこと)
 - [🚀 はじめに設定する](#-はじめに設定する)
+- [🖧 1 プロセスを共有する（HTTP モード）](#-1-プロセスを共有するhttp-モード)
 - [💬 会話での頼み方](#-会話での頼み方)
 - [🧰 どのツールを使うか](#-どのツールを使うか)
 - [🧠 複雑な問題を段階的に考える（freeagent_think）](#-複雑な問題を段階的に考えるfreeagent_think)
@@ -131,6 +132,37 @@ freeagent_ask で「接続できました」と一言だけ答えさせて。
 検索は成功するのに相談だけ失敗する場合は、プロキシ・キー・利用枠を確認します。
 設定・キーの変更は実行中のサーバーには自動反映されません。**再起動が確実**です。
 最近の Hermes には `/reload-mcp` もあります（[公式 MCP 設定リファレンス](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference#reloading-config)）。
+
+### 5. 複数クライアントで 1 プロセスを共有する（HTTP モード・任意）
+
+**既定は stdio です（1 クライアント = 1 プロセス）。何も指定しなければ従来どおりです。**
+
+KANBAN のワーカーや複数の Bot から同時に使うと、stdio では**クライアントごとに別プロセス**が立ちます。
+するとプロセス内に持っているものが分割されます: ホストごとのアクセス間隔、クールダウン、品質統計、
+モデル一覧のキャッシュ（600 秒）、同時実行の上限。同じホストへ二重に投げたり、統計が上書きされたりします
+（`AGENTS.md` 規約 28 が警告している状態そのものです）。HTTP モードでは **1 プロセスを複数クライアントが共有**します。
+
+```bash
+# サーバーを HTTP モードで起動する（動かしたままにする）
+python src/freeagent_bind/server.py --transport http --port 8765
+```
+
+```bash
+# Hermes 側は url で登録する（command / args は使わない）
+hermes config set mcp_servers.freeagent-bind.url http://127.0.0.1:8765/mcp
+hermes config set mcp_servers.freeagent-bind.headers.x-freeagent-harness hermes
+```
+
+- 待受は既定で **127.0.0.1 のみ**。`--host 0.0.0.0` にするなら `--token <値>` を必ず付けてください
+  （付けないと同一ネットワークの誰でも呼べます）。認証は `Authorization: Bearer <値>` か `x-freeagent-token`。
+- **二重起動は意図的に失敗します**（状態が 2 つに割れると気づけないため）。別ポートは `--port` で指定します。
+- トランスポートは `--transport` / `FREEAGENT_TRANSPORT`（既定 `stdio`）。残りは `FREEAGENT_HTTP_*`（[環境変数](#-環境変数)）。
+- HTTP の起動は待受まで実測 463ms（同じ環境の import 単体は 101ms）。**stdio の起動時間は変わりません**
+  （`http.server` は HTTP のときだけ読み込みます）。
+- 共有されるのは**レート制限と統計**です。推論の同時実行数の上限（`FREEAGENT_MAX_WORKERS`）は
+  プロセス全体で 1 つになるので、クライアントを増やしても並列度は増えません。
+- HTTP では `FREEAGENT_HARNESS` の env が渡らないので、目印は**ヘッダ**で付けます（上の `headers`）。
+  付け忘れると「ハーネスを判別できません」のログが出ます（動作は変わりません）。
 
 ## 💬 会話での頼み方
 
@@ -406,7 +438,11 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | 依頼した数より回答が少ない | 候補不足、推論失敗、代替候補の重複回避など。`selection.notes` とモデルごとのエラーを確認 |
 | 思考ノートが見つからない | 期限切れ・ID 違い。閲覧はエラー、思考の追加なら新規開始。古い内容は復元されません |
 | AI が自分から使わない | 登録だけで自動利用は保証されません。まず会話でツール名を指定。必要なら[自動利用の設定](#-自動的に使わせたいとき) |
-| ログに「ハーネスを判別できません」 | `FREEAGENT_HARNESS=hermes` を設定して再起動。判別不能でも動作は変わりません |
+| ログに「ハーネスを判別できません」 | stdio は `FREEAGENT_HARNESS=hermes`、HTTP は設定の `headers` に `x-freeagent-harness: hermes` を入れて再起動。判別不能でも動作は変わりません |
+| HTTP モードが起動しない（ポート使用中） | 二重起動は意図的に失敗します。`--port` を変えるか、動いているプロセスを止めます |
+| HTTP で `401` | `--token` を設定したのにヘッダを送っていません。`Authorization: Bearer <値>` を付けます |
+| HTTP で `404 session not found` | セッションが期限切れです（既定 30 分・`FREEAGENT_HTTP_SESSION_TTL`）。クライアントは initialize からやり直します |
+| HTTP で「ハーネスを判別できません」 | HTTP では env が渡りません。設定の `headers` に `x-freeagent-harness: hermes` を入れます |
 
 ### ⏳ タイムアウトの考え方（接続と読み取りを分離）
 
@@ -444,6 +480,10 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | 登録すれば必ず自動的に使う | ツール選択はメイン LLM と設定に依存します |
 | Internet Archive で日本語を検索できる | IA のメタデータ検索は日本語（CJK）クエリを拒否します（実測 10/10 が `QUERY_NOT_READY`）。英語の語で指定してください |
 | Qiita を未認証で連続検索できる | 未認証は 60 回/時です。同じ問いはキャッシュで即返りますが、別の問いは 1 分待ちます（`FREEAGENT_QIITA_TOKEN` で 1,000 回/時・3.6 秒間隔） |
+| HTTP にすれば大量並列をさばける | 共有するのはレート制限と統計です。推論の同時実行数の上限はプロセス全体で 1 つなので、クライアントが増えても並列度は増えません |
+| HTTP なら安全に外へ出せる | 既定は 127.0.0.1 のみ・トークンなしです。`--host 0.0.0.0` にするときは必ず `--token` を付けてください。TLS は提供しません |
+| HTTP で複数マシンから共有できる | 単一ホスト前提です（ループバック）。複数マシン間の調整はしません |
+| サーバー起点の通知が必ず届く | SSE（`GET`）を張ったセッションにだけ届きます。張らないクライアントでは、警告は最初のツール結果に載ります（stdio と同じ） |
 
 **過去の実測例（環境・モデル・時間帯で変動します）**：4 体の panel は 14〜20 秒、
 多段討議を含む 1 ターンは 3 分 52 秒でした。思考ノートの記録だけならサブ呼び出しは 0 回、
@@ -482,6 +522,10 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 第8段階（0.2444 秒）と同じ計測方法で測った値です（HEAD の 14,654 文字は同じ方法で再現して確認）。
 
 検索APIの追加は推論モデルの能力を増やしません。ツールスキーマの増加もメインLLMの入力負担になります。
+
+HTTP トランスポート（v0.6.0）は**ツール定義を変えない**ため、ツール一覧JSONは 14,882 文字のまま、
+stdio の起動も変わっていません（同じ環境で HEAD 103.3ms → 100.7ms、各 7 回中央値。差はノイズ）。
+HTTP の待受までは 463ms（4 回のうち初回を除く中央値）でした。
 
 </details>
 
@@ -995,6 +1039,14 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_TRACE` / `FREEAGENT_STATS` / `FREEAGENT_COOLDOWN` | 1 | トレース・品質統計・クールダウンの記録 |
 | `FREEAGENT_DEBUG_LOG` | 空 | 指定パスへ stdio の送受信を 1 行ずつ追記（クライアント互換の切り分け用） |
 | `FREEAGENT_HERMES_BIN` | `hermes`（`which` で探索） | `freeagent_delegate` に使う実行ファイル |
+| `FREEAGENT_TRANSPORT` | `stdio` | `http` で HTTP モード（1 プロセス共有）。`--transport` が優先 |
+| `FREEAGENT_HTTP_HOST` / `FREEAGENT_HTTP_PORT` | `127.0.0.1` / `8765` | HTTP の待受（`--host` / `--port` が優先） |
+| `FREEAGENT_HTTP_PATH` | `/mcp` | HTTP のパス（`--path` が優先） |
+| `FREEAGENT_HTTP_TOKEN` | 空 | 設定したときだけ認証を要求（`Authorization: Bearer` か `x-freeagent-token`） |
+| `FREEAGENT_HTTP_SESSION_TTL` | 1800 | HTTP セッションの寿命（秒）。失効後は 404 になり、クライアントは initialize からやり直す |
+| `FREEAGENT_HTTP_KEEPALIVE` | 15.0 | SSE のキープアライブ間隔（秒） |
+| `FREEAGENT_HTTP_MAX_BODY` | 4194304 | POST 本文の上限（バイト。超えると 413） |
+| `FREEAGENT_HTTP_MAX_SESSIONS` | 64 | 同時セッション数の上限（超えたら古い順に落とす） |
 
 **推論バックエンド（サブ LLM）のキー**
 

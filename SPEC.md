@@ -679,6 +679,43 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
 - `apply_proactive.py --apply` は自分の節（args に `freeagent_bind` を含む）の `env.FREEAGENT_HARNESS` が `hermes`
   でなければ設定コマンドを加える（`--check` は表示だけ。exit コードには影響しない）。
 
+### 8.2 HTTP (StreamableHTTP) トランスポート（§10）
+
+**既定は stdio。** `--transport http` / `FREEAGENT_TRANSPORT=http` のときだけ HTTP で待ち受ける。目的は
+「**1 プロセスを複数クライアントが共有する**」こと。stdio を N 本立てると、プロセス内に持つホスト予算
+（`_KB_RATE_NEXT`）・`_KB_CACHE` / `_KB_INFLIGHT`・`_MODELS_CACHE`（600 秒）・`_COOLDOWN`・`model_stats`・
+`MAX_WORKERS` が N 分割される（規約 28 が警告する「同一 IP の連打」）。
+
+仕様の範囲は、Hermes の `mcp.client.streamable_http` が実際に要求する経路に絞る（実測で確定）:
+
+| 要求 | 契約 |
+|---|---|
+| `POST <path>`（単一メッセージ） | `200` + `application/json` + **JSON-RPC オブジェクト 1 個**。配列で返すとクライアントは `Failed to parse JSON response` で切る |
+| `POST <path>`（batch） | `200` + **配列** |
+| `POST <path>`（通知＝id なし） | `202` + 本文なし。**要求に 202 を返すとクライアントは失敗として扱う** |
+| `initialize` の応答 | `mcp-session-id` ヘッダを付ける（以降クライアントが返す）。未知のセッションは `404` + `-32001`。ヘッダ無しの要求は**素通し**（他クライアント互換） |
+| `GET <path>` | `Accept: text/event-stream` とセッションが必須。サーバー起点の通知（§8.6）を SSE で流し、空ならキープアライブのコメント行。セッション無し `400` / 未知 `404` / Accept 違い `406` |
+| `DELETE <path>` | `204` でセッション終了（以後は `404`）。未知は `404` |
+| 認証 | `FREEAGENT_HTTP_TOKEN` を設定したときだけ要求（`Authorization: Bearer` か `x-freeagent-token`、`secrets.compare_digest`）。未設定なら素通し |
+| パス・本文 | `FREEAGENT_HTTP_PATH`（既定 `/mcp`）以外は `404`。`FREEAGENT_HTTP_MAX_BODY` 超は `413` |
+
+- **メソッド表は §9 の `_replies_for` 1 か所**に置き、stdio の `_dispatch_batch` / `_dispatch_message` と
+  HTTP が共有する（表を分けると片方だけ更新され、stdio と HTTP が食い違う）。`_dispatch_message` は
+  `tools/call` だけプールへ流す（従来どおり）。**id なしの `initialize` / `logging/setLevel` には応答しない**
+  （batch 経路に揃えた。従来の単一経路は id `null` の応答を書いていた）。
+- 通知はセッションの待ち行列へ入れ、`GET` の SSE で流す。`GET` を張らないクライアントには届かないが、
+  警告は最初のツール結果にも載るので実害はない。
+- **二重起動は失敗させる**: `ThreadingHTTPServer` の `allow_reuse_address` を `False` にする
+  （Windows の `SO_REUSEADDR` は同一ポートへの二重バインドを許し、状態が 2 つに割れたまま気づけない）。
+- **ハーネス目印はヘッダでも受ける**（`x-freeagent-harness`。HTTP では子プロセスの env が渡らないため）。
+  ヘッダ > env の優先で、`detect_harness(params, env, marker)` の `marker` がヘッダ由来（`source: "header"`）。
+- 実装は標準ライブラリのみ（`http.server`）。stdio の起動を重くしないため `http.server` と `argparse` は
+  HTTP の関数の中で遅延 import する。
+- セッションは `FREEAGENT_HTTP_SESSION_TTL`（既定 1800 秒）で失効し、上限（既定 64）に達したら古い順に落とす。
+  `_HARNESS` はプロセス共有なので判定は**最後に initialize したクライアント**のものになる（警告 1 回・
+  最初の結果への注記 1 回という性質は変わらない）。
+- 検証: `python scripts/smoke_http.py`（実クライアント経路）と `tests/test_http_transport.py`。
+
 ## 9. 拡張の手順（新しいツールを足すとき）
 
 1. §6 に `tool_xxx(args) -> dict` を足す（例外を出さない。引数は `as_*` で変換）。
@@ -750,7 +787,8 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
 python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # レジストリ・スキーマ・版の整合
 python -m unittest discover -s tests         # オフライン回帰（件数は実行結果を参照）
-python scripts/smoke_stdio.py                # 実クライアント経路
+python scripts/smoke_stdio.py                # 実クライアント経路（stdio）
+python scripts/smoke_http.py                 # 実クライアント経路（HTTP: 通知 202 / batch / セッション / SSE）
 python scripts/check_offline.py              # 全滅時の縮退（例外漏れ・ハング・状態汚染なし）
 python scripts/measure_adoption.py           # 自発利用率（state.db を読むだけ）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存

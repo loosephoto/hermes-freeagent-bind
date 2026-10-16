@@ -8,7 +8,7 @@ Internet Archive / Qiita** は
 明示指定で追加する。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は対象外**。
 
 - 全体像は `README.md`、**実装の契約は `SPEC.md`**（変更時は両方を同一変更内で更新する）。
-- 本体は `src/freeagent_bind/server.py` の 1 ファイルで、**§0〜§9 の区画**に分かれている。
+- 本体は `src/freeagent_bind/server.py` の 1 ファイルで、**§0〜§10 の区画**に分かれている。
   機能追加は既存の行を書き換えるのではなく**新しい§を立てる**形で行い、冒頭 docstring の目次も更新する。
 
 ## セットアップ
@@ -31,6 +31,7 @@ python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # TOOLS/HANDLERS の一致・スキーマ・版・content の規約
 python -m unittest discover -s tests         # オフライン回帰（件数は実行結果を参照・ネットワーク不要）
 python scripts/smoke_stdio.py                # 実クライアント経路（initialize/tools/list/tools/call）
+python scripts/smoke_http.py                 # HTTP 経路（1 プロセス共有。通知 202・batch・セッション・SSE）
 python scripts/probe_knowledge_stdio.py      # 新規知識ソースの実API・stdio（ネットワークあり）
 python scripts/check_offline.py              # バックエンド全滅: 例外漏れ・ハング・状態汚染が無いこと
 python scripts/measure_adoption.py           # 自発利用率の測定（state.db を読むだけ・副作用なし。必要場面の近似判定も出す）
@@ -247,6 +248,15 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     （規約 29 の「キー必須ソースは未設定なら HTTP を出さない」とは型が違う）。見送り（実測）: Reddit
     （未認証は 403 で遮断・事前審査必須）/ openBD（キーワード検索 API 無し）/ Botipedia（公開 API 無し）/
     Free Dictionary API（停止）。
+
+38. **HTTP は「1 プロセス共有」のための経路で、既定は stdio**（§10）。単一メッセージには
+    **JSON-RPC オブジェクト 1 個**で応答する（配列で返すと Hermes のクライアントが `Failed to parse JSON
+    response` で切る）。通知には 202 を返し、**要求に 202 を返さない**。`initialize` の応答に
+    `mcp-session-id` を付け、未知のセッションは 404。メソッド表は §9 の `_replies_for` に集約し、
+    stdio と HTTP で分岐を作らない。**二重起動は失敗させる**（Windows の `SO_REUSEADDR` は同一ポートへの
+    二重バインドを許すので `allow_reuse_address = False`）。HTTP では env の目印が渡らないため、ハーネス判別は
+    `x-freeagent-harness` ヘッダを env より優先する。`http.server` / `argparse` は遅延 import（stdio の起動を
+    重くしない）。検証は `python scripts/smoke_http.py` と `tests/test_http_transport.py`。
 
 ## ライセンス
 

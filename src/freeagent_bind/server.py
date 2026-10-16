@@ -25,6 +25,7 @@ Internet Archive / Qiita）で
   §7 ツール定義         §8 表示（content）
   §8.5 失敗時の「次の一手」（structuredContent.next_action）
   §8.6 ハーネス判別（Hermes 以外で起動されたときの警告）   §9 JSON-RPC / stdio
+  §10 HTTP (StreamableHTTP) トランスポート（1 プロセスを複数クライアントで共有）
 
 設計方針（旧 hermes-memex の実測で裏づけられた規約を継承）
   * 実行時依存ゼロ（標準ライブラリのみ）・stdio の JSON-RPC 2.0 を自前実装
@@ -63,7 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.5.2"
+SERVER_VERSION = "0.6.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -6655,6 +6656,9 @@ def error_advice(data: dict) -> dict:
 # FREEAGENT_HARNESS_WARN=0 で警告を止める（判定結果は structuredContent.harness に残す）。
 
 HARNESS_MARKER_ENV = "FREEAGENT_HARNESS"
+# HTTP では子プロセスの env が渡らないので、同じ目印をヘッダでも受ける（Hermes の mcp_servers は
+# `headers:` を毎リクエスト送る）。stdio は従来どおり env の目印。
+HARNESS_MARKER_HEADER = "x-freeagent-harness"
 HARNESS_WARN_ENV = "FREEAGENT_HARNESS_WARN"
 _SDK_DEFAULT_CLIENT = "mcp"
 _LOG_LEVELS = ("debug", "info", "notice", "warning", "error", "critical", "alert", "emergency")
@@ -6662,19 +6666,25 @@ _HARNESS_LOCK = threading.Lock()
 _HARNESS: dict = {"info": None, "announced": False, "notified": False, "log_level": "info"}
 
 
-def detect_harness(params, env=None) -> dict:
-    """initialize の params と環境変数からハーネスを判定する（文字列比較だけ・サブプロセスなし）。"""
+def detect_harness(params, env=None, marker=None) -> dict:
+    """initialize の params・目印（env か HTTP ヘッダ）からハーネスを判定する（文字列比較だけ・サブプロセスなし）。
+
+    `marker` は HTTP のヘッダ（`HARNESS_MARKER_HEADER`）由来。HTTP では子プロセスの env が渡らないため、
+    明示の目印はヘッダで受ける（stdio は env）。
+    """
     env = os.environ if env is None else env
     params = params if isinstance(params, dict) else {}
     client = params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else {}
     name = client.get("name") if isinstance(client.get("name"), str) else ""
     version = client.get("version") if isinstance(client.get("version"), str) else ""
-    marker = (env.get(HARNESS_MARKER_ENV) or "").strip()
-    info = {"client": name, "client_version": version, "marker": marker}
-    if marker:
-        kind = "hermes" if marker.lower() == "hermes" else "other"
-        return {**info, "kind": kind, "source": "env",
-                "reason": f"{HARNESS_MARKER_ENV}={marker}"}
+    from_header = (marker or "").strip()
+    declared = from_header or (env.get(HARNESS_MARKER_ENV) or "").strip()
+    info = {"client": name, "client_version": version, "marker": declared}
+    if declared:
+        kind = "hermes" if declared.lower() == "hermes" else "other"
+        return {**info, "kind": kind, "source": "header" if from_header else "env",
+                "reason": (f"{HARNESS_MARKER_HEADER}={declared}" if from_header
+                           else f"{HARNESS_MARKER_ENV}={declared}")}
     if "hermes" in name.lower():
         return {**info, "kind": "hermes", "source": "clientInfo", "reason": f"clientInfo.name={name}"}
     if name and name != _SDK_DEFAULT_CLIENT:
@@ -6697,10 +6707,11 @@ def harness_message(info: dict) -> str:
     """人間向けの 1 段落（stderr・content・ログ通知で共用）。LLM への指示は書かない（規約 3）。"""
     if not info or info.get("kind") == "hermes":
         return ""
-    fix = f"hermes config set mcp_servers.freeagent-bind.env.{HARNESS_MARKER_ENV} hermes"
+    fix = (f"HTTP なら設定の headers に {HARNESS_MARKER_HEADER}: hermes、"
+           f"stdio なら `hermes config set mcp_servers.freeagent-bind.env.{HARNESS_MARKER_ENV} hermes`")
     if info.get("kind") == "unknown":
         return (f"ハーネスを判別できません（{info.get('reason')}）。Hermes Agent で使っているなら "
-                f"`{fix}` で目印を入れると判別できます。")
+                f"{fix} で目印を入れると判別できます。")
     parts = [f"Hermes Agent 以外のクライアント（{info.get('client') or info.get('marker') or '不明'}）で"
              "動作しています。"]
     if _harness_backend_is_default():
@@ -6721,9 +6732,14 @@ def harness_instructions(info: dict) -> str:
     return note + PROACTIVE_INSTRUCTIONS
 
 
-def harness_on_initialize(params) -> dict:
-    """initialize で呼ぶ。判定を保存し、stderr に 1 回だけ書く。initialize 応答（dict）を返す。"""
-    info = detect_harness(params)
+def harness_on_initialize(params, marker=None) -> dict:
+    """initialize で呼ぶ。判定を保存し、stderr に 1 回だけ書く。initialize 応答（dict）を返す。
+
+    `marker` は HTTP のヘッダ（`HARNESS_MARKER_HEADER`）由来の目印。HTTP では 1 プロセスを複数
+    クライアントが共有するので、この判定はプロセス内で最後に initialize したクライアントのものになる
+    （警告は 1 プロセス 1 回・最初のツール結果の注記も 1 回だけ、という従来の性質は変わらない）。
+    """
+    info = detect_harness(params, marker=marker)
     announce = False
     with _HARNESS_LOCK:
         _HARNESS["info"] = info
@@ -6884,70 +6900,65 @@ def handle_tool_call(params: dict) -> dict:
             "structuredContent": data, "isError": is_error}
 
 
+def _replies_for(msg, marker=None) -> list:
+    """メッセージ 1 件分の応答（通知を含む）。**メソッド表はここ 1 か所**に置く。
+
+    stdio の `_dispatch_batch` / `_dispatch_message` と HTTP（§10）が同じ表を使う。表を分けると、
+    メソッドやツールを足したときに片方だけ直して **stdio と HTTP で挙動が食い違う**（規約 20 と同型の事故）。
+    id を持たないメッセージ（通知）には応答を返さない（MCP 仕様）。ただし `notifications/initialized`
+    の直後に送る §8.6 のログ通知だけは「通知」として返す。
+    """
+    if not isinstance(msg, dict) or not isinstance(msg.get("method"), str):
+        return [{"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}]
+    method, msg_id = msg["method"], msg.get("id")
+    params = msg.get("params") or {}
+    if method in ("notifications/initialized", "initialized"):
+        note = harness_log_notification()   # §8.6（other のときだけ・1 回）
+        return [note] if note else []
+    if msg_id is None:
+        return []
+    if method == "initialize":
+        return [{"jsonrpc": "2.0", "id": msg_id, "result": harness_on_initialize(params, marker=marker)}]
+    if method == "logging/setLevel":
+        err = harness_set_level(params)
+        return [{"jsonrpc": "2.0", "id": msg_id, **({"error": err} if err else {"result": {}})}]
+    if method == "tools/list":
+        return [{"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}]
+    if method == "tools/call":
+        return [{"jsonrpc": "2.0", "id": msg_id, "result": handle_tool_call(params)}]
+    if method == "ping":
+        return [{"jsonrpc": "2.0", "id": msg_id, "result": {}}]
+    return [{"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"method not found: {method}"}}]
+
+
+def _emit(replies: list) -> None:
+    """応答の配列を 1 行で stdout へ書く（batch の応答形）。"""
+    if not replies:
+        return
+    with WRITE_LOCK:
+        write_line(json.dumps(replies, ensure_ascii=False))
+
+
 def _dispatch_batch(items: list) -> None:
     """JSON-RPC batch を 1 行の response array として返す。通知には応答しない。"""
     replies = []
     for item in items:
-        if not isinstance(item, dict) or not isinstance(item.get("method"), str):
-            replies.append({"jsonrpc": "2.0", "id": None,
-                            "error": {"code": -32600, "message": "invalid request"}})
-            continue
-        method, msg_id = item["method"], item.get("id")
-        params = item.get("params") or {}
-        if method in ("notifications/initialized", "initialized"):
-            note = harness_log_notification()   # §8.6（other のときだけ・1 回）
-            if note:
-                replies.append(note)
-            continue
-        if msg_id is None:
-            continue
-        if method == "initialize":
-            replies.append({"jsonrpc": "2.0", "id": msg_id, "result": harness_on_initialize(params)})
-        elif method == "logging/setLevel":
-            err = harness_set_level(params)
-            replies.append({"jsonrpc": "2.0", "id": msg_id, **({"error": err} if err else {"result": {}})})
-        elif method == "tools/list":
-            replies.append({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
-        elif method == "tools/call":
-            result = handle_tool_call(params)
-            replies.append({"jsonrpc": "2.0", "id": msg_id, "result": result})
-        elif method == "ping":
-            replies.append({"jsonrpc": "2.0", "id": msg_id, "result": {}})
-        else:
-            replies.append({"jsonrpc": "2.0", "id": msg_id,
-                            "error": {"code": -32601, "message": f"method not found: {method}"}})
-    if replies:
-        with WRITE_LOCK:
-            write_line(json.dumps(replies, ensure_ascii=False))
+        replies.extend(_replies_for(item))
+    _emit(replies)
 
 
 def _dispatch_message(msg: dict, pool: ThreadPoolExecutor) -> None:
+    """単一メッセージ。tools/call だけはプールで並列に流す（他のメソッドは表を共用）。"""
     method = msg.get("method")
     msg_id = msg.get("id")
-    params = msg.get("params") or {}
-    if method == "initialize":
-        respond(msg_id, harness_on_initialize(params))   # §8.6
-    elif method in ("notifications/initialized", "initialized"):
-        note = harness_log_notification()   # §8.6（other のときだけ・1 回）
-        if note:
-            _debug("out", note)
-            with WRITE_LOCK:
-                write_line(json.dumps(note, ensure_ascii=False))
-        return
-    elif method == "logging/setLevel":
-        err = harness_set_level(params)
-        if err:
-            respond(msg_id, error=err)
-        else:
-            respond(msg_id, {})
-    elif method == "tools/list":
-        respond(msg_id, {"tools": TOOLS})
-    elif method == "tools/call":
+    if method == "tools/call" and msg_id is not None:
+        params = msg.get("params") or {}
         pool.submit(lambda i=msg_id, p=params: respond(i, handle_tool_call(p)))
-    elif method == "ping":
-        respond(msg_id, {})
-    elif msg_id is not None:
-        respond(msg_id, error={"code": -32601, "message": f"method not found: {method}"})
+        return
+    for reply in _replies_for(msg):
+        _debug("out", reply)
+        with WRITE_LOCK:
+            write_line(json.dumps(reply, ensure_ascii=False))
 
 
 def serve() -> None:
@@ -6978,8 +6989,352 @@ def serve() -> None:
             respond(None, error={"code": -32600, "message": "invalid request"})
 
 
-def main() -> None:
-    """エントリポイント（python -m freeagent_bind / console_scripts から呼ばれる）。"""
+# ================================================================ §10 HTTP (StreamableHTTP)
+
+# 既定は stdio（1 クライアント 1 プロセス）。HTTP モードでは **1 プロセスを複数のクライアントが共有**する。
+# 共有されるのは、いままで「プロセスの数だけ複製されていた」もの:
+#   * `_KB_CACHE` / `_KB_INFLIGHT` … 同じ問いはキャッシュに当たり、**同時実行は 1 回の上流取得に畳まれる**
+#   * `_KB_RATE_NEXT` … ホスト単位のアクセス間隔（規約 28 が警告する「複数 MCP による同一 IP の連打」を防ぐ）
+#   * `_MODELS_CACHE`（600 秒）・`_COOLDOWN`・`model_stats`・`_ModelClaims`
+#   * `MAX_WORKERS` … Free モデルへの同時実行数の上限がプロセス全体で 1 つになる
+# stdio を N 本立てるとこれらが N 分割され、レート制限も統計も守られない（どちらもプロセス内ロック）。
+#
+# 実装は**標準ライブラリのみ**（依存ゼロは維持）。仕様の範囲は、Hermes の MCP クライアント
+# （`mcp.client.streamable_http`）が実際に要求する経路に絞る。実測で確かめた要求:
+#   * POST … 単一メッセージには **JSON オブジェクト 1 個**で応答する（配列で返すとクライアントは
+#     `Failed to parse JSON response` で切る）。batch のときだけ配列
+#   * POST … 通知（id なし）には **202**（本文なし）。要求に 202 を返すとクライアントは失敗にする
+#   * initialize の応答に `mcp-session-id` を付けると、以降クライアントが同じヘッダを返す
+#   * GET … `Accept: text/event-stream` でサーバー起点の通知（§8.6 の警告）を流す。セッション必須
+#   * DELETE … セッション終了（204）
+# 認証は `FREEAGENT_HTTP_TOKEN` を設定したときだけ要求する（既定は 127.0.0.1 のみに束縛）。
+
+HTTP_TRANSPORT_ENV = "FREEAGENT_TRANSPORT"
+HTTP_HOST_ENV = "FREEAGENT_HTTP_HOST"
+HTTP_PORT_ENV = "FREEAGENT_HTTP_PORT"
+HTTP_PATH_ENV = "FREEAGENT_HTTP_PATH"
+HTTP_TOKEN_ENV = "FREEAGENT_HTTP_TOKEN"
+HTTP_DEFAULT_HOST = "127.0.0.1"
+HTTP_DEFAULT_PORT = 8765
+HTTP_DEFAULT_PATH = "/mcp"
+HTTP_SESSION_HEADER = "mcp-session-id"
+HTTP_SESSION_TTL = _env_float("FREEAGENT_HTTP_SESSION_TTL", 1800.0)
+HTTP_SSE_KEEPALIVE = _env_float("FREEAGENT_HTTP_KEEPALIVE", 15.0)
+HTTP_MAX_BODY = max(65536, _env_int("FREEAGENT_HTTP_MAX_BODY", 4 * 1024 * 1024))
+HTTP_MAX_SESSIONS = max(1, _env_int("FREEAGENT_HTTP_MAX_SESSIONS", 64))
+
+_HTTP_SESSIONS: dict = {}
+_HTTP_SESSIONS_LOCK = threading.Lock()
+
+
+def http_config(argv=None) -> dict:
+    """HTTP/stdio の設定を env と argv から決める（argv が勝つ）。
+
+    未知の引数は**エラーにしない**（古いクライアントが余分な引数を渡しても起動を止めない）。stderr に
+    1 行だけ出して続行する。既定は従来どおり stdio。
+    """
+    import argparse
+    env_transport = (os.environ.get(HTTP_TRANSPORT_ENV) or "stdio").strip().lower()
+    parser = argparse.ArgumentParser(prog=SERVER_NAME, add_help=True,
+                                     description="Free モデルをサブ LLM として並列に走らせる MCP サーバー")
+    parser.add_argument("--transport", choices=("stdio", "http"), default=env_transport or "stdio",
+                        help=f"stdio（既定・1 クライアント 1 プロセス）か http（{HTTP_TRANSPORT_ENV}）")
+    parser.add_argument("--host", default=os.environ.get(HTTP_HOST_ENV, HTTP_DEFAULT_HOST))
+    parser.add_argument("--port", type=int, default=_env_int(HTTP_PORT_ENV, HTTP_DEFAULT_PORT))
+    parser.add_argument("--path", default=os.environ.get(HTTP_PATH_ENV, HTTP_DEFAULT_PATH))
+    parser.add_argument("--token", default=os.environ.get(HTTP_TOKEN_ENV, ""))
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        try:
+            sys.stderr.write(f"[{SERVER_NAME}] 未知の引数を無視します: {unknown}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    path = args.path if args.path.startswith("/") else "/" + args.path
+    return {"transport": args.transport, "host": args.host, "port": args.port,
+            "path": path.rstrip("/") or HTTP_DEFAULT_PATH, "token": args.token or ""}
+
+
+def _http_session_new() -> str:
+    sid = os.urandom(16).hex()
+    with _HTTP_SESSIONS_LOCK:
+        if len(_HTTP_SESSIONS) >= HTTP_MAX_SESSIONS:
+            _http_sessions_prune(force=True)
+        _HTTP_SESSIONS[sid] = {"created": now_ts(), "seen": now_ts(),
+                               "queue": [], "cv": threading.Condition(), "closed": False}
+    return sid
+
+
+def _http_session_get(sid: str):
+    if not sid:
+        return None
+    with _HTTP_SESSIONS_LOCK:
+        session = _HTTP_SESSIONS.get(sid)
+        if session is not None:
+            session["seen"] = now_ts()
+        return session
+
+
+def _http_session_touch(session) -> None:
+    if session is not None:
+        session["seen"] = now_ts()
+
+
+def _http_sessions_prune(force: bool = False) -> int:
+    """期限切れのセッションを落とす。上限に達したら古い順に落とす（force）。"""
+    now = now_ts()
+    with _HTTP_SESSIONS_LOCK:
+        stale = [k for k, v in _HTTP_SESSIONS.items() if now - as_float(v.get("seen"), 0.0) > HTTP_SESSION_TTL]
+        if not stale and force:
+            order = sorted(_HTTP_SESSIONS, key=lambda k: as_float(_HTTP_SESSIONS[k].get("seen"), 0.0))
+            stale = order[:max(1, HTTP_MAX_SESSIONS // 4)]
+        for k in stale:
+            session = _HTTP_SESSIONS.pop(k, None)
+            if session is None:
+                continue
+            session["closed"] = True
+            with session["cv"]:
+                session["cv"].notify_all()
+        return len(stale)
+
+
+def _http_session_drop(sid: str) -> bool:
+    with _HTTP_SESSIONS_LOCK:
+        session = _HTTP_SESSIONS.pop(sid, None)
+    if session is None:
+        return False
+    session["closed"] = True
+    with session["cv"]:
+        session["cv"].notify_all()
+    return True
+
+
+def _http_queue_notification(session, note) -> None:
+    """サーバー起点の通知をセッションの SSE 待ち行列へ入れる（GET が無ければ溜めておく）。"""
+    if session is None or not isinstance(note, dict):
+        return
+    with session["cv"]:
+        if len(session["queue"]) < 128:
+            session["queue"].append(note)
+        session["cv"].notify_all()
+
+
+def _http_process(msg, session, marker=None):
+    """POST の本文 1 件を処理する。(本文に載せる応答, 202 を返すべきか) を返す。
+
+    通知は本文に載せずセッションの待ち行列へ回す（MCP 仕様: 通知に応答してはならない）。
+    `marker` は `HARNESS_MARKER_HEADER` の値（§8.6 の目印）。
+    """
+    items = msg if isinstance(msg, list) else [msg]
+    replies = []
+    for item in items:
+        for reply in _replies_for(item, marker):
+            if isinstance(reply, dict) and "id" in reply:
+                replies.append(reply)
+            else:
+                _http_queue_notification(session, reply)
+    if not replies:
+        return None, True
+    if isinstance(msg, list):
+        return replies, False
+    return replies[0], False
+
+
+def _http_auth_ok(headers, token: str) -> bool:
+    """トークン未設定なら素通し。設定時は Authorization: Bearer か x-freeagent-token を要求する。"""
+    if not token:
+        return True
+    import secrets
+    given = ""
+    auth = headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        given = auth[7:].strip()
+    if not given:
+        given = (headers.get("x-freeagent-token") or "").strip()
+    return bool(given) and secrets.compare_digest(given, token)
+
+
+def _http_make_handler(config: dict):
+    import http.server
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = f"{SERVER_NAME}/{SERVER_VERSION}"
+        sys_version = ""
+
+        def log_message(self, fmt, *args):  # noqa: A003 - 親の API 名
+            _debug("http", f"{self.address_string()} {fmt % args}")
+
+        # ---- 応答の共通形 ----
+        def _json(self, status: int, payload, *, session_id=None) -> None:
+            body = b"" if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            if body:
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            if session_id:
+                self.send_header(HTTP_SESSION_HEADER, session_id)
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def _error(self, status: int, code: int, message: str) -> None:
+            self._json(status, {"jsonrpc": "2.0", "id": None, "error": {"code": code, "message": message}})
+
+        def _path_ok(self) -> bool:
+            path = urllib.parse.urlparse(self.path).path
+            return path.rstrip("/") == config["path"].rstrip("/")
+
+        def _guard(self) -> bool:
+            """パスと認証。通れば True、拒否したら応答を書いて False。"""
+            if not self._path_ok():
+                self._error(404, -32601, f"unknown path: {self.path}（待受は {config['path']}）")
+                return False
+            if not _http_auth_ok(self.headers, config.get("token") or ""):
+                self._error(401, -32000, f"unauthorized（{HTTP_TOKEN_ENV} のトークンが必要です）")
+                return False
+            return True
+
+        # ---- 本体 ----
+        def do_POST(self):  # noqa: N802 - 親の API 名
+            if not self._guard():
+                return
+            try:
+                length = int(self.headers.get("content-length") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            if length > HTTP_MAX_BODY:
+                return self._error(413, -32600, f"request body too large（上限 {HTTP_MAX_BODY} バイト）")
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                msg = json.loads(raw.decode("utf-8")) if raw else None
+            except Exception:
+                return self._error(400, -32700, "parse error")
+            if msg is None:
+                return self._error(400, -32600, "invalid request")
+            sid = (self.headers.get(HTTP_SESSION_HEADER) or "").strip()
+            session = _http_session_get(sid) if sid else None
+            if sid and session is None:
+                return self._error(404, -32001, "session not found（initialize からやり直してください）")
+            new_sid = None
+            if isinstance(msg, dict) and msg.get("method") == "initialize" and session is None:
+                new_sid = _http_session_new()
+                session = _http_session_get(new_sid)
+            marker = (self.headers.get(HARNESS_MARKER_HEADER) or "").strip() or None
+            try:
+                payload, accepted = _http_process(msg, session, marker)
+            except Exception as exc:   # ツールは例外を漏らさない（規約 1）。ここも最後の砦
+                _debug("http_error", f"{type(exc).__name__}: {exc}")
+                return self._error(500, -32603, f"internal error: {type(exc).__name__}: {exc}")
+            _http_session_touch(session)
+            if accepted:
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                if new_sid:
+                    self.send_header(HTTP_SESSION_HEADER, new_sid)
+                self.end_headers()
+                return
+            return self._json(200, payload, session_id=new_sid)
+
+        def do_GET(self):  # noqa: N802 - 親の API 名
+            if not self._guard():
+                return
+            sid = (self.headers.get(HTTP_SESSION_HEADER) or "").strip()
+            if not sid:
+                return self._error(400, -32600, f"GET には {HTTP_SESSION_HEADER} ヘッダが必要です")
+            session = _http_session_get(sid)
+            if session is None:
+                return self._error(404, -32001, "session not found")
+            if "text/event-stream" not in (self.headers.get("accept") or "").lower():
+                return self._error(406, -32600, "GET には Accept: text/event-stream が必要です")
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.flush()
+                while True:
+                    with session["cv"]:
+                        if session["queue"]:
+                            note = session["queue"].pop(0)
+                        else:
+                            session["cv"].wait(HTTP_SSE_KEEPALIVE)
+                            note = session["queue"].pop(0) if session["queue"] else None
+                    if note is None:
+                        if session.get("closed"):
+                            break
+                        self.wfile.write(b": keep-alive\n\n")   # SSE のコメント行（クライアントは無視する）
+                    else:
+                        data = json.dumps(note, ensure_ascii=False)
+                        self.wfile.write(f"event: message\ndata: {data}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
+            return
+
+        def do_DELETE(self):  # noqa: N802 - 親の API 名
+            if not self._guard():
+                return
+            sid = (self.headers.get(HTTP_SESSION_HEADER) or "").strip()
+            if sid and not _http_session_drop(sid):
+                return self._error(404, -32001, "session not found")
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    return Handler
+
+
+def _http_build_server(config: dict):
+    """待受ソケットを作って返す（`serve_forever` は呼び出し側。テストが自前で止められるように分ける）。"""
+    import http.server
+
+    class _Server(http.server.ThreadingHTTPServer):
+        # Windows の SO_REUSEADDR は「同じポートへの二重バインド」を許す。共有が目的なので、
+        # 二重起動は黙って通さず必ず失敗させる（状態が 2 つに割れると気づけない）。
+        allow_reuse_address = False
+        daemon_threads = True
+
+    return _Server((config["host"], config["port"]), _http_make_handler(config))
+
+
+def serve_http(config: dict) -> None:
+    """HTTP モードで待ち受ける（1 プロセスを複数クライアントで共有する）。"""
+    try:
+        server = _http_build_server(config)
+    except OSError as exc:
+        try:
+            sys.stderr.write(f"[{SERVER_NAME}] HTTP を {config['host']}:{config['port']} で開始できません: {exc}\n"
+                             f"  同じポートで既に動いていませんか（1 プロセス共有が目的なので二重起動は不要です）。"
+                             f"別ポートは --port / {HTTP_PORT_ENV} で指定できます。\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        raise SystemExit(2)
+    host, port = server.server_address[0], server.server_address[1]
+    try:
+        sys.stderr.write(f"[{SERVER_NAME}] HTTP 待受 http://{host}:{port}{config['path']}"
+                         f"（token {'あり' if config.get('token') else 'なし'}・pid {os.getpid()}）\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def main(argv=None) -> None:
+    """エントリポイント。既定は stdio（従来どおり）。`--transport http` / `FREEAGENT_TRANSPORT=http` で HTTP。"""
+    config = http_config(sys.argv[1:] if argv is None else argv)
+    if config["transport"] == "http":
+        serve_http(config)
+        return
     try:
         serve()
     except (KeyboardInterrupt, BrokenPipeError):
