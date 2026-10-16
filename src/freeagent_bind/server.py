@@ -64,7 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.7.1"
+SERVER_VERSION = "0.7.2"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -5906,6 +5906,7 @@ def _think_view(sid: str, stored: dict | None, brief: bool = False) -> dict:
     steps = [s for s in (stored.get("steps") or []) if isinstance(s, dict)]
     last = max([as_int(s.get("n"), 0, 0, 9999) for s in steps] + [0])
     total = _think_latest_total(steps)
+    card = as_str(stored.get("card"))
     data = {
         "session_id": sid, "view": True, "brief": bool(brief), "step": last or None,
         "question": stored.get("question") or "",
@@ -5913,10 +5914,11 @@ def _think_view(sid: str, stored: dict | None, brief: bool = False) -> dict:
         "ledger": _think_ledger_view(steps, keep=THOUGHT_MAX_STEPS, row=stored, brief=brief),
         "verification": None, "verified": False, "alternatives": None,
         "verifier_models": [m for m in (stored.get("verifier_models") or []) if isinstance(m, str)],
-        "card": as_str(stored.get("card")),
+        "card": card,
         "notes": [],
         "next_call": {"tool": "freeagent_think",
-                      "args": {"session_id": sid, "thought": "<次の思考>", "thought_number": last + 1}},
+                      "args": {"session_id": sid, "thought": "<次の思考>", "thought_number": last + 1,
+                               **({"card": card} if card else {})}},
     }
     data["suggestions"] = _think_suggestions(data, steps, True)
     return data

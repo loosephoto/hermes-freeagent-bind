@@ -24,6 +24,7 @@ from freeagent_bind import server as S  # noqa: E402
 class TestAuditRegressions(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="fa-audit-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
         self.env = {key: os.environ.get(key) for key in (
             "FREEAGENT_STATE_DIR", "FREEAGENT_STATS_PATH", "FREEAGENT_SESSIONS_PATH")}
         os.environ["FREEAGENT_STATE_DIR"] = self.tmp

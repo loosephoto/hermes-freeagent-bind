@@ -683,7 +683,11 @@ KANBAN のワーカー（`hermes -p <profile> chat -q "work kanban task t_x"`）
 - `view=true` + `card`（`session_id` 省略時）で、そのカードの台帳を**読み戻せる**（`thought_find_by_card` が
   最後に更新された台帳を返す）。`session_id` を併せて渡した場合は **`session_id` が優先**（card は記録のみ）。
 - カードが未知なら**推測せずエラー**（`カード <id> に紐づく台帳はありません`）。
-- 応答に `card` を返し、`next_call.args.card` にも引き継ぐ（次の思考で落とさないため）。
+- 応答に `card` を返し、`next_call.args.card` にも引き継ぐ（次の思考で落とさないため。`view` の応答も同じ）。
+- **別プロセスからも読める**: 台帳は `thoughts.json` に落ちるので、ワーカーとは**別の MCP プロセス**（メイン
+  セッションなど）でも `view=true` + `card` で同じ道筋を読み戻せる。**実測（v0.7.1・別プロセス実行）**: カード
+  `t_ae980837` の `view` で `ledger.steps_recorded=2` / `ledger.latest` に 2 手の本文 / `active_path=[1,2]` が返り、
+  未知カードは推測せずエラーになった。**カード ID を控えておけば、メインがワーカーの思考を後から監査できる**。
 - **完了・ブロックはこのツールの仕事ではない**: カードの終端は `kanban_complete` / `kanban_block`（Hermes の
   `kanban_*` ツール）で行う。MCP サーバーはボードを書かない（ワーカー系譜の MCP 子プロセスは書き込みフェンスで
   `PermissionError` になる。§6.13 の調査で確認済み）。description にもその分担を書いてある（規約 5）。

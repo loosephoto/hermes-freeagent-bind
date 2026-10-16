@@ -167,6 +167,7 @@ class TestHandleToolCallContract(unittest.TestCase):
 class TestSessions(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="fa-sess-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
         self._old = os.environ.get("FREEAGENT_SESSIONS_PATH")
         os.environ["FREEAGENT_SESSIONS_PATH"] = os.path.join(self.tmp, "sessions.json")
         S._SESSIONS.clear()
@@ -219,6 +220,7 @@ class TestThoughtLedgerStore(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="fa-think-store-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
         self._old = os.environ.get("FREEAGENT_THOUGHTS_PATH")
         os.environ["FREEAGENT_THOUGHTS_PATH"] = os.path.join(self.tmp, "thoughts.json")
         S._THOUGHTS.clear()
@@ -345,6 +347,7 @@ class TestThinkCardLink(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="fa-think-card-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
         self._old = os.environ.get("FREEAGENT_THOUGHTS_PATH")
         os.environ["FREEAGENT_THOUGHTS_PATH"] = os.path.join(self.tmp, "thoughts.json")
         os.environ["FREEAGENT_THOUGHTS"] = "1"
@@ -393,6 +396,13 @@ class TestThinkCardLink(unittest.TestCase):
         self.assertEqual(got["card"], "t_card2")
         self.assertEqual(got["step"], 1)
 
+    def test_view_next_call_carries_card(self):
+        """読み戻した後も同じカードで続けられる（next_call に card を入れる）。"""
+        S.tool_think({"thought": "1 手目", "thought_number": 1, "card": "t_next"})
+        got = S.tool_think({"view": True, "card": "t_next"})
+        self.assertEqual(got["next_call"]["args"]["card"], "t_next")
+        self.assertEqual(got["next_call"]["args"]["thought_number"], 2)
+
     def test_view_by_unknown_card_errors_without_guessing(self):
         got = S.tool_think({"view": True, "card": "t_nope"})
         self.assertIn("error", got)
@@ -415,6 +425,7 @@ class TestThinkTool(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="fa-think-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
         self._old = os.environ.get("FREEAGENT_THOUGHTS_PATH")
         os.environ["FREEAGENT_THOUGHTS_PATH"] = os.path.join(self.tmp, "thoughts.json")
         S._THOUGHTS.clear()
@@ -615,6 +626,7 @@ class TestThinkStructure(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="fa-think-st-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
         self._old = os.environ.get("FREEAGENT_THOUGHTS_PATH")
         os.environ["FREEAGENT_THOUGHTS_PATH"] = os.path.join(self.tmp, "thoughts.json")
         S._THOUGHTS.clear()
@@ -878,6 +890,7 @@ class TestThinkStructure(unittest.TestCase):
 class TestCooldownAndStats(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="fa-cd-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
         self._old = os.environ.get("FREEAGENT_STATE_DIR")
         os.environ["FREEAGENT_STATE_DIR"] = self.tmp
         S._COOLDOWN.clear()

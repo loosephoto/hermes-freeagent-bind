@@ -356,7 +356,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | ステップ数 | `thought_number`（省略すると末尾＋1）、`total_thoughts`（見込み。増やしても減らしてもよい。省略するとノートの値を引き継ぐ）、`next_thought_needed: false`（結論に入る） |
 | サブに頼む | `verify: true`（反論）、`propose_alternatives: true`（別案）、`size`（人数・既定 2・最大 4）、`models` / `prefer` / `exclude`、`max_tokens` |
 | 読み返す | `view: true` + `session_id`（大きい台帳は `brief: true` を併用すると現行の道筋だけを返す。省いた件数は `omitted`）。`session_id` の代わりに `card` でも読める |
-| KANBAN のカードに紐づける | `card: "t_xxxx"`（KANBAN のワーカーが自分のカード ID を入れる。**同じ card で呼び続けると同じノートを継続する**ので `session_id` を覚えていなくてよい。`view: true` + `card` でそのカードの道筋を読み戻せる。**カードの完了・ブロックは `kanban_complete` / `kanban_block`** で行い、このノートは書き換えない） |
+| KANBAN のカードに紐づける | `card: "t_xxxx"`（KANBAN のワーカーが自分のカード ID を入れる。**同じ card で呼び続けると同じノートを継続する**ので `session_id` を覚えていなくてよい。`view: true` + `card` でそのカードの道筋を読み戻せる（ワーカーとは別プロセスのメインセッションからも同じ card で読める＝後から思考を監査できる）。**カードの完了・ブロックは `kanban_complete` / `kanban_block`** で行い、このノートは書き換えない） |
 
 次の一手の提案（「未検証の仮説があります」「未決着の分岐が 2 本あります」など）は、画面の表示ではなく
 メイン LLM 向けの `structuredContent.suggestions` に入ります。
