@@ -115,13 +115,79 @@ class TestAuditRegressions(unittest.TestCase):
         self.assertTrue(got["error"])
 
     def test_wikipedia_search_fetches_summaries_in_one_api_call(self):
+        """要約は検索応答（`generator=search` + `prop=extracts`）から取る。記事ごとの N+1 はしない。
+
+        完全一致の lookup（`titles=`）が 1 本増えたので**合計 2 本**が正しい（§5.1 の順位対策）。
+        """
         S._KB_CACHE.pop("wiki:ja:one-call-test:1", None)
         search_result = {"query": {"pages": {"1": {"title": "Article", "index": 1,
                                                         "extract": "Plain summary"}}}}
-        with mock.patch.object(S, "kb_json", return_value=(search_result, "")) as request:
+        urls = []
+        def fake(url, **kwargs):
+            urls.append(url)
+            if "titles=" in url:
+                return {"query": {"pages": {"-1": {"title": "one-call-test", "missing": ""}}}}, ""
+            return search_result, ""
+        with mock.patch.object(S, "kb_json", side_effect=fake):
             got = S.kb_wikipedia("one-call-test", limit=1)
-        self.assertEqual(request.call_count, 1)
+        self.assertEqual(len(urls), 2, urls)
+        self.assertEqual(sum(1 for u in urls if "generator=search" in u), 1)
+        self.assertEqual(sum(1 for u in urls if "titles=" in u), 1)
         self.assertEqual(got["items"][0]["summary"], "Plain summary")
+
+    def test_wikipedia_promotes_exact_title_hit(self):
+        """実測の再現: 素の検索が無関係な項目を返しても、完全一致があれば先頭に来る。"""
+        S._KB_CACHE.pop("wiki:ja:exact-promote:2", None)
+        search_result = {"query": {"pages": {
+            "1": {"title": "マークアップ言語", "index": 1, "extract": "markup"},
+            "2": {"title": "機械翻訳", "index": 2, "extract": "mt"},
+            "3": {"title": "プログラミング言語", "index": 3, "extract": "prog"}}}}
+        exact_result = {"query": {"pages": {"9": {"title": "大規模言語モデル", "index": 1,
+                                                  "extract": "LLM の説明"}}}}
+        def fake(url, **kwargs):
+            if "titles=" in url:
+                return exact_result, ""
+            return search_result, ""
+        with mock.patch.object(S, "kb_json", side_effect=fake):
+            got = S.kb_wikipedia("exact-promote", limit=2)
+        titles = [item["title"] for item in got["items"]]
+        self.assertEqual(titles, ["大規模言語モデル", "マークアップ言語"], titles)
+        self.assertEqual(got["citations"][0]["title"], "大規模言語モデル")
+        self.assertIn("LLM の説明", got["citations"][0]["summary"])
+
+    def test_wikipedia_exact_hit_with_empty_extract_is_not_promoted(self):
+        """実測: 「〜の一覧」は記事があるのに intro が 0 文字。空の中身を昇格させない。"""
+        S._KB_CACHE.pop("wiki:ja:exact-empty:1", None)
+        search_result = {"query": {"pages": {"1": {"title": "Article", "index": 1, "extract": "body"}}}}
+        exact_result = {"query": {"pages": {"9": {"title": "exact-empty", "index": 1, "extract": ""}}}}
+        def fake(url, **kwargs):
+            return (exact_result, "") if "titles=" in url else (search_result, "")
+        with mock.patch.object(S, "kb_json", side_effect=fake):
+            got = S.kb_wikipedia("exact-empty", limit=1)
+        self.assertEqual([item["title"] for item in got["items"]], ["Article"])
+
+    def test_wikipedia_exact_lookup_skipped_for_search_operators(self):
+        """`intitle:` などをタイトルとして引くと無関係な記事に当たるので、その形では lookup を投げない。"""
+        S._KB_CACHE.pop("wiki:ja:intitle:foo:1", None)
+        urls = []
+        def fake(url, **kwargs):
+            urls.append(url)
+            return {"query": {"pages": {"1": {"title": "A", "index": 1, "extract": "b"}}}}, ""
+        with mock.patch.object(S, "kb_json", side_effect=fake):
+            got = S.kb_wikipedia("intitle:foo", limit=1)
+        self.assertEqual(len(urls), 1, urls)
+        self.assertEqual([item["title"] for item in got["items"]], ["A"])
+
+    def test_wikipedia_exact_lookup_failure_keeps_search_result(self):
+        """lookup が落ちても検索結果は変えない（片方の失敗で全体を落とさない）。"""
+        S._KB_CACHE.pop("wiki:ja:exact-fail:1", None)
+        search_result = {"query": {"pages": {"1": {"title": "Article", "index": 1, "extract": "body"}}}}
+        def fake(url, **kwargs):
+            return (None, "HTTP 500: boom") if "titles=" in url else (search_result, "")
+        with mock.patch.object(S, "kb_json", side_effect=fake):
+            got = S.kb_wikipedia("exact-fail", limit=1)
+        self.assertEqual(got["error"], "")
+        self.assertEqual([item["title"] for item in got["items"]], ["Article"])
 
     def test_kb_errors_are_not_cached(self):
         calls = []
