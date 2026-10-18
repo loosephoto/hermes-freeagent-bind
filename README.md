@@ -166,6 +166,35 @@ hermes config set mcp_servers.freeagent-bind.headers.x-freeagent-harness hermes
 - HTTP では `FREEAGENT_HARNESS` の env が渡らないので、目印は**ヘッダ**で付けます（上の `headers`）。
   付け忘れると「ハーネスを判別できません」のログが出ます（動作は変わりません）。
 
+#### Windows で常駐させる（見張りつき・黒いウィンドウを出しません）
+
+手で起動したプロセスはログオフで消えるので、Windows では「ログオン時に起動し、落ちたら戻す」配線を置きます。
+**その配線は repo から生成できます**（機械固有のパスは引数で与えます。既定は `%LOCALAPPDATA%\hermes`）。
+
+```bash
+python scripts/install_resident_windows.py                          # 表示のみ（1 バイトも書きません）
+python scripts/install_resident_windows.py --write --force           # 生成（worker / launcher / ログオン起動 / 切替スクリプト）
+python scripts/install_resident_windows.py --write --force --task    # 5 分ごとの見張りタスクも登録
+```
+
+| 生成物 | 役割 |
+|---|---|
+| `<hermes-home>\freeagent-service\run_server.pyw` | コンソールを作らない起動役（`pythonw.exe` から走ります） |
+| `<hermes-home>\freeagent-service\Hermes_Freeagent.vbs` | worker。待受済みなら何もせず終了（二重起動の防止） |
+| `Startup\Hermes_Freeagent.vbs` | ログオン時に worker を隠して起動 |
+| `…\apply_freeagent_http.sh` / `revert_freeagent_stdio.sh` | `hermes config` の切替と戻し |
+
+- **生存確認は WMI（`Win32_Process` のコマンドライン照合）**で行います。子プロセスを作らないので、
+  netstat のためのコンソールも生まれません。WMI が使えない環境では `WinHttp` の接続確認に落ちます。
+- **サーバー本体は `pythonw.exe`（GUI サブシステム）で起動し、ログはファイルへ直接追記**します。
+  `WshShell.Exec("cmd /c netstat …")` や `cmd /c … >> log` は**使いません**。子プロセスにコンソールが付き、
+  Windows 11（既定のターミナルが Windows Terminal）では**数分おきに黒いウィンドウが一瞬出ます**
+  （実測: 5 分周期の見張りで毎回 1 個。ウィンドウを隠す指定でも表示されました）。
+- 見張りは `schtasks` の 5 分間隔で、**生きていれば何もしない**冪等な設計です。落ちていたときだけ起動します。
+- 二重起動の判定は、launcher が付ける目印 `freeagent-resident-<port>` と、旧来の
+  `server.py … --port <port>` の**両方**に当てます（片方だけだと、起動方式を変えた直後に二重起動します）。
+- 既定のポートは 8790 です（`--port` で変更できます。Hermes 側の `url` も同じ値にしてください）。
+
 ## 💬 会話での頼み方
 
 引数を覚える必要はありません。最初は用途を普通の言葉で頼み、選ばれなければツール名を添えてください。

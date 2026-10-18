@@ -798,6 +798,19 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   `_HARNESS` はプロセス共有なので判定は**最後に initialize したクライアント**のものになる（警告 1 回・
   最初の結果への注記 1 回という性質は変わらない）。
 - 検証: `python scripts/smoke_http.py`（実クライアント経路）と `tests/test_http_transport.py`。
+- **Windows での常駐化は repo の生成器が担う**（`scripts/install_resident_windows.py`）。worker（VBS）・
+  launcher（`.pyw`）・ログオン起動・見張りタスク・`hermes config` の切替/戻しを 1 コマンドで作り直せる
+  （機械固有のパスは引数。既定 `%LOCALAPPDATA%\hermes`）。**生成物はコンソールを生まない**: 生存確認は
+  WMI（`Win32_Process` の CommandLine 照合＝子プロセスを作らない。使えないときだけ WinHttp へ落ちる）、
+  起動は `pythonw.exe`（GUI サブシステム）、ログは VBScript のファイル追記。`WshShell.Exec("cmd /c netstat …")`
+  や `cmd /c …` は子プロセスにコンソールを割り当て、Windows 11（既定のターミナル = Windows Terminal）では
+  **数分おきに黒いウィンドウが一瞬出る**（実測: 5 分周期の見張りで毎回 1 個。ウィンドウを隠す指定でも表示された）。
+  二重起動の判定は launcher が付ける目印 `freeagent-resident-<port>` と旧来の `server.py … --port <port>` の
+  **両方**に当てる（片方だけだと起動方式を変えた直後に二重起動し、`allow_reuse_address = False` の
+  ため起動が失敗する）。検証: `tests/test_resident_installer.py`。
+- **目印（ハーネス判別）の点検も HTTP に対応する**: `scripts/apply_proactive.py --check` は
+  `x-freeagent-harness` ヘッダを env と同じ目印として読み、HTTP なら不足時にヘッダを足すコマンドを出す
+  （ヘッダを読まないと常駐運用の実機で「未設定」と誤警告した）。
 
 ## 9. 拡張の手順（新しいツールを足すとき）
 

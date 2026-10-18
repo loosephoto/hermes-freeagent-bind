@@ -90,6 +90,7 @@ MARKER_END = "<!-- /freeagent-bind: proactive-usage -->"
 # ハーネス判別の目印（server.py §8.6）。Hermes の clientInfo は MCP SDK 既定の "mcp" で区別できないため、
 # 設定の env: ブロック（子プロセスにそのまま渡る唯一の経路）で「Hermes から起動した」と明示する。
 HARNESS_MARKER_ENV = "FREEAGENT_HARNESS"
+HARNESS_MARKER_HEADER = "x-freeagent-harness"
 
 
 def upsert_snippet(existing: str, snippet: str = SNIPPET) -> tuple[str, str]:
@@ -224,10 +225,23 @@ def own_server(cfg: str, servers: list[str]) -> str | None:
 
 
 def configured_marker(cfg: str, server: str) -> str:
-    """設定済みの env.FREEAGENT_HARNESS（ハーネス判別の目印。server.py §8.6）。"""
-    m = re.search(r"^\s+" + re.escape(HARNESS_MARKER_ENV) + r":\s*['\"]?([^'\"\s]*)",
-                  server_block(cfg, server), re.M)
-    return m.group(1) if m else ""
+    """設定済みのハーネス判別の目印（server.py §8.6）。優先順はサーバー側と同じ。
+
+    ヘッダ `x-freeagent-harness` > env `FREEAGENT_HARNESS`。**常駐 HTTP では子プロセスの env が
+    渡らない**ので、ヘッダを見ないと「未設定」と誤判定して env を足すコマンドを出してしまう
+    （実測: HTTP 運用の実機で `--check` がこの誤警告を出した）。
+    """
+    block = server_block(cfg, server)
+    for key in (HARNESS_MARKER_HEADER, HARNESS_MARKER_ENV):
+        m = re.search(r"^\s+" + re.escape(key) + r":\s*['\"]?([^'\"\s]*)", block, re.M)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def is_http(cfg: str, server: str) -> bool:
+    """そのサーバーが `url`（HTTP）で登録されているか（`command` と `url` は片方だけ・SPEC §8.2）。"""
+    return bool(re.search(r"^\s+url:\s*\S", server_block(cfg, server), re.M))
 
 
 def configured_exclude(server: str) -> list[str]:
@@ -424,11 +438,19 @@ def main() -> int:
     own = own_server(cfg, servers)
     marker = configured_marker(cfg, own) if own else ""
     if own and marker.lower() != "hermes":
-        commands.append(["hermes", "config", "set", f"mcp_servers.{own}.env.{HARNESS_MARKER_ENV}", "hermes"])
-        print(f"· {own}: ハーネス判別の目印 {HARNESS_MARKER_ENV}=hermes が未設定"
-              f"（現在: {marker or 'なし'}）。Hermes から起動したと判別できるよう設定に加えます")
+        if is_http(cfg, own):
+            # 常駐 HTTP は子プロセスではないので env が渡らない（SPEC §8.6）。ヘッダで付ける。
+            commands.append(["hermes", "config", "set",
+                             f"mcp_servers.{own}.headers.{HARNESS_MARKER_HEADER}", "hermes"])
+            print(f"· {own}: ハーネス判別の目印 {HARNESS_MARKER_HEADER}=hermes が未設定"
+                  f"（現在: {marker or 'なし'}）。HTTP では env が渡らないのでヘッダで付けます")
+        else:
+            commands.append(["hermes", "config", "set", f"mcp_servers.{own}.env.{HARNESS_MARKER_ENV}", "hermes"])
+            print(f"· {own}: ハーネス判別の目印 {HARNESS_MARKER_ENV}=hermes が未設定"
+                  f"（現在: {marker or 'なし'}）。Hermes から起動したと判別できるよう設定に加えます")
     elif own:
-        print(f"· {own}: ハーネス判別の目印 {HARNESS_MARKER_ENV}=hermes 設定済み")
+        print(f"· {own}: ハーネス判別の目印 hermes 設定済み"
+              f"（{'ヘッダ ' + HARNESS_MARKER_HEADER if is_http(cfg, own) else HARNESS_MARKER_ENV}）")
     print()
 
     if args.check:

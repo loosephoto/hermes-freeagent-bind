@@ -1595,6 +1595,38 @@ class TestProactivePatternMatching(unittest.TestCase):
     def test_glob_matches_real_names(self):
         self.assertEqual(len(self.mod.pattern_hits("ask-*", self.REAL)), 6)
 
+    # HTTP（常駐）では子プロセスの env が渡らず、目印はヘッダで付く（SPEC §8.2 / §8.6）。
+    HTTP_CFG = (
+        "mcp_servers:\n"
+        "  freeagent-bind:\n"
+        "    url: http://127.0.0.1:8790/mcp\n"
+        "    headers:\n"
+        "      x-freeagent-harness: hermes\n"
+        "  other:\n"
+        "    command: py\n"
+    )
+    STDIO_CFG = (
+        "mcp_servers:\n"
+        "  freeagent-bind:\n"
+        "    command: py\n"
+        "    args: ['C:/repo/src/freeagent_bind/server.py']\n"
+        "    env:\n"
+        "      FREEAGENT_HARNESS: hermes\n"
+    )
+
+    def test_http_header_counts_as_the_harness_marker(self):
+        """ヘッダの目印を読めないと、常駐 HTTP の実機で「未設定」と誤警告する（実測）。"""
+        self.assertEqual(self.mod.configured_marker(self.HTTP_CFG, "freeagent-bind"), "hermes")
+        self.assertTrue(self.mod.is_http(self.HTTP_CFG, "freeagent-bind"))
+
+    def test_stdio_env_is_still_the_marker(self):
+        self.assertEqual(self.mod.configured_marker(self.STDIO_CFG, "freeagent-bind"), "hermes")
+        self.assertFalse(self.mod.is_http(self.STDIO_CFG, "freeagent-bind"))
+
+    def test_marker_is_read_per_server(self):
+        """隣のサーバーの env を自分の目印と取り違えないこと。"""
+        self.assertEqual(self.mod.configured_marker(self.HTTP_CFG, "other"), "")
+
     def test_snippet_covers_all_thinking_features(self):
         """判断規則の単一の出典に、分解・改訂・分岐・見積り・仮説の常用と無効時の振る舞いが入っている。"""
         for key in ("freeagent_think", "plan", "revises_thought", "branch_from_thought",
