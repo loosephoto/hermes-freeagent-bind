@@ -166,6 +166,26 @@ class TestHttpProtocol(HttpCase):
         r = self.call({"jsonrpc": "2.0", "id": 10, "method": "ping"}, session_id=sid)
         self.assertEqual(r["status"], 404)
 
+    def test_initialize_prunes_oldest_session_when_at_capacity(self):
+        old_limit = S.HTTP_MAX_SESSIONS
+        S.HTTP_MAX_SESSIONS = 1
+        self.addCleanup(setattr, S, "HTTP_MAX_SESSIONS", old_limit)
+        with S._HTTP_SESSIONS_LOCK:
+            S._HTTP_SESSIONS.clear()
+
+        _, old_sid = self.initialize()
+        request = {"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                   "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                              "clientInfo": {"name": "test-client", "version": "1"}}}
+        r = self.call(request, timeout=1)
+        new_sid = r["headers"].get(SESSION_HEADER)
+        self.assertEqual(r["status"], 200)
+        self.assertTrue(new_sid)
+        self.assertNotEqual(new_sid, old_sid)
+
+        old = self.call({"jsonrpc": "2.0", "id": 3, "method": "ping"}, session_id=old_sid)
+        self.assertEqual(old["status"], 404)
+
     def test_unknown_path_is_404(self):
         r = self.call({"jsonrpc": "2.0", "id": 11, "method": "ping"}, path="/other")
         self.assertEqual(r["status"], 404)

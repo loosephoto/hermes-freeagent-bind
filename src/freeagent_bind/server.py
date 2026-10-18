@@ -7195,7 +7195,7 @@ def _http_session_new() -> str:
     sid = os.urandom(16).hex()
     with _HTTP_SESSIONS_LOCK:
         if len(_HTTP_SESSIONS) >= HTTP_MAX_SESSIONS:
-            _http_sessions_prune(force=True)
+            _http_sessions_prune_locked(force=True)
         _HTTP_SESSIONS[sid] = {"created": now_ts(), "seen": now_ts(),
                                "queue": [], "cv": threading.Condition(), "closed": False}
     return sid
@@ -7216,22 +7216,27 @@ def _http_session_touch(session) -> None:
         session["seen"] = now_ts()
 
 
+def _http_sessions_prune_locked(force: bool = False) -> int:
+    """呼び出し側が `_HTTP_SESSIONS_LOCK` を保持した状態で期限切れセッションを落とす。"""
+    now = now_ts()
+    stale = [k for k, v in _HTTP_SESSIONS.items() if now - as_float(v.get("seen"), 0.0) > HTTP_SESSION_TTL]
+    if not stale and force:
+        order = sorted(_HTTP_SESSIONS, key=lambda k: as_float(_HTTP_SESSIONS[k].get("seen"), 0.0))
+        stale = order[:max(1, HTTP_MAX_SESSIONS // 4)]
+    for k in stale:
+        session = _HTTP_SESSIONS.pop(k, None)
+        if session is None:
+            continue
+        session["closed"] = True
+        with session["cv"]:
+            session["cv"].notify_all()
+    return len(stale)
+
+
 def _http_sessions_prune(force: bool = False) -> int:
     """期限切れのセッションを落とす。上限に達したら古い順に落とす（force）。"""
-    now = now_ts()
     with _HTTP_SESSIONS_LOCK:
-        stale = [k for k, v in _HTTP_SESSIONS.items() if now - as_float(v.get("seen"), 0.0) > HTTP_SESSION_TTL]
-        if not stale and force:
-            order = sorted(_HTTP_SESSIONS, key=lambda k: as_float(_HTTP_SESSIONS[k].get("seen"), 0.0))
-            stale = order[:max(1, HTTP_MAX_SESSIONS // 4)]
-        for k in stale:
-            session = _HTTP_SESSIONS.pop(k, None)
-            if session is None:
-                continue
-            session["closed"] = True
-            with session["cv"]:
-                session["cv"].notify_all()
-        return len(stale)
+        return _http_sessions_prune_locked(force)
 
 
 def _http_session_drop(sid: str) -> bool:
