@@ -41,6 +41,7 @@ Internet Archive / Qiita）で
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import datetime
 import email.utils
@@ -65,7 +66,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.8.1"
+SERVER_VERSION = "0.8.2"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -481,6 +482,72 @@ def _load_json(path: str, default):
             return json.load(fh)
     except (OSError, ValueError):
         return default
+
+
+def _file_mtime(path: str) -> float | None:
+    """ファイルの更新時刻（無ければ None）。**別プロセスの更新を察觉する**ために使う。"""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+@contextlib.contextmanager
+def _file_lock(path: str, timeout: float = 10.0):
+    """**プロセス間**の排他ロック（同じファイルへの同時更新を 1 本に直列化する）。
+
+    台帳（`thoughts.json`）のロックはプロセス内だけ（`threading`）なので、同じ
+    `FREEAGENT_STATE_DIR` を複数プロセスで共有すると **last-writer-wins** になり、
+    他プロセスの思考が黙って消える（実測: 4 プロセスの同時書き込みで 5 試行中 3 回で欠落）。
+    ロックファイルは対象ファイルの隣（`thoughts.json.lock`）に置く。
+    Windows は `msvcrt.locking`、POSIX は `fcntl.flock`。**取れなくても止めない**（best-effort）。
+    """
+    lock_path = f"{path}.lock"
+    handle = None
+    acquired = False
+    try:
+        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+        handle = open(lock_path, "a+b")
+        try:
+            if handle.seek(0, os.SEEK_END) == 0:
+                handle.write(b"\0")
+                handle.flush()
+        except OSError:
+            pass
+        deadline = time.monotonic() + max(0.1, timeout)
+        while True:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+        yield acquired
+    finally:
+        if handle is not None:
+            try:
+                if acquired:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                handle.close()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------- §2.1 クールダウン
@@ -1163,6 +1230,8 @@ def session_drop(sid: str) -> None:
 
 _THOUGHTS: dict[str, dict] = {}
 _THOUGHTS_LOADED = False
+# ディスクの最終読み込み時刻（**別プロセスの更新を察觉する**ために使う）。
+_THOUGHTS_MTIME = 0.0
 _THOUGHTS_LOCK = threading.RLock()
 THOUGHTS_ENABLED = _env_on("FREEAGENT_THOUGHTS", True)
 # 相談セッション（1 時間）より長めに持つ（思考の連鎖は 1 ターンをまたぐことがある）。
@@ -1186,25 +1255,93 @@ def _thoughts_prune(data: dict, now: float) -> dict:
     return alive
 
 
+def _thoughts_disk_chains(path: str) -> dict:
+    """ディスク上の台帳（chains）を読む。壊れていても空で返す。"""
+    data = _load_json(path, {})
+    rows = data.get("chains") if isinstance(data, dict) else None
+    return rows if isinstance(rows, dict) else {}
+
+
+def _thoughts_merge_row(base: dict, mine: dict) -> dict:
+    """2 つの台帳行を統合する（別プロセスが同じ台帳へ同時に書いたときの last-writer-wins 防止）。
+
+    **集合もの（`steps`）は番号の和集合**（同じ番号は新しい方が優先）で、
+    **状態もの（`plan` / `plan_retired` / `branch_meta` / `total_history`）は
+    `updated_at` が新しい方の値をそのまま使う**（計画の改訂は「差し替え」なので
+    和集合にすると廃止した項目が復活してしまう）。
+    """
+    base = base or {}
+    mine = mine or {}
+    newer, older = (mine, base)
+    if as_float(base.get("updated_at"), 0.0) > as_float(mine.get("updated_at"), 0.0):
+        newer, older = base, mine
+    out = json.loads(json.dumps(older))
+    # ステップは番号の和集合（古い方 → 新しい方 で上書き）。
+    steps: dict[int, dict] = {}
+    for s in list(older.get("steps") or []) + list(newer.get("steps") or []):
+        if isinstance(s, dict):
+            steps[as_int(s.get("n"), 0, 0, 9999)] = s
+    out["steps"] = [steps[k] for k in sorted(steps)]
+    # 状態もの（計画・分岐・見積り履歴）は新しい方の値をそのまま使う。
+    for key in ("plan", "plan_retired", "branch_meta", "total_history"):
+        if key in newer:
+            out[key] = newer.get(key)
+    for key in ("card", "question"):
+        if newer.get(key):
+            out[key] = newer[key]
+    vms = [m for m in (out.get("verifier_models") or []) if isinstance(m, str)]
+    for m in [m for m in (newer.get("verifier_models") or []) if isinstance(m, str)]:
+        if m not in vms:
+            vms.append(m)
+    out["verifier_models"] = vms[:12]
+    out["created_at"] = newer.get("created_at") or older.get("created_at") or now_ts()
+    out["updated_at"] = max(as_float(base.get("updated_at"), 0.0),
+                             as_float(mine.get("updated_at"), 0.0))
+    return out
+
+
+def _thoughts_write_locked(path: str, chains: dict) -> bool:
+    """ロックの中で台帳を書き出す（**呼び出し側がロックを持っている**前提）。"""
+    global _THOUGHTS_MTIME
+    payload = {"version": 1, "saved_at": now_ts(),
+               "chains": _thoughts_prune(chains, now_ts())}
+    ok = _atomic_write(path, json.dumps(payload, ensure_ascii=False))
+    if ok:
+        _THOUGHTS_MTIME = _file_mtime(path) or 0.0
+    return ok
+
+
 def _ensure_thoughts_loaded() -> None:
-    global _THOUGHTS_LOADED
-    if _THOUGHTS_LOADED or not THOUGHTS_ENABLED:
-        return
-    with _THOUGHTS_LOCK:
-        if _THOUGHTS_LOADED:
-            return
-        data = _load_json(thoughts_path(), {})
-        rows = data.get("chains") if isinstance(data, dict) else None
-        _THOUGHTS.update(_thoughts_prune(rows if isinstance(rows, dict) else {}, now_ts()))
-        _THOUGHTS_LOADED = True
+    """台帳をメモリへ読み込む。**別プロセスが更新していたら読み直す**（陳腐化の解消）。
 
-
-def _thoughts_save() -> bool:
+    一度读过だけでは、別プロセス（MCP 子プロセス = KANBAN ワーカーなど）が足した思考を
+    永久に見えない（実測: ワーカーの 2 手目が常駐プロセスから見えず、親の保存で
+    ファイル上から消えた）。更新時刻が変わっていればディスクから取り直す。
+    """
+    global _THOUGHTS_LOADED, _THOUGHTS_MTIME
     if not THOUGHTS_ENABLED:
-        return False
+        return
+    path = thoughts_path()
+    mtime = _file_mtime(path)
     with _THOUGHTS_LOCK:
-        payload = {"version": 1, "saved_at": now_ts(), "chains": _thoughts_prune(_THOUGHTS, now_ts())}
-    return _atomic_write(thoughts_path(), json.dumps(payload, ensure_ascii=False))
+        if not _THOUGHTS_LOADED:
+            rows = _thoughts_disk_chains(path)
+            _THOUGHTS.update(_thoughts_prune(rows, now_ts()))
+            _THOUGHTS_LOADED = True
+            _THOUGHTS_MTIME = mtime if mtime is not None else 0.0
+            return
+        if mtime is None:
+            return
+        if abs(mtime - _THOUGHTS_MTIME) < 1e-6:
+            return
+        rows = _thoughts_prune(_thoughts_disk_chains(path), now_ts())
+        for sid, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            cur = _THOUGHTS.get(sid)
+            if cur is None or as_float(row.get("updated_at"), 0.0) >= as_float((cur or {}).get("updated_at"), 0.0):
+                _THOUGHTS[sid] = row
+        _THOUGHTS_MTIME = mtime
 
 
 def new_thought_id() -> str:
@@ -1232,35 +1369,77 @@ def thought_merge(sid: str, step: dict, *, question: str = "", verifier_models: 
     （メインは 1 ターンで複数ツールを並行に呼ぶ前提で書く。規約 14）。`assign_number=True` のとき
     番号をロック内で採番する。`sid` が未知・期限切れなら**古い内容は復活させず**新しい ID を採番する。
     上限（`THOUGHT_MAX_STEPS`）に達していたら**黙って捨てず** `refused` を立てて返す。
+
+    **プロセス間でも同じ**ようにする: ファイルロック（`_file_lock`）を取り、直前のファイル内容と
+    統合してから書く。実測: 4 プロセスが同時に同じ台帳へ書くと、5 試行中 3 回で思考が欠落していた
+    （last-writer-wins）。番号の採番も**ファイル反映後の内容**に対して行うので、
+    別プロセスが同じ番号を採番しても片方が消えない。
     """
     _ensure_thoughts_loaded()
     with _THOUGHTS_LOCK:
-        target = sid if sid in _THOUGHTS else new_thought_id()
-        row = json.loads(json.dumps(_THOUGHTS.get(target) or {}))
-        steps = [s for s in (row.get("steps") or []) if isinstance(s, dict)]
-        step = dict(step)
-        if assign_number:
-            step["n"] = max([as_int(s.get("n"), 0, 0, 9999) for s in steps] + [0]) + 1
-        number = as_int(step.get("n"), 0, 0, 9999)
-        replaced = any(as_int(s.get("n"), 0, 0, 9999) == number for s in steps)
-        if not replaced and len(steps) >= THOUGHT_MAX_STEPS:
-            return {"session_id": target, "step": None, "steps_recorded": len(steps), "refused": True}
-        old = next((s for s in steps if as_int(s.get("n"), 0, 0, 9999) == number), None)
-        steps = [s for s in steps if as_int(s.get("n"), 0, 0, 9999) != number] + [step]
-        steps.sort(key=lambda s: as_int(s.get("n"), 0, 0, 9999))
-        # 他ステップ・台帳メタへの波及（改訂済みの印・仮説の状態・分岐の状態・計画）も**同じロック内**。
-        _thought_apply_ops(row, steps, step, old, ops or {})   # §2.7
-        row.update({
-            "steps": steps,
-            # KANBAN のカード ID（任意）。渡された値が優先で、未指定なら既存を保つ（§6.9 の card 引数）。
-            "card": card or row.get("card") or "",
-            "question": question or row.get("question") or "",
-            "verifier_models": verifier_models or row.get("verifier_models") or [],
-            "created_at": row.get("created_at") or now_ts(),
-            "updated_at": now_ts(),
-        })
-        _THOUGHTS[target] = row
-        _thoughts_save()
+        path = thoughts_path()
+        if not THOUGHTS_ENABLED:
+            # 台帳が無効なら**ロックファイルも作らない**（状態ディレクトリを汚さない）。
+            target = sid if sid in _THOUGHTS else new_thought_id()
+            row = json.loads(json.dumps(_THOUGHTS.get(target) or {}))
+            steps = [s for s in (row.get("steps") or []) if isinstance(s, dict)]
+            step = dict(step)
+            if assign_number:
+                step["n"] = max([as_int(s.get("n"), 0, 0, 9999) for s in steps] + [0]) + 1
+            number = as_int(step.get("n"), 0, 0, 9999)
+            replaced = any(as_int(s.get("n"), 0, 0, 9999) == number for s in steps)
+            if not replaced and len(steps) >= THOUGHT_MAX_STEPS:
+                return {"session_id": target, "step": None, "steps_recorded": len(steps), "refused": True}
+            old = next((s for s in steps if as_int(s.get("n"), 0, 0, 9999) == number), None)
+            steps = [s for s in steps if as_int(s.get("n"), 0, 0, 9999) != number] + [step]
+            steps.sort(key=lambda s: as_int(s.get("n"), 0, 0, 9999))
+            _thought_apply_ops(row, steps, step, old, ops or {})
+            row.update({"steps": steps,
+                        "card": card or row.get("card") or "",
+                        "question": question or row.get("question") or "",
+                        "verifier_models": verifier_models or row.get("verifier_models") or [],
+                        "created_at": row.get("created_at") or now_ts(),
+                        "updated_at": now_ts()})
+            _THOUGHTS[target] = row
+            return {"session_id": target, "step": step, "steps_recorded": len(steps),
+                    "refused": False, "replaced": replaced}
+        with _file_lock(path):
+            disk = _thoughts_disk_chains(path)
+            known = sid if (sid and (sid in disk or sid in _THOUGHTS)) else ""
+            base = _thoughts_merge_row(disk.get(known) or {}, _THOUGHTS.get(known) or {}) if known else {}
+            target = known or new_thought_id()
+            row = json.loads(json.dumps(base))
+            steps = [s for s in (row.get("steps") or []) if isinstance(s, dict)]
+            step = dict(step)
+            if assign_number:
+                step["n"] = max([as_int(s.get("n"), 0, 0, 9999) for s in steps] + [0]) + 1
+            number = as_int(step.get("n"), 0, 0, 9999)
+            replaced = any(as_int(s.get("n"), 0, 0, 9999) == number for s in steps)
+            if not replaced and len(steps) >= THOUGHT_MAX_STEPS:
+                return {"session_id": target, "step": None, "steps_recorded": len(steps), "refused": True}
+            old = next((s for s in steps if as_int(s.get("n"), 0, 0, 9999) == number), None)
+            steps = [s for s in steps if as_int(s.get("n"), 0, 0, 9999) != number] + [step]
+            steps.sort(key=lambda s: as_int(s.get("n"), 0, 0, 9999))
+            # 他ステップ・台帳メタへの波及（改訂済みの印・仮説の状態・分岐の状態・計画）も**同じロック内**。
+            _thought_apply_ops(row, steps, step, old, ops or {})   # §2.7
+            row.update({
+                "steps": steps,
+                # KANBAN のカード ID（任意）。渡された値が優先で、未指定なら既存を保つ（§6.9 の card 引数）。
+                "card": card or row.get("card") or "",
+                "question": question or row.get("question") or "",
+                "verifier_models": verifier_models or row.get("verifier_models") or [],
+                "created_at": row.get("created_at") or now_ts(),
+                "updated_at": now_ts(),
+            })
+            # ディスク上の同じ台帳と統合してから書く（別プロセスの内容を消さない）。
+            merged = _thoughts_merge_row(disk.get(target) or {}, row)
+            disk[target] = merged
+            for other_sid, other_row in disk.items():
+                if isinstance(other_row, dict):
+                    _THOUGHTS[other_sid] = other_row
+            _thoughts_write_locked(path, disk)
+            row = merged
+            _THOUGHTS[target] = row
     return {"session_id": target, "step": step, "steps_recorded": len(steps),
             "refused": False, "replaced": replaced}
 
@@ -1284,10 +1463,18 @@ def thought_find_by_card(card: str) -> str:
 
 
 def thought_drop(sid: str) -> None:
+    if not sid:
+        return
     _ensure_thoughts_loaded()
     with _THOUGHTS_LOCK:
         _THOUGHTS.pop(sid, None)
-    _thoughts_save()
+        if not THOUGHTS_ENABLED:
+            return
+        path = thoughts_path()
+        with _file_lock(path):
+            disk = _thoughts_disk_chains(path)
+            disk.pop(sid, None)
+            _thoughts_write_locked(path, disk)
 
 
 # ---------------------------------------------------------------- §2.7 思考台帳の構造（分解・改訂・分岐・仮説）
@@ -1387,10 +1574,12 @@ def _thought_apply_ops(row: dict, steps: list[dict], step: dict, old: dict | Non
         # （id を再利用すると、既存の subgoal 参照が別の項目を指すようになる）。
         plan, retired = _plan_merge(plan, retired, list(ops["plan"][:THOUGHT_PLAN_MAX]))
         row["plan_revised_at"] = n
-    sub = as_int(step.get("subgoal"), 0, 0, THOUGHT_PLAN_MAX)
+    # `subgoal` は**解決済みの plan 項目の id**（§6.10 の `_think_structure` が解決する）。
+    # id は差し替えをまたいで 12 を超えることがあるので上限を広く取る（THOUGHT_PLAN_MAX は位置数）。
+    sub = as_int(step.get("subgoal"), 0, 0, 9999)
     if sub and ops.get("subgoal_done"):
         for item in plan:
-            if item.get("id") == sub:
+            if as_int(item.get("id"), 0, 0, 9999) == sub:
                 item["done_at"] = n
     row["plan"] = plan
     row["plan_retired"] = retired
@@ -5606,12 +5795,17 @@ def _think_ledger_view(steps: list[dict], *, keep: int = 8, row: dict | None = N
         "superseded": [{"step": as_int(s.get("n"), 0, 0, 9999), "by": s.get("superseded_by")}
                        for s in steps if s.get("superseded_by")],
         "active_path": [as_int(s.get("n"), 0, 0, 9999) for s in active],
-        "plan": [{"id": p.get("id"), "text": truncate(p.get("text") or "", 200),
+        # `id` は**同一性**（差し替えをまたいで不変）／`position` は今の plan での並び順（1 始まり）。
+        # `subgoal` はこの id を指す（§6.10）。
+        "plan": [{"id": p.get("id"), "position": i + 1,
+                  "text": truncate(p.get("text") or "", 200),
                   "done": bool(p.get("done_at")), "done_at": p.get("done_at"),
                   "steps": [as_int(s.get("n"), 0, 0, 9999) for s in steps
-                            if as_int(s.get("subgoal"), 0, 0, 999) == p.get("id")]} for p in plan],
+                            if as_int(s.get("subgoal"), 0, 0, 999) == p.get("id")]}
+                 for i, p in enumerate(plan)],
         # 計画から抜けた項目（廃止）。**記録を黙って消さない**（§2.7）。
-        "plan_retired": [{"id": p.get("id"), "text": truncate(p.get("text") or "", 200),
+        "plan_retired": [{"id": p.get("id"), "position": None,
+                          "text": truncate(p.get("text") or "", 200),
                           "done": bool(p.get("done_at")), "done_at": p.get("done_at"),
                           "steps": [as_int(s.get("n"), 0, 0, 9999) for s in steps
                                     if as_int(s.get("subgoal"), 0, 0, 999) == p.get("id")]}
@@ -5892,6 +6086,8 @@ def tool_think(args: dict) -> dict:
         "tests_hypothesis": step.get("tests_hypothesis"),
         "hypothesis_status": step.get("result_status") or step.get("hypothesis_status"),
         "subgoal": step.get("subgoal"),
+        # 解決前（呼び出し側の指定）と解決後（plan 項目の id）の両方を出す。
+        "subgoal_ref": st.get("subgoal_raw") or None,
         "total_thoughts": total or None,
         "total_auto_adjusted": total_auto,
         "next_thought_needed": needed,
@@ -6079,13 +6275,33 @@ def _think_structure(args: dict, steps: list[dict], n: int, row: dict) -> tuple[
         plan_now, _retired = _plan_merge(old_plan, old_retired, plan)
     else:
         plan_now = old_plan
-    # 廃止された項目も `subgoal` の参照先として有効（記録を黙って消さない）。
-    # 参照できる id は「現在の plan + 廃止済み plan」のすべて。
-    known_sub_ids = {as_int(p.get("id"), 0, 0, 999) for p in plan_now}
-    known_sub_ids |= {as_int(p.get("id"), 0, 0, 999) for p in old_retired}
-    sub = as_int(args.get("subgoal"), 0, 0, 999)
-    if sub and sub not in known_sub_ids:
-        return fail(f"subgoal={sub} は計画にありません（計画 {len(plan_now)} 項目。先に plan で分解してください）")
+    # `subgoal` の解決（§6.10）。**番号の解釈は 1 つだけ**にする:
+    #   1) 現在の plan の**id**に一致 → その項目（同一性。差し替えをまたいでも不変）
+    #   2)  현재 plan の**1 始まりの位置** → その項目（id が一致しない番号は位置として扱う）
+    #   3) 廃止済み項目の id → その項目（記録は残す。達成済みには-mark しない）
+    # どれにも当たらなければエラー（推測で繋がない）。
+    # 旧実装は id だけで照合していたため、差し替えの後は位置と id がずれて
+    # **位置 1 の項目ではなく廃止済み項目を完了扱い**にしていた（実測: 20 回反復で 20 回再現）。
+    sub_raw = as_int(args.get("subgoal"), 0, 0, 999)
+    sub = 0
+    sub_kind = ""
+    if sub_raw:
+        live_ids = [as_int(p.get("id"), 0, 0, 9999) for p in plan_now]
+        if sub_raw in live_ids:
+            sub, sub_kind = sub_raw, "id"
+        elif 1 <= sub_raw <= len(plan_now):
+            sub = as_int(plan_now[sub_raw - 1].get("id"), 0, 0, 9999)
+            sub_kind = "position"
+        elif any(as_int(p.get("id"), 0, 0, 9999) == sub_raw for p in old_retired):
+            sub, sub_kind = sub_raw, "retired"
+        else:
+            return fail(f"subgoal={sub_raw} は計画にありません（計画 {len(plan_now)} 項目。"
+                        "先に plan で分解してください）")
+        if sub_kind == "position":
+            notes.append(f"subgoal={sub_raw} は plan の {sub_raw} 番目（id={sub}）として解決しました。")
+        elif sub_kind == "retired":
+            notes.append(f"subgoal={sub_raw} は計画から廃止済みの項目（id={sub}）です。"
+                         "記録は残しますが、達成済みには-markしません。")
     sub_done = as_flag(args.get("subgoal_done"))
     if sub_done and not sub:
         return fail("subgoal_done には subgoal（達成したサブ目標の番号）が必要です")
@@ -6094,7 +6310,8 @@ def _think_structure(args: dict, steps: list[dict], n: int, row: dict) -> tuple[
                   "branch_id": bid, "branch_from": bfrom,
                   "resolve_branch": resolve, "branch_status": bstatus,
                   "tests_hypothesis": tests, "hypothesis_status": hstatus,
-                  "plan": plan, "subgoal": sub, "subgoal_done": sub_done, "notes": notes}
+                  "plan": plan, "subgoal": sub, "subgoal_raw": sub_raw,
+                  "subgoal_kind": sub_kind, "subgoal_done": sub_done, "notes": notes}
 
 
 def _think_needed_flag(args: dict) -> bool:
@@ -6430,7 +6647,11 @@ TOOLS: list[dict] = [
                          "description": "思考の種類（既定 step。tests_hypothesis 指定時は test）"},
                 "plan": {"type": "array", "items": {"type": "string"},
                          "description": f"サブ目標への分解（最大 {THOUGHT_PLAN_MAX}。再送で計画を改訂）"},
-                "subgoal": {"type": "integer", "description": "この思考が扱うサブ目標の番号（plan の 1 始まり）"},
+                "subgoal": {"type": "integer",
+                            "description": "この思考が扱うサブ目標の番号。**plan 項目の id**（台帳の plan[].id と"
+                                           "出力の「N.」に同じ数が出る）で指定する。id に一致する項目が無く"
+                                           "1 始まりの位置に当たる場合は、その位置の項目として扱う"
+                                           "（差し替えで id が飛び番号になるため）。"},
                 "subgoal_done": {"type": "boolean", "description": "subgoal を達成済みにする"},
                 "thought_number": {"type": "integer", "description": "思考番号（省略時は末尾+1）"},
                 "total_thoughts": {"type": "integer",
@@ -6878,7 +7099,11 @@ def _render_body(name: str, data: dict) -> str:
             for item in plan:
                 mark = "✅" if item.get("done") else "□"
                 refs = "".join(f" #{x}" for x in (item.get("steps") or []))
-                lines.append(f"  {mark} {item.get('id')}. {truncate(item.get('text') or '', 100)}"
+                # 見出しは**位置**（1 始まり）。id は同一性なので同じ値なら省略する。
+                pos = item.get("position") or item.get("id")
+                ident = item.get("id")
+                tail = "" if ident is None or ident == pos else f"（id={ident}）"
+                lines.append(f"  {mark} {pos}. {truncate(item.get('text') or '', 100)}{tail}"
                              + (f"（{refs.strip()}）" if refs else ""))
         state_ja = {"open": "未決着", "adopted": "採用", "abandoned": "棄却", "merged": "統合"}
         if branches:
