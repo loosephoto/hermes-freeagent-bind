@@ -1,0 +1,8 @@
+# 改行の扱いを明示する（実測: `core.autocrlf` の自動判定に任せると、1 行だけ LF が混ざった
+# ファイルが **binary と判定**されて（`git ls-files --eol` が `i/-text`）、
+# blob に CRLF が残って**差分が全行分**になっていた（AGENTS.md で 732 行の差分として現れた）。
+#
+# `text=auto` で「blob は LF」「作業ツリーは Windows では CRLF」になる。
+# `eol=lf` を付けると Windows の作業ツリーも LF になるので、**付けない**
+# （既存の .md / .py は作業ツリーが CRLF・blob が LF という状態だった）。
+* text=auto

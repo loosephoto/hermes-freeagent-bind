@@ -84,12 +84,19 @@ class TestGitHubCodeSearch(unittest.TestCase):
             got = S.kb_github("cite-summary", kind="repo", limit=1)
         self.assertEqual(http.call_args.kwargs["extra_headers"]["Accept"],
                          "application/vnd.github+json")
-        self.assertEqual(http.call_args.kwargs["budget_key"], "api.github.com/search/repositories")
+        # repo と issue は**同じ枠**（実測 2026-10-20: どちらも `X-RateLimit-Resource: search` で、
+        # 交互に叩くと Remaining が 9→9→8→8 と減る＝枠が共通）。
+        self.assertEqual(http.call_args.kwargs["budget_key"], "api.github.com/search")
         self.assertEqual(got["citations"][0]["summary"], "Repo description")
         self.assertNotIn("snippet", got["items"][0])
 
     def test_budget_keys_and_intervals_are_split_per_endpoint(self):
-        """code の 10/分に repo / issue の 30/分を巻き込まない（実測: 枠が別）。"""
+        """code の 10/分は repo / issue と**別の枠**（実測: `X-RateLimit-Resource` が違う）。
+
+        ただし **repo と issue 自体は同じ枠**（`search` 全体で 1 つ）。
+        実測 2026-10-20: repo と issue はどちらも `X-RateLimit-Resource: search` を返し、
+        交互に叩くと Remaining が 9→9→8→8 と減った（＝片方の枠を片方が使う）。
+        """
         seen = {}
 
         def capture(url, interval, **kwargs):
@@ -101,8 +108,8 @@ class TestGitHubCodeSearch(unittest.TestCase):
             S.kb_github("q1", kind="repo", limit=1)
             S.kb_github("q2", kind="issue", limit=1)
             S.kb_github("q3", kind="code", limit=1)
-        self.assertEqual(seen["api.github.com/search/repositories"], S._GH_SEARCH_INTERVAL)
-        self.assertEqual(seen["api.github.com/search/issues"], S._GH_SEARCH_INTERVAL)
+        self.assertEqual(seen["api.github.com/search"], S._GH_SEARCH_INTERVAL,
+                         "repo と issue は同じ枠（search 全体）")
         self.assertEqual(seen["api.github.com/search/code"], S._GH_CODE_INTERVAL)
         self.assertGreater(S._GH_CODE_INTERVAL, S._GH_SEARCH_INTERVAL)
 

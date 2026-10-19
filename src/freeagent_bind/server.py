@@ -66,7 +66,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.8.2"
+SERVER_VERSION = "0.8.3"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -261,6 +261,15 @@ CINII_APPID = os.environ.get("FREEAGENT_CINII_APPID", "").strip()
 # （§5.20。cinii と同じ「キー必須の明示ソース」の型）。
 LIBRARIESIO_KEY = os.environ.get("FREEAGENT_LIBRARIESIO_KEY", "").strip()
 KB_TTL = _env_float("FREEAGENT_KB_TTL", 1800.0)     # 知識取得のメモリ内 TTL（秒）
+# **429 の再試行回数**（0 なら再試行しない）。実測: crossref の 429 は共有プールのTransientな
+# 拒否で、再試行すると 10 試行すべて成功した（待つ必要なし）。§5.8。
+_KB_HTTP_429_RETRIES = max(0, _env_int("FREEAGENT_KB_429_RETRIES", 2))
+# 429 の `Retry-After` を尊重して待つ上限（秒）。
+_KB_HTTP_429_MAX_WAIT_S = max(0.0, _env_float("FREEAGENT_KB_429_MAX_WAIT", 2.0))
+# 同一キーの取得を待つ上限（秒）。既定は締め切り（`KB_DEADLINE`）と同じ。
+# 超えたら待たずに自分で取得する（利用者を待たせない。§5.8）。
+_KB_INFLIGHT_WAIT_MAX_S = max(0.0, _env_float("FREEAGENT_KB_INFLIGHT_WAIT_MAX", 0.0)
+                               or _env_float("FREEAGENT_KB_DEADLINE", 8.0))
 KB_TIMEOUT = _env_float("FREEAGENT_KB_TIMEOUT", 20.0)
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
 # OpenAlex は匿名の検索を提供元側で一時停止することがある（実測: 503 + "Anonymous search is paused"）。
@@ -2555,28 +2564,44 @@ def kb_http(url: str, *, accept: str = "application/json", extra_headers: dict |
     headers = {"User-Agent": KB_USER_AGENT, "Accept": accept}
     if extra_headers:
         headers.update(extra_headers)
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
     budget = timeout if timeout is not None else KB_TIMEOUT
     deadline = time.monotonic() + max(0.1, budget)
-    try:
-        with _urlopen(req, budget) as resp:
-            return int(resp.status), _kb_read_within(resp, deadline)
-    except urllib.error.HTTPError as exc:
-        body = ""
-        retry_after = exc.headers.get("Retry-After") if exc.headers else None
-        status = int(exc.code)
+    # **429 は再試行する**（実測 2026-10-20）。
+    # crossref の 429 は**レート制限ではなく共有プールのTransientな拒否**で、
+    # 間隔（0.4〜1.0 秒）不管で 10 回中 1〜3 回出る。→ 再試行すると 10 試行すべて成功した
+    # （待つ必要なし・11〜14 リクエスト）。**待っても直らない**ので待たない。
+    for attempt in range(_KB_HTTP_429_RETRIES + 1):
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            body = exc.read().decode("utf-8", "replace")[:300]
-        except Exception:
-            pass
-        finally:
-            exc.close()
-        if status in (403, 429, 503):
-            _kb_block(host, _parse_retry_after(retry_after, None) if status == 429 else _KB_BLOCK_S)
-        return status, body
-    except Exception as exc:
-        _kb_block(host, 120.0)  # 接続不可・タイムアウトも短くブロックする
-        return 0, f"{type(exc).__name__}: {exc}"
+            with _urlopen(req, budget) as resp:
+                return int(resp.status), _kb_read_within(resp, deadline)
+        except urllib.error.HTTPError as exc:
+            # **応答本文と要求本文で名前を分ける**（同じ変数名を使うと、再試行時に
+            # 文字列の本文を送って `TypeError: POST data should be bytes` になる）。
+            resp_body = ""
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            status = int(exc.code)
+            try:
+                resp_body = exc.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            finally:
+                exc.close()
+            if status == 429 and attempt < _KB_HTTP_429_RETRIES:
+                # **遮断しない**（= 一時的な拒否。ホストをブロックすると他のソースまで巻き込む）。
+                # Retry-After があれば尊重する（Google 等は数秒〜数分）。無ければ待たない。
+                if retry_after:
+                    wait_s = min(_parse_retry_after(retry_after, None), _KB_HTTP_429_MAX_WAIT_S)
+                    if wait_s > 0 and time.monotonic() + wait_s < deadline:
+                        time.sleep(wait_s)
+                continue
+            if status in (403, 429, 503):
+                _kb_block(host, _parse_retry_after(retry_after, None) if status == 429 else _KB_BLOCK_S)
+            return status, resp_body
+        except Exception as exc:
+            _kb_block(host, 120.0)  # 接続不可・タイムアウトも短くブロックする
+            return 0, f"{type(exc).__name__}: {exc}"
+    return 0, "HTTP 429: 再試行しても応答がありませんでした"
 
 
 def kb_json(url: str, *, extra_headers: dict | None = None,
@@ -2600,6 +2625,14 @@ def kb_json(url: str, *, extra_headers: dict | None = None,
 
 
 def _kb_cached(key: str, producer):
+    """結果をキャッシュする。**同時実行は 1 回の上流取得に畳まれる**（単一飛行）。
+
+    待ち（`event.wait()`）には**上限**がある（`_KB_INFLIGHT_WAIT_MAX_S`、既定は `KB_DEADLINE`）。
+    理由: 待ちに上限が無いと、**取得が 14 秒かかるソースで 2 番目は 13.8 秒待つ**ことになり
+    締め切り（`KB_DEADLINE`=8 秒）を超えて**利用者を待たせる**（実測）。
+    上限に達したら**待たずに自分の取得を開始する**（重複取得より早い応答）。
+    """
+    wait_deadline = time.monotonic() + _KB_INFLIGHT_WAIT_MAX_S
     while True:
         with _KB_CACHE_LOCK:
             hit = _KB_CACHE.get(key)
@@ -2614,7 +2647,18 @@ def _kb_cached(key: str, producer):
                 owner = False
         if owner:
             break
-        event.wait()
+        # 待ちの上限。切れたら**自分で取得する**（待つより早い）。
+        remaining = wait_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        event.wait(min(remaining, 0.25))
+        if event.is_set():
+            with _KB_CACHE_LOCK:
+                hit = _KB_CACHE.get(key)
+                if hit and now_ts() - as_float(hit.get("at"), 0.0) < KB_TTL:
+                    return copy.deepcopy(hit.get("value"))
+            # 取得は終わったがキャッシュに残っていない（失敗）→ 自分で取る。
+            break
     try:
         value = producer()
         if not (isinstance(value, dict) and value.get("error")):
@@ -2947,6 +2991,13 @@ def kb_arxiv(query: str, limit: int = 5) -> dict:
 
 # ---------------------------------------------------------------- §5.4 Crossref
 
+# Crossref のローカル予算（秒）。**実測に基づく**（2026-10-20）:
+# 429 は**レート制限ではなく共有プールのTransientな拒否**で、間隔（0.4/0.6/0.8/1.0 秒）不管で
+# 10 回中 1〜3 回出る。→ 間隔では直らない。**再試行で直る**（§5.8 の 429 再試行）。
+# よって予算は「詰まらせない」程度に緩くする（0.5 秒だと 429 の原因を作ってしまう）。
+_CROSSREF_INTERVAL = max(0.0, _env_float("FREEAGENT_CROSSREF_INTERVAL", 0.1))
+
+
 def kb_crossref(query: str, limit: int = 5) -> dict:
     """DOI 登録機関のメタデータ（書誌）。`mailto` を付けると polite pool に入る。"""
     limit = as_int(limit, 5, 1, 20)
@@ -2956,7 +3007,8 @@ def kb_crossref(query: str, limit: int = 5) -> dict:
                   "select": "DOI,title,author,issued,container-title,type,URL,abstract,is-referenced-by-count,publisher"}
         if KB_MAILTO:
             params["mailto"] = KB_MAILTO
-        data, err = kb_json("https://api.crossref.org/works?" + urllib.parse.urlencode(params))
+        data, err = _kb_new_json("https://api.crossref.org/works?" + urllib.parse.urlencode(params),
+                                 _CROSSREF_INTERVAL)
         if err:
             return {"source": "crossref", "error": err}
         rows = ((data or {}).get("message") or {}).get("items") or []
@@ -3078,7 +3130,12 @@ def kb_github(query: str, kind: str = "repo", limit: int = 5) -> dict:
                + urllib.parse.urlencode({"q": query, "per_page": limit}) + sort)
         interval = (_GH_CODE_INTERVAL if kind == "code" else
                     (_GH_SEARCH_INTERVAL if GITHUB_TOKEN else _GH_SEARCH_INTERVAL_UNAUTH))
-        data, err = _kb_new_json(url, interval, budget_key=f"api.github.com/search/{endpoint}",
+        # **予算キーは search 全体で 1 枠**（実測 2026-10-20: repo と issue はどちらも
+        # `X-RateLimit-Resource: search` で、交互に叩くと Remaining が 9→9→8→8 と減る＝枠が共通）。
+        # エンドポイントごとに別のキーにすると、**同じホストの枠を奪い合う**
+        # （fan-out で成功 1/4 になっていた）。`code` 検索は枠が違うので別キーにする。
+        budget_key = "api.github.com/search/code" if kind == "code" else "api.github.com/search"
+        data, err = _kb_new_json(url, interval, budget_key=budget_key,
                                  extra_headers=headers)
         if err:
             return {"source": "github", "kind": kind, "error": err}
@@ -3161,6 +3218,9 @@ def _kb_gather(picked: list[str], query: str, limit: int, opts: dict,
 
     def work(src: str) -> None:
         start = time.monotonic()
+        # このスレッドの締め切りを載せる（予算待ちの判断に使う。§5.11）。
+        # **24 個の `kb_*` の signatures を変えずに**届けるための経路。
+        _KB_LOCAL.deadline_at = opts.get("deadline_at")
         try:
             res = _kb_source_result(src, query, limit, opts)
         except Exception as exc:  # 例外を外へ漏らさない（規約 1）
@@ -3387,6 +3447,23 @@ def _kb_source_result(src: str, query: str, limit: int, opts: dict) -> dict:
 
 _KB_RATE_NEXT: dict[str, float] = {}
 _KB_RATE_LOCK = threading.Lock()
+# 枠待ちを「待つ」かどうかの上限（秒）。**待ち時間がこの値を超えるときは待たない**
+# （利用者を待たせない。429 には「あと N 秒」を出して再試行に、最低限卷く）。
+# 既定は締め切り（`KB_DEADLINE`・既定 8 秒）と同じ。fan-out では各ソースが独立スレッドで
+# 走るため、1 ソースが待っても**全体の待ち時間は max(各ソース)**（他ソースは並列で進む）。
+_KB_RATE_WAIT_MAX_S = max(0.0, _env_float("FREEAGENT_KB_RATE_WAIT_MAX", 0.0)
+                           or _env_float("FREEAGENT_KB_DEADLINE", 8.0))
+# 「待つ」ときに、応答時間が残るよう確保する余白（秒）。
+_KB_RATE_WAIT_MARGIN_S = max(0.0, _env_float("FREEAGENT_KB_RATE_WAIT_MARGIN", 1.0))
+# 現在のスレッドの締め切り（`time.monotonic()` 基準）。`_kb_gather` がソースごとに設定する。
+# **24 個の `kb_*` の引数を変えずに**予算待ちの判断を届けるための経路（§5.11）。
+_KB_LOCAL = threading.local()
+
+
+def _kb_deadline_at() -> float | None:
+    """このスレッドの締め切り（無ければ None）。"""
+    value = getattr(_KB_LOCAL, "deadline_at", None)
+    return value if isinstance(value, (int, float)) else None
 
 
 def _kb_rate_acquire(host: str, interval: float) -> float:
@@ -3400,20 +3477,15 @@ def _kb_rate_acquire(host: str, interval: float) -> float:
         return 0.0
 
 
-def _kb_new_json(url: str, interval: float, payload: dict | None = None,
-                 budget_key: str = "", extra_headers: dict | None = None) -> tuple[dict | None, str]:
-    """ホスト別の予算を取ってから JSON を取る。`payload` を渡すと POST。
+def _kb_rate_reserve(host: str, interval: float, at: float) -> None:
+    """指定時刻から叩けるよう枠を予約する（**待ってから叩く**ために使う）。"""
+    with _KB_RATE_LOCK:
+        _KB_RATE_NEXT[host] = max(_KB_RATE_NEXT.get(host, 0.0), at)
 
-    `budget_key` は §5.18 / §5.19 用の逃げ道で、**同じホストに別サービスが同居する**ときや
-    **1 回の取得で同じホストの複数エンドポイントを叩く**ときに、予算を分けるために使う
-    （遮断の記憶は netloc のまま＝ホスト単位）。
-    """
-    host = urllib.parse.urlsplit(url).netloc
-    if _kb_is_blocked(host):
-        return None, f"blocked: {host} は一時停止中です"
-    wait = _kb_rate_acquire(budget_key or host, interval)
-    if wait:
-        return None, f"HTTP 429: ローカルのアクセス間隔制御（あと {wait:.1f} 秒）。同一ホストの枠を共有します"
+
+def _kb_fetch_json(url: str, payload: dict | None,
+                   extra_headers: dict | None) -> tuple[dict | None, str]:
+    """JSON を 1 回取る（POST は `payload` を渡す）。予算の話は `_kb_new_json` 側。"""
     # payload 無しのときは従来どおり位置引数 1 つで呼ぶ（呼び出し側の互換を壊さない）。
     if payload is None:
         return kb_json(url, extra_headers=extra_headers) if extra_headers else kb_json(url)
@@ -3421,6 +3493,42 @@ def _kb_new_json(url: str, interval: float, payload: dict | None = None,
     if extra_headers:
         headers.update(extra_headers)
     return kb_json(url, extra_headers=headers, payload=payload)
+
+
+def _kb_new_json(url: str, interval: float, payload: dict | None = None,
+                 budget_key: str = "", extra_headers: dict | None = None) -> tuple[dict | None, str]:
+    """ホスト別の予算を取ってから JSON を取る。`payload` を渡すと POST。
+
+    `budget_key` は §5.18 / §5.19 用の逃げ道で、**同じホストに別サービスが同居する**ときや
+    **1 回の取得で同じホストの複数エンドポイントを叩く**ときに、予算を分けるために使う
+    （遮断の記憶は netloc のまま＝ホスト単位）。
+
+    **枠が埋まっているときは、待てるなら待って叩く**（§5.11）。
+    実測: 同じホストへ 2 本同時に投げると片方が「HTTP 429: ローカルのアクセス間隔制御」で
+    落ちた（fan-out で成功 1/4）。**上流には枠が残っていた**（GitHub の `X-RateLimit-Remaining`
+    が 9→8→7 と減る）＝ サーバーのローカル予算だけが原因だった。
+    → 待たずに落とすのではなく**待つ**。ただし待つのは
+    **(a) 待ち時間が `_KB_RATE_WAIT_MAX_S` 以下**、**(b) 締め切り内に収まる**、のときだけ。
+    どちらかを満たさないときは待たずに 429 を返す（利用者を待たせない）。
+    """
+    host = urllib.parse.urlsplit(url).netloc
+    if _kb_is_blocked(host):
+        return None, f"blocked: {host} は一時停止中です"
+    key = budget_key or host
+    wait = _kb_rate_acquire(key, interval)
+    if wait:
+        deadline_at = _kb_deadline_at()
+        left = (deadline_at - time.monotonic()) if deadline_at is not None else 0.0
+        can_wait = (wait <= _KB_RATE_WAIT_MAX_S
+                    and deadline_at is not None
+                    and wait + _KB_RATE_WAIT_MARGIN_S <= left)
+        if can_wait:
+            time.sleep(wait)
+            _kb_rate_reserve(key, interval, time.monotonic())
+            return _kb_fetch_json(url, payload, extra_headers)
+        return None, (f"HTTP 429: ローカルのアクセス間隔制御（あと {wait:.1f} 秒）。"
+                      "同一ホストの枠を共有します")
+    return _kb_fetch_json(url, payload, extra_headers)
 
 
 # ---------------------------------------------------------------- §5.12 OpenAIRE Graph V3（明示指定のみ）

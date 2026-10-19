@@ -530,11 +530,11 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 バックエンド拡張時のローカル実測（2026-10-02、同一Python、各7回の中央値。
 起動〜initialize〜tools/list〜終了を含むため、起動単体の保証値ではありません）:
 
-| 測定 | 第3段階HEAD（28f89d1） | 第4段階追加後 | 推論プロバイダ追加後 | CiNii追加後（1f653b6） | 第6段階追加後 | GitHubコード検索の改良後 | 第7段階（医学・生物を外しHN/SWH/Libraries.io追加）後 | 非チャット除外後 | 第8段階（Internet Archive追加）後 | 第9段階（Qiita追加）後 | v0.8.1（記述の整備）後 | v0.8.2（台帳の競合・subgoal契約）後 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ツール数 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
-| ツール一覧JSON文字数（ensure_ascii=false・compact） | 13,116 | 13,220 | 13,278 | 13,513 | 14,092 | 14,230 | 14,316 | 14,399 | 14,654 | 14,882 | 15,870 | 15,972 |
-| stdioプロセス往復・終了（7回中央値） | 0.2216秒 | 0.2267秒 | 0.2181秒 | 0.1652秒 | 0.1664秒 | 0.1611秒 | 0.2305秒 | 0.0281秒 | 0.2444秒 | 0.2605秒 | 0.2431秒 | 0.2431秒 |
+| 測定 | 第3段階HEAD（28f89d1） | 第4段階追加後 | 推論プロバイダ追加後 | CiNii追加後（1f653b6） | 第6段階追加後 | GitHubコード検索の改良後 | 第7段階（医学・生物を外しHN/SWH/Libraries.io追加）後 | 非チャット除外後 | 第8段階（Internet Archive追加）後 | 第9段階（Qiita追加）後 | v0.8.1（記述の整備）後 | v0.8.2（台帳の競合・subgoal契約）後 | v0.8.3（レート予算・429再試行）後 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ツール数 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
+| ツール一覧JSON文字数（ensure_ascii=false・compact） | 13,116 | 13,220 | 13,278 | 13,513 | 14,092 | 14,230 | 14,316 | 14,399 | 14,654 | 14,882 | 15,870 | 15,972 | 15,972 |
+| stdioプロセス往復・終了（7回中央値） | 0.2216秒 | 0.2267秒 | 0.2181秒 | 0.1652秒 | 0.1664秒 | 0.1611秒 | 0.2305秒 | 0.0281秒 | 0.2444秒 | 0.2605秒 | 0.2431秒 | 0.2431秒 | 0.2431秒 |
 
 文字数の列は同じ方法で測り直した値です（`8f0df1e` で 13,278 を再現して方法を確認）。
 往復時間は実行環境の負荷で変わり、同じコミットでも 0.22 秒 → 0.17 秒の差が出ます。
@@ -563,6 +563,9 @@ v0.8.1 では**説明の整備**（規約 5 の 3 マーカーを全ツールに
 v0.8.2 は**台帳の複数プロセス競合の修正**と**`subgoal` の契約の修正**だけを行った。
 ツールは 11 のまま。文字数は **+102 文字（+0.6%）** の 15,972（`subgoal` の説明が
 「plan 項目の id」と「位置」の両方を明記するぶんだけ）。往復時間は 0.2431 秒（変わっていない）。
+
+v0.8.3 は**レート予算・429 の再試行・inflight 待ちの上限**の修正。
+**ツール定義は変わらない**（文字数 15,972 のまま・往復時間も 0.2431 秒のまま）。
 
 検索APIの追加は推論モデルの能力を増やしません。ツールスキーマの増加もメインLLMの入力負担になります。
 
@@ -1156,6 +1159,16 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_USER_AGENT` | `hermes-freeagent-bind/0.1 (+…/hermes-freeagent-bind)` | 知識 API に名乗る UA（連絡先入りが望ましい。crates.io は識別可能な UA が必須） |
 | `FREEAGENT_CONNECT_TIMEOUT` / `FREEAGENT_READ_TIMEOUT` | 10.0 / 180.0 | 外部 HTTP の (connect, read) タイムアウト（秒） |
 | `FREEAGENT_KB_TTL` / `FREEAGENT_KB_TIMEOUT` | 1800.0 / 20.0 | 知識取得のキャッシュ TTL・読み取りタイムアウト（秒） |
+| `FREEAGENT_KB_429_RETRIES` / `FREEAGENT_KB_429_MAX_WAIT` | 2 / 2.0 | 429 の再試行回数と `Retry-After` を尊重して待つ上限（秒）。crossref の 429 は共有プールのTransientな拒否で、**再試行で必ず通る**（実測） |
+| `FREEAGENT_KB_RATE_WAIT_MAX` / `FREEAGENT_KB_RATE_WAIT_MARGIN` | 8.0（= `KB_DEADLINE`）/ 1.0 | ホスト予算の待ちを許す上限（秒）と、応答時間が残るよう確保する余白。待ちが上限を超えるときは待たずに 429 を返す |
+| `FREEAGENT_KB_INFLIGHT_WAIT_MAX` | 8.0（= `KB_DEADLINE`） | 同一キーの取得を待つ上限（秒）。超えたら待たずに自分で取得する（利用者を待たせない） |
+| `FREEAGENT_CROSSREF_INTERVAL` | 0.1 | Crossref のローカル最小間隔（秒）。429 は間隔ではなく**再試行**で対処する（実測: 間隔では直らない） |
+| `FREEAGENT_KB_HEDGE_DELAY` / `FREEAGENT_KB_HEDGE_MIN_REMAINING` | 0.6 / 0.05 | 代替取得（arXiv→DataCite）を始めるまでの待ちと、締め切り直前に始めないための下限（秒） |
+| `FREEAGENT_EVIDENCE_ITEM_CHARS` / `FREEAGENT_EVIDENCE_TOTAL_CHARS` | 360 / 3200 | 根拠本文の 1 件あたり・全体の注入上限（文字） |
+| `FREEAGENT_SESSION_MAX` | 64 | 相談セッションの保持数上限 |
+| `FREEAGENT_STATS_HALFLIFE_DAYS` | 30 | 品質統計の減衰半減期（日） |
+| `FREEAGENT_TRACE_MAX_BYTES` | 262144 | トレースファイルの最大サイズ（バイト） |
+| `FREEAGENT_EMPTY_TOKEN_CAP` | 2048 | 空応答時の予算引き上げの上限（トークン） |
 | `FREEAGENT_TRACE` / `FREEAGENT_STATS` / `FREEAGENT_COOLDOWN` | 1 | トレース・品質統計・クールダウンの記録 |
 | `FREEAGENT_DEBUG_LOG` | 空 | 指定パスへ stdio の送受信を 1 行ずつ追記（クライアント互換の切り分け用） |
 | `FREEAGENT_HERMES_BIN` | `hermes`（`which` で探索） | `freeagent_delegate` に使う実行ファイル |

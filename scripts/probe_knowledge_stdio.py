@@ -66,11 +66,13 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
     if not isinstance(cites, list) or not cites or data.get("citation_count") != len(cites):
         raise ValueError("citation count mismatch or no citations")
     for cite in cites:
-        if not isinstance(cite, dict) or not {"source", "title", "url", "summary"}.issubset(cite):
+        # `summary` は**空ならキーが無い**（`_cite` は空値を落とす）。だから必須ではない。
+        # `metadata_only` の引用（抄録の無いソース）は `summary` を持たないのが正しい形。
+        if not isinstance(cite, dict) or not {"source", "title", "url"}.issubset(cite):
             raise ValueError("citation shape mismatch")
         if cite["source"] not in served or not isinstance(cite["title"], str) or not cite["title"].strip():
             raise ValueError("citation source/title mismatch")
-        if not isinstance(cite["summary"], str):
+        if "summary" in cite and not isinstance(cite["summary"], str):
             raise ValueError("citation summary must be a string")
         if cite["source"] in ("datacite", "openaire") and "year" not in cite:
             raise ValueError("new citation year field is missing")
@@ -192,7 +194,7 @@ def main() -> int:
         print(content[0].get("text", ""))
         citations = validate_lookup(data, args.sources, args.fallback)
         print(json.dumps({"citation_count": len(citations), "timings": data.get("timings"),
-                          "summaries": sum(bool(c["summary"]) for c in citations),
+                          "summaries": sum(bool(c.get("summary")) for c in citations),
                           "acquisition_sources": sorted({c["source"] for c in citations})}, ensure_ascii=False))
         print("知識API stdio検証 OK（initialize / tools/list / 実API tools/call）")
         return 0

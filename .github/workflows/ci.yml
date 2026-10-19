@@ -59,6 +59,30 @@ jobs:
       - name: Adoption meter runs
         run: python scripts/measure_adoption.py --sessions 5 || true
 
+      # AGENTS.md のゲート一覧に載っている検査を**全部** CI でも回す（規約 51）。
+      # apply_proactive は既定表示のみ（設定を書き換えない）ので副作用なし。
+      - name: Proactive config check (no writes)
+        run: python scripts/apply_proactive.py --check
+
+      # 知识ソースの実 API 疎通（ネットワークあり・推論なし・キー不要のソースだけ）。
+      # キー必須のソース（cinii / librariesio）は未設定なら**外して続行**する（未設定は失敗ではない）。
+      # 実測: CI が回していないと、ソースの退行（URL 変更・応答形の変更）が誰も気づかない。
+      # **openalex と ia は外す**: 前者は共有の日次予算切れ（"Insufficient budget … $0 remaining"）で
+      # 後者は匿名枠の消費で**CI が不安定**になる（= 落ちると原因が掴めない）。どちらも
+      # `scripts/measure_relevance.py`（記録する検証・失敗にはしない）で引き続き見る。
+      - name: Knowledge probe (real API, stdio path)
+        run: python scripts/probe_knowledge_stdio.py --sources wikipedia wikidata arxiv crossref github
+
+      # 知識バックエンドの応答時間と関連性の測定器が動くこと（読むだけ・失敗にはしない）。
+      - name: Knowledge meters run
+        run: |
+          python scripts/measure_kb.py --report || true
+          python scripts/measure_relevance.py --report || true
+
+      # モデルの生存確認の暖機（プロキシが無い環境では何もしない）。
+      - name: Model warmup runs
+        run: python scripts/warmup_models.py || true
+
   lint-encoding:
     runs-on: ubuntu-latest
     steps:
