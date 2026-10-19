@@ -591,6 +591,67 @@ en では「Transformer / Transformer (deep learning) / Generative pre-trained t
   1 位が変圧器で、**言語を変えても直らない**（en でも電気機器が 1 位）ため、曖昧語は既知の限界として記録する。
 - 記録先は `FREEAGENT_RELEVANCE_PATH`（既定 `<state_dir>/relevance.jsonl`）。モデルは呼ばない・キー不要のソースだけ。
 
+### 6.15 健全性監査の findings と v0.8.1 の修正（2026-10-19）
+
+健全性監査で 15 件の不都合を実測で再現した。うち 2 件は重大（実害あり）、5 件は機能不具合、
+8 件は記述の陳腐化・規約違反だった。**すべて v0.8.1 で修正**し、`tests/test_audit_v081.py`
+（20 件）に退行を固定した。
+
+**重大 1 — 知識取得の読み取りに壁時計の上限が無かった**（§5.8 / 規約 27）。
+`urlopen(timeout=…)` の上限は「ソケット 1 回の待ち」に対するもので、**リクエスト全体の壁時計制限
+ではない**。1 バイトずつ drip する提供元では読みが終わるまで何分も待った（実測: ローカル drip
+サーバで **98.0 秒** = `KB_TIMEOUT`（既定 20 秒）の 5 倍、zenodo 実測で **122.75 秒**）。
+一方 `_kb_gather` の締め切り（8 秒）は**待たずに返す**ので利用者には影響しなかったが、
+裏の取得スレッド（daemon）が 2 分以上動き続け、常駐 HTTP ではスレッドを占有していた。
+→ `_kb_read_within(resp, deadline)` を追加し、**残りの壁時計予算**を見ながら読む。
+  終端判定は `Content-Length`（`read1` は 1 バイトずつしか返さないことがある）で行い、
+  予算超過は `TimeoutError` として失敗扱いにする（ホストを短く遮断）。
+  修正後: drip 応答は **20.0 秒**で打ち切り、通常ソースは 0.3〜1.7 秒のまま（退行なし）。
+
+**重大 2 — 常駐 HTTP に `Origin` / `Host` の検証が無かった**（§8.2 / 規約 38）。
+MCP の StreamableHTTP は `Origin` ヘッダの検証を要求（仕様の MUST）するが、素通しだった
+（実測: `Origin: https://evil.example` と `Host: evil.example` の両方で **200**）。
+ブラウザで開いた別ページから `http://127.0.0.1:8790/mcp` へ JSON-RPC を送れる状態だった
+（`FREEAGENT_HTTP_TOKEN` 未設定なら認証ガードも無い）。
+→ `_http_origin_ok` / `_http_host_ok` を追加。`Origin` が無い CLI は通し、
+  待ち受ホストと一致するオリジンだけ許可（`Origin: null` は拒否）、`Host` も待ち受ホストと
+  一致を要求する。待受が `0.0.0.0` のときは制限しない（LAN 公開のとき）。
+  修正後: 他サイト・`Origin: null`・偽装 `Host` は **403**、CLI と同一オリジンは **200**。
+
+**機能不具合 5 件**:
+
+- **計画の差し替えで達成済みと同一性が消えた**（§2.7）。`plan=["A","B"]` で A 完了 →
+  `plan=["B"]` にすると A の `done` が消え、**id 1 が別物 B に付け替わっていた**。
+  → `_plan_merge` を追加。同じ文面は id と `done_at` を引き継ぎ、新しい文面には**未使用の id**を
+  割り当て、抜けた項目は**廃止**（`plan_retired`）として残す。廃止項目も `subgoal` の参照先と
+  して有効なので、**参照が宙に浮かない**。
+- **`next_thought_needed: null` が終端になっていた**。`as_flag(None)` は False なので、
+  クライアントが null を送っただけで台帳が暗黙に終端した（実測: null → False / キー無し → True）。
+  → `_think_needed_flag` を追加し、**明示された null は未指定扱い**（既定 True）にする。
+- **終端なのに `next_call` が出ていた**。「続けるか」を False にしておきながら次の思考を誘導していた。
+  → 終端時は `next_call` を `None` にする。
+- **不正な `sources` 名が content に出なかった**。`structuredContent.unknown_sources` には
+  あるのに人間向け表示に無いので、typo が黙って捨てられていた。
+  → `freeagent_lookup` / `freeagent_grounded` の content と、`_render_body` のエラー分岐に表示する。
+- **`freeagent_models` の返り値キーがモードで違った**（引数なし → `free_models` のみ /
+  `query` 付き → `models` のみ）。→ **常に両方**を返す（差分は `query` だけ）。
+
+**記述の陳腐化・規約違反 8 件**（規約 5 / SPEC §7）:
+
+- description の 3 マーカー（【使う条件】【使わない条件】【競合より優先】）が **7/11 ツールで欠落**。
+  → `_NOT_USE_DESC` を新設し、**各マーカーの本文を 1 か所**に集約（`_desc_assemble`）。
+  【競合より優先】の**重複**（panel / grounded / consult で 2 回）も解消。
+- `freeagent_models` の `provider` 説明が 7 つしか無く**実在の `vercel` / `ollama` が無い**。
+  → `PROVIDER_ORDER` から生成するようにした（以後プロバイダを足しても自動で追従）。
+- `freeagent_grounded` の `sources` 説明が **`query`** を参照していた（実引数は `question`）。
+  → `question` に修正。あわせて**本文根拠にならないソース**（crossref / hn）を明記。
+- `lang` の説明が「Wikipedia/Wikidata の言語。省略時は問いから自動」と書いていたが、
+  **wikidata は `ja` 固定**（実測で ja の方が当たったため。AGENTS 規約 40 / §6.14）。
+  → 説明で区別する。
+- README のツール一覧JSON文字数が 14,882 のまま（HEAD は 15,870）。
+- CI に `scripts/smoke_http.py` が無かった（HTTP 経路の退行が見えない）。
+  → CI に追加。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。

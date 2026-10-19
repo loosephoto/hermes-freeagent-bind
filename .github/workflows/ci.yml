@@ -46,6 +46,11 @@ jobs:
       - name: stdio smoke (real JSON-RPC path)
         run: python scripts/smoke_stdio.py
 
+      # HTTP 経路（通知 202・batch・セッション・SSE・Origin/Host 検証）も同じ契約で守ること。
+      # stdio だけ回すと HTTP 側の退行が見えない（実測: HTTP の Origin 検証が抜けていた）。
+      - name: HTTP smoke (real StreamableHTTP path)
+        run: python scripts/smoke_http.py
+
       # バックエンド全滅（死んだポート・キー無し）でも例外を漏らさず、ハングせず、状態を汚さないこと。
       - name: Offline degradation (no backend)
         run: python scripts/check_offline.py

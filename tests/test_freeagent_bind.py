@@ -1425,13 +1425,23 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
             got = S.tool_models({"all": True})
             self.assertFalse(got["query"]["probed"])
 
-    def test_search_mode_skips_free_models_list(self):
-        """検索時は free_models を返さない（出力が二重になる）。"""
+    def test_search_mode_also_returns_free_models_list(self):
+        """**返り値のキーはモードで変えない**（`models` と `free_models` は常に両方）。
+
+        実測: 以前は検索時だけ `free_models` が無く、引数なしだと `models` が無かった。
+        利用側がモードで別のキーを読むと詰まるので、**常に両方**を返す。
+        """
         with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: []), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
              unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: ["a/b"]):
-            self.assertNotIn("free_models", S.tool_models({"query": "x"}))
-            self.assertIn("free_models", S.tool_models({}))
+            searched = S.tool_models({"query": "x"})
+            listed = S.tool_models({})
+            self.assertIn("free_models", searched)
+            self.assertIn("free_models", listed)
+            self.assertIn("models", searched)
+            self.assertIn("models", listed)
+            # 返り値のキーの差が「検索の情報」だけになる。
+            self.assertEqual(set(searched) - set(listed), {"query"})
 
 
 class TestOfflineTolerance(unittest.TestCase):

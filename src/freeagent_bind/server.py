@@ -50,6 +50,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -64,7 +65,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.8.0"
+SERVER_VERSION = "0.8.1"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -1308,6 +1309,46 @@ BRANCH_STATES = ("open", "adopted", "abandoned", "merged")
 THOUGHT_PLAN_MAX = 12
 
 
+def _plan_merge(old_items: list[dict], old_retired: list[dict],
+                new_texts: list[str]) -> tuple[list[dict], list[dict]]:
+    """計画の差し替え（新しい plan と、廃止された項目）。
+
+    **同じ文面は同じ id を保つ**。id は「そのサブ目標の同一性」なので、差し替えで
+    入れ替わると、それまで `subgoal` で参照していたステップが**別の項目を指すようになる**
+    （実測: `plan=["A","B"]` で A 完了 → `plan=["B"]` で B が id 1 になり、ステップ 1 が
+    A についてのものだったのに B に付け替わる）。
+
+    * 同じ文面は元の id と `done_at`（達成済みの印）を引き継ぐ。
+    * 新しい文面は**使っていない id**を割り当てる（別項目の id を再利用しない）。
+    * 抜けた項目は**廃止**として残す（達成済みの記録と参照を黙って消さない）。
+      廃止項目も `subgoal` の参照先として有効なので、参照が宙に浮かない。
+    """
+    by_text: dict[str, dict] = {}
+    for item in list(old_items) + list(old_retired):
+        text = as_str(item.get("text"))
+        if text and text not in by_text:
+            by_text[text] = item
+    used_ids = {as_int(item.get("id"), 0, 0, 9999)
+                for item in list(old_items) + list(old_retired)}
+    next_id = max(used_ids or {0}) + 1
+    new_plan: list[dict] = []
+    for text in new_texts:
+        prev = by_text.get(text)
+        if prev is not None:
+            new_plan.append({"id": as_int(prev.get("id"), 0, 0, 9999), "text": text,
+                             "done_at": prev.get("done_at")})
+        else:
+            new_plan.append({"id": next_id, "text": text, "done_at": None})
+            next_id += 1
+    wanted = set(new_texts)
+    new_retired = [dict(item) for item in old_retired
+                   if as_str(item.get("text")) not in wanted]
+    for item in old_items:
+        if as_str(item.get("text")) not in wanted:
+            new_retired.append(dict(item))
+    return new_plan, new_retired
+
+
 def _thought_apply_ops(row: dict, steps: list[dict], step: dict, old: dict | None, ops: dict) -> None:
     n = as_int(step.get("n"), 0, 0, 9999)
     by_n = {as_int(s.get("n"), 0, 0, 9999): s for s in steps}
@@ -1340,10 +1381,11 @@ def _thought_apply_ops(row: dict, steps: list[dict], step: dict, old: dict | Non
         meta[res]["resolved_at"] = None if ops["branch_status"] == "open" else n
     row["branch_meta"] = meta
     plan = [p for p in (row.get("plan") or []) if isinstance(p, dict)]
+    retired = [p for p in (row.get("plan_retired") or []) if isinstance(p, dict)]
     if ops.get("plan"):
-        done = {p.get("text"): p.get("done_at") for p in plan if p.get("done_at")}
-        plan = [{"id": i + 1, "text": text, "done_at": done.get(text)}
-                for i, text in enumerate(ops["plan"][:THOUGHT_PLAN_MAX])]
+        # 同じ文面は id と達成済みの印を引き継ぐ。新しい文面には**未使用の id**を割り当てる
+        # （id を再利用すると、既存の subgoal 参照が別の項目を指すようになる）。
+        plan, retired = _plan_merge(plan, retired, list(ops["plan"][:THOUGHT_PLAN_MAX]))
         row["plan_revised_at"] = n
     sub = as_int(step.get("subgoal"), 0, 0, THOUGHT_PLAN_MAX)
     if sub and ops.get("subgoal_done"):
@@ -1351,6 +1393,7 @@ def _thought_apply_ops(row: dict, steps: list[dict], step: dict, old: dict | Non
             if item.get("id") == sub:
                 item["done_at"] = n
     row["plan"] = plan
+    row["plan_retired"] = retired
     total = as_int(ops.get("total"), 0, 0, 999)
     history = [h for h in (row.get("total_history") or []) if isinstance(h, dict)]
     if total and (not history or history[-1].get("total") != total):
@@ -2202,12 +2245,120 @@ def _kb_is_blocked(host: str) -> bool:
         return True
 
 
+def _kb_socket_of(resp):
+    """HTTP 応答のソケットを取り出す（見つからなければ None）。"""
+    for path in (("fp", "raw", "_sock"), ("fp", "_sock"), ("fp", "raw", "socket")):
+        obj = resp
+        try:
+            for attr in path:
+                obj = getattr(obj, attr)
+            return obj
+        except AttributeError:
+            continue
+    return None
+
+
+def _kb_set_socket_timeout(resp, seconds: float) -> None:
+    """応答のソケットに読み取りタイムアウトを張り直す（残りの壁時計予算）。
+
+    `urlopen(timeout=…)` は接続前のソケットに設定した値をそのまま使い続けるため、
+    読み取り中に 1 回の `read` が壁時計予算を突き抜ける。ここでは残りの予算を
+    ソケットに張り直し、1 回の recv 自体を予算内に収める。
+    """
+    sock = _kb_socket_of(resp)
+    if sock is None:
+        return
+    try:
+        sock.settimeout(max(0.1, seconds))
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
+def _kb_content_length(resp) -> int | None:
+    """応答の `Content-Length` を返す（無ければ None）。
+
+    終端判定に使う（§5.8）。`read1` は 1 バイトずつしか返さないことがあるため、
+    「読了多少バイトか」をヘッダの長さで照合して終端を判断する。
+    """
+    try:
+        headers = getattr(resp, "headers", None)
+        raw = headers.get("Content-Length") if headers is not None else None
+        if raw is None:
+            return None
+        return int(raw)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _kb_read_within(resp, deadline: float) -> str:
+    """応答本文を**壁時計予算内**で読み、UTF-8 の文字列にして返す。
+
+    `urlopen(timeout=…)` はソケット 1 回の待ちの上限であってリクエスト全体の壁時計上限ではない。
+    1 バイトずつ drip する提供元では読みが終わるまで待ち続ける（実測: 98.0 秒 / `KB_TIMEOUT`=20 秒）。
+
+    2 段構えで止める:
+      1. **チャンク単位の読み**（`read1`）— 大きな `read(n)` は n バイト揃うまでブロックする
+         （drip 応答では本文が終わるまで戻らない）ので、届いたぶんだけ読む。
+      2. **残りの壁時計予算をソケットに張り直す**— 1 回の recv も予算内に収める。
+
+    予算超過は TimeoutError として外へ出す（呼び出し側の `kb_http` が失敗として扱い、
+    ホストを短く遮断する）。
+    """
+    chunks: list[bytes] = []
+    # **読む量ではなく予算で打ち切る**。
+    # `read(n)` は n バイト揃うまでブロックする（drip 応答では本文が終わるまで戻らない）ので、
+    # 大きな n を指定すると予算を突き抜ける。`read1(n)` は「届いたぶんだけ」を返す。
+    #
+    # 終端の判定は **Content-Length** で行う（応答ヘッダに長さがある）。
+    # `read1` は 1 バイトずつしか返らないことがある（実測: drip 応答で 1 バイト / 回）ので、
+    # 読み進めるたびに「We've read all the data」になるまで繰り返す。
+    # Content-Length が無い（chunked / 長さ不明）ときは、`read1` が空を返すまで読む。
+    # ソケットの読み取りタイムアウトは残りの壁時計予算に張り直すので、
+    # recv 自体が予算内に収まる（`kb_http` の timeout は「ソケット 1 回の待ち」の上限で、
+    # リクエスト全体の壁時計上限ではない）。
+    reader = getattr(resp, "read1", None)
+    expected = _kb_content_length(resp)
+    total = 0
+    previous: bytes | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"読み取りが {KB_TIMEOUT:g} 秒の予算を超えました")
+        _kb_set_socket_timeout(resp, remaining)
+        try:
+            if reader is not None:
+                chunk = reader(65536)
+            else:
+                try:
+                    chunk = resp.read(65536)
+                except TypeError:
+                    chunk = resp.read()
+        except (TimeoutError, socket.timeout) as exc:
+            raise TimeoutError(f"読み取りが {KB_TIMEOUT:g} 秒の予算を超えました") from exc
+        if not chunk:
+            break
+        if previous is not None and chunk == previous and expected is None:
+            # 同じ内容を返す実装（テストの FakeResp）= 読み終端。
+            break
+        previous = chunk
+        chunks.append(chunk)
+        total += len(chunk)
+        if expected is not None and total >= expected:
+            break
+    return b"".join(chunks).decode("utf-8", "replace")
+
 def kb_http(url: str, *, accept: str = "application/json", extra_headers: dict | None = None,
             timeout: float | None = None, body: bytes | None = None,
             method: str = "GET") -> tuple[int, str]:
     """(status, body) を返す。例外は投げず、失敗も status で表す（呼び出し側で分岐する）。
 
     `body` を渡すと POST になる（§5.18 の OSV のように POST 専用の API があるため）。
+
+    **読み取りは壁時計でも打ち切る**（§5.8）。`urlopen(timeout=…)` の上限は「ソケット 1 回の待ち」に対する
+    もので、**リクエスト全体の壁時計制限ではない**。1 バイトずつ drip する応答では
+    ソケット毎回がタイムアウト内なので、応答が終わるまで何分も待ち続ける（実測: ローカル drip
+    サーバで 98.0 秒・`KB_TIMEOUT`=20 秒の 5 倍、zenodo 実測で 122.75 秒）。
+    → 読み取りループに残りの壁時計予算を渡し、超過したら打ち切る。
     """
     host = urllib.parse.urlparse(url).netloc
     if _kb_is_blocked(host):
@@ -2216,9 +2367,11 @@ def kb_http(url: str, *, accept: str = "application/json", extra_headers: dict |
     if extra_headers:
         headers.update(extra_headers)
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    budget = timeout if timeout is not None else KB_TIMEOUT
+    deadline = time.monotonic() + max(0.1, budget)
     try:
-        with _urlopen(req, timeout or KB_TIMEOUT) as resp:
-            return int(resp.status), resp.read().decode("utf-8", "replace")
+        with _urlopen(req, budget) as resp:
+            return int(resp.status), _kb_read_within(resp, deadline)
     except urllib.error.HTTPError as exc:
         body = ""
         retry_after = exc.headers.get("Retry-After") if exc.headers else None
@@ -4571,6 +4724,7 @@ def tool_models(args: dict) -> dict:
     query = as_str(args.get("query")) or as_str(args.get("q"))
     provider_filter = as_str(args.get("provider"))
     limit = as_int(args.get("limit"), 40, 1, 200)
+    shown: list[dict] = []          # 検索モードで絞り込んだ一覧（非検索モードでは空）
     data = {
         "providers": status,
         "total_models": sum(row["models"] for row in status),
@@ -4701,8 +4855,21 @@ def tool_models(args: dict) -> dict:
              "observations": model_observations(ref)}
             for ref in free
         ]
-    elif not searching:
-        data["free_models"] = free
+    # **返り値のキーはモードで変えない**。`models`（絞り込んだ一覧）と
+    # `free_models`（サブLLMに使える Free 全体）は**常に両方**を返す。片方だけだと
+    # 利用側がモードで別のキーを読む羽目になる（実測: 引数なし → free_models のみ /
+    # query 付き → models のみ）。
+    data["models"] = [{
+        "ref": make_ref(r["provider"], r["id"]),
+        "provider": r["provider"],
+        "id": r["id"],
+        "free": bool(r.get("free")),
+        "free_via": r.get("free_via") or [],
+        "context_length": r.get("context_length"),
+        "usable": provider_ready(r["provider"]),
+        "probe": r.get("probe"),
+    } for r in shown]
+    data["free_models"] = free
     return data
 
 
@@ -4898,7 +5065,8 @@ def tool_grounded(args: dict) -> dict:
     citations = [c for c in (kb.get("citations") or []) if _kb_has_evidence(c)]
     if not citations:
         return {"error": "根拠が 0 件でした。query を変えるか sources を広げてください",
-                "lookup": {"sources": kb.get("sources"), "errors": kb.get("errors")}}
+                "lookup": {"sources": kb.get("sources"), "errors": kb.get("errors"),
+                           "unknown_sources": kb.get("unknown_sources") or []}}
     window = _evidence_window(citations)
     if not window["numbers"]:
         return {"error": "本文根拠を注入できませんでした。根拠の取得・本文予算を確認してください"}
@@ -5420,6 +5588,7 @@ def _think_ledger_view(steps: list[dict], *, keep: int = 8, row: dict | None = N
             branches.setdefault(step["branch_id"], []).append(as_int(step.get("n"), 0, 0, 9999))
     active = _think_active(steps, row)
     plan = [p for p in (row.get("plan") or []) if isinstance(p, dict)]
+    retired = [p for p in (row.get("plan_retired") or []) if isinstance(p, dict)]
     shown = active if brief else steps[-keep:]
     out = {
         "steps_recorded": len(steps),
@@ -5441,6 +5610,12 @@ def _think_ledger_view(steps: list[dict], *, keep: int = 8, row: dict | None = N
                   "done": bool(p.get("done_at")), "done_at": p.get("done_at"),
                   "steps": [as_int(s.get("n"), 0, 0, 9999) for s in steps
                             if as_int(s.get("subgoal"), 0, 0, 999) == p.get("id")]} for p in plan],
+        # 計画から抜けた項目（廃止）。**記録を黙って消さない**（§2.7）。
+        "plan_retired": [{"id": p.get("id"), "text": truncate(p.get("text") or "", 200),
+                          "done": bool(p.get("done_at")), "done_at": p.get("done_at"),
+                          "steps": [as_int(s.get("n"), 0, 0, 9999) for s in steps
+                                    if as_int(s.get("subgoal"), 0, 0, 999) == p.get("id")]}
+                         for p in retired],
         "plan_progress": {"done": sum(1 for p in plan if p.get("done_at")), "total": len(plan)},
         "hypotheses": [{"n": as_int(s.get("n"), 0, 0, 9999), "text": truncate(s.get("text") or "", 200),
                         "status": s.get("hypothesis_status") or "open",
@@ -5705,7 +5880,10 @@ def tool_think(args: dict) -> dict:
     steps_out = [s for s in (after.get("steps") or []) if isinstance(s, dict)]
     used = [m for m in (after.get("verifier_models") or used) if isinstance(m, str)]
 
-    needed = as_flag(args.get("next_thought_needed", args.get("needs_more_thoughts", True)))
+    # 「続けるか」。**明示された null は「未指定」扱い**（既定 True へ戻す）。
+    # `as_flag(None)` は False になるので素朴に書くと、クライアントが null を送っただけで
+    # 台帳が暗黙に終端する（実測: null → False / キー無し → True）。
+    needed = _think_needed_flag(args)
     data = {
         "session_id": sid, "step": n, "text": step["text"], "kind": step.get("kind") or "step",
         "branch_id": step["branch_id"], "is_revision": step["is_revision"],
@@ -5723,13 +5901,19 @@ def tool_think(args: dict) -> dict:
         "alternatives": alternatives,
         "verifier_models": used,
         "notes": notes,
-        "next_call": {"tool": "freeagent_think",
-                      "args": {"session_id": sid, "thought": "<次の思考>",
-                               "thought_number": n + 1, "verify": bool(verification),
-                               **({"total_thoughts": max(total, n + 1)} if total else {}),
-                               **({"card": card} if card else {})}},
+        # 終端（next_thought_needed=false）のときは**次の思考を誘導しない**。
+        # 「続けるか」を False にしておきながら next_call を出すと、呼び出し側が
+        # 勝手に次を積んでしまう（実測: 終端なのに「<次の思考>」が出ていた）。
         "privacy_note": "台帳は思考の記録です。判断と責任はメインLLMに残ります。",
     }
+    if needed:
+        data["next_call"] = {"tool": "freeagent_think",
+                             "args": {"session_id": sid, "thought": "<次の思考>",
+                                      "thought_number": n + 1, "verify": bool(verification),
+                                      **({"total_thoughts": max(total, n + 1)} if total else {}),
+                                      **({"card": card} if card else {})}}
+    else:
+        data["next_call"] = None
     if card:
         data["card"] = card          # KANBAN のカードへの紐づけ（引けたことを呼び出し側に見せる）
     data["suggestions"] = _think_suggestions(data, steps_out, needed)
@@ -5795,9 +5979,14 @@ def _think_active(steps: list[dict], row: dict | None) -> list[dict]:
 
 def _think_preview_row(row: dict, st: dict) -> dict:
     """今回の呼び出しで決まる計画・分岐の決着を反映した台帳メタの写し（検証者に見せる用。書かない）。"""
-    out = json.loads(json.dumps({k: row.get(k) for k in ("plan", "branch_meta")}))
+    out = json.loads(json.dumps({k: row.get(k) for k in ("plan", "plan_retired", "branch_meta")}))
     if st.get("plan"):
-        out["plan"] = [{"id": i + 1, "text": t, "done_at": None} for i, t in enumerate(st["plan"])]
+        # 実際のマージと同じ id 割当てにする（検証者に別の plan を見せない）。
+        old_plan = [p for p in (out.get("plan") or []) if isinstance(p, dict)]
+        old_retired = [p for p in (out.get("plan_retired") or []) if isinstance(p, dict)]
+        merged, retired = _plan_merge(old_plan, old_retired, list(st["plan"]))
+        out["plan"] = merged
+        out["plan_retired"] = retired
     meta = out.get("branch_meta") if isinstance(out.get("branch_meta"), dict) else {}
     if st.get("resolve_branch") and st["resolve_branch"] in meta:
         meta[st["resolve_branch"]]["status"] = st["branch_status"]
@@ -5883,9 +6072,19 @@ def _think_structure(args: dict, steps: list[dict], n: int, row: dict) -> tuple[
     plan = [truncate(p, 200) for p in as_str_list(args.get("plan"))]
     if len(plan) > THOUGHT_PLAN_MAX:
         return fail(f"plan は {THOUGHT_PLAN_MAX} 項目までです（{len(plan)} 項目）。粒度を上げて分けてください")
-    plan_now = plan or [p for p in (row.get("plan") or []) if isinstance(p, dict)]
+    old_plan = [p for p in (row.get("plan") or []) if isinstance(p, dict)]
+    old_retired = [p for p in (row.get("plan_retired") or []) if isinstance(p, dict)]
+    if plan:
+        # 差し替え後の plan で id を振り直す（実際のマージと同じ割当て）。
+        plan_now, _retired = _plan_merge(old_plan, old_retired, plan)
+    else:
+        plan_now = old_plan
+    # 廃止された項目も `subgoal` の参照先として有効（記録を黙って消さない）。
+    # 参照できる id は「現在の plan + 廃止済み plan」のすべて。
+    known_sub_ids = {as_int(p.get("id"), 0, 0, 999) for p in plan_now}
+    known_sub_ids |= {as_int(p.get("id"), 0, 0, 999) for p in old_retired}
     sub = as_int(args.get("subgoal"), 0, 0, 999)
-    if sub and not 1 <= sub <= len(plan_now):
+    if sub and sub not in known_sub_ids:
         return fail(f"subgoal={sub} は計画にありません（計画 {len(plan_now)} 項目。先に plan で分解してください）")
     sub_done = as_flag(args.get("subgoal_done"))
     if sub_done and not sub:
@@ -5896,6 +6095,25 @@ def _think_structure(args: dict, steps: list[dict], n: int, row: dict) -> tuple[
                   "resolve_branch": resolve, "branch_status": bstatus,
                   "tests_hypothesis": tests, "hypothesis_status": hstatus,
                   "plan": plan, "subgoal": sub, "subgoal_done": sub_done, "notes": notes}
+
+
+def _think_needed_flag(args: dict) -> bool:
+    """「続けるか」を読む。**明示された null は未指定扱い**（既定 True）。
+
+    `as_flag(None)` は False なので、素朴に `as_flag(args.get("next_thought_needed", True))` と書くと、
+    クライアントが `null` を送っただけで台帳が暗黙に終端する（実測: null → False）。
+    MCP クライアントは「引数を省略した」と「null を送った」を区別しないので、
+    どちらも「未指定 → True」と解釈するのが安全側。
+    `needs_more_thoughts` は `next_thought_needed` の別名（両方あれば前者を優先）。
+    """
+    for key in ("next_thought_needed", "needs_more_thoughts"):
+        if key not in args:
+            continue
+        value = args.get(key)
+        if value is None:
+            continue          # null = 未指定 → 次の別名か既定へ
+        return as_flag(value)
+    return True
 
 
 def _think_view(sid: str, stored: dict | None, brief: bool = False) -> dict:
@@ -5996,7 +6214,7 @@ TOOLS: list[dict] = [
                 "query": {"type": "string", "description": "モデル ID の部分一致（例: qwen / llama / :free）"},
                 "q": {"type": "string", "description": "query の別名"},
                 "provider": {"type": "string",
-                             "description": "nous / openrouter / nvidia / huggingface / groq / cloudflare / gemini のいずれか"},
+                             "description": " / ".join(PROVIDER_ORDER) + " のいずれか"},
                 "limit": {"type": "integer", "description": "表示件数（既定 40・最大 200）"},
                 "offset": {"type": "integer", "description": "読み飛ばす件数（ページ送り）"},
                 "free_only": {"type": "boolean", "description": "有料モデルを除き、Free だけを対象にする"},
@@ -6090,7 +6308,7 @@ TOOLS: list[dict] = [
                 "sources": {"type": "array", "items": {"type": "string"},
                             "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。検索構文 tag:Python user:foo created:>2026-01-01。**未認証は 60 回/時**で別の問いは 1 分待ち、FREEAGENT_QIITA_TOKEN を設定すると 1,000 回/時）。対象は科学とプログラミングまでで医学・生物学は含まない"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
-                "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語。**省略時は問いから自動**（日本語・中国語・韓国語なら ja、それ以外は en）。英語の語（Transformer など）は自動で en になるので、通常は指定しない。明示するとその言語で引く"},
+                "lang": {"type": "string", "description": "Wikipedia / Wikidata の言語。**wikipedia は省略時に問いから自動**（日本語・中国語・韓国語なら ja、それ以外は en。英語の語（Transformer など）は自動で en になるので、通常は指定しない。**wikidata は既定 ja 固定**（実測で ja の方が当たったため。en にすると機械学習の項目が電気機器に化ける）。明示するとその言語で引く"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須・10 req/分）。code はファイルへのポインタと一致箇所の断片を返し、ライセンス情報を含まない（取り込む前に repo 検索で確認する）。repo: owner/name・path:・language:・filename:・in:file の修飾子を付けると精度が上がる"},
                 "fallback": {"type": "boolean", "description": "既定 false。自然語 arXiv検索の失敗/遅延時に DataCite を許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"],
@@ -6113,11 +6331,11 @@ TOOLS: list[dict] = [
             "properties": {
                 "question": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6種。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。**未認証は 60 回/時**、FREEAGENT_QIITA_TOKEN で 1,000 回/時）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。医学・生物学は対象外"},
+                            "description": "既定6種。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**question は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。**未認証は 60 回/時**、FREEAGENT_QIITA_TOKEN で 1,000 回/時）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。**crossref / hn は抄録・本文が無く grounded の本文根拠にならない**（書誌と議論のメタデータだけ）。医学・生物学は対象外"},
                 "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
                 "limit": {"type": "integer"},
-                "lang": {"type": "string", "description": "Wikipedia/Wikidata の言語。**省略時は問いから自動**（日本語・中国語・韓国語なら ja、それ以外は en）"},
+                "lang": {"type": "string", "description": "Wikipedia / Wikidata の言語。**wikipedia は省略時に問いから自動**（日本語・中国語・韓国語なら ja、それ以外は en）。**wikidata は既定 ja 固定**（明示すればその言語で引く）"},
                 "models": {"type": "array", "items": {"type": "string"}},
                 "size": {"type": "integer", "description": "参加モデル数（既定 2）"},
                 "max_tokens": {"type": "integer"},
@@ -6308,21 +6526,40 @@ HANDLERS = {
 # 効くのは「毎ターン注入される場所の判断規則」と「競合の汎用面を外すこと」だが、記述側でも
 # **競合の実名**と**無効・不通時の振る舞い**を書いておくと、読まれた場合の選択が正しくなる。
 _EXTRA_DESC: dict[str, str] = {
-    "freeagent_panel": "【競合より優先】`delegate_task`（同一モデルの分身＝多様性ゼロ）や "
+    "freeagent_models": "モデルの**一覧**が要るだけの場面では `panel` / `consult` の自動選抜で足りる。"
+                        "どの Free モデルが存在するかを自分で引きたいときはこちら。",
+    "freeagent_ask": "`delegate_task`（Hermes 本体を別プロセスで走らせる重い委譲）ほどではなく、"
+                     "1 つの独立意見だけで足りるならこちらが速い。",
+    "freeagent_map": "要素ごとに別モデルへ並列に投げる必要が無いなら `panel` で足りる。",
+    "freeagent_panel": "`delegate_task`（同一モデルの分身＝多様性ゼロ）や "
                        "`deliberation` の ask_* を N 回並べる代わりにこれを使う。",
-    "freeagent_consult": "【競合より優先】`deliberation`（単発の意見集約）にはラウンド・合意度の推移・"
+    "freeagent_consult": "`deliberation`（単発の意見集約）にはラウンド・合意度の推移・"
                          "少数意見の保持が無い。往復して前提を更新したいならこれ。",
-    "freeagent_think": "【競合より優先】思考を記録するだけのツール（sequential-thinking 系）は番号を積むだけで、"
+    "freeagent_think": "思考を記録するだけのツール（sequential-thinking 系）は番号を積むだけで、"
                        "計画の進捗・改訂済みの印・分岐の決着・仮説の状態を持たず、検証者もいない。"
                        "分解・改訂・分岐・仮説を**構造として**残し、要所だけ別モデルに反証・別案を出させるならこれ。",
-    "freeagent_grounded": "【競合より優先】`web_search` は単一視点で根拠が本文に埋もれる。"
+    "freeagent_grounded": "`web_search` は単一視点で根拠が本文に埋もれる。"
                           "出典本文つき・番号つきで複数モデルに答えさせたいならこれ。",
-    "freeagent_lookup": "【競合より優先】`web_search` より学術ソース（arXiv / Crossref / OpenAlex）と"
+    "freeagent_lookup": "`web_search` より学術ソース（arXiv / Crossref / OpenAlex）と"
                         "構造化データ（Wikidata）に強い。**LLM を経由しないので幻覚が混入しない**。",
-    "freeagent_agent": "【競合より優先】`delegate_task` は Hermes 本体を丸ごと起動する重い委譲。"
+    "freeagent_agent": "`delegate_task` は Hermes 本体を丸ごと起動する重い委譲。"
                        "読み取り専用の調査で足りるならこれ（副作用なし）。根拠の引用は自動で検査される。",
-    "freeagent_delegate": "【競合より優先】`delegate_task` より独立性が高い（別プロセス）。"
+    "freeagent_delegate": "`delegate_task` より独立性が高い（別プロセス）。"
                           "ただし既定では無効（`FREEAGENT_ALLOW_AGENT=1` が要る）。",
+}
+# 【使わない条件】…「この場面では別の手段が速い/軽い」。全ツールに必須（規約 5 / SPEC §7）。
+_NOT_USE_DESC: dict[str, str] = {
+    "freeagent_models": "通常は不要（panel / consult 等が自動で選ぶ）。",
+    "freeagent_ask": "単発の事実確認は `web_search` や `lookup` が速い。",
+    "freeagent_fanout": "1 つの問いに少数の視点なら `panel` が十分。多数決の記録が要らないなら `ask`。",
+    "freeagent_panel": "1 モデルで足りるなら `ask`。出典つきの回答が要るなら `grounded`。",
+    "freeagent_lookup": "単一の事実だけなら `web_search` が速い。",
+    "freeagent_grounded": "根拠の引用が要らないなら `panel`。引用の番号が要らないなら `ask` で足りる。",
+    "freeagent_map": "要素が数個だけなら `panel` / `ask` で足りる。",
+    "freeagent_consult": "前提の往復が要らない単発の意見なら `panel`。",
+    "freeagent_think": "1 問 1 答・単純な事実確認・雑談では使わない（1 ターンが無駄に伸びる）。",
+    "freeagent_agent": "読み取り専用の調査で足りず、書き込みや実作業が必要なときは `delegate` を使う。",
+    "freeagent_delegate": "軽い委譲で足りるなら `agent` / `panel`。",
 }
 _DESC_FALLBACK = (
     "【無効・不通のとき】このサーバーが使えない場合（`enabled false` / バックエンド全滅）は、"
@@ -6336,10 +6573,33 @@ _PARALLEL_TOOLS = {"freeagent_models", "freeagent_ask", "freeagent_fanout", "fre
                    "freeagent_lookup", "freeagent_grounded", "freeagent_map", "freeagent_consult",
                    "freeagent_think"}
 
+
+def _desc_assemble(base: str, name: str) -> str:
+    """description を【使う条件】【使わない条件】【競合より優先】…の順に組み立てる。
+
+    **マーカーの重複を組まない**（同じ見出しを 2 回出さない）。各マーカーの本文は
+    1 か所だけを正とする:
+      * 【使う条件】はツール定義の直書きにだけ書く。
+      * 【使わない条件】は `_NOT_USE_DESC` にだけ書く。
+      * 【競合より優先】は**直書きと `_EXTRA_DESC` の両方に書かない**。
+        直書きに既有ならそれを優先し、無ければ `_EXTRA_DESC` を使う。
+    値が空ならマーカーごと省く（空のマーカーを残さない）。
+    """
+    parts = [base]
+    not_use = _NOT_USE_DESC.get(name, "")
+    if not_use and "【使わない条件】" not in base:
+        parts.append("【使わない条件】" + not_use)
+    extra = _EXTRA_DESC.get(name, "")
+    if extra and "【競合より優先】" not in base:
+        parts.append("【競合より優先】" + extra)
+    if name in _PARALLEL_TOOLS:
+        parts.append(_DESC_PARALLEL)
+    parts.append(_DESC_FALLBACK)
+    return "".join(parts)
+
+
 for _tool in TOOLS:
-    _extra = _EXTRA_DESC.get(_tool["name"], "")
-    _parallel = _DESC_PARALLEL if _tool["name"] in _PARALLEL_TOOLS else ""
-    _tool["description"] = f'{_tool["description"]}{_extra}{_parallel}{_DESC_FALLBACK}'
+    _tool["description"] = _desc_assemble(_tool["description"], _tool["name"])
 
 
 # ================================================================ §8 表示（content）
@@ -6364,7 +6624,19 @@ def _render_body(name: str, data: dict) -> str:
     if not isinstance(data, dict):
         return str(data)[:2000]
     if data.get("error"):
-        return f"⚠️ {data['error']}"
+        # エラーでも**原因になる情報**は残す（未知のソース名など、切り分けに必要）。
+        extra = ""
+        lookup = data.get("lookup")
+        lookup = lookup if isinstance(lookup, dict) else {}
+        unknown = lookup.get("unknown_sources") or data.get("unknown_sources") or []
+        if unknown:
+            extra = ("\n⚠ 未知のソースを無視しました: " + ", ".join(unknown)
+                     + "（名前は sources の説明を参照）")
+        errs = lookup.get("errors") or data.get("errors")
+        if isinstance(errs, dict) and errs:
+            detail = "; ".join(f"{k}: {truncate(str(v), 90)}" for k, v in list(errs.items())[:5])
+            extra += f"\n内訳: {detail}"
+        return f"⚠️ {data['error']}{extra}"
 
     if name == "freeagent_models":
         lines = []
@@ -6485,6 +6757,11 @@ def _render_body(name: str, data: dict) -> str:
         if late:
             head += f" / 締め切り {data.get('deadline_s')} 秒に間に合わず {len(late)} 件"
         lines = [head]
+        # **指定したのに使えなかったソース名を隠さない**（typo を黙って捨てない）。
+        unknown = data.get("unknown_sources") or []
+        if unknown:
+            lines.append(f"  ⚠ 未知のソースを無視しました: {', '.join(unknown)}"
+                         "（名前は sources の説明を参照）")
 
         def secs(src: str) -> str:
             t = timings.get(src)
@@ -6516,6 +6793,13 @@ def _render_body(name: str, data: dict) -> str:
         lines = [f"根拠 {data.get('evidence_citation_count', data.get('citation_count'))} 件 / 引用付き回答 "
                  f"{data.get('answers_with_citations')}/{data.get('answered')} 体"
                  f" / 合意度 {data.get('agreement')}"]
+        # 検索の失敗（未知のソース名など）も人間に見せる（typo を黙って捨てない）。
+        lookup = data.get("lookup")
+        lookup = lookup if isinstance(lookup, dict) else {}
+        unknown = lookup.get("unknown_sources") or data.get("unknown_sources") or []
+        if unknown:
+            lines.append(f"⚠ 未知のソースを無視しました: {', '.join(unknown)}"
+                         "（名前は sources の説明を参照）")
         for row in (data.get("answers") or []):
             if row.get("error"):
                 lines.append(f"  • {row['model']}: ✗ {truncate(row['error'], 120)}")
@@ -7295,8 +7579,75 @@ def _http_auth_ok(headers, token: str) -> bool:
     return bool(given) and secrets.compare_digest(given, token)
 
 
+def _http_origin_ok(headers, allowed_hosts: set[str]) -> tuple[bool, str]:
+    """`Origin` ヘッダを検証する（ブラウザからのクロスサイト呼び出しの抑止）。
+
+    MCP の StreamableHTTP は **`Origin` ヘッダの検証を要求**する（仕様の MUST）。
+    素通しだと、ブラウザで開いた別ページが `http://127.0.0.1:8790/mcp` へ
+    JSON-RPC を送れて、推論の消費や台帳の書き込みを体外から起こせる（実測: 検証前は
+    `Origin: https://evil.example` でも 200 を返していた）。
+
+    判定:
+      * `Origin` が無い（CLI / ネイティブクライアント）→ 通し。
+      * `Origin` が `http://` / `https://` で、**ホストが待ち受のホストと一致** → 通し。
+        （待受が 127.0.0.1 なら `http://127.0.0.1:8790` と同じオリジンだけ許可）
+      * `Origin: null`（file:// など）→ 通ししない（ローカルファイルからの呼び出しは
+        恣意的なサイトからも生成できる）。
+      * 上のどれにも当たらなければ 403。
+    """
+    origin = (headers.get("origin") or "").strip()
+    if not origin:
+        return True, ""
+    if origin.lower() == "null":
+        return False, "Origin: null は拒否しました（ローカルファイルからの呼び出しは遮断します）"
+    parsed = urllib.parse.urlsplit(origin)
+    if parsed.scheme not in ("http", "https"):
+        return False, f"Origin のスキームが不正です: {origin[:80]}"
+    host = (parsed.hostname or "").lower()
+    if host in allowed_hosts:
+        return True, ""
+    return False, (f"Origin が許可されていません: {origin[:80]}"
+                   f"（許可: {', '.join(sorted(allowed_hosts))}）")
+
+
+def _http_host_ok(headers, allowed_hosts: set[str]) -> tuple[bool, str]:
+    """`Host` ヘッダが待ち受のホストと一致するか（DNS rebinding の防御）。
+
+    `Host` が偽装されると、攻撃者のドメインが 127.0.0.1 へ解決される。
+    ブラウザは `Origin` も付けるので Origin 検証が主だが、非ブラウザの
+    クライアントにもこの制約を掛ける。
+    """
+    host_header = (headers.get("host") or "").strip().lower()
+    if not host_header:
+        return True, ""   # HTTP/1.0 には Host が無い
+    if ":" in host_header:
+        host_header = host_header.rsplit(":", 1)[0]
+    if host_header in allowed_hosts:
+        return True, ""
+    return False, f"Host が許可されていません: {host_header[:80]}"
+
+
 def _http_make_handler(config: dict):
     import http.server
+
+    # Origin / Host の検証で許可するホスト。待受のホスト自身と、そのローカル別名。
+    # 待ち受けが 0.0.0.0 / :: なら wildcard 扱いでどの Host も通す（LAN 公開のとき）。
+    bind_host = str(config.get("host") or HTTP_DEFAULT_HOST).strip().lower()
+    if bind_host in ("0.0.0.0", "::", "[::]", "*", ""):
+        allowed_hosts: set[str] = set()      # 空 = 制限しない
+    else:
+        allowed_hosts = {bind_host, "127.0.0.1", "localhost", "::1"}
+        allowed_hosts.discard("")
+    # 空集合のときは「制限なし」なので判定を缓める（allowed_hosts が空なら常に通す）。
+    def _origin_allowed(headers) -> tuple[bool, str]:
+        if not allowed_hosts:
+            return True, ""
+        return _http_origin_ok(headers, allowed_hosts)
+
+    def _host_allowed(headers) -> tuple[bool, str]:
+        if not allowed_hosts:
+            return True, ""
+        return _http_host_ok(headers, allowed_hosts)
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -7328,9 +7679,20 @@ def _http_make_handler(config: dict):
             return path.rstrip("/") == config["path"].rstrip("/")
 
         def _guard(self) -> bool:
-            """パスと認証。通れば True、拒否したら応答を書いて False。"""
+            """パス・認証・Origin/Host。通れば True、拒否したら応答を書いて False。"""
             if not self._path_ok():
                 self._error(404, -32601, f"unknown path: {self.path}（待受は {config['path']}）")
+                return False
+            # Origin / Host の検証（MCP StreamableHTTP の仕様 MUST・DNS rebinding の防御）。
+            # ブラウザからのクロスサイト呼び出しを体外から起こせないようにする（実測: 検証前は
+            # `Origin: https://evil.example` でも 200 を返していた）。
+            ok, why = _origin_allowed(self.headers)
+            if not ok:
+                self._error(403, -32003, why)
+                return False
+            ok, why = _host_allowed(self.headers)
+            if not ok:
+                self._error(403, -32004, why)
                 return False
             if not _http_auth_ok(self.headers, config.get("token") or ""):
                 self._error(401, -32000, f"unauthorized（{HTTP_TOKEN_ENV} のトークンが必要です）")
