@@ -66,7 +66,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.8.4"
+SERVER_VERSION = "0.8.5"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -6061,6 +6061,63 @@ def _think_suggestions(data: dict, steps: list[dict], needed: bool) -> list[str]
     return out
 
 
+def _think_verify_block(args: dict, question: str, steps: list, step: dict,
+                       preview: dict, used: list, sid_in: str):
+    """`verify=true` の検証を実行して (verification, used, failure) を返す。
+
+    `failure` は**環境障害で台帳を汚さずに終わらせる場合の応答**（`None` なら正常）。
+    検証は独立モデルによる反証探索であり、合意の収集ではない（§7.2）。
+    """
+    refs, info = select_models(as_int(args.get("size"), 2, 1, 4),
+                               as_str_list(args.get("models")) or None,
+                               prefer=as_str_list(args.get("prefer")) or None,
+                               exclude=(as_str_list(args.get("exclude")) or []) + used)
+    if not refs:
+        return None, used, _no_models()   # 状態を書かない（環境障害で台帳を汚さない）
+    results = ask_many(refs, _think_prompt(question, steps, step, preview), system=THINK_CRITIC_SYSTEM,
+                       max_tokens=as_int(args.get("max_tokens"), 400, 16, 2000), kind="think",
+                       avoid=as_str_list(args.get("exclude")) or None)
+    rows: list[dict] = []
+    for ref, res in zip(refs, results):
+        if res.get("error"):
+            rows.append({"model": ref, "error": res["error"]})
+            continue
+        parsed = parse_verdict(res["text"])
+        rows.append({"model": ref, "served_by": res.get("served_by"),
+                     "verdict": parsed["verdict"], "objection": parsed["objection"],
+                     "oversight": parsed["oversight"], "confidence": parsed["confidence"],
+                     "labels_found": parsed["labels_found"],
+                     "text": truncate(res["text"], 600), "cot_leak": res.get("cot_leak")})
+    answered = [r for r in rows if not r.get("error")]
+    failed = [r for r in rows if r.get("error")]
+    # 環境障害で 1 体も応答していないなら**書かない**（規約 21）。モデル側の失敗（429 等）は
+    # 従来どおり記録し、`answered: 0` として隠さず返す。
+    if not answered and failed and all(is_env_failure(r.get("error") or "") for r in failed):
+        return None, used, {"error": "検証に到達できませんでした（バックエンド不通: "
+                          f"{truncate(failed[0].get('error') or '', 120)}）。"
+                          "この思考は台帳に記録していません。",
+                  "session_id": sid_in or None, "verifier_models": refs,
+                  "failures": [{"model": r["model"], "error": truncate(r.get("error") or "", 160)}
+                               for r in failed]}
+    confs = [r["confidence"] for r in answered if isinstance(r.get("confidence"), int)]
+    verification = {
+        "models": refs, "selection": info, "answered": len(answered), "failed": len(failed),
+        "verdicts": {v: sum(1 for r in answered if r.get("verdict") == v)
+                     for v in ("妥当", "要修正", "根拠不足")},
+        "unlabeled": sum(1 for r in answered if not r.get("verdict")),
+        "confidence_mean": round(sum(confs) / len(confs), 1) if confs else None,
+        "objections": [{"model": r["model"], "objection": r["objection"]}
+                       for r in answered if r.get("objection")],
+        "oversights": [{"model": r["model"], "oversight": r["oversight"]}
+                       for r in answered if r.get("oversight")],
+        "answers": rows,
+        "failed_rows": [{"model": r["model"], "error": truncate(r.get("error") or "", 160)}
+                        for r in failed],
+        "agreement": agreement_of([r.get("verdict") or "" for r in answered if r.get("verdict")]),
+        "note": "検証は独立モデルによる反証探索です。合意は正しさの保証ではありません。",
+    }
+    return verification, (used + [r["model"] for r in rows])[:12], None
+
 def tool_think(args: dict) -> dict:
     """メインの思考ステップを台帳に積み、任意で独立モデルに反証させる。
 
@@ -6155,56 +6212,12 @@ def tool_think(args: dict) -> dict:
 
     verification = None
     if as_flag(args.get("verify")):
-        refs, info = select_models(as_int(args.get("size"), 2, 1, 4),
-                                   as_str_list(args.get("models")) or None,
-                                   prefer=as_str_list(args.get("prefer")) or None,
-                                   exclude=(as_str_list(args.get("exclude")) or []) + used)
-        if not refs:
-            return _no_models()   # 状態を書かない（環境障害で台帳を汚さない）
-        results = ask_many(refs, _think_prompt(question, steps, step, preview), system=THINK_CRITIC_SYSTEM,
-                           max_tokens=as_int(args.get("max_tokens"), 400, 16, 2000), kind="think",
-                           avoid=as_str_list(args.get("exclude")) or None)
-        rows: list[dict] = []
-        for ref, res in zip(refs, results):
-            if res.get("error"):
-                rows.append({"model": ref, "error": res["error"]})
-                continue
-            parsed = parse_verdict(res["text"])
-            rows.append({"model": ref, "served_by": res.get("served_by"),
-                         "verdict": parsed["verdict"], "objection": parsed["objection"],
-                         "oversight": parsed["oversight"], "confidence": parsed["confidence"],
-                         "labels_found": parsed["labels_found"],
-                         "text": truncate(res["text"], 600), "cot_leak": res.get("cot_leak")})
-        answered = [r for r in rows if not r.get("error")]
-        failed = [r for r in rows if r.get("error")]
-        # 環境障害で 1 体も応答していないなら**書かない**（規約 21）。モデル側の失敗（429 等）は
-        # 従来どおり記録し、`answered: 0` として隠さず返す。
-        if not answered and failed and all(is_env_failure(r.get("error") or "") for r in failed):
-            return {"error": "検証に到達できませんでした（バックエンド不通: "
-                             f"{truncate(failed[0].get('error') or '', 120)}）。"
-                             "この思考は台帳に記録していません。",
-                    "session_id": sid_in or None, "verifier_models": refs,
-                    "failures": [{"model": r["model"], "error": truncate(r.get("error") or "", 160)}
-                                 for r in failed]}
-        confs = [r["confidence"] for r in answered if isinstance(r.get("confidence"), int)]
-        verification = {
-            "models": refs, "selection": info, "answered": len(answered), "failed": len(failed),
-            "verdicts": {v: sum(1 for r in answered if r.get("verdict") == v)
-                         for v in ("妥当", "要修正", "根拠不足")},
-            "unlabeled": sum(1 for r in answered if not r.get("verdict")),
-            "confidence_mean": round(sum(confs) / len(confs), 1) if confs else None,
-            "objections": [{"model": r["model"], "objection": r["objection"]}
-                           for r in answered if r.get("objection")],
-            "oversights": [{"model": r["model"], "oversight": r["oversight"]}
-                           for r in answered if r.get("oversight")],
-            "answers": rows,
-            "failed_rows": [{"model": r["model"], "error": truncate(r.get("error") or "", 160)}
-                            for r in failed],
-            "agreement": agreement_of([r.get("verdict") or "" for r in answered if r.get("verdict")]),
-            "note": "検証は独立モデルによる反証探索です。合意は正しさの保証ではありません。",
-        }
+        # 検証ブロックは `_think_verify_block` へ分けた（`tool_think` の巨大化対策。§7.2）。
+        verification, used, failure = _think_verify_block(
+            args, question, steps, step, preview, used, sid_in)
+        if failure is not None:
+            return failure     # 状態を書かない（環境障害で台帳を汚さない。規約 21）
         step["verification"] = verification
-        used = (used + [r["model"] for r in rows])[:12]
 
     alternatives = None
     if as_flag(args.get("propose_alternatives")):
@@ -7005,7 +7018,373 @@ def render(name: str, data: dict) -> str:
     return body
 
 
+def _render_models(data: dict) -> str:
+    """`freeagent_models` の本文（`content` = 人間向け日本語）。"""
+    lines = []
+    for row in data.get("providers") or []:
+        # ✓ は「資格情報がある」だけでなく「一覧が取れている」ことも表す。取れていないのに ✓ だと、
+        # モデル 0 件の理由（プロキシ停止など）が分からない（実測: nous が ✓ 0 件で並んだ）。
+        if row.get("ready") and not row.get("error"):
+            mark = "✓"
+        elif row.get("ready"):
+            mark = "⚠"
+        else:
+            mark = "—"
+        if not row.get("ready") and row.get("requires_activation"):
+            missing = ", ".join(row.get("missing_settings") or []) or "設定確認"
+            note = f"  [無効: {missing}]"
+        elif not row.get("ready") and row.get("key_env"):
+            note = f"  [{row['key_env']} 未設定 → 検索のみ]"
+        else:
+            note = ""
+        lines.append(f"  {mark} {row['provider']:11} {row['models']:4} モデル / Free {row['free']:3}{note}")
+        if row.get("error"):
+            lines.append(f"      到達不可: {row['error'][:100]}")
+    head = (f"サブLLMバックエンド（{sum(1 for r in data.get('providers') or [] if r.get('ready'))} プロバイダ有効）\n"
+            + "\n".join(lines))
+    head += (f"\nFree候補 {data.get('free_candidates')} 件（うち今すぐ使用可 {data.get('usable_now')}）"
+             f" / 全 {data.get('total_models')} モデル\n既定: {data.get('default_model')}")
+    non_chat = data.get("non_chat_candidates") or 0
+    if non_chat:
+        # 選抜から外した分を黙って消さない（「要約で無い」と「そもそも無い」を混同させない）。
+        head += (f"\n非チャット（埋め込み・分類器・画像/音声生成）{non_chat} 件は自動選抜から除外"
+                 "（一覧には表示）")
+    cooling = data.get("cooling") or {}
+    if cooling:
+        # 全部並べると 1 行が長すぎて読めない（実測: 55 件で画面が埋まった）。先頭だけ出して件数を添える。
+        shown = list(cooling)[:8]
+        head += (f"\nクールダウン中 {len(cooling)} 件: " + ", ".join(shown)
+                 + (f" … 他 {len(cooling) - len(shown)} 件" if len(cooling) > len(shown) else ""))
+    harness = data.get("harness") or {}
+    if harness:
+        label = {"hermes": "Hermes Agent", "other": "Hermes 以外", "unknown": "判別不能"}.get(
+            harness.get("kind"), harness.get("kind"))
+        head += f"\nハーネス: {label}（{harness.get('reason')}）"
+    q = data.get("query")
+    if q:
+        head += (f"\n\n🔍 検索: query={q.get('query')!r} provider={q.get('provider')}"
+                 + (" free 限定" if q.get("free_only") else "")
+                 + (f" offset={q['offset']}" if q.get("offset") else "")
+                 + f" → {q.get('matched')} 件（Free {q.get('matched_free')}）"
+                 f"／表示 {q.get('shown')} 件")
+        if q.get("probed"):
+            head += (f"\n   生存確認: 試行 {q.get('probe_attempted')} / 応答 {q.get('probe_alive')}"
+                     + (f" / 遅い {q.get('probe_slow')}" if q.get("probe_slow") else "")
+                     + "（404=廃止・403=権限なしは一覧から除外）")
+            for row in (q.get("probe_dropped") or []):
+                head += f"\n     ✗ {row['ref']} [{row.get('verdict')}]: {(row.get('error') or '')[:80]}"
+            for row in (q.get("probe_errors") or []):
+                head += f"\n     ◷ {row['ref']} [{row.get('verdict')}]: {(row.get('error') or '')[:80]}"
+        for m in (data.get("models") or []):
+            tags = []
+            if m.get("free"):
+                tags.append("Free" + (f" via {','.join(m['free_via'])}" if m.get("free_via") else ""))
+            if not m.get("usable"):
+                tags.append("キー未設定")
+            if m.get("probe") and m["probe"] != "alive":
+                tags.append(f"要再確認={m['probe']}")
+            ctx = f" ctx={m['context_length']}" if m.get("context_length") else ""
+            head += f"\n  • {m['ref']}{ctx} [{', '.join(tags) or '有料'}]"
+        if not (data.get("models") or []):
+            hint = ("該当なし。query を短くするか provider を外してください" if not q.get("probed")
+                    else "生存確認で全滅しました（キー・権限を確認してください）")
+            head += f"\n  （{hint}）"
+    for row in (data.get("stats") or [])[:12]:
+        head += (f"\n  • {row['model']} [{row['status']}] 品質 {row['quality']}"
+                 f" 観測 {row['observations']}")
+    return head
+def _render_ask(data: dict) -> str:
+    """`freeagent_ask` の本文（`content` = 人間向け日本語）。"""
+    out = [f"[{data.get('served_by')}] {data.get('answer', '')}"]
+    meta = [f"{data.get('latency_s')}s"]
+    if data.get("fell_back"):
+        meta.append(f"代替へ回った（要求 {data.get('model')}）")
+    if data.get("truncated"):
+        meta.append("切断あり")
+    if data.get("cot_leak"):
+        meta.append("思考過程の混入")
+    out.append("(" + ", ".join(str(m) for m in meta) + ")")
+    return "\n".join(out)
+def _render_fanout(data: dict) -> str:
+    """`freeagent_fanout` の本文（`content` = 人間向け日本語）。"""
+    head = (f"{data.get('calls')} 呼び出し / 成功 {data.get('ok')} / 失敗 {data.get('failed')}"
+            f" / wall {data.get('wall_s')}s（逐次なら約 {data.get('sequential_estimate_s')}s、"
+            f"倍率 {data.get('speedup')}）")
+    body = ""
+    for row in (data.get("results") or [])[:12]:
+        text = row.get("answer") or row.get("error") or ""
+        body += f"\n  • {row['model']}: {truncate(text, 200)}"
+    return head + body
+def _render_panel(data: dict) -> str:
+    """`freeagent_panel` の本文（`content` = 人間向け日本語）。"""
+    conf_mean = data.get("confidence_mean")
+    conf_note = f"（確信度平均 {conf_mean}）" if isinstance(conf_mean, (int, float)) else ""
+    lines = [f"回答 {data.get('answered')}/{len(data.get('models') or [])} 体"
+             f" / 独立した実モデル {data.get('independent_sources', data.get('answered'))} 体"
+             f" / 合意度 {data.get('agreement')}{conf_note}"]
+    for group in (data.get("consensus") or [])[:5]:
+        lines.append(f"  • {', '.join(group['models'])}: {truncate(group['excerpt'], 160)}")
+    if data.get("open_questions"):
+        lines.append("⚠️ メインに確認したい点:")
+        for row in data["open_questions"][:5]:
+            lines.append(f"  - {row['model']}: {truncate(row['question'], 160)}")
+    lines.append("ℹ️ 合意度は表層の一致であって正しさの保証ではありません。")
+    return "\n".join(lines)
+def _render_lookup(data: dict) -> str:
+    """`freeagent_lookup` の本文（`content` = 人間向け日本語）。"""
+    timings = data.get("timings") or {}
+    late = data.get("timed_out") or []
+    head = f"出典 {data.get('citation_count')} 件（{', '.join(data.get('sources') or [])}）"
+    if late:
+        head += f" / 締め切り {data.get('deadline_s')} 秒に間に合わず {len(late)} 件"
+    lines = [head]
+    # **指定したのに使えなかったソース名を隠さない**（typo を黙って捨てない）。
+    unknown = data.get("unknown_sources") or []
+    if unknown:
+        lines.append(f"  ⚠ 未知のソースを無視しました: {', '.join(unknown)}"
+                     "（名前は sources の説明を参照）")
+
+    def secs(src: str) -> str:
+        t = timings.get(src)
+        return f"・{t:.1f} 秒" if isinstance(t, (int, float)) else ""
+
+    for src, res in (data.get("results") or {}).items():
+        items = res.get("items") or []
+        if res.get("timed_out"):
+            lines.append(f"  ⏱ {src}: 締め切りに間に合いませんでした（取得は継続・次回はキャッシュから）")
+            continue
+        if not items:
+            lines.append(f"  × {src}{secs(src)}: {(res.get('error') or '該当なし')[:90]}")
+            if res.get("fallback_attempt"):
+                lines.append(f"      代替 datacite も失敗: {truncate(res['fallback_attempt'].get('error') or '', 90)}")
+            continue
+        acquisition = (res.get("fallback") or {}).get("served_by")
+        label = f"{src} → {acquisition}（代替）" if acquisition else src
+        lines.append(f"  ✓ {label} ({len(items)} 件{secs(src)})")
+        if acquisition:
+            lines.append(f"      主系: {truncate(res['fallback'].get('primary_error') or '', 100)}")
+        if res.get("attribution"):
+            lines.append(f"      {res['attribution']}")
+        for item in items[:2]:
+            title = item.get("title") or item.get("label") or ""
+            lines.append(f"      {truncate(title, 90)} — {item.get('url', '')}")
+    return "\n".join(lines)
+def _render_grounded(data: dict) -> str:
+    """`freeagent_grounded` の本文（`content` = 人間向け日本語）。"""
+    lines = [f"根拠 {data.get('evidence_citation_count', data.get('citation_count'))} 件 / 引用付き回答 "
+             f"{data.get('answers_with_citations')}/{data.get('answered')} 体"
+             f" / 合意度 {data.get('agreement')}"]
+    # 検索の失敗（未知のソース名など）も人間に見せる（typo を黙って捨てない）。
+    lookup = data.get("lookup")
+    lookup = lookup if isinstance(lookup, dict) else {}
+    unknown = lookup.get("unknown_sources") or data.get("unknown_sources") or []
+    if unknown:
+        lines.append(f"⚠ 未知のソースを無視しました: {', '.join(unknown)}"
+                     "（名前は sources の説明を参照）")
+    for row in (data.get("answers") or []):
+        if row.get("error"):
+            lines.append(f"  • {row['model']}: ✗ {truncate(row['error'], 120)}")
+            continue
+        lines.append(f"  • {row['model']}: {truncate(row.get('answer') or '', 400)}")
+    lines.append("出典:")
+    for i, cite in enumerate(data.get("citations") or [], 1):
+        lines.append(f"  [{i}] [{cite.get('source')}] {truncate(cite.get('title') or '', 80)} {cite.get('url')}")
+    credits = [c for cite in (data.get("citations") or []) for c in
+               ((cite.get("attributions") or []) + ([cite["attribution"]] if cite.get("attribution") else []))]
+    if credits:
+        lines[1:1] = list(dict.fromkeys(credits))
+    return "\n".join(lines[:40])
+def _render_map(data: dict) -> str:
+    """`freeagent_map` の本文（`content` = 人間向け日本語）。"""
+    lines = [f"{data.get('count')} 件 / 成功 {data.get('ok')} / 失敗 {data.get('failed')}"
+             f"（モデル {data.get('model')}）"]
+    for row in (data.get("results") or [])[:10]:
+        text = row.get("output") or f"✗ {row.get('error', '')}"
+        lines.append(f"  • {truncate(row.get('item') or '', 60)} → {truncate(text, 160)}")
+    if data.get("reduced"):
+        lines.append(f"統合:\n{truncate(data['reduced'], 1200)}")
+    return "\n".join(lines)
+def _render_consult(data: dict) -> str:
+    """`freeagent_consult` の本文（`content` = 人間向け日本語）。"""
+    lines = [f"相談 {data.get('session_id')} / mode={data.get('mode')} / "
+             f"ラウンド{data.get('rounds_run')} / stage={data.get('stage')}",
+             f"合意度 {data.get('agreement')} / 確信度平均 {data.get('confidence_mean')}"]
+    failed_rows = data.get("failed") or []
+    shown = {(row.get("model"), row.get("error")) for row in failed_rows}
+    for row in failed_rows:
+        lines.append(f"  ✗ {row.get('model')}（このラウンドは脱落）: {truncate(row.get('error') or '', 90)}")
+    for row in (data.get("consensus") or [])[:5]:
+        conf = row.get("confidence")
+        suffix = f"（確信度 {conf}）" if isinstance(conf, int) else ""
+        lines.append(f"  • {row['model']}: {truncate(row.get('conclusion') or '', 160)}{suffix}")
+    debate = data.get("debate_summary")
+    if debate:
+        lines.append("討論推移（表層合意度）: "
+                     + " → ".join(str(x) for x in debate.get("agreement_by_round", [])))
+        for p in debate.get("participants", [])[:5]:
+            lines.append(f"  ◦ {p['model']}: 初回「{truncate(p.get('initial_position') or '', 60)}」"
+                         f" → 最終「{truncate(p.get('final_position') or '', 60)}」"
+                         + ("（立場変更）" if p.get("changed") else ""))
+            if p.get("strongest_objection"):
+                lines.append(f"      反論: {truncate(p['strongest_objection'], 120)}")
+        for row in debate.get("dropped") or []:
+            if (row.get("model"), row.get("error")) in shown:
+                continue  # 直近ラウンドの脱落として既に出している（二重表示しない）
+            lines.append(f"  ✗ {row.get('model')}（第{row.get('round')}ラウンド "
+                         f"{row.get('kind')} で脱落）: {truncate(row.get('error') or '', 90)}")
+    if data.get("open_questions_for_main"):
+        lines.append("⚠️ メインに確認したい点:")
+        lines += [f"  - {q}" for q in data["open_questions_for_main"][:5]]
+        lines.append("→ 回答して session_id を付けて再呼び出ししてください（main_reply）")
+    lines.append("ℹ️ 最終判断はメイン。サブの出力は仮説として扱ってください。")
+    return "\n".join(lines)
+def _render_think(data: dict) -> str:
+    """`freeagent_think` の本文（`content` = 人間向け日本語）。"""
+    ledger = data.get("ledger") or {}
+    branches = ledger.get("branches") or []
+    head = (f"思考 #{data.get('step') or '-'}（記録 {ledger.get('steps_recorded', 0)} 件"
+            f" / 分岐 {len(branches)} / 修正 {len(ledger.get('revisions') or [])}）")
+    if data.get("total_thoughts"):
+        head += f" / 見積り総数 {data['total_thoughts']}"
+        if data.get("total_auto_adjusted"):
+            head += "（自動で引き上げ）"
+    if data.get("view"):
+        head = ("【台帳の閲覧（記録なし・要約）】" if data.get("brief")
+                else "【台帳の閲覧（記録なし）】") + head
+    lines = [head]
+    plan = ledger.get("plan") or []
+    if plan:
+        prog = ledger.get("plan_progress") or {}
+        lines.append(f"計画: {prog.get('done', 0)}/{prog.get('total', len(plan))} 達成")
+        for item in plan:
+            mark = "✅" if item.get("done") else "□"
+            refs = "".join(f" #{x}" for x in (item.get("steps") or []))
+            # 見出しは**位置**（1 始まり）。id は同一性なので同じ値なら省略する。
+            pos = item.get("position") or item.get("id")
+            ident = item.get("id")
+            tail = "" if ident is None or ident == pos else f"（id={ident}）"
+            lines.append(f"  {mark} {pos}. {truncate(item.get('text') or '', 100)}{tail}"
+                         + (f"（{refs.strip()}）" if refs else ""))
+    state_ja = {"open": "未決着", "adopted": "採用", "abandoned": "棄却", "merged": "統合"}
+    if branches:
+        lines.append("分岐: " + " / ".join(
+            f"{b.get('branch_id')}"
+            + (f"（#{b['from']} から・" if b.get("from") else "（")
+            + f"{state_ja.get(b.get('status') or 'open', b.get('status'))}）"
+            for b in branches))
+    hyps = ledger.get("hypotheses") or []
+    if hyps:
+        hyp_ja = {"open": "未検証", "supported": "支持", "refuted": "反証", "inconclusive": "保留"}
+        lines.append("仮説: " + " / ".join(
+            f"#{h.get('n')} {hyp_ja.get(h.get('status') or 'open', h.get('status'))}"
+            + ("（改訂済み）" if h.get("superseded_by") else "") for h in hyps))
+    # 要約（brief）は現行の道筋だけなので全部出す。通常は末尾だけ（閲覧 12 / 記録 5）。
+    shown_rows = ledger.get("latest") or []
+    if not data.get("brief"):
+        shown_rows = shown_rows[-(12 if data.get("view") else 5):]
+    for row in shown_rows:
+        tag = f" [{row['branch_id']}]" if row.get("branch_id") else ""
+        tag += " [修正]" if row.get("is_revision") else ""
+        if row.get("kind") == "hypothesis":
+            tag += " [仮説]"
+        elif row.get("kind") == "test" and row.get("tests_hypothesis"):
+            tag += f" [#{row['tests_hypothesis']} の検証]"
+        elif row.get("kind") == "conclusion":
+            tag += " [結論]"
+        if row.get("superseded_by"):
+            tag += f" [#{row['superseded_by']} で改訂済み]"
+        lines.append(f"  • #{row.get('n')}{tag}: {truncate(row.get('text') or '', 140)}")
+    if data.get("brief") and ledger.get("omitted"):
+        lines.append(f"  （改訂・棄却で外した思考 {ledger['omitted']} 件は省略。全文は brief なしで view）")
+    verify = data.get("verification")
+    if verify:
+        counts = verify.get("verdicts") or {}
+        conf = verify.get("confidence_mean")
+        lines.append(f"検証（独立 {verify.get('answered')}/{len(verify.get('models') or [])} 体）: "
+                     f"妥当 {counts.get('妥当', 0)} / 要修正 {counts.get('要修正', 0)}"
+                     f" / 根拠不足 {counts.get('根拠不足', 0)}"
+                     + (f" / 確信度平均 {conf}" if isinstance(conf, (int, float)) else ""))
+        for row in (verify.get("answers") or []):
+            if row.get("error"):
+                lines.append(f"  ✗ {row.get('model')}: {truncate(row.get('error') or '', 100)}")
+                continue
+            lines.append(f"  ◦ {row.get('model')}: {row.get('verdict') or '判定なし'}")
+            if row.get("objection"):
+                lines.append(f"      反証: {truncate(row['objection'], 140)}")
+            if row.get("oversight"):
+                lines.append(f"      見落とし: {truncate(row['oversight'], 140)}")
+        if verify.get("failed_rows"):
+            lines.append(f"  ⚠️ 検証に失敗 {len(verify['failed_rows'])} 体（脱落は隠していません）")
+    elif not data.get("view"):
+        lines.append("検証なし（台帳のみ。verify=true で独立モデルの反証が付きます）")
+    alt = data.get("alternatives")
+    if alt:
+        lines.append(f"代替案（独立 {alt.get('answered')}/{len(alt.get('models') or [])} 体・"
+                     f"{len(alt.get('items') or [])} 件）:")
+        for item in (alt.get("items") or [])[:8]:
+            lines.append(f"  ◇ {item.get('model')}: {truncate(item.get('text') or '', 160)}")
+        for row in (alt.get("failed_rows") or []):
+            lines.append(f"  ✗ {row.get('model')}: {truncate(row.get('error') or '', 100)}")
+    for note in (data.get("notes") or []):
+        lines.append(f"⚠️ {note}")
+    lines.append("ℹ️ 検証・代替案は独立モデルによる反証・提案で、合意は正しさの保証ではありません。")
+    return "\n".join(lines)
+def _render_agent(data: dict) -> str:
+    """`freeagent_agent` の本文（`content` = 人間向け日本語）。"""
+    lines = [f"【サブエージェント調査】{data.get('answered')}/{len(data.get('models') or [])} 体が回答"
+             f" / ツール呼び出し {data.get('tool_calls')} 回"
+             f" / 出典 {data.get('citation_count')} 件"
+             f" / 根拠を引用した回答 {data.get('answers_with_citations')} 体"
+             f" / 合意度 {data.get('agreement')}"]
+    for row in (data.get("agents") or []):
+        if row.get("error"):
+            lines.append(f"  • {row['model']}: ✗ {truncate(row['error'], 120)}")
+            continue
+        mark = "✅" if row.get("cited_ok") else "⚠️ 引用なし"
+        lines.append(f"  • {row['model']}（{row.get('steps')}ステップ, {mark}）: "
+                     f"{truncate(row.get('answer') or '', 220)}")
+        if row.get("unsupported_citations"):
+            nums = ", ".join(f"[{n}]" for n in row["unsupported_citations"])
+            lines.append(f"      ⚠️ 根拠に無い引用番号: {nums}")
+        if row.get("steps_exhausted"):
+            lines.append("      ⚠️ ステップ上限に達し、回答に到達しませんでした（推測はしません）")
+            for ev in (row.get("evidence") or [])[:4]:
+                lines.append(f"      根拠: {truncate(ev, 130)}")
+        for step in (row.get("trace") or [])[:3]:
+            lines.append(f"      ↳ {step['tool']}"
+                         f"({truncate(json.dumps(step['args'], ensure_ascii=False), 60)})"
+                         f" hits={step['hits']}")
+    if data.get("citations"):
+        lines.append("出典:")
+        for cite in data["citations"][:6]:
+            lines.append(f"  - [{cite.get('source')}] {truncate(cite.get('title') or '', 80)} {cite.get('url')}")
+    lines.append(f"ℹ️ {data.get('usage_note', '')}")
+    return "\n".join(lines)
+def _render_delegate(data: dict) -> str:
+    """`freeagent_delegate` の本文（`content` = 人間向け日本語）。"""
+    return (f"exit={data.get('exit_code')}（{data.get('elapsed_s')}s）\n"
+            f"{truncate(data.get('stdout') or '', 2000)}")
+# ツール別の本文レンダラ（`_render_body` から機械的に分離した）。
+# 名前 → 関数の対応表。**分岐表を手で書くのは漏れるので、関数名から生成**する。
+_RENDERERS = {
+    "freeagent_models": _render_models,
+    "freeagent_ask": _render_ask,
+    "freeagent_fanout": _render_fanout,
+    "freeagent_panel": _render_panel,
+    "freeagent_lookup": _render_lookup,
+    "freeagent_grounded": _render_grounded,
+    "freeagent_map": _render_map,
+    "freeagent_consult": _render_consult,
+    "freeagent_think": _render_think,
+    "freeagent_agent": _render_agent,
+    "freeagent_delegate": _render_delegate,
+}
 def _render_body(name: str, data: dict) -> str:
+    """ツールの応答を `content`（人間向け日本語）にする。
+
+    ツール別の描画は `_RENDERERS`（ツール名 → 描画関数）へ分けた。
+    描画関数はこの関数の `name == ...` 分岐をそのまま移したもの（**振る舞いは同一**）。
+    """
     if not isinstance(data, dict):
         return str(data)[:2000]
     if data.get("error"):
@@ -7022,352 +7401,9 @@ def _render_body(name: str, data: dict) -> str:
             detail = "; ".join(f"{k}: {truncate(str(v), 90)}" for k, v in list(errs.items())[:5])
             extra += f"\n内訳: {detail}"
         return f"⚠️ {data['error']}{extra}"
-
-    if name == "freeagent_models":
-        lines = []
-        for row in data.get("providers") or []:
-            # ✓ は「資格情報がある」だけでなく「一覧が取れている」ことも表す。取れていないのに ✓ だと、
-            # モデル 0 件の理由（プロキシ停止など）が分からない（実測: nous が ✓ 0 件で並んだ）。
-            if row.get("ready") and not row.get("error"):
-                mark = "✓"
-            elif row.get("ready"):
-                mark = "⚠"
-            else:
-                mark = "—"
-            if not row.get("ready") and row.get("requires_activation"):
-                missing = ", ".join(row.get("missing_settings") or []) or "設定確認"
-                note = f"  [無効: {missing}]"
-            elif not row.get("ready") and row.get("key_env"):
-                note = f"  [{row['key_env']} 未設定 → 検索のみ]"
-            else:
-                note = ""
-            lines.append(f"  {mark} {row['provider']:11} {row['models']:4} モデル / Free {row['free']:3}{note}")
-            if row.get("error"):
-                lines.append(f"      到達不可: {row['error'][:100]}")
-        head = (f"サブLLMバックエンド（{sum(1 for r in data.get('providers') or [] if r.get('ready'))} プロバイダ有効）\n"
-                + "\n".join(lines))
-        head += (f"\nFree候補 {data.get('free_candidates')} 件（うち今すぐ使用可 {data.get('usable_now')}）"
-                 f" / 全 {data.get('total_models')} モデル\n既定: {data.get('default_model')}")
-        non_chat = data.get("non_chat_candidates") or 0
-        if non_chat:
-            # 選抜から外した分を黙って消さない（「要約で無い」と「そもそも無い」を混同させない）。
-            head += (f"\n非チャット（埋め込み・分類器・画像/音声生成）{non_chat} 件は自動選抜から除外"
-                     "（一覧には表示）")
-        cooling = data.get("cooling") or {}
-        if cooling:
-            # 全部並べると 1 行が長すぎて読めない（実測: 55 件で画面が埋まった）。先頭だけ出して件数を添える。
-            shown = list(cooling)[:8]
-            head += (f"\nクールダウン中 {len(cooling)} 件: " + ", ".join(shown)
-                     + (f" … 他 {len(cooling) - len(shown)} 件" if len(cooling) > len(shown) else ""))
-        harness = data.get("harness") or {}
-        if harness:
-            label = {"hermes": "Hermes Agent", "other": "Hermes 以外", "unknown": "判別不能"}.get(
-                harness.get("kind"), harness.get("kind"))
-            head += f"\nハーネス: {label}（{harness.get('reason')}）"
-        q = data.get("query")
-        if q:
-            head += (f"\n\n🔍 検索: query={q.get('query')!r} provider={q.get('provider')}"
-                     + (" free 限定" if q.get("free_only") else "")
-                     + (f" offset={q['offset']}" if q.get("offset") else "")
-                     + f" → {q.get('matched')} 件（Free {q.get('matched_free')}）"
-                     f"／表示 {q.get('shown')} 件")
-            if q.get("probed"):
-                head += (f"\n   生存確認: 試行 {q.get('probe_attempted')} / 応答 {q.get('probe_alive')}"
-                         + (f" / 遅い {q.get('probe_slow')}" if q.get("probe_slow") else "")
-                         + "（404=廃止・403=権限なしは一覧から除外）")
-                for row in (q.get("probe_dropped") or []):
-                    head += f"\n     ✗ {row['ref']} [{row.get('verdict')}]: {(row.get('error') or '')[:80]}"
-                for row in (q.get("probe_errors") or []):
-                    head += f"\n     ◷ {row['ref']} [{row.get('verdict')}]: {(row.get('error') or '')[:80]}"
-            for m in (data.get("models") or []):
-                tags = []
-                if m.get("free"):
-                    tags.append("Free" + (f" via {','.join(m['free_via'])}" if m.get("free_via") else ""))
-                if not m.get("usable"):
-                    tags.append("キー未設定")
-                if m.get("probe") and m["probe"] != "alive":
-                    tags.append(f"要再確認={m['probe']}")
-                ctx = f" ctx={m['context_length']}" if m.get("context_length") else ""
-                head += f"\n  • {m['ref']}{ctx} [{', '.join(tags) or '有料'}]"
-            if not (data.get("models") or []):
-                hint = ("該当なし。query を短くするか provider を外してください" if not q.get("probed")
-                        else "生存確認で全滅しました（キー・権限を確認してください）")
-                head += f"\n  （{hint}）"
-        for row in (data.get("stats") or [])[:12]:
-            head += (f"\n  • {row['model']} [{row['status']}] 品質 {row['quality']}"
-                     f" 観測 {row['observations']}")
-        return head
-
-    if name == "freeagent_ask":
-        out = [f"[{data.get('served_by')}] {data.get('answer', '')}"]
-        meta = [f"{data.get('latency_s')}s"]
-        if data.get("fell_back"):
-            meta.append(f"代替へ回った（要求 {data.get('model')}）")
-        if data.get("truncated"):
-            meta.append("切断あり")
-        if data.get("cot_leak"):
-            meta.append("思考過程の混入")
-        out.append("(" + ", ".join(str(m) for m in meta) + ")")
-        return "\n".join(out)
-
-    if name == "freeagent_fanout":
-        head = (f"{data.get('calls')} 呼び出し / 成功 {data.get('ok')} / 失敗 {data.get('failed')}"
-                f" / wall {data.get('wall_s')}s（逐次なら約 {data.get('sequential_estimate_s')}s、"
-                f"倍率 {data.get('speedup')}）")
-        body = ""
-        for row in (data.get("results") or [])[:12]:
-            text = row.get("answer") or row.get("error") or ""
-            body += f"\n  • {row['model']}: {truncate(text, 200)}"
-        return head + body
-
-    if name == "freeagent_panel":
-        conf_mean = data.get("confidence_mean")
-        conf_note = f"（確信度平均 {conf_mean}）" if isinstance(conf_mean, (int, float)) else ""
-        lines = [f"回答 {data.get('answered')}/{len(data.get('models') or [])} 体"
-                 f" / 独立した実モデル {data.get('independent_sources', data.get('answered'))} 体"
-                 f" / 合意度 {data.get('agreement')}{conf_note}"]
-        for group in (data.get("consensus") or [])[:5]:
-            lines.append(f"  • {', '.join(group['models'])}: {truncate(group['excerpt'], 160)}")
-        if data.get("open_questions"):
-            lines.append("⚠️ メインに確認したい点:")
-            for row in data["open_questions"][:5]:
-                lines.append(f"  - {row['model']}: {truncate(row['question'], 160)}")
-        lines.append("ℹ️ 合意度は表層の一致であって正しさの保証ではありません。")
-        return "\n".join(lines)
-
-    if name == "freeagent_lookup":
-        timings = data.get("timings") or {}
-        late = data.get("timed_out") or []
-        head = f"出典 {data.get('citation_count')} 件（{', '.join(data.get('sources') or [])}）"
-        if late:
-            head += f" / 締め切り {data.get('deadline_s')} 秒に間に合わず {len(late)} 件"
-        lines = [head]
-        # **指定したのに使えなかったソース名を隠さない**（typo を黙って捨てない）。
-        unknown = data.get("unknown_sources") or []
-        if unknown:
-            lines.append(f"  ⚠ 未知のソースを無視しました: {', '.join(unknown)}"
-                         "（名前は sources の説明を参照）")
-
-        def secs(src: str) -> str:
-            t = timings.get(src)
-            return f"・{t:.1f} 秒" if isinstance(t, (int, float)) else ""
-
-        for src, res in (data.get("results") or {}).items():
-            items = res.get("items") or []
-            if res.get("timed_out"):
-                lines.append(f"  ⏱ {src}: 締め切りに間に合いませんでした（取得は継続・次回はキャッシュから）")
-                continue
-            if not items:
-                lines.append(f"  × {src}{secs(src)}: {(res.get('error') or '該当なし')[:90]}")
-                if res.get("fallback_attempt"):
-                    lines.append(f"      代替 datacite も失敗: {truncate(res['fallback_attempt'].get('error') or '', 90)}")
-                continue
-            acquisition = (res.get("fallback") or {}).get("served_by")
-            label = f"{src} → {acquisition}（代替）" if acquisition else src
-            lines.append(f"  ✓ {label} ({len(items)} 件{secs(src)})")
-            if acquisition:
-                lines.append(f"      主系: {truncate(res['fallback'].get('primary_error') or '', 100)}")
-            if res.get("attribution"):
-                lines.append(f"      {res['attribution']}")
-            for item in items[:2]:
-                title = item.get("title") or item.get("label") or ""
-                lines.append(f"      {truncate(title, 90)} — {item.get('url', '')}")
-        return "\n".join(lines)
-
-    if name == "freeagent_grounded":
-        lines = [f"根拠 {data.get('evidence_citation_count', data.get('citation_count'))} 件 / 引用付き回答 "
-                 f"{data.get('answers_with_citations')}/{data.get('answered')} 体"
-                 f" / 合意度 {data.get('agreement')}"]
-        # 検索の失敗（未知のソース名など）も人間に見せる（typo を黙って捨てない）。
-        lookup = data.get("lookup")
-        lookup = lookup if isinstance(lookup, dict) else {}
-        unknown = lookup.get("unknown_sources") or data.get("unknown_sources") or []
-        if unknown:
-            lines.append(f"⚠ 未知のソースを無視しました: {', '.join(unknown)}"
-                         "（名前は sources の説明を参照）")
-        for row in (data.get("answers") or []):
-            if row.get("error"):
-                lines.append(f"  • {row['model']}: ✗ {truncate(row['error'], 120)}")
-                continue
-            lines.append(f"  • {row['model']}: {truncate(row.get('answer') or '', 400)}")
-        lines.append("出典:")
-        for i, cite in enumerate(data.get("citations") or [], 1):
-            lines.append(f"  [{i}] [{cite.get('source')}] {truncate(cite.get('title') or '', 80)} {cite.get('url')}")
-        credits = [c for cite in (data.get("citations") or []) for c in
-                   ((cite.get("attributions") or []) + ([cite["attribution"]] if cite.get("attribution") else []))]
-        if credits:
-            lines[1:1] = list(dict.fromkeys(credits))
-        return "\n".join(lines[:40])
-
-    if name == "freeagent_map":
-        lines = [f"{data.get('count')} 件 / 成功 {data.get('ok')} / 失敗 {data.get('failed')}"
-                 f"（モデル {data.get('model')}）"]
-        for row in (data.get("results") or [])[:10]:
-            text = row.get("output") or f"✗ {row.get('error', '')}"
-            lines.append(f"  • {truncate(row.get('item') or '', 60)} → {truncate(text, 160)}")
-        if data.get("reduced"):
-            lines.append(f"統合:\n{truncate(data['reduced'], 1200)}")
-        return "\n".join(lines)
-
-    if name == "freeagent_consult":
-        lines = [f"相談 {data.get('session_id')} / mode={data.get('mode')} / "
-                 f"ラウンド{data.get('rounds_run')} / stage={data.get('stage')}",
-                 f"合意度 {data.get('agreement')} / 確信度平均 {data.get('confidence_mean')}"]
-        failed_rows = data.get("failed") or []
-        shown = {(row.get("model"), row.get("error")) for row in failed_rows}
-        for row in failed_rows:
-            lines.append(f"  ✗ {row.get('model')}（このラウンドは脱落）: {truncate(row.get('error') or '', 90)}")
-        for row in (data.get("consensus") or [])[:5]:
-            conf = row.get("confidence")
-            suffix = f"（確信度 {conf}）" if isinstance(conf, int) else ""
-            lines.append(f"  • {row['model']}: {truncate(row.get('conclusion') or '', 160)}{suffix}")
-        debate = data.get("debate_summary")
-        if debate:
-            lines.append("討論推移（表層合意度）: "
-                         + " → ".join(str(x) for x in debate.get("agreement_by_round", [])))
-            for p in debate.get("participants", [])[:5]:
-                lines.append(f"  ◦ {p['model']}: 初回「{truncate(p.get('initial_position') or '', 60)}」"
-                             f" → 最終「{truncate(p.get('final_position') or '', 60)}」"
-                             + ("（立場変更）" if p.get("changed") else ""))
-                if p.get("strongest_objection"):
-                    lines.append(f"      反論: {truncate(p['strongest_objection'], 120)}")
-            for row in debate.get("dropped") or []:
-                if (row.get("model"), row.get("error")) in shown:
-                    continue  # 直近ラウンドの脱落として既に出している（二重表示しない）
-                lines.append(f"  ✗ {row.get('model')}（第{row.get('round')}ラウンド "
-                             f"{row.get('kind')} で脱落）: {truncate(row.get('error') or '', 90)}")
-        if data.get("open_questions_for_main"):
-            lines.append("⚠️ メインに確認したい点:")
-            lines += [f"  - {q}" for q in data["open_questions_for_main"][:5]]
-            lines.append("→ 回答して session_id を付けて再呼び出ししてください（main_reply）")
-        lines.append("ℹ️ 最終判断はメイン。サブの出力は仮説として扱ってください。")
-        return "\n".join(lines)
-
-    if name == "freeagent_think":
-        ledger = data.get("ledger") or {}
-        branches = ledger.get("branches") or []
-        head = (f"思考 #{data.get('step') or '-'}（記録 {ledger.get('steps_recorded', 0)} 件"
-                f" / 分岐 {len(branches)} / 修正 {len(ledger.get('revisions') or [])}）")
-        if data.get("total_thoughts"):
-            head += f" / 見積り総数 {data['total_thoughts']}"
-            if data.get("total_auto_adjusted"):
-                head += "（自動で引き上げ）"
-        if data.get("view"):
-            head = ("【台帳の閲覧（記録なし・要約）】" if data.get("brief")
-                    else "【台帳の閲覧（記録なし）】") + head
-        lines = [head]
-        plan = ledger.get("plan") or []
-        if plan:
-            prog = ledger.get("plan_progress") or {}
-            lines.append(f"計画: {prog.get('done', 0)}/{prog.get('total', len(plan))} 達成")
-            for item in plan:
-                mark = "✅" if item.get("done") else "□"
-                refs = "".join(f" #{x}" for x in (item.get("steps") or []))
-                # 見出しは**位置**（1 始まり）。id は同一性なので同じ値なら省略する。
-                pos = item.get("position") or item.get("id")
-                ident = item.get("id")
-                tail = "" if ident is None or ident == pos else f"（id={ident}）"
-                lines.append(f"  {mark} {pos}. {truncate(item.get('text') or '', 100)}{tail}"
-                             + (f"（{refs.strip()}）" if refs else ""))
-        state_ja = {"open": "未決着", "adopted": "採用", "abandoned": "棄却", "merged": "統合"}
-        if branches:
-            lines.append("分岐: " + " / ".join(
-                f"{b.get('branch_id')}"
-                + (f"（#{b['from']} から・" if b.get("from") else "（")
-                + f"{state_ja.get(b.get('status') or 'open', b.get('status'))}）"
-                for b in branches))
-        hyps = ledger.get("hypotheses") or []
-        if hyps:
-            hyp_ja = {"open": "未検証", "supported": "支持", "refuted": "反証", "inconclusive": "保留"}
-            lines.append("仮説: " + " / ".join(
-                f"#{h.get('n')} {hyp_ja.get(h.get('status') or 'open', h.get('status'))}"
-                + ("（改訂済み）" if h.get("superseded_by") else "") for h in hyps))
-        # 要約（brief）は現行の道筋だけなので全部出す。通常は末尾だけ（閲覧 12 / 記録 5）。
-        shown_rows = ledger.get("latest") or []
-        if not data.get("brief"):
-            shown_rows = shown_rows[-(12 if data.get("view") else 5):]
-        for row in shown_rows:
-            tag = f" [{row['branch_id']}]" if row.get("branch_id") else ""
-            tag += " [修正]" if row.get("is_revision") else ""
-            if row.get("kind") == "hypothesis":
-                tag += " [仮説]"
-            elif row.get("kind") == "test" and row.get("tests_hypothesis"):
-                tag += f" [#{row['tests_hypothesis']} の検証]"
-            elif row.get("kind") == "conclusion":
-                tag += " [結論]"
-            if row.get("superseded_by"):
-                tag += f" [#{row['superseded_by']} で改訂済み]"
-            lines.append(f"  • #{row.get('n')}{tag}: {truncate(row.get('text') or '', 140)}")
-        if data.get("brief") and ledger.get("omitted"):
-            lines.append(f"  （改訂・棄却で外した思考 {ledger['omitted']} 件は省略。全文は brief なしで view）")
-        verify = data.get("verification")
-        if verify:
-            counts = verify.get("verdicts") or {}
-            conf = verify.get("confidence_mean")
-            lines.append(f"検証（独立 {verify.get('answered')}/{len(verify.get('models') or [])} 体）: "
-                         f"妥当 {counts.get('妥当', 0)} / 要修正 {counts.get('要修正', 0)}"
-                         f" / 根拠不足 {counts.get('根拠不足', 0)}"
-                         + (f" / 確信度平均 {conf}" if isinstance(conf, (int, float)) else ""))
-            for row in (verify.get("answers") or []):
-                if row.get("error"):
-                    lines.append(f"  ✗ {row.get('model')}: {truncate(row.get('error') or '', 100)}")
-                    continue
-                lines.append(f"  ◦ {row.get('model')}: {row.get('verdict') or '判定なし'}")
-                if row.get("objection"):
-                    lines.append(f"      反証: {truncate(row['objection'], 140)}")
-                if row.get("oversight"):
-                    lines.append(f"      見落とし: {truncate(row['oversight'], 140)}")
-            if verify.get("failed_rows"):
-                lines.append(f"  ⚠️ 検証に失敗 {len(verify['failed_rows'])} 体（脱落は隠していません）")
-        elif not data.get("view"):
-            lines.append("検証なし（台帳のみ。verify=true で独立モデルの反証が付きます）")
-        alt = data.get("alternatives")
-        if alt:
-            lines.append(f"代替案（独立 {alt.get('answered')}/{len(alt.get('models') or [])} 体・"
-                         f"{len(alt.get('items') or [])} 件）:")
-            for item in (alt.get("items") or [])[:8]:
-                lines.append(f"  ◇ {item.get('model')}: {truncate(item.get('text') or '', 160)}")
-            for row in (alt.get("failed_rows") or []):
-                lines.append(f"  ✗ {row.get('model')}: {truncate(row.get('error') or '', 100)}")
-        for note in (data.get("notes") or []):
-            lines.append(f"⚠️ {note}")
-        lines.append("ℹ️ 検証・代替案は独立モデルによる反証・提案で、合意は正しさの保証ではありません。")
-        return "\n".join(lines)
-
-    if name == "freeagent_agent":
-        lines = [f"【サブエージェント調査】{data.get('answered')}/{len(data.get('models') or [])} 体が回答"
-                 f" / ツール呼び出し {data.get('tool_calls')} 回"
-                 f" / 出典 {data.get('citation_count')} 件"
-                 f" / 根拠を引用した回答 {data.get('answers_with_citations')} 体"
-                 f" / 合意度 {data.get('agreement')}"]
-        for row in (data.get("agents") or []):
-            if row.get("error"):
-                lines.append(f"  • {row['model']}: ✗ {truncate(row['error'], 120)}")
-                continue
-            mark = "✅" if row.get("cited_ok") else "⚠️ 引用なし"
-            lines.append(f"  • {row['model']}（{row.get('steps')}ステップ, {mark}）: "
-                         f"{truncate(row.get('answer') or '', 220)}")
-            if row.get("unsupported_citations"):
-                nums = ", ".join(f"[{n}]" for n in row["unsupported_citations"])
-                lines.append(f"      ⚠️ 根拠に無い引用番号: {nums}")
-            if row.get("steps_exhausted"):
-                lines.append("      ⚠️ ステップ上限に達し、回答に到達しませんでした（推測はしません）")
-                for ev in (row.get("evidence") or [])[:4]:
-                    lines.append(f"      根拠: {truncate(ev, 130)}")
-            for step in (row.get("trace") or [])[:3]:
-                lines.append(f"      ↳ {step['tool']}"
-                             f"({truncate(json.dumps(step['args'], ensure_ascii=False), 60)})"
-                             f" hits={step['hits']}")
-        if data.get("citations"):
-            lines.append("出典:")
-            for cite in data["citations"][:6]:
-                lines.append(f"  - [{cite.get('source')}] {truncate(cite.get('title') or '', 80)} {cite.get('url')}")
-        lines.append(f"ℹ️ {data.get('usage_note', '')}")
-        return "\n".join(lines)
-
-    if name == "freeagent_delegate":
-        return (f"exit={data.get('exit_code')}（{data.get('elapsed_s')}s）\n"
-                f"{truncate(data.get('stdout') or '', 2000)}")
+    renderer = _RENDERERS.get(name)
+    if renderer is not None:
+        return renderer(data)
 
     return truncate(json.dumps(data, ensure_ascii=False), 2000)
 
