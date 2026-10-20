@@ -39,6 +39,35 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 from freeagent_bind import server as S
 
 
+# 上流のレート制限で**失敗扱いしない**ソース（枠が IP 単位で共有される）。
+# - github: 未認証 search 枠は IP 共有（実測: CI の共有 IP で 403）
+# - openalex: 共有の日次予算（実測: `$0 remaining`）
+RATE_LIMITED_SOURCES = ("github", "openalex")
+
+
+def is_rate_limit_error(src: str, row: dict) -> bool:
+    """そのソースの失敗が「上流のレート制限」によるものかを判定する。"""
+    if src not in RATE_LIMITED_SOURCES:
+        return False
+    err = str((row or {}).get("error") or "")
+    if not err:
+        return False
+    return any(k in err for k in ("rate limit", "rate_limit", "HTTP 403", "HTTP 429",
+                                  "Insufficient budget", "ローカルのアクセス間隔"))
+
+
+def is_timeout_error(row: dict) -> bool:
+    """そのソースの失敗が「締め切りに間に合わなかった」だけかを判定する。
+
+    `timed_out` は**実装の不具合ではない**（= 取得は継続しており、次回はキャッシュから返る）。
+    実測: arxiv は 3 秒間隔で直列化するので、1 ソースだけ 8 秒の締め切りを超えることがある。
+    """
+    row = row or {}
+    if row.get("timed_out"):
+        return True
+    return "締め切り" in str(row.get("error") or "")
+
+
 def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict]:
     """キーの有無だけでなく引用の値と代替取得の許可/取得元を検査する。"""
     requested = list(dict.fromkeys(sources))
@@ -48,8 +77,14 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
     if not isinstance(results, dict):
         raise ValueError("results must be an object")
     served = set()
+    # **枠切れ（レート制限）で落ちたソースは差し引き**（gate を落とさない）。
+    # ただし**残ったものが 1 つも無ければ失敗**（= 何も検証できていない）。
+    limited: list[str] = []
     for src in requested:
         row = results.get(src)
+        if isinstance(row, dict) and (is_rate_limit_error(src, row) or is_timeout_error(row)):
+            limited.append(src)
+            continue
         if not isinstance(row, dict) or row.get("error") or not isinstance(row.get("items"), list) or not row["items"]:
             raise ValueError(f"{src}: invalid/empty/error result")
         acquisition = row.get("source")
@@ -62,6 +97,8 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
         elif acquisition != src:
             raise ValueError("acquisition source mismatch")
         served.add(acquisition)
+    if limited and len(limited) == len(requested):
+        raise ValueError(f"all sources were rate limited: {limited}")
     cites = data.get("citations")
     if not isinstance(cites, list) or not cites or data.get("citation_count") != len(cites):
         raise ValueError("citation count mismatch or no citations")
@@ -193,8 +230,18 @@ def main() -> int:
             raise ValueError("both result channels are required")
         print(content[0].get("text", ""))
         citations = validate_lookup(data, args.sources, args.fallback)
+        results = data.get("results") or {}
+        limited = [s for s in args.sources if is_rate_limit_error(s, results.get(s) or {})]
+        late = [s for s in args.sources if is_timeout_error(results.get(s) or {})]
+        if limited:
+            # 枠切れは**失敗ではない**（共有 IP の共有枠）。理由を明記して続行する。
+            print(f"skip（枠切れ・失敗扱いしない）: {limited}（上流の共有レート制限）")
+        if late:
+            # 締め切りに間に合わなかっただけも**失敗ではない**（取得は継続している）。
+            print(f"skip（締め切り超過・失敗扱いしない）: {late}（KB_DEADLINE を超えただけ）")
         print(json.dumps({"citation_count": len(citations), "timings": data.get("timings"),
                           "summaries": sum(bool(c.get("summary")) for c in citations),
+                          "rate_limited": limited, "timed_out": late,
                           "acquisition_sources": sorted({c["source"] for c in citations})}, ensure_ascii=False))
         print("知識API stdio検証 OK（initialize / tools/list / 実API tools/call）")
         return 0

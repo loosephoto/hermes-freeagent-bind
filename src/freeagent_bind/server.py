@@ -66,7 +66,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.8.3"
+SERVER_VERSION = "0.8.4"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -2998,8 +2998,17 @@ def kb_arxiv(query: str, limit: int = 5) -> dict:
 _CROSSREF_INTERVAL = max(0.0, _env_float("FREEAGENT_CROSSREF_INTERVAL", 0.1))
 
 
-def kb_crossref(query: str, limit: int = 5) -> dict:
-    """DOI 登録機関のメタデータ（書誌）。`mailto` を付けると polite pool に入る。"""
+def kb_crossref(query: str, limit: int = 5, need_evidence: bool = False) -> dict:
+    """DOI 登録機関のメタデータ（書誌）。`mailto` を付けると polite pool に入る。
+
+    **`need_evidence=True`（= `grounded` の場面）なら `filter=has-abstract:true` を付ける**（§6.18）。
+    実測: Crossref の abstract の充填率は**平均 27%**（9 クエリ × 5 件 = 45 件中 12 件）。
+    → そのままでは「引用は返るのに本文根拠 0 件」になる（= grounded の根拠が尽きる）。
+    `has-abstract:true` を付けると **9 クエリすべてで 5/5（100%）** になる。
+    代償は関連度が少し落ちる（上位に別の論文が混ざる）が、
+    **根拠が要る場面では「根拠が無い書誌」より「少し関連度の落ちた根拠」の方が有用**。
+    `need_evidence=False`（= `lookup` の場面）は**書誌の網羅性**を優先するのでフィルタしない。
+    """
     limit = as_int(limit, 5, 1, 20)
 
     def produce() -> dict:
@@ -3007,6 +3016,8 @@ def kb_crossref(query: str, limit: int = 5) -> dict:
                   "select": "DOI,title,author,issued,container-title,type,URL,abstract,is-referenced-by-count,publisher"}
         if KB_MAILTO:
             params["mailto"] = KB_MAILTO
+        if need_evidence:
+            params["filter"] = "has-abstract:true"
         data, err = _kb_new_json("https://api.crossref.org/works?" + urllib.parse.urlencode(params),
                                  _CROSSREF_INTERVAL)
         if err:
@@ -3033,7 +3044,8 @@ def kb_crossref(query: str, limit: int = 5) -> dict:
         return {"source": "crossref", "items": items, "citations": cites,
                 "error": "" if items else "該当なし"}
 
-    return _kb_cached(f"crossref:{query}:{limit}", produce)
+    # キャッシュキーに**根拠の有無を入れる**（同じクエリでも返すべき引用が違う。§6.18）。
+    return _kb_cached(f"crossref:{query}:{limit}:{'evi' if need_evidence else 'bib'}", produce)
 
 
 # ---------------------------------------------------------------- §5.5 OpenAlex
@@ -3185,7 +3197,8 @@ KB_BACKENDS = {
     "wikipedia": lambda q, limit, opts: kb_wikipedia(q, lang=opts.get("lang") or "", limit=limit),
     "wikidata": lambda q, limit, opts: kb_wikidata(q, lang=opts.get("lang") or "ja", limit=limit),
     "arxiv": lambda q, limit, opts: kb_arxiv(q, limit=limit),
-    "crossref": lambda q, limit, opts: kb_crossref(q, limit=limit),
+    "crossref": lambda q, limit, opts: kb_crossref(q, limit=limit,
+                                                 need_evidence=opts.get("need_evidence") is True),
     "openalex": lambda q, limit, opts: kb_openalex(q, limit=limit),
     "github": lambda q, limit, opts: kb_github(q, kind=opts.get("kind") or "repo", limit=limit),
 }
@@ -3252,7 +3265,8 @@ def _kb_gather(picked: list[str], query: str, limit: int, opts: dict,
 
 def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int = 3,
                      lang: str = "ja", kind: str = "repo", max_workers: int | None = None,
-                     deadline: float | None = None, datacite_kind: str = "all", fallback: bool = False) -> dict:
+                     deadline: float | None = None, datacite_kind: str = "all", fallback: bool = False,
+                     need_evidence: bool = False) -> dict:
     """指定ソースを**並列に**引いて、出典つきでまとめる。LLM を使わないので幻覚が入らない。
 
     全体の締め切り（`KB_DEADLINE`）までに届いた分だけ返す（§5.8）。`max_workers` は互換のため
@@ -3272,7 +3286,10 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
     limit = as_int(limit, 3, 1, 10)
     # lang 未指定は「空」で渡す（wikipedia が問いから自動判定する。wikidata は or "ja" で従来どおり）。
     opts = {"lang": as_str(lang, ""), "kind": as_str(kind, "repo"),
-            "datacite_kind": as_str(datacite_kind, "all"), "fallback": fallback is True}
+            "datacite_kind": as_str(datacite_kind, "all"), "fallback": fallback is True,
+            # 「本文根拠が要る場面か」= `grounded`。**根拠の確保を最優先する場面**と
+            # **書誌の網羅性を最優先する場面**は違う（§6.18）。
+            "need_evidence": need_evidence is True}
     by_source, timings = _kb_gather(picked, query, limit, opts, deadline)
     citations: list[dict] = []
     errors = {}
@@ -4526,8 +4543,13 @@ KB_BACKENDS.update({
 #     pkg.go.dev（キーワード検索 API 無し）/ Homebrew・Go module index（一括ダンプ）/ Zenn（非公式 API）。
 
 
-def kb_hn(query: str, limit: int = 5) -> dict:
-    """Hacker News（Algolia 検索）の投稿。帰属表示が必要。本文は投稿者による議論テキスト。"""
+def kb_hn(query: str, limit: int = 5, need_evidence: bool = False) -> dict:
+    """Hacker News（Algolia 検索）の投稿。帰属表示が必要。本文は投稿者による議論テキスト。
+
+    `need_evidence=True`（= `grounded` の場面）なら**コメントも検索する**（§6.18）。
+    実測: `tags=story` の `story_text` はほぼ空（リンク投稿）→ 根拠 0 件。
+    `tags=comment` の `comment_text` には議論本文が入る（実測 263〜1607 文字）。
+    """
     query = as_str(query)
     limit = as_int(limit, 5, 1, 20)
     if not query:
@@ -4536,33 +4558,63 @@ def kb_hn(query: str, limit: int = 5) -> dict:
                    "https://hn.algolia.com/")
 
     def produce() -> dict:
+        # **story と comment の両方を検索する**（§6.18）。
+        # 実測: `tags=story` の `story_text` は**ほぼ空**（リンク投稿のため）→ 根拠 0 件。
+        # 一方 `tags=comment` の `comment_text` には**議論本文**が入る（実測 263〜1607 文字）。
+        # Algolia は `tags` を複数指定できない（実測: `(story,comment)` は story と同じ結果）。
+        # → **別のクエリとして 2 回**取り、コメントを先に（本文が根拠になるため）、story を後に置く。
         params = {"query": query, "tags": "story", "hitsPerPage": limit}
         data, err = _kb_new_json("https://hn.algolia.com/api/v1/search?"
                                  + urllib.parse.urlencode(params), 0.4)
         if err:
             return {"source": "hn", "error": err}
         rows = _kb_array(_kb_object(data, "HN応答").get("hits"), "hits")
+        comment_rows: list = []
+        if need_evidence:
+            cparams = {"query": query, "tags": "comment", "hitsPerPage": limit}
+            # **予算キーを分ける**（同じホストの別エンドポイント。`_kb_new_json` の逃げ道）。
+            # 分けないと 2 連打で 2 番目が「HTTP 429: ローカルのアクセス間隔制御」で落ち、
+            # comment 側の結果が 0 件になっていた（実測）。
+            cdata, cerr = _kb_new_json("https://hn.algolia.com/api/v1/search?"
+                                       + urllib.parse.urlencode(cparams), 0.4,
+                                       budget_key="hn.algolia.com/search-comment")
+            if cerr:
+                # comment が落ちても story は生かす（**片方の失敗で全部dropsさせない**）。
+                comment_rows = []
+            else:
+                comment_rows = _kb_array(_kb_object(cdata, "HN応答").get("hits"), "hits")
         items = []
-        for row in rows[:limit]:
+        # コメント → story の順（**本文が根拠になる方を先に**出す）。
+        for row, is_comment in [(r, True) for r in comment_rows] + [(r, False) for r in rows]:
             if not isinstance(row, dict):
                 raise ValueError("HN の hit はオブジェクトではありません")
             oid = as_str(row.get("objectID"))
-            title = _plain_text(as_str(row.get("title")), 300)
+            title = _plain_text(as_str(row.get("title") or row.get("story_title")), 300)
             if not oid or not title:
                 continue
+            body = as_str(row.get("comment_text") if is_comment else row.get("story_text"))
             points, comments = row.get("points"), row.get("num_comments")
+            extra = {"points": points if type(points) is int else None,
+                     "comments": comments if type(comments) is int else None,
+                     "article_url": as_str(row.get("url"))}
+            if is_comment:
+                # コメントは**属する story の ID** を残す（上位 story へ辿れるように）。
+                extra["story_id"] = as_str(row.get("story_id")) or None
+                extra["parent_id"] = as_str(row.get("parent_id")) or None
             items.append({"title": title,
                           "url": "https://news.ycombinator.com/item?id=" + urllib.parse.quote(oid, safe=""),
-                          "summary": _plain_text(as_str(row.get("story_text")), 600),
-                          "identifier": oid, "kind": "hn-story", "summary_kind": "discussion",
+                          "summary": _plain_text(body, 600),
+                          "identifier": oid, "kind": "hn-comment" if is_comment else "hn-story",
+                          "summary_kind": "discussion",
                           "year": as_str(row.get("created_at"))[:4], "container": "Hacker News",
                           "authors": [as_str(row.get("author"))] if as_str(row.get("author")) else [],
-                          "extra": {"points": points if type(points) is int else None,
-                                    "comments": comments if type(comments) is int else None,
-                                    "article_url": as_str(row.get("url"))}})
+                          "extra": extra})
+            if len(items) >= limit:
+                break
         return _kb_generic_result("hn", items, attribution)
 
-    return _kb_new_cached(f"hn:{query}:{limit}", "hn", produce)
+    # キャッシュキーに**根拠の有無を入れる**（コメント検索の有無で結果が違う。§6.18）。
+    return _kb_new_cached(f"hn:{query}:{limit}:{'evi' if need_evidence else 'bib'}", "hn", produce)
 
 
 def kb_swh(query: str, limit: int = 5) -> dict:
@@ -4648,7 +4700,8 @@ def kb_librariesio(query: str, limit: int = 5) -> dict:
 
 
 SOURCES = (*SOURCES, "hn", "swh", "librariesio")
-KB_BACKENDS.update({"hn": lambda q, limit, opts: kb_hn(q, limit),
+KB_BACKENDS.update({"hn": lambda q, limit, opts: kb_hn(q, limit,
+                                                    need_evidence=opts.get("need_evidence") is True),
                     "swh": lambda q, limit, opts: kb_swh(q, limit),
                     "librariesio": lambda q, limit, opts: kb_librariesio(q, limit)})
 
@@ -5358,7 +5411,10 @@ def tool_grounded(args: dict) -> dict:
     kb = knowledge_lookup(question, sources, limit=as_int(args.get("limit"), 3, 1, 10),
                           lang=as_str(args.get("lang"), ""),
                           kind=as_str(args.get("github_kind"), "repo"),
-                          datacite_kind=as_str(args.get("datacite_kind"), "all"), fallback=args.get("fallback") is True)
+                          datacite_kind=as_str(args.get("datacite_kind"), "all"), fallback=args.get("fallback") is True,
+                          # **本文根拠が要る場面**（§6.18）。crossref は `has-abstract:true` を、
+                          # hn はコメントも検索する（根拠の充填率を上げる）。
+                          need_evidence=True)
     citations = [c for c in (kb.get("citations") or []) if _kb_has_evidence(c)]
     if not citations:
         return {"error": "根拠が 0 件でした。query を変えるか sources を広げてください",
@@ -6631,7 +6687,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "query": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6ソース: wikipedia / wikidata / arxiv / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。検索構文 tag:Python user:foo created:>2026-01-01。**未認証は 60 回/時**で別の問いは 1 分待ち、FREEAGENT_QIITA_TOKEN を設定すると 1,000 回/時）。対象は科学とプログラミングまでで医学・生物学は含まない"},
+                            "description": "既定6ソース: wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件） / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。検索構文 tag:Python user:foo created:>2026-01-01。**未認証は 60 回/時**で別の問いは 1 分待ち、FREEAGENT_QIITA_TOKEN を設定すると 1,000 回/時）。対象は科学とプログラミングまでで医学・生物学は含まない"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
                 "lang": {"type": "string", "description": "Wikipedia / Wikidata の言語。**wikipedia は省略時に問いから自動**（日本語・中国語・韓国語なら ja、それ以外は en。英語の語（Transformer など）は自動で en になるので、通常は指定しない。**wikidata は既定 ja 固定**（実測で ja の方が当たったため。en にすると機械学習の項目が電気機器に化ける）。明示するとその言語で引く"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須・10 req/分）。code はファイルへのポインタと一致箇所の断片を返し、ライセンス情報を含まない（取り込む前に repo 検索で確認する）。repo: owner/name・path:・language:・filename:・in:file の修飾子を付けると精度が上がる"},
@@ -6656,7 +6712,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "question": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6種。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**question は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。**未認証は 60 回/時**、FREEAGENT_QIITA_TOKEN で 1,000 回/時）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。**crossref / hn は抄録・本文が無く grounded の本文根拠にならない**（書誌と議論のメタデータだけ）。医学・生物学は対象外"},
+                            "description": "既定6種（wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件）/ crossref / openalex / github）。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**question は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。**未認証は 60 回/時**、FREEAGENT_QIITA_TOKEN で 1,000 回/時）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。**crossref は抄録が無い書誌が多い**（grounded では抄録の有る論文に絞る） / **hn は議論のコメントが本文根拠になる**（故事的リンク投稿は本文が無い）。医学・生物学は対象外"},
                 "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
                 "limit": {"type": "integer"},

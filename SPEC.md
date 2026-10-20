@@ -750,6 +750,41 @@ fan-out では各ソースが独立スレッドなので、1 ソースが待っ�
 - `Retry-After` があると尊重するが、**待つ上限**（`_KB_HTTP_429_MAX_WAIT_S`）を掛ける
   （Google 等は数秒〜数分なので、無制限には待たない）。
 
+### 6.18 引用の根拠充填率（2026-10-20・v0.8.4）
+
+健全性監査で挙がった「引用は返るのに本文根拠が無い」を実測して直した。
+**根拠の要否は場面で違う**ので、**場面ごとに別の取り方**にしている。
+
+**実測 1 — crossref の abstract 充填率は平均 27%**（9 クエリ × 5 件 = 45 件中 12 件）。
+クエリによって 0/5（rust programming language・static analysis・webAssembly・blockchain）から
+5/5（type theory）まで偏る。→ そのままでは `grounded` の**根拠が尽きる**。
+Crossref は `filter=has-abstract:true` を公式にサポートしている。
+これを付けると **9 クエリすべてで 5/5（45/45 = 100%）**。関連度は少し落ちる（上位に別の論文が混ざる）が、
+**根拠が要る場面では「根拠が無い書誌」より「少し関連度の落ちた根拠」の方が有用**。
+
+**実測 2 — hn の `story_text` はほぼ空**（リンク投稿なので）。
+`tags=story` の検索だけだと**根拠 0 件**。一方 `tags=comment` の `comment_text` には
+**議論本文**が入る（実測 263〜1607 文字）。Algolia は `tags` を複数指定できない
+（実測: `(story,comment)` は story と同じ結果）→ **別のクエリとして 2 回**取る。
+
+**実測 3 — arXiv は日本語クエリで 0 件**（英語なら 5/5）。
+→ `sources` 説明（`freeagent_lookup` / `freeagent_grounded` 両方）に**「英文の語で指定」**を明記。
+
+**設計 — `need_evidence` フラグ**。
+`knowledge_lookup` に `need_evidence`（既定 False）を足し、`grounded` だけが True で呼ぶ。
+- `grounded`（根拠が要る場面）: crossref は `has-abstract:true` を付け、hn はコメントも検索する。
+- `lookup`（書誌の網羅性が要る場面）: **絞り込まない**（フィルタしない）。
+
+**実装上の注意（この特定の変更で踏んだ）**:
+- **キャッシュキーにも根拠の有無を入れる**。crossref / hn は**同じクエリでも返すべき引用が違う**
+  （crossref は `has-abstract` の有無で別の論文を返す）。入れないと先に取った結果が使い回される
+  （実測: フラグを立てても充填率が 27% のままだった）。
+- **同一ホストへ 1 回の取得で複数のエンドポイントを叩くときは `budget_key` で予算を分ける**。
+  hn の story → comment の 2 連打は**別予算キー**にしないと 2 番目が
+  「HTTP 429: ローカルのアクセス間隔制御」で落ち、comment 側の結果が 0 件になっていた
+  （`if not cerr` で黙って捨てられていた）。`_kb_new_json` の docstring が明示している逃げ道。
+- **片方の失敗で全部落とさない**。comment が落ちても story は生かす。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。
