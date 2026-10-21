@@ -17,7 +17,7 @@ Internet Archive / Qiita）で
                                              §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 /
                                              §2.7 思考台帳の構造（分解・改訂・分岐・仮説））
   §3 プロバイダとモデル（§3.1 Free-tier provider guards / §3.2 チャット向けの選別 /
-                    §3.3 一覧の取得＝並列・締め切り・プロセス間キャッシュ）  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
+                    §3.3 一覧の取得＝並列・締め切り・プロセス間キャッシュ）  §4 サブLLM呼び出し    §5 知識バックエンド（§5.2.1 接続の再利用 / §5.8 締め切り / §5.9 DataCite /
                     §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR /
                     §5.16 DOAJ・npm・crates.io / §5.17 CiNii Research（appid 必須） / §5.18 プログラミング・標準 /
                     §5.19 科学（医学・生物学は対象外） / §5.20 プログラミング特化: HN・Software Heritage・Libraries.io /
@@ -67,7 +67,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.9.0"
+SERVER_VERSION = "0.9.1"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -3044,7 +3044,7 @@ def kb_wikidata(query: str, lang: str = "ja", limit: int = 3) -> dict:
     def produce() -> dict:
         q = urllib.parse.urlencode({"action": "wbsearchentities", "format": "json", "language": lang,
                                     "uselang": lang, "search": query, "limit": limit})
-        data, err = kb_json(f"https://www.wikidata.org/w/api.php?{q}")
+        data, err = kb_json_keepalive(f"https://www.wikidata.org/w/api.php?{q}")
         if err:
             return {"source": "wikidata", "error": err}
         hits = (data or {}).get("search") or []
@@ -3054,7 +3054,7 @@ def kb_wikidata(query: str, lang: str = "ja", limit: int = 3) -> dict:
         if ids:
             q2 = urllib.parse.urlencode({"action": "wbgetentities", "format": "json",
                                          "ids": "|".join(ids[:limit]), "props": "claims"})
-            e_data, _ = kb_json(f"https://www.wikidata.org/w/api.php?{q2}")
+            e_data, _ = kb_json_keepalive(f"https://www.wikidata.org/w/api.php?{q2}")
             entities = ((e_data or {}).get("entities") or {})
         claims_out: dict[str, list] = {}
         for qid in ids[:limit]:
@@ -3082,7 +3082,7 @@ def kb_wikidata(query: str, lang: str = "ja", limit: int = 3) -> dict:
             q3 = urllib.parse.urlencode({"action": "wbgetentities", "format": "json",
                                          "ids": "|".join(sorted(ref_ids)[:40]), "props": "labels",
                                          "languages": lang})
-            l_data, _ = kb_json(f"https://www.wikidata.org/w/api.php?{q3}")
+            l_data, _ = kb_json_keepalive(f"https://www.wikidata.org/w/api.php?{q3}")
             for qid, ent in ((l_data or {}).get("entities") or {}).items():
                 lab = (((ent.get("labels") or {}).get(lang) or {}).get("value"))
                 if lab:
@@ -3102,6 +3102,250 @@ def kb_wikidata(query: str, lang: str = "ja", limit: int = 3) -> dict:
                 "error": "" if items else "該当なし"}
 
     return _kb_cached(f"wd:{lang}:{query}:{limit}", produce)
+
+
+# ---------------------------------------------------------------- §5.2.1 接続の再利用（wikidata の api.php）
+#
+# 実測（2026-10-21・この環境）: `kb_wikidata` は api.php を**最大 3 回**直列に呼ぶ
+# （wbsearchentities → wbgetentities(claims) → wbgetentities(labels)）。呼び出しごとに TCP + TLS を
+# 張り直すと 3 連続の中央値 3.732 秒、1 本の接続で通すと 3.096 秒（**-0.636 秒・17%**。
+# TLS ハンドシェイクは 163〜183ms／回なので、2 回ぶん ≈ 0.35 秒は確実に消える）。
+# 2 番目の `wbgetentities(claims)` は**約 1.0 MB を chunked（Content-Length 無し）**で返すので、
+# 「読み切れば在庫に返せる」ことが条件になる（下の `_ka_read_body`）。
+#
+# 共用経路（`kb_http`）に混ぜない理由: `kb_http` はリダイレクト追従・プロキシ env・読み取り途中の
+# 打ち切りを持つ 24 ソース共通の道で、接続の使い回しを入れると影響範囲が一気に広がる。
+# ここは**接続の再利用だけ**を担い、
+#   * リダイレクトは追わない（wikidata の api.php は 200 を返す。実測）
+#   * プロキシが設定された環境では `kb_json` へ委譲する（`ProxyHandler` の挙動を変えない）
+#   * `FREEAGENT_KB_KEEPALIVE=0` でも `kb_json` へ委譲する（切り分け用）
+#   * 予算は `_kb_deadline_at()`（§5.8 がワーカースレッドへ載せる親の締め切り）と
+#     `FREEAGENT_KB_TIMEOUT` の小さいほう
+# に限定する。**死んだ接続は「失敗」ではなく作り直して 1 回だけやり直す**（持続接続の失効を
+# 遮断と混同しない。遮断するのは 2 回目も失敗したときだけ＝`kb_http` と同じ扱い）。
+#
+# 在庫は origin ごとに `FREEAGENT_KB_POOL_MAX` 本（既定 2）まで、空きは `FREEAGENT_KB_POOL_IDLE`
+# 秒（既定 120）で捨てる。**貸出中は在庫から外す**ので、同時実行が待たされることはない。
+
+_KA_POOL_MAX = max(0, min(8, _env_int("FREEAGENT_KB_POOL_MAX", 2)))
+_KA_POOL_IDLE = max(1.0, min(3600.0, _env_float("FREEAGENT_KB_POOL_IDLE", 120.0)))
+_KA_IDLE: dict[str, list[tuple[http.client.HTTPConnection, float]]] = {}
+_KA_LOCK = threading.Lock()
+_KA_OPENS = [0]        # 接続を作った回数（回帰テストと実測のため）
+
+
+def _ka_close(conn) -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _ka_reset() -> None:
+    """在庫を空にする（テストと切り分け用）。**貸出中の接続には触らない**。"""
+    with _KA_LOCK:
+        pools = list(_KA_IDLE.values())
+        _KA_IDLE.clear()
+    for entries in pools:
+        for conn, _at in entries:
+            _ka_close(conn)
+
+
+def _ka_ssl_context() -> ssl.SSLContext:
+    """`_OPENER` と同じ `SSLContext` を使う（`_refresh_ssl_context` の更新が効く）。"""
+    for handler in getattr(_OPENER, "handlers", ()):
+        if isinstance(handler, _HTTPSHandler):
+            ctx = getattr(handler, "_context", None)
+            if isinstance(ctx, ssl.SSLContext):
+                return ctx
+    return ssl.create_default_context()
+
+
+def _ka_proxied(host: str) -> bool:
+    """プロキシ経由が必要な環境か（`urllib` と同じ判定を使う）。判定できないときは True（共用経路へ）。"""
+    try:
+        proxies = urllib.request.getproxies()
+        if not proxies:
+            return False
+        return not urllib.request.proxy_bypass(host)
+    except Exception:
+        return True
+
+
+def _ka_allowed(url: str) -> bool:
+    """接続を使い回して良いか（プロキシ環境と `FREEAGENT_KB_KEEPALIVE=0` では共用経路へ）。"""
+    if _KA_POOL_MAX <= 0 or not _env_on("FREEAGENT_KB_KEEPALIVE", True):
+        return False
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except ValueError:
+        return False
+    return not _ka_proxied(host)
+
+
+def _ka_new_conn(parts, budget: float) -> http.client.HTTPConnection:
+    """新しい接続を作る（`timeout` は**接続と読み取りの両方**に掛ける）。"""
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    timeout = max(0.5, min(budget, CONNECT_TIMEOUT))
+    _KA_OPENS[0] += 1
+    if parts.scheme == "https":
+        return http.client.HTTPSConnection(parts.hostname, port, timeout=timeout,
+                                           context=_ka_ssl_context())
+    return http.client.HTTPConnection(parts.hostname, port, timeout=timeout)
+
+
+def _ka_set_timeout(conn, end: float) -> float:
+    """残り予算を `conn.timeout` とソケットの両方に張る（片方だけだと 1 回の recv が予算を超える）。"""
+    left = max(0.2, end - time.monotonic())
+    conn.timeout = left
+    sock = getattr(conn, "sock", None)
+    if sock is not None:
+        try:
+            sock.settimeout(left)
+        except (OSError, ValueError):
+            pass
+    return left
+
+
+def _ka_borrow(origin: str):
+    """在庫から 1 本借りる（期限切れは捨てる）。無ければ None（呼び出し側が新しく作る）。"""
+    cutoff = time.monotonic() - _KA_POOL_IDLE
+    stale: list = []
+    with _KA_LOCK:
+        entries = _KA_IDLE.get(origin) or []
+        while entries:
+            conn, at = entries.pop()
+            if at >= cutoff:
+                _KA_IDLE[origin] = entries
+                for old in stale:
+                    _ka_close(old)
+                return conn
+            stale.append(conn)
+        _KA_IDLE.pop(origin, None)
+    for old in stale:
+        _ka_close(old)
+    return None
+
+
+def _ka_give_back(origin: str, conn) -> None:
+    """在庫へ返す（満杯なら閉じる）。**壊れた接続は返さない**（呼び出し側が `_ka_close` する）。"""
+    if _KA_POOL_MAX <= 0:
+        _ka_close(conn)
+        return
+    with _KA_LOCK:
+        entries = _KA_IDLE.setdefault(origin, [])
+        if len(entries) < _KA_POOL_MAX:
+            entries.append((conn, time.monotonic()))
+            return
+    _ka_close(conn)
+
+
+def _ka_read_body(resp, deadline: float) -> str:
+    """持続接続用の読み取り（`_kb_read_within` と同じ 2 段構え・**重複ヒューリスティック無し**）。
+
+    在庫へ返す条件は「**本文を読み切った**」こと。`_kb_read_within` はテストの `FakeResp` 用に
+    「同じ内容が 2 回続いたら終端」という推測を持つが、その推測で止まると**未読を残したまま**
+    接続を返すことになり、次のリクエストが壊れる。ここは終端の理由を区別できるよう、
+    `read1` が空を返すか `Content-Length` に達するまでしか止めない
+    （chunked の終端でも `read1` は空を返す。実測: 1.0 MB の chunked 応答で確認）。
+    """
+    chunks: list[bytes] = []
+    total = 0
+    expected = _kb_content_length(resp)
+    reader = getattr(resp, "read1", None)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"読み取りが {KB_TIMEOUT:g} 秒の予算を超えました")
+        _kb_set_socket_timeout(resp, remaining)
+        try:
+            chunk = reader(65536) if reader is not None else resp.read(65536)
+        except (TimeoutError, socket.timeout) as exc:
+            raise TimeoutError(f"読み取りが {KB_TIMEOUT:g} 秒の予算を超えました") from exc
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if expected is not None and total >= expected:
+            break
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
+def kb_json_keepalive(url: str, *, timeout: float | None = None) -> tuple[dict | None, str]:
+    """JSON を取る（**接続を使い回す版**・§5.2.1）。戻り値の形は `kb_json` と同じ。
+
+    プロキシ環境と `FREEAGENT_KB_KEEPALIVE=0` では `kb_json` へ委譲する（挙動を変えない）。
+    現時点の呼び出し元は wikidata のみ。
+    """
+    if not _ka_allowed(url):
+        return kb_json(url)
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError as exc:
+        return None, f"URL が不正です: {exc}"
+    host = parts.netloc
+    if _kb_is_blocked(host):
+        return None, f"blocked: {host} は直近の失敗により一時的にスキップしています"
+    end = time.monotonic() + max(0.1, KB_TIMEOUT if timeout is None else timeout)
+    deadline_at = _kb_deadline_at()
+    if deadline_at is not None:
+        end = min(end, deadline_at)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    headers = {"User-Agent": KB_USER_AGENT, "Accept": "application/json"}
+    error = "応答がありませんでした"
+    for attempt in range(2):
+        remaining = end - time.monotonic()
+        if remaining <= 0.2:
+            error = "締め切りの残りが足りません"
+            break
+        conn = _ka_borrow(origin)
+        if conn is None:
+            conn = _ka_new_conn(parts, remaining)
+        else:
+            _ka_set_timeout(conn, end)
+        try:
+            conn.request("GET", target, headers=headers)
+            resp = conn.getresponse()
+        except Exception as exc:
+            # 在庫の接続が失効していた（サーバー側のアイドル切断など）／接続できない。
+            _ka_close(conn)
+            error = f"{type(exc).__name__}: {exc}"
+            if attempt == 0:
+                continue                      # 作り直して 1 回だけやり直す
+            _kb_block(host, 120.0)
+            return None, error
+        retry_after = resp.headers.get("Retry-After") if getattr(resp, "headers", None) else None
+        reusable = not getattr(resp, "will_close", True)
+        try:
+            body = _ka_read_body(resp, end)
+        except Exception as exc:
+            _ka_close(conn)
+            error = f"{type(exc).__name__}: {exc}"
+            if attempt == 0 and time.monotonic() < end:
+                continue
+            _kb_block(host, 120.0)
+            return None, error
+        if reusable:
+            _ka_give_back(origin, conn)
+        else:
+            _ka_close(conn)
+        status = int(resp.status)
+        if status == 429 and attempt == 0:
+            # `kb_http` と同じ扱い: 429 は**再試行**で直る（遮断しない）。
+            wait_s = min(_parse_retry_after(retry_after, None), _KB_HTTP_429_MAX_WAIT_S)
+            if wait_s > 0 and time.monotonic() + wait_s < end:
+                time.sleep(wait_s)
+            continue
+        if status in (403, 429, 503):
+            _kb_block(host, _parse_retry_after(retry_after, None) if status == 429 else _KB_BLOCK_S)
+        if status != 200:
+            return None, f"HTTP {status}: {body[:200]}"
+        try:
+            return json.loads(body), ""
+        except ValueError as exc:
+            return None, f"JSON 解析失敗: {exc}"
+    return None, error
 
 
 # ---------------------------------------------------------------- §5.3 arXiv

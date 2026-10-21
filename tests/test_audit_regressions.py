@@ -178,7 +178,7 @@ class TestAuditRegressions(unittest.TestCase):
         def fake(url, **kwargs):
             urls.append(url)
             return {"search": []}, ""
-        with mock.patch.object(S, "kb_json", side_effect=fake):
+        with mock.patch.object(S, "kb_json_keepalive", side_effect=fake):
             S.KB_BACKENDS["wikidata"]("transformer-wd", 1, {"lang": ""})
         self.assertTrue(urls)
         self.assertIn("language=ja", urls[0], urls[0])
@@ -458,7 +458,7 @@ class TestAuditRegressions(unittest.TestCase):
             ({"search": [{"id": "Q1", "label": "Thing", "description": "A thing"}]}, ""),
             ({"entities": {"Q1": {"claims": {}}}}, ""),
         ]
-        with mock.patch.object(S, "kb_json", side_effect=responses):
+        with mock.patch.object(S, "kb_json_keepalive", side_effect=responses):
             got = S.kb_wikidata("cite-summary", limit=1)
         self.assertEqual(got["citations"][0]["summary"], "A thing")
 
