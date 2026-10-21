@@ -138,11 +138,13 @@ class InstallerCase(unittest.TestCase):
         for line in self.m.write_plan(plan, force=True):
             self.assertTrue(line.startswith("wrote:"), line)
         for path in (self.cfg["paths"]["worker"], self.cfg["paths"]["startup"]):
-            raw = open(path, "rb").read()
+            with open(path, "rb") as fh:
+                raw = fh.read()
             self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"), ".vbs は全行 CRLF であること")
 
             raw.decode("ascii")  # 非 ASCII が混ざれば UnicodeDecodeError
-        launcher = open(self.cfg["paths"]["launcher"], "rb").read()
+        with open(self.cfg["paths"]["launcher"], "rb") as fh:
+            launcher = fh.read()
         self.assertNotIn(b"\r\n", launcher, "pythonw が読む .pyw は LF でよい")
 
     def test_existing_files_are_kept_without_force(self):

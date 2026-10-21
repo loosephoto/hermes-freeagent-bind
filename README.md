@@ -591,6 +591,10 @@ v0.9.1 は**wikidata の接続の再利用（keep-alive）**（SPEC §6.1.1）�
 在庫は origin ごとに `FREEAGENT_KB_POOL_MAX` 本（既定 2）・空きは `FREEAGENT_KB_POOL_IDLE` 秒（既定 120）で
 捨てる。プロキシ環境では常に無効。回帰は `tests/test_kb_wikidata.py`（17 件・ネットワーク不要）。
 
+v0.9.2 は**テストコードの品質のみ**（`tests/test_resident_installer.py` の `ResourceWarning` を解消。
+`open(...).read()` を `with open(...) as fh:` に直した）。**サーバーの挙動は v0.9.1 と同じ**で、
+ツール定義も変わらない（文字数 15,972 のまま）。
+
 
 検索APIの追加は推論モデルの能力を増やしません。ツールスキーマの増加もメインLLMの入力負担になります。
 
