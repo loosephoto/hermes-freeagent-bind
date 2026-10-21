@@ -1,6 +1,8 @@
 """Gemini Developer API free-tier provider contracts (offline)."""
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -28,7 +30,19 @@ class TestGeminiFreeTier(unittest.TestCase):
         self.assertIn("generativelanguage.googleapis.com/v1beta/openai",
                       S.PROVIDER_SPECS["gemini"]["base_url"])
 
+    def _restore_state_dir(self):
+        if self._old_state is None:
+            os.environ.pop("FREEAGENT_STATE_DIR", None)
+        else:
+            os.environ["FREEAGENT_STATE_DIR"] = self._old_state
+
     def setUp(self):
+        # カタログのディスクキャッシュ（§3.3）が**本番の状態ディレクトリ**へ書かないようにする。
+        self._tmp_state = tempfile.mkdtemp(prefix="fa-provider-")
+        self.addCleanup(lambda: shutil.rmtree(self._tmp_state, ignore_errors=True))
+        self._old_state = os.environ.get("FREEAGENT_STATE_DIR")
+        os.environ["FREEAGENT_STATE_DIR"] = self._tmp_state
+        self.addCleanup(self._restore_state_dir)
         with S._MODELS_LOCK:
             S._MODELS_CACHE.pop("gemini", None)
 

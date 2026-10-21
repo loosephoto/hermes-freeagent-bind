@@ -41,6 +41,7 @@
 | `sessions.json` | 進行中の相談（問い・ラウンド・メインの回答） | 消えると往復が切れる（TTL 1 時間） |
 | `thoughts.json` | 進行中の思考台帳（思考・計画・分岐の状態・改訂の印・仮説の状態・見積りの履歴・検証結果・代替案） | 消えると思考の連鎖が切れる（TTL 2 時間・台帳 32 件・1 台帳 24 思考） |
 | `provider_auth.json` | 認証で失敗したプロバイダ（15 分・自動選抜から外す） | 消えてよい（次の 403 で再記録） |
+| `model_catalog.json` | プロバイダ別のモデル一覧（TTL 600 秒・§4.4） | 消えてよい（次の選抜で取り直す。**プロセスをまたいで温かくするためだけ**のキャッシュ） |
 
 いずれも **tmp へ書いて `os.replace` で原子置換**し、`threading.Lock` で保護する。原子置換は
 **書きかけの `<name>.<pid>.<tid>.tmp` を掃除してから**行う（実測: 途中で落ちた書きかけが状態
@@ -149,6 +150,34 @@
   外す（目印は**区切りに囲まれた語**だけに当てる）。**明示指定は在庫の全 Free で確認する**ので
   名指ししたモデルはこれまでどおり試す。`freeagent_models` は `non_chat_candidates` に件数を出し、
   一覧では見えるままにする。
+
+### 4.4 一覧の取得（§3.3・並列・締め切り・プロセス間キャッシュ）
+
+`fetch_provider_models` / `all_models` / `provider_status` は選抜の入口で、**サブLLM のツール
+（`ask` / `panel` / `grounded` / `think` …）が必ず通る**。ここが直列だと、遅いプロバイダ 1 つの
+待ち時間がそのまま利用者の待ち時間になる（1 リクエストの上限は `min(30.0, READ_TIMEOUT)`）。
+
+- **取得の順序はメモリ → ディスク → HTTP**。ディスク（`model_catalog.json`）の TTL は 600 秒で、
+  メモリと同じ。stdio はセッションごとに新しいプロセスなので、ディスクが無いと**起動のたびに
+  全プロバイダへ投げ直していた**（実測 0.842 秒・直列）。
+- **並列 + 締め切り**: プロバイダごとに専用スレッドで投げ、`FREEAGENT_CATALOG_DEADLINE`（既定 10 秒）
+  で打ち切る（プロバイダはすべて別ホストなので同時でよい）。合計は max(各プロバイダ) になる。
+- **間に合わなかった分は前回の成功値で埋める**（メモリ → ディスク・TTL 無視）。**取得の「失敗」は
+  埋めない** — 空 + `error` のまま返し、`provider_status` に出す（規約 8。締め切り超過は「分からない」、
+  失敗は「分かった上で取れない」で別物）。
+- **単一飛行**（`_MODELS_INFLIGHT`）: 同じプロバイダの取得が進行中なら待つ（並列ツール呼び出しで
+  上流へ二重に投げない。`_kb_cached` と同じ型）。
+- **書くのは成功したときだけ**（空では書かない）。`FREEAGENT_STATE_DIR` の下に
+  `model_catalog.json`（`version` + `providers`）を tmp + `os.replace` で置き、`_file_lock` で
+  プロセス間を直列化し、読みは mtime が変わったときだけ読み直す。`FREEAGENT_CATALOG_CACHE=0` で無効化。
+  バックエンド全滅の検査（`check_offline.py`）は「状態ディレクトリにファイルが増えない」ことを見るので、
+  失敗時に書かないことが契約になる。
+- **実測（2026-10-21・この環境）**: `all_models()` 冷 0.842 秒（直列）→ 0.693 秒（並列）。
+  新しいプロセスで最初の選抜まで 0.31〜0.75 秒 → **0.0025 秒**（ディスクが温かいとき）。
+  `all_models()` を別プロセスから: 0.7965 秒 → **0.005 秒**。
+- 選抜を知識取得と**重ねる**案（`grounded` で先に選抜スレッドを起動）は**採らなかった**。早期返却
+  （根拠 0 件）の経路で提供元へ一覧要求を出す契約違反になり（`tests/test_knowledge_extensions.py` が
+  固定している）、ディスクキャッシュで縮むのは初回の 0.3 秒だけなので割に合わない。
 
 ## 5. 呼び出し（§4）
 
@@ -1004,7 +1033,7 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
 
 **既定は stdio。** `--transport http` / `FREEAGENT_TRANSPORT=http` のときだけ HTTP で待ち受ける。目的は
 「**1 プロセスを複数クライアントが共有する**」こと。stdio を N 本立てると、プロセス内に持つホスト予算
-（`_KB_RATE_NEXT`）・`_KB_CACHE` / `_KB_INFLIGHT`・`_MODELS_CACHE`（600 秒）・`_COOLDOWN`・`model_stats`・
+（`_KB_RATE_NEXT`）・`_KB_CACHE` / `_KB_INFLIGHT`・`_MODELS_CACHE`（600 秒。**一覧だけは `model_catalog.json` に落ちるので、プロセスを入れ替えても温かい**・§4.4）・`_COOLDOWN`・`model_stats`・
 `MAX_WORKERS` が N 分割される（規約 28 が警告する「同一 IP の連打」）。
 
 仕様の範囲は、Hermes の `mcp.client.streamable_http` が実際に要求する経路に絞る（実測で確定）:
@@ -1120,7 +1149,7 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
 ```bash
 python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # レジストリ・スキーマ・版の整合
-python -m unittest discover -s tests         # オフライン回帰（件数は実行結果を参照）
+python -m unittest discover -s tests         # オフライン回帰（件数は実行結果を参照。一覧キャッシュは `tests/test_catalog_cache.py`）
 python scripts/smoke_stdio.py                # 実クライアント経路（stdio）
 python scripts/smoke_http.py                 # 実クライアント経路（HTTP: 通知 202 / batch / セッション / SSE）
 python scripts/check_offline.py              # 全滅時の縮退（例外漏れ・ハング・状態汚染なし）

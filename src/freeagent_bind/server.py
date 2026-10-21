@@ -16,7 +16,8 @@ Internet Archive / Qiita）で
                                              §2.3 トレース / §2.4 相談セッション /
                                              §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 /
                                              §2.7 思考台帳の構造（分解・改訂・分岐・仮説））
-  §3 プロバイダとモデル（§3.1 Free-tier provider guards / §3.2 チャット向けの選別）  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
+  §3 プロバイダとモデル（§3.1 Free-tier provider guards / §3.2 チャット向けの選別 /
+                    §3.3 一覧の取得＝並列・締め切り・プロセス間キャッシュ）  §4 サブLLM呼び出し    §5 知識バックエンド（§5.8 締め切り / §5.9 DataCite /
                     §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR /
                     §5.16 DOAJ・npm・crates.io / §5.17 CiNii Research（appid 必須） / §5.18 プログラミング・標準 /
                     §5.19 科学（医学・生物学は対象外） / §5.20 プログラミング特化: HN・Software Heritage・Libraries.io /
@@ -66,7 +67,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.8.5"
+SERVER_VERSION = "0.9.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -1784,15 +1785,135 @@ def _context_length(provider: str, raw: dict):
     return raw.get("context_length") or raw.get("context_window")
 
 
-def fetch_provider_models(provider: str, ttl: float = 600.0) -> list[dict]:
-    """モデル一覧。Free モデルは入れ替わるので**固定しない**（毎回ここから解決する）。"""
-    spec = PROVIDER_SPECS.get(provider) or {}
-    if spec.get("catalog_requires_ready") and not provider_ready(provider):
-        return []
+# ---------------------------------------------------------------- §3.3 一覧の取得（並列・締め切り・プロセス間キャッシュ）
+#
+# 実測（2026-10-21・この環境）: 冷起動のカタログ取得は**直列で 0.842 秒**
+# （nous 0.433 / huggingface 0.313 / openrouter 0.213 / nvidia 0.102）。ここは
+# **サブLLM のツール（ask / panel / grounded / think …）が選抜の前に必ず通る**ので、
+# この待ち時間はそのまま利用者の待ち時間になる。しかも 1 リクエストの上限は 30 秒
+# （`min(30.0, READ_TIMEOUT)`）なので、1 ホストが固まると**直列の和が上限**になる。
+#   * **並列**: プロバイダはすべて別ホストなので同時に投げてよい（合計 = max(各プロバイダ)）。
+#   * **締め切り**: `FREEAGENT_CATALOG_DEADLINE`（既定 10 秒）で打ち切り、間に合わなかった
+#     プロバイダは**前回の成功値**（メモリ → ディスク・TTL 無視）で埋める。取得が
+#     「失敗」した場合は従来どおり空 + `error` を返す（失敗を隠さない・規約 8）。
+#   * **プロセス間キャッシュ**: `model_catalog.json`（`FREEAGENT_STATE_DIR`。TTL は 600 秒）。
+#     stdio はセッションごとに新しいプロセスなので、ディスクが無いと**起動のたびに
+#     全プロバイダへ投げ直す**（実測 0.842 秒）。書くのは**成功したときだけ**
+#     （規約 21。`check_offline.py` が「状態ディレクトリが空のまま」で検査する）。
+#   * **単一飛行**: 同じプロバイダの取得が進行中なら待つ（並列ツール呼び出しで上流へ二重に投げない）。
+# 一覧を信じない設計なので（規約 16）、前回値で選抜して外れても 1 回降格するだけである。
+CATALOG_TTL = 600.0                       # メモリ／ディスクの既定 TTL（秒）
+_CATALOG_FILE = "model_catalog.json"
+_CATALOG_DEADLINE_S = max(1.0, _env_float("FREEAGENT_CATALOG_DEADLINE", 10.0))
+_MODELS_INFLIGHT: dict[str, threading.Event] = {}
+_MODELS_INFLIGHT_LOCK = threading.Lock()
+_CATALOG_DISK: dict[str, dict] = {}       # provider -> {"at": float, "rows": [...]}（ディスクのミラー）
+_CATALOG_DISK_MTIME: float | None = None
+_CATALOG_DISK_LOCK = threading.Lock()
+_CATALOG_DISK_MAX_ROWS = 2000             # 1 プロバイダで保持する行数の上限（壊れた応答の歯止め）
+
+
+def catalog_path() -> str:
+    """モデル一覧のプロセス間キャッシュの置き場。"""
+    return os.path.join(state_dir(), _CATALOG_FILE)
+
+
+def catalog_cache_enabled() -> bool:
+    """ディスクキャッシュの有無（`FREEAGENT_CATALOG_CACHE=0` で無効化。テストと切り分け用）。"""
+    return _env_on("FREEAGENT_CATALOG_CACHE", True)
+
+
+def _catalog_disk_snapshot() -> dict:
+    """ディスクの内容を返す。**更新時刻（mtime）が変わったときだけ読み直す**（別プロセスの追記を見る）。
+
+    壊れたファイル・知らない形は**空として扱う**（例外を外へ漏らさない・規約 1）。
+    """
+    global _CATALOG_DISK_MTIME
+    if not catalog_cache_enabled():
+        return {}
+    path = catalog_path()
+    mtime = _file_mtime(path)
+    with _CATALOG_DISK_LOCK:
+        if mtime is None:
+            _CATALOG_DISK.clear()
+            _CATALOG_DISK_MTIME = None
+            return {}
+        if _CATALOG_DISK_MTIME == mtime:
+            return dict(_CATALOG_DISK)
+        data = _load_json(path, {})
+        providers = data.get("providers") if isinstance(data, dict) else None
+        loaded = {
+            name: {"at": row.get("at"), "rows": row.get("rows")}
+            for name, row in (providers or {}).items()
+            if isinstance(row, dict) and isinstance(row.get("rows"), list) and row.get("rows")
+        }
+        _CATALOG_DISK.clear()
+        _CATALOG_DISK.update(loaded)
+        _CATALOG_DISK_MTIME = mtime
+        return dict(loaded)
+
+
+def _catalog_disk_rows(provider: str, ttl: float) -> tuple[list[dict], bool]:
+    """ディスクの行と「TTL 内か」を返す（`ttl <= 0` は常に鮮度なし＝HTTP を出す）。"""
+    entry = _catalog_disk_snapshot().get(provider) or {}
+    rows = entry.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return [], False
+    fresh = ttl > 0 and now_ts() - as_float(entry.get("at"), 0.0) < ttl
+    return list(rows), fresh
+
+
+def _catalog_disk_store(provider: str, rows: list[dict]) -> bool:
+    """成功した一覧をディスクへ書く。**空では書かない**（環境障害で状態を汚さない・規約 21）。
+
+    読み直してから足す（他プロセスの項目を消さない）＋ `_file_lock` でプロセス間を直列化する。
+    """
+    global _CATALOG_DISK_MTIME
+    if not rows or not catalog_cache_enabled():
+        return False
+    path = catalog_path()
+    entry = {"at": now_ts(), "rows": rows[:_CATALOG_DISK_MAX_ROWS]}
+    with _file_lock(path):
+        data = _load_json(path, {})
+        providers = dict(data.get("providers") or {}) if isinstance(data, dict) else {}
+        providers[provider] = entry
+        ok = _atomic_write(path, json.dumps({"version": 1, "providers": providers},
+                                            ensure_ascii=False))
+    if ok:
+        with _CATALOG_DISK_LOCK:
+            _CATALOG_DISK[provider] = entry
+            _CATALOG_DISK_MTIME = _file_mtime(path)
+    return ok
+
+
+def _models_memory(provider: str, ttl: float | None = None) -> list[dict] | None:
+    """メモリの一覧。`ttl=None` は期限を見ない（前回値として使う）。無ければ None。"""
     with _MODELS_LOCK:
         cached = _MODELS_CACHE.get(provider)
-        if cached and now_ts() - as_float(cached.get("at"), 0.0) < ttl:
-            return list(cached.get("rows") or [])
+        if not cached:
+            return None
+        if ttl is not None and now_ts() - as_float(cached.get("at"), 0.0) >= ttl:
+            return None
+        return list(cached.get("rows") or [])
+
+
+def _models_store(provider: str, rows: list[dict], error: str = "") -> None:
+    with _MODELS_LOCK:
+        _MODELS_CACHE[provider] = {"at": now_ts(), "rows": list(rows), "error": error}
+
+
+def _catalog_stale_rows(provider: str) -> list[dict]:
+    """取得できなかったプロバイダを**前回の成功値**で埋める（メモリ → ディスク・TTL 無視）。"""
+    with _MODELS_LOCK:
+        cached = _MODELS_CACHE.get(provider) or {}
+    if cached.get("rows") and not cached.get("error"):
+        return list(cached["rows"])
+    rows, _fresh = _catalog_disk_rows(provider, 0.0)
+    return rows
+
+
+def _fetch_provider_catalog(provider: str, spec: dict) -> list[dict]:
+    """HTTP で 1 回取る（失敗も `_MODELS_CACHE` に載せる＝隠さない）。"""
     rows: list[dict] = []
     error = ""
     try:
@@ -1816,9 +1937,69 @@ def fetch_provider_models(provider: str, ttl: float = 600.0) -> list[dict]:
             })
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-    with _MODELS_LOCK:
-        _MODELS_CACHE[provider] = {"at": now_ts(), "rows": rows, "error": error}
+    _models_store(provider, rows, error)
+    if rows:
+        _catalog_disk_store(provider, rows)
     return rows
+
+
+def fetch_provider_models(provider: str, ttl: float = CATALOG_TTL) -> list[dict]:
+    """モデル一覧。Free モデルは入れ替わるので**固定しない**（毎回ここから解決する）。
+
+    取得の順序はメモリ → ディスク → HTTP（§3.3）。取得が締め切りに間に合わなかったときだけ
+    **前回の成功値**で埋める（取得の「失敗」は空 + `error` のまま返す＝失敗を隠さない）。
+    """
+    spec = PROVIDER_SPECS.get(provider) or {}
+    if spec.get("catalog_requires_ready") and not provider_ready(provider):
+        return []
+    hit = _models_memory(provider, ttl)
+    if hit is not None:
+        return hit
+    disk_rows, disk_fresh = _catalog_disk_rows(provider, ttl)
+    if disk_fresh:
+        _models_store(provider, disk_rows)
+        return list(disk_rows)
+    owner = False
+    with _MODELS_INFLIGHT_LOCK:
+        event = _MODELS_INFLIGHT.get(provider)
+        if event is None:
+            event = threading.Event()
+            _MODELS_INFLIGHT[provider] = event
+            owner = True
+    if owner:
+        try:
+            return _fetch_provider_catalog(provider, spec)
+        finally:
+            with _MODELS_INFLIGHT_LOCK:
+                _MODELS_INFLIGHT.pop(provider, None)
+            event.set()
+    # 進行中の取得を待つ（上限 `_CATALOG_DEADLINE_S`）。取れなければ前回の成功値で埋める。
+    event.wait(_CATALOG_DEADLINE_S)
+    hit = _models_memory(provider, ttl)
+    return hit if hit is not None else _catalog_stale_rows(provider)
+
+
+def _catalog_prefetch(providers: list[str], ttl: float = CATALOG_TTL,
+                      deadline: float | None = None) -> None:
+    """プロバイダごとの一覧を**並列に**取り、全体の締め切りで打ち切る（§3.3）。
+
+    締め切りを超えたプロバイダの取得は裏で続く（完了すれば次の呼び出しがディスク／メモリから温まる）。
+    """
+    budget = _CATALOG_DEADLINE_S if deadline is None else max(0.0, deadline)
+    started = []
+    for name in providers:
+        if _models_memory(name, ttl) is not None:
+            continue
+        thread = threading.Thread(target=fetch_provider_models, args=(name, ttl),
+                                  name=f"catalog-{name}", daemon=True)
+        thread.start()
+        started.append(thread)
+    end = time.monotonic() + budget
+    for thread in started:
+        left = end - time.monotonic()
+        if left <= 0:
+            break
+        thread.join(left)
 
 
 # ================================================================ §3.1 Free-tier provider guards
@@ -1943,17 +2124,23 @@ def is_chat_model(provider: str, raw: dict) -> bool:
     return not _NON_CHAT_OUTPUT_RE.search(model_id)
 
 
-def all_models(ttl: float = 600.0) -> list[dict]:
+def all_models(ttl: float = CATALOG_TTL) -> list[dict]:
+    """全プロバイダの一覧。**プロバイダごとに並列に取り、全体の締め切りで打ち切る**（§3.3）。"""
+    _catalog_prefetch(list(PROVIDER_ORDER), ttl)
     out: list[dict] = []
     for provider in PROVIDER_ORDER:
-        out.extend(fetch_provider_models(provider, ttl=ttl))
+        rows = _models_memory(provider, ttl)
+        out.extend(rows if rows is not None else _catalog_stale_rows(provider))
     return out
 
 
 def provider_status() -> list[dict]:
+    """プロバイダごとの要約。取得も**並列**（1 ホストの遅延が他を直列で待たせない・§3.3）。"""
+    _catalog_prefetch(list(PROVIDER_ORDER), CATALOG_TTL)
     rows = []
     for provider in PROVIDER_ORDER:
-        models = fetch_provider_models(provider)
+        fresh = _models_memory(provider, CATALOG_TTL)
+        models = fresh if fresh is not None else _catalog_stale_rows(provider)
         spec = PROVIDER_SPECS.get(provider) or {}
         with _MODELS_LOCK:
             error = (_MODELS_CACHE.get(provider) or {}).get("error") or ""
@@ -1980,10 +2167,13 @@ def free_model_refs(free_only: bool = True, chat_only: bool = False) -> list[str
     自動選抜とフォールバックはこちらを使い、明示指定の在庫確認は既定（全 Free）を使う。
     """
     refs: list[str] = []
+    # 一覧は**並列**に温めてから読む（冷起動の直列取得を利用者の待ち時間にしない・§3.3）。
+    _catalog_prefetch([p for p in PROVIDER_ORDER if provider_ready(p)], CATALOG_TTL)
     for provider in PROVIDER_ORDER:
         if not provider_ready(provider):
             continue
-        for row in fetch_provider_models(provider):
+        rows = _models_memory(provider, CATALOG_TTL)
+        for row in (rows if rows is not None else _catalog_stale_rows(provider)):
             if free_only and not row.get("free"):
                 continue
             if chat_only and not row.get("chat", True):
@@ -2007,6 +2197,7 @@ def resolve_ref(ref: str, free_only: bool = True) -> tuple[str, str]:
     if provider:
         return provider, model
     if model:
+        _catalog_prefetch(list(PROVIDER_ORDER), CATALOG_TTL)   # 並列に温めてから探す（§3.3）
         for name in PROVIDER_ORDER:
             if any(r["id"] == model for r in fetch_provider_models(name)):
                 return name, model
@@ -5423,6 +5614,9 @@ def tool_grounded(args: dict) -> dict:
     window = _evidence_window(citations)
     if not window["numbers"]:
         return {"error": "本文根拠を注入できませんでした。根拠の取得・本文予算を確認してください"}
+    # **根拠 0 件・本文なしで早期に返す経路では選抜を走らせない**（提供元へ無駄な一覧要求を出さない）。
+    # モデル選抜を知識取得と重ねる案は実測で採らなかった: 一覧がディスクキャッシュ（§3.3）で温まる
+    # ため、重ねて縮むのは初回だけの 0.3 秒で、早期返却の契約を壊すほうが損。
     refs, info = _select_or_error(args, default_size=2)
     if not refs:
         return _no_models()

@@ -141,7 +141,7 @@ freeagent_ask で「接続できました」と一言だけ答えさせて。
 
 KANBAN のワーカーや複数の Bot から同時に使うと、stdio では**クライアントごとに別プロセス**が立ちます。
 するとプロセス内に持っているものが分割されます: ホストごとのアクセス間隔、クールダウン、品質統計、
-モデル一覧のキャッシュ（600 秒）、同時実行の上限。同じホストへ二重に投げたり、統計が上書きされたりします
+モデル一覧のキャッシュ（600 秒）、同時実行の上限。同じホストへ二重に投げたり、統計が上書きされたりします（**モデル一覧だけは v0.9.0 からディスクにも載ります**＝プロセスを入れ替えても温かく、起動直後の選抜が待たされません。SPEC §4.4）
 （`AGENTS.md` 規約 28 が警告している状態そのものです）。HTTP モードでは **1 プロセスを複数クライアントが共有**します。
 
 ```bash
@@ -566,6 +566,16 @@ v0.8.2 は**台帳の複数プロセス競合の修正**と**`subgoal` の契約
 
 v0.8.3 は**レート予算・429 の再試行・inflight 待ちの上限**の修正。
 **ツール定義は変わらない**（文字数 15,972 のまま・往復時間も 0.2431 秒のまま）。
+
+v0.9.0 は**モデル一覧の取得の高速化**（並列・締め切り・プロセス間キャッシュ・SPEC §4.4）。
+ツール定義は変わらない（文字数 15,972 のまま）ので上表の列は増やしていない。実測（2026-10-21・この環境）:
+
+| 計測 | 変更前 | 変更後 |
+|---|---:|---:|
+| `all_models()`（冷・直列 → 並列） | 0.842〜1.135 秒 | **0.693 秒** |
+| 別プロセスから `all_models()`（ディスクが温かい） | 0.7965 秒 | **0.0050 秒** |
+| 新しいプロセスで最初の選抜まで（1 回目 / 2 回目 / 3 回目） | 0.311 / 0.504 / 0.746 秒 | 0.297 / **0.0025** / **0.0024** 秒 |
+
 
 検索APIの追加は推論モデルの能力を増やしません。ツールスキーマの増加もメインLLMの入力負担になります。
 
@@ -1175,6 +1185,8 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_KB_TTL` / `FREEAGENT_KB_TIMEOUT` | 1800.0 / 20.0 | 知識取得のキャッシュ TTL・読み取りタイムアウト（秒） |
 | `FREEAGENT_KB_429_RETRIES` / `FREEAGENT_KB_429_MAX_WAIT` | 2 / 2.0 | 429 の再試行回数と `Retry-After` を尊重して待つ上限（秒）。crossref の 429 は共有プールのTransientな拒否で、**再試行で必ず通る**（実測） |
 | `FREEAGENT_KB_RATE_WAIT_MAX` / `FREEAGENT_KB_RATE_WAIT_MARGIN` | 8.0（= `KB_DEADLINE`）/ 1.0 | ホスト予算の待ちを許す上限（秒）と、応答時間が残るよう確保する余白。待ちが上限を超えるときは待たずに 429 を返す |
+| `FREEAGENT_CATALOG_DEADLINE` | 10.0 | モデル一覧を**並列に投げて打ち切る**までの締め切り（秒・1 以上）。間に合わなかったプロバイダは前回の成功値で埋める（SPEC §4.4） |
+| `FREEAGENT_CATALOG_CACHE` | 1 | `0` でモデル一覧のプロセス間キャッシュ（`model_catalog.json`）を無効化する |
 | `FREEAGENT_KB_INFLIGHT_WAIT_MAX` | 8.0（= `KB_DEADLINE`） | 同一キーの取得を待つ上限（秒）。超えたら待たずに自分で取得する（利用者を待たせない） |
 | `FREEAGENT_CROSSREF_INTERVAL` | 0.1 | Crossref のローカル最小間隔（秒）。429 は間隔ではなく**再試行**で対処する（実測: 間隔では直らない） |
 | `FREEAGENT_KB_HEDGE_DELAY` / `FREEAGENT_KB_HEDGE_MIN_REMAINING` | 0.6 / 0.05 | 代替取得（arXiv→DataCite）を始めるまでの待ちと、締め切り直前に始めないための下限（秒） |
@@ -1248,6 +1260,8 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_TRACE_PATH` | `traces.jsonl`（トレース） |
 | `FREEAGENT_SESSIONS_PATH` | `sessions.json`（相談セッション） |
 | `FREEAGENT_THOUGHTS_PATH` | `thoughts.json`（思考台帳・TTL と上限つき。**知識は蓄積しない**） |
+
+`model_catalog.json`（**モデル一覧のプロセス間キャッシュ**・SPEC §4.4）は `FREEAGENT_STATE_DIR` 直下に固定で、パスを上書きする変数はありません（`FREEAGENT_CATALOG_CACHE=0` で無効化）。
 
 ---
 
