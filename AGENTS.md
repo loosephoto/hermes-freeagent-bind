@@ -37,6 +37,7 @@ python scripts/check_offline.py              # バックエンド全滅: 例外�
 python scripts/measure_adoption.py           # 自発利用率の測定（state.db を読むだけ・副作用なし。必要場面の近似判定も出す）
 python scripts/measure_kb.py --report         # 知識バックエンドの時間帯別の応答時間（記録を読むだけ）
 python scripts/measure_relevance.py           # 知識ソースの関連性（トップ1 の的中率。ネットワークあり）
+python scripts/measure_quality.py --cases 6   # 戦略ごとの正答率（ネットワーク・Free の枠を使う）
 python scripts/apply_proactive.py            # 率先利用の設定（既定は表示のみ。--apply で適用）
 FREEAGENT_PROBE_NET=1 python scripts/smoke_stdio.py   # バックエンド生存（プロキシが要る）
 env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py   # モデルの生存確認を定着（数分）
@@ -403,6 +404,19 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     合計呼び出し上限（`FREEAGENT_MAX_CALLS_PER_RUN`）は `["all"]` でも効かせる。
     観測値（`concurrency` / `slot_waited`）は**提供元名**で返す（ref をそのままキーにすると
     架空の提供元が並ぶ。実測）。
+
+57. **選抜は Beta 事後を決定的に使う**（SPEC §5.2）。`score = mean + 0.25·sd`（`a=1+成功, b=1+失敗`）で、
+    成功率は **kind ごとに n で重み付け**して合算する。旧実装は kind の単純平均に `0.25/(1+n)` を足し、
+    **観測 1 件の成功が n=50・90% を上回り**、同点はアルファベット順で決まっていた（実測: 本番 traces で
+    旧順位と事後平均順の上位 8 が 0/8 一致）。乱数は使わない（同じ入力で同じ順位＝テストと説明が再現する）。
+    `model_quality` / `model_status`（利用者向けの表示）は意味を変えない。順位だけが変わる。
+58. **クォータは宣言制で、宣言が無ければ状態を書かない**（SPEC §5.2）。`FREEAGENT_QUOTA_LIMITS` に
+    書いた提供元だけを使い切る前に止める（`rpm` / `rpd` / `tpm` / `tpd`、日は **UTC 境界**）。
+    宣言が無いときに `quota.json` を作ると `check_offline.py` の「状態を書かない」契約が壊れる。
+    同時実行の枠（規約 55）は**同時数**、クォータは**窓の量**で、片方だけでは守れない。
+59. **429 のクールダウンははしごを上る**（60 → 180 → 600 秒・上限 900）。1 回目は `Retry-After` を
+    尊重する（短く指定されたら従う）。**冷えてから再度 429 なら 1 段目に戻す**。一律 60 秒だと
+    「毎分 1 回叩いて毎回 429」になり、相手の枠を無駄に食う（実測: 8 モデルの panel で 1〜2 件の 429）。
 
 ## ライセンス
 

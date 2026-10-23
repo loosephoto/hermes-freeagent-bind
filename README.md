@@ -267,6 +267,9 @@ HF はモデル ID の末尾に `:提供元` を付けて経路を固定でき�
 | `models: ["all"]` で在庫の全 Free（対話モデル）を 1 語で展開 | 8 モデルの panel が 1 回で走る |
 | 並列度（スレッド）4 → 8。**提供元が違えば同時に走る** | 同一提供元は枠で直列化（枠待ち 2〜4 件を実測） |
 | 429 を受けたらその提供元の枠を 1 本減らし、成功が続けば 1 本戻す | 枠 8 → 429 で 7 → 6 へ自動縮小 |
+| **日次の上限**（宣言したもの）を使い切る前に止める | `FREEAGENT_QUOTA_LIMITS=openrouter:rpd=1000` なら 1 日 1,000 回を超えない（UTC 境界で戻る） |
+| 429 が続いたらクールダウンを延ばす | 60 → 180 → 600 秒（同じ相手を毎分叩かない） |
+| 選抜が「観測 1 件の幸運」に負けない | 旧: n=1 成功が n=50・90% を上回った → 新: Beta 事後で下回る |
 
 結果は `structuredContent.concurrency` に載ります（`per_provider` の `limit` / `cap`、`waited_total`、
 `reduced_total`、`scope` は「このプロセスの累計」）。`slot_waited` は**その呼び出しで枠待ちした件数**です。
@@ -274,6 +277,22 @@ HF はモデル ID の末尾に `:提供元` を付けて経路を固定でき�
 **429 の主因はモデル単位の upstream capacity**（`The requested model is temporarily at capacity upstream`）で、
 こちらの同時数を下げても 0 にはなりません。枠は「自分で撒いた 429」を減らす一次防護であって、
 提供元の在庫が尽きている場合（例: `This model is no longer free`）は 404 として別に返ります。
+
+### 📊 オーケストレーションを測る（`scripts/measure_quality.py`）
+
+「何人集めるか・どう統合するか」は**正答率でしか比べられません**（速度は `measure_kb.py`、自発率は
+`measure_adoption.py` が見ます）。期待値を宣言したケースで、戦略ごとの正答率・呼び出し数・秒を出します。
+
+```bash
+python scripts/measure_quality.py                     # 6 ケース・4 戦略・プール 8 体
+python scripts/measure_quality.py --cases all --repeat 2
+python scripts/measure_quality.py --strategies single,panel --json
+```
+
+- 戦略: `single`（1 体）/ `panel`（多数決）/ `moa`（提案 → 統合）/ `cascade`（2 体で一致したら打ち切り）
+- 採点は**機械判定**（数値は許容誤差、文字列は受理リストの部分一致）。主観文の採点はしません
+- 結果は `<state>/quality.jsonl` に追記（`--no-write` で止まる）。**実呼び出し**なので Free の枠を使います
+- **ケースが少ないと天井に当たります**（実測: 4〜6 問では全戦略 100%）。判断は `--cases all --repeat 2` で
 
 ## 🧠 複雑な問題を段階的に考える（`freeagent_think`）
 
@@ -592,6 +611,12 @@ v0.9.5 は**提供元別の同時実行ゲート**と**モデル数の上限の�
 ツールは 11 のまま。文字数は **+873 文字（+5.4%）** の 17,064（`models` の `["all"]`、`size` の上限、
 枠待ちの説明を `description` に足したぶん。**ツールを増やさずに能力を足す**方針なので、増分は説明に寄る）。
 往復時間は 0.2282 秒。**8 モデルの panel で 429 が 0〜1 件**（枠 6）・回答 6〜7/8・壁 6.0〜6.3 秒。
+
+v0.11.0 は**オーケストレーションの改善**（SPEC §5.2）: 選抜を Beta 事後（kind を n で重み付け・
+決定的）に、**クォータ窓**（宣言した上限を UTC 日境界で守る）を追加、**429 のクールダウンを
+はしご**（60→180→600 秒）に、**正答率の測定器** `scripts/measure_quality.py` を追加。
+**ツール定義は変えていない**（11 のまま・文字数 17,064 のまま・往復 0.2282 秒）。
+`structuredContent` には `quota` が増える（宣言が無ければ `null`）。
 
 v0.9.0 は**モデル一覧の取得の高速化**（並列・締め切り・プロセス間キャッシュ・SPEC §4.4）。
 ツール定義は変わらない（文字数 15,972 のまま）ので上表の列は増やしていない。実測（2026-10-21・この環境）:
@@ -1322,6 +1347,8 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_PROVIDER_LIMITS` | 空 | 提供元別の枠を明示（例: `openrouter=2,huggingface=1`）。未知の名前は無視 |
 | `FREEAGENT_GATE_WAIT_S` | 20 | 枠が空くのを待つ上限（秒・1〜120）。過ぎたら**脱落として返す** |
 | `FREEAGENT_GATE_RESTORE_AFTER` | 3 | 連続成功がこの回数に達したら枠を 1 本戻す |
+| `FREEAGENT_QUOTA_LIMITS` | 空 | 提供元の上限を**宣言**する（例: `openrouter:rpd=1000+nous:rpm=60`。単位は `rpm` / `rpd` / `tpm` / `tpd`）。宣言した提供元だけ使用量を記録し、超える前に止める |
+| `FREEAGENT_QUOTA` | 1 | クォータ窓を有効にする（`0` で宣言を無視・何も記録しない） |
 | `FREEAGENT_MAX_CALLS_PER_RUN` | 40 | fanout の組合せ上限（map 全体の制限ではありません） |
 | `FREEAGENT_KB_DEADLINE` | 8 | 知識取得全体の締め切り（秒・1〜120）。遅れたソースは `⏱` で脱落表示 |
 | `FREEAGENT_KB_LATENCY_PATH` | `kb_latency.jsonl` | `measure_kb.py` の記録先 |

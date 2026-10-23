@@ -67,7 +67,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.9.5"
+SERVER_VERSION = "0.11.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -628,6 +628,10 @@ _COOLDOWN_LOCK = threading.Lock()
 _COOLDOWN_DEFAULT_S = 60.0
 _COOLDOWN_MAX_S = 900.0
 _UNAVAILABLE_S = 3600.0
+# 429 のクールダウンは**回数ではしごを上る**（1 回目 60 秒 → 2 回目 180 秒 → 3 回目以降 600 秒）。
+# 一律 60 秒だと「1 分ごとに叩いて毎回 429」になり、相手の枠を無駄に消費する（実測: 8 モデルの
+# panel で同じ提供元が 1〜2 件の 429 を返す）。上限は `_COOLDOWN_MAX_S`。
+_COOLDOWN_LADDER_S = (60.0, 180.0, 600.0)
 
 
 def cooldowns_path() -> str:
@@ -686,7 +690,7 @@ def _parse_retry_after(value: str | None, now: float | None = None) -> float:
     return _COOLDOWN_DEFAULT_S
 
 
-def note_cooldown(ref: str, secs: float, reason: str) -> float:
+def note_cooldown(ref: str, secs: float, reason: str, strikes: int = 1) -> float:
     if not COOLDOWN_ENABLED:
         return 0.0
     _ensure_cooldown_loaded()
@@ -695,13 +699,29 @@ def note_cooldown(ref: str, secs: float, reason: str) -> float:
         cur = _COOLDOWN.get(ref)
         if cur and as_float(cur.get("until"), 0.0) > until:
             return as_float(cur.get("until"), 0.0)  # 既存の方が長いなら伸ばさない
-        _COOLDOWN[ref] = {"until": until, "reason": reason, "retry_after_s": round(secs, 1)}
+        _COOLDOWN[ref] = {"until": until, "reason": reason, "retry_after_s": round(secs, 1),
+                          "strikes": int(strikes)}
     _cooldown_save()
     return until
 
 
 def note_rate_limited(ref: str, retry_after: str | None = None, reason: str = "HTTP 429") -> float:
-    return note_cooldown(ref, _parse_retry_after(retry_after), reason)
+    """429 を記録する。**回数ではしごを上る**（1 回目は Retry-After を尊重、2 回目以降は段を守る）。
+
+    冷えきってから再度 429 なら 1 段目からやり直す（時間をあけた 1 回を「何度目か」に数えない）。
+    """
+    _ensure_cooldown_loaded()
+    with _COOLDOWN_LOCK:
+        entry = _COOLDOWN.get(ref) or {}
+        previous = int(as_float(entry.get("strikes"), 0.0))
+        still_cooling = as_float(entry.get("until"), 0.0) > now_ts()
+    strikes = previous + 1 if still_cooling else 1
+    step = _COOLDOWN_LADDER_S[min(strikes - 1, len(_COOLDOWN_LADDER_S) - 1)]
+    wait = _parse_retry_after(retry_after) if retry_after else step
+    if strikes > 1:
+        wait = max(wait, step)          # 連続で踏んだら短い Retry-After でも段を下回らない
+    label = reason if strikes == 1 else f"{reason}（{strikes} 回目）"
+    return note_cooldown(ref, min(wait, _COOLDOWN_MAX_S), label, strikes=strikes)
 
 
 def note_unavailable(ref: str, status: int) -> float:
@@ -1012,19 +1032,50 @@ def model_status(ref: str) -> str:
     return "degraded"
 
 
+def _rank_counts(ref: str) -> tuple[float, float]:
+    """順位づけ用の (成功, 失敗) の減衰つき疑似カウント。
+
+    **種別（kind）を観測数 n で重み付けして合算する**。`model_quality` は種別ごとの品質を単純平均するので、
+    `ask` 1 件成功・`panel` 50 件失敗のモデルが「品質 0.5」に見える。順位はその歪みをそのまま使わない。
+    """
+    _ensure_stats_loaded()
+    kinds = (_STATS["models"].get(ref) or {}).get("kinds") or {}
+    success = 0.0
+    total = 0.0
+    for row in kinds.values():
+        if not isinstance(row, dict):
+            continue
+        n = as_float(row.get("n"), 0.0)
+        if n <= 0:
+            continue
+        success += _kind_quality(row)[0] * n
+        total += n
+    return success, max(0.0, total - success)
+
+
+_RANK_EXPLORE = 0.25     # Beta 事後の標準偏差に掛ける探索の強さ
+
+
+def _rank_score(ref: str) -> float:
+    """Beta 事後の平均 + 探索項（標準偏差）。**観測 1 件の幸運が実績を上回り続けない**。
+
+    事後の平均は (1+成功)/(2+n) なので、n が小さいほど 0.5 へ縮む（事前分布による縮小が自動で入る）。
+    標準偏差も n とともに小さくなるので、探索は「まだ分からないモデル」にだけ効く。
+    乱数は使わない（同じ入力で同じ順位＝説明とテストが再現する。Thompson の事後を決定的に使う形）。
+    """
+    success, fail = _rank_counts(ref)
+    a = 1.0 + success
+    b = 1.0 + fail
+    total = a + b
+    var = (a * b) / (total * total * (total + 1.0))
+    return a / total + _RANK_EXPLORE * math.sqrt(max(0.0, var))
+
+
 def rank_models(refs: list[str]) -> list[str]:
     """品質順。観測が少ないモデルへ探索ボーナスを与え、新しい Free モデルが試されない問題を防ぐ。"""
     if not RANK_ENABLED:
         return list(refs)
-    total = sum(model_observations(r) for r in refs) or 1.0
-
-    def score(ref: str) -> float:
-        n = model_observations(ref)
-        q = model_quality(ref) if n else 0.5
-        explore = 0.25 * (1.0 / (1.0 + n)) * (1.0 + 1.0 / (1.0 + total))
-        return q + explore
-
-    return sorted(refs, key=lambda r: (-score(r), r))
+    return sorted(refs, key=lambda r: (-_rank_score(r), r))
 
 
 def diverse_order(refs: list[str]) -> list[str]:
@@ -2543,13 +2594,216 @@ class _ProviderGate:
 PROVIDER_GATE = _ProviderGate()
 
 
+# ---------------------------------------------------------------- §3.5 提供元のクォータ窓
+#
+# Free の上限は「分あたりの回数」だけでなく**日あたり**で切られる（公開情報: OpenRouter の無料枠は
+# 1,000 リクエスト/日、ModelScope は 2,000/日）。日次は 429 と違って**静かに使い切って翌日まで
+# 全部失敗**になるので、同時実行の枠（§3.4）だけでは守れない。
+#   * **宣言された上限だけ**を守る（`FREEAGENT_QUOTA_LIMITS="openrouter:rpd=1000,nous:rpm=60"`）。
+#     宣言が無ければ何もしない（推測で止めない・状態も書かない＝既定の挙動を変えない）。
+#   * 単位は提供元全体（提供元は口座単位で数えることが多い）。rpm / rpd / tpm / tpd。
+#   * 分は直近 60 秒、日は **UTC の日付境界**（提供元は 00:00 UTC に戻す）。
+#   * 超過する呼び出しは 429 を踏む前に `QuotaExhaustedError` で**脱落**にする（理由つき）。
+
+_QUOTA_UNITS = ("rpm", "rpd", "tpm", "tpd")
+
+
+class QuotaExhaustedError(Exception):
+    """宣言されたクォータ（分次・日次）を使い切った（429 を踏む前に止めた）。"""
+
+
+def _parse_quota_limits(raw: str, valid) -> dict[str, dict[str, int]]:
+    """`openrouter:rpd=1000,nous:rpm=60` を読む（未知の提供元名・壊れた値は無視）。"""
+    out: dict[str, dict[str, int]] = {}
+    for part in (raw or "").replace(";", ",").split(","):
+        name, sep, spec = part.partition(":")
+        name = name.strip().lower()
+        if not sep or name not in valid:
+            continue
+        for item in spec.split("+"):
+            key, eq, value = item.partition("=")
+            key = key.strip().lower()
+            if not eq or key not in _QUOTA_UNITS:
+                continue
+            try:
+                out.setdefault(name, {})[key] = max(1, int(value.strip()))
+            except ValueError:
+                continue
+    return out
+
+
+_QUOTA_LIMITS = _parse_quota_limits(os.environ.get("FREEAGENT_QUOTA_LIMITS", ""), set(PROVIDER_SPECS))
+QUOTA_ENABLED = _env_on("FREEAGENT_QUOTA", True) and bool(_QUOTA_LIMITS)
+_QUOTA: dict[str, dict] = {}
+_QUOTA_LOADED = False
+_QUOTA_LOCK = threading.Lock()
+_QUOTA_MINUTE_S = 60.0
+
+
+def quota_path() -> str:
+    return os.environ.get("FREEAGENT_QUOTA_PATH") or os.path.join(state_dir(), "quota.json")
+
+
+def _quota_row(provider: str, now: float) -> dict:
+    """分・日の窓を必要なら進める（分は直近 60 秒、日は UTC の日付境界）。"""
+    row = _QUOTA.setdefault(provider, {})
+    day = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y-%m-%d")
+    if row.get("day") != day:
+        row["day"] = day
+        row["day_req"] = 0
+        row["day_tok"] = 0
+    if now - as_float(row.get("min_start"), 0.0) >= _QUOTA_MINUTE_S:
+        row["min_start"] = now
+        row["min_req"] = 0
+        row["min_tok"] = 0
+    return row
+
+
+def _ensure_quota_loaded() -> None:
+    global _QUOTA_LOADED
+    if _QUOTA_LOADED or not QUOTA_ENABLED:
+        return
+    with _QUOTA_LOCK:
+        if _QUOTA_LOADED:
+            return
+        data = _load_json(quota_path(), {})
+        rows = data.get("providers") if isinstance(data, dict) else None
+        if isinstance(rows, dict):
+            for name, row in rows.items():
+                if isinstance(row, dict):
+                    _QUOTA[name] = row
+        _QUOTA_LOADED = True
+
+
+def _quota_save() -> bool:
+    if not QUOTA_ENABLED:
+        return False
+    with _QUOTA_LOCK:
+        payload = {"version": 1, "providers": copy.deepcopy(_QUOTA)}
+    return _atomic_write(quota_path(), json.dumps(payload, ensure_ascii=False))
+
+
+def _quota_used(row: dict) -> dict[str, int]:
+    return {"rpm": int(row.get("min_req") or 0), "rpd": int(row.get("day_req") or 0),
+            "tpm": int(row.get("min_tok") or 0), "tpd": int(row.get("day_tok") or 0)}
+
+
+def _quota_reason(provider: str, used: dict[str, int], limits: dict[str, int]) -> str | None:
+    for unit in _QUOTA_UNITS:
+        limit = limits.get(unit)
+        if limit and used[unit] >= limit:
+            when = "次の 60 秒" if unit in ("rpm", "tpm") else "UTC の日付が変わるまで"
+            return (f"提供元 {provider} の {unit.upper()} 上限 {limit} に達しました（使用 {used[unit]}）。"
+                    f"{when}待つか、FREEAGENT_QUOTA_LIMITS を見直してください")
+    return None
+
+
+def quota_block(provider: str) -> str | None:
+    """**読むだけ**の判定（消費しない）。1 回分を確保するのは `quota_reserve`。"""
+    limits = _QUOTA_LIMITS.get(provider) if QUOTA_ENABLED else None
+    if not limits:
+        return None
+    _ensure_quota_loaded()
+    with _QUOTA_LOCK:
+        used = _quota_used(_quota_row(provider, now_ts()))
+    return _quota_reason(provider, used, limits)
+
+
+def quota_reserve(provider: str) -> str | None:
+    """1 リクエスト分を**先に確保**する（check-then-act の穴を塞ぐ）。
+
+    上限判定と加算を 1 つのロック内で行う。呼び出し側は「送る直前に確保 → 送る → トークンだけ足す」の
+    順にする。確保しないと、並列 N 本が同じ残量を読んで**全員が通る**（実測: 枠 4 本・上限 3 で 4 本通った）。
+    """
+    limits = _QUOTA_LIMITS.get(provider) if QUOTA_ENABLED else None
+    if not limits:
+        return None
+    _ensure_quota_loaded()
+    reserved = False
+    with _QUOTA_LOCK:
+        row = _quota_row(provider, now_ts())
+        used = _quota_used(row)
+        reason = _quota_reason(provider, used, limits)
+        if reason:
+            return reason
+        row["min_req"] = used["rpm"] + 1
+        row["day_req"] = used["rpd"] + 1
+        reserved = True
+    if reserved:
+        _quota_save()
+    return None
+
+
+def quota_add_tokens(provider: str, tokens: int = 0) -> None:
+    """消費したトークンを足す（リクエスト数は `quota_reserve` で確保済み）。"""
+    if tokens <= 0 or not QUOTA_ENABLED or not _QUOTA_LIMITS.get(provider):
+        return
+    _ensure_quota_loaded()
+    with _QUOTA_LOCK:
+        row = _quota_row(provider, now_ts())
+        row["min_tok"] = int(row.get("min_tok") or 0) + int(tokens)
+        row["day_tok"] = int(row.get("day_tok") or 0) + int(tokens)
+    _quota_save()
+
+
+def quota_record(provider: str, tokens: int = 0) -> None:
+    """1 回分（リクエスト＋トークン）を記録する。上限なら何もせず False 相当を返す。"""
+    if quota_reserve(provider) is not None:
+        return
+    quota_add_tokens(provider, tokens)
+
+
+def quota_report(providers: list[str] | None = None) -> dict | None:
+    """今の使用量（宣言がある提供元だけ）。宣言が無ければ None。"""
+    if not QUOTA_ENABLED:
+        return None
+    names = [n for n in _gate_provider_names(providers if providers is not None else list(_QUOTA_LIMITS))
+             if _QUOTA_LIMITS.get(n)]
+    if not names:
+        return None
+    _ensure_quota_loaded()
+    now = now_ts()
+    out: dict[str, dict] = {}
+    with _QUOTA_LOCK:
+        for name in names:
+            used = _quota_used(_quota_row(name, now))
+            limits = _QUOTA_LIMITS.get(name) or {}
+            out[name] = {unit: {"used": used[unit], "limit": limits[unit]}
+                         for unit in _QUOTA_UNITS if limits.get(unit)}
+    return {"providers": out, "scope": "このプロセスの記録（提供元単位・UTC 日境界）"}
+
+
+def quota_reset() -> None:
+    """テスト用。学習した使用量を初期化する。"""
+    with _QUOTA_LOCK:
+        _QUOTA.clear()
+
+
+def _result_tokens(result: dict) -> int:
+    """使用トークン数（`tokens` は dict / 数値 / 欠落のどれでも来る＝テストのモックで実測した）。"""
+    tokens = result.get("tokens") if isinstance(result, dict) else None
+    if isinstance(tokens, bool):
+        return 0
+    if isinstance(tokens, (int, float)):
+        return int(tokens)
+    if not isinstance(tokens, dict):
+        return 0
+    total = 0
+    for key in ("prompt", "completion"):
+        value = tokens.get(key)
+        if isinstance(value, (int, float)):
+            total += int(value)
+    return total
+
+
 def _gated_call_once(provider: str, model: str, prompt: str, system: str,
                      max_tokens: int, temperature: float | None,
                      timeout: float | None = None,
                      wait_budget: float | None = None) -> tuple[dict, float]:
-    """提供元の枠を取って `_call_once` する。`(結果, 待ち秒)` を返す。
+    """提供元の枠（§3.4・クォータ §3.5）を取って `_call_once` する。`(結果, 待ち秒)` を返す。
 
     枠が取れないときは **429 を踏む代わりに待って諦める**（`ProviderBusyError`）。
+    宣言されたクォータを使い切っていれば `QuotaExhaustedError`（待たずに別の提供元へ回す）。
     `wait_budget` は 1 つの `call_model` が候補を回るあいだに使ってよい待ち時間の残り。
     """
     waited = PROVIDER_GATE.acquire(provider, timeout=wait_budget)
@@ -2559,10 +2813,15 @@ def _gated_call_once(provider: str, model: str, prompt: str, system: str,
             f"{GATE_WAIT_S:g} 秒待っても取れませんでした。size を減らす／`FREEAGENT_PROVIDER_LIMITS` で"
             "枠を上げる／別の提供元を有効にする、のいずれかで解消します")
     try:
+        # 送る**直前**に 1 回分を確保する（並列 N 本が同じ残量を読んで全員通るのを防ぐ・§3.5）
+        exhausted = quota_reserve(provider)
+        if exhausted:
+            raise QuotaExhaustedError(exhausted)
         result = _call_once(provider, model, prompt, system, max_tokens, temperature,
                             timeout=timeout)
     finally:
         PROVIDER_GATE.release(provider)
+    quota_add_tokens(provider, _result_tokens(result))
     return result, waited
 
 
@@ -2755,6 +3014,12 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
             wait_left = 0.0
             skipped.append(cand)
             _debug("provider_busy", {"ref": cand})
+            continue
+        except QuotaExhaustedError as exc:
+            # 宣言された上限に達した（§3.5）。**待たない**が、別の提供元の候補は試す。
+            last_error = str(exc)
+            skipped.append(cand)
+            _debug("quota_exhausted", {"ref": cand})
             continue
         except HttpStatusError as exc:
             last_error = f"HTTP {exc.status}: {exc.body[:200]}"
@@ -6068,6 +6333,7 @@ def tool_fanout(args: dict) -> dict:
         "wall_s": wall, "sequential_estimate_s": sequential,
         "speedup": round(sequential / wall, 2) if wall > 0 else None,
         "results": rows, "selection": info, "concurrency": PROVIDER_GATE.report(refs),
+        "quota": quota_report(refs),
         **_rate_limit_report(results),
     }
 
@@ -6111,6 +6377,7 @@ def tool_panel(args: dict) -> dict:
                            for a in good if a.get("question")],
         "answers": answers,
         "concurrency": PROVIDER_GATE.report(refs),
+        "quota": quota_report(refs),
         **_rate_limit_report(results),
         "agreement_note": "合意度は解析済みの結論の表層類似度であり、正しさの確率ではありません。",
     }
@@ -6232,6 +6499,7 @@ def tool_grounded(args: dict) -> dict:
         "unsupported_citations": sorted({n for row in good for n in row.get("unsupported_citations", [])}),
         "models": refs, "selection": info, "answers": answers,
         "concurrency": PROVIDER_GATE.report(refs),
+        "quota": quota_report(refs),
         "agreement": agreement_of([a.get("answer") or "" for a in good]),
         "answers_with_citations": sum(1 for a in good if a.get("cited_ok")),
         "answered": len(good), "failed": len(answers) - len(good),
@@ -6445,6 +6713,7 @@ def tool_consult(args: dict) -> dict:
         "question": truncate(question, 400),
         "models": refs, "selection": info,
         "concurrency": PROVIDER_GATE.report(refs),
+        "quota": quota_report(refs),
         "agreement": agreement_of([row.get("conclusion") or "" for row in last]),
         "agreement_note": "表層合意度。正しさの確率ではありません。",
         "confidence_mean": round(sum(conf) / len(conf), 1) if conf else None,
