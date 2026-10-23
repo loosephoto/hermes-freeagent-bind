@@ -64,7 +64,7 @@
 
 ## 4. モデル解決と選抜
 
-### 4.1 プロバイダ（12 つ）
+### 4.1 プロバイダ（18 つ）
 
 | プロバイダ | base_url | Free 判定 | 一覧の取得 | 実測（2026-09 時点） |
 |---|---|---|---|---|
@@ -80,8 +80,23 @@
 | `zai` | `api.z.ai/api/paas/v4` | Free tier確認 + 3 ID許可リスト | API key必須 (`/models`) | 一覧は**有料の旗艦 11 件だけ**を返し Free の 3 ID を含まない（実測 2026-10-23）→ 許可リストの ID を在庫として補う（`synthesize_free_ids`。既定は無効）。Free の 3 ID は推論 200、有料は 429 `Insufficient balance` |
 | `mistral` | `api.mistral.ai/v1` | Experiment plan確認 + `free_kind="credit"` | API key必須（未認証は 401） | カタログは認証必須のため未実測。Experiment plan は月 約10億トークン・電話確認・RPM 低め |
 | `modelscope` | `api-inference.modelscope.cn/v1` | 無料枠確認 + `free_kind="credit"` | **未認証可** | カタログ **37 件**（pricing なし・日次枠で回復）。Qwen / DeepSeek / GLM / Step など |
+| `cerebras` | `api.cerebras.ai/v1` | Free trial（$5・カード登録・30 日）確認 + `free_kind="credit"` | API key必須（未認証 401 `Wrong API Key`） | 未実測（資格情報なし）。クレジット失効後は従量課金 |
+| `sambanova` | `api.sambanova.ai/v1` | 支払い方法なし＝Free tier の確認 + `free_kind="credit"` | **未認証可** | カタログ **5 件**（未認証 200・実測 0.2 秒）。Free tier は 20 RPM / 20 RPD（公式レート制限表） |
+| `novita` | `api.novita.ai/v3/openai` | 無料クレジット（$0.5〜$1・期間限定）の確認 + `free_kind="credit"` | **未認証可** | カタログ **95 件**（未認証 200・実測 2.0 秒）。クレジットを使い切ると課金 |
+| `siliconflow` | `api.siliconflow.com/v1` | 無料モデルの確認 + `free_kind="credit"` | API key必須（未認証 401 `Token is invalid`） | 未実測（資格情報なし）。無料モデルはレート制限固定。中国版は `api.siliconflow.cn/v1` |
+| `longcat` | `api.longcat.chat/openai/v1` | 公開ベータ無料枠（公称 50 万トークン/日）の確認 + `free_kind="credit"` | API key必須（未認証 401） | 未実測（資格情報なし）。Meituan の OpenAI 互換エンドポイント |
+| `opencode` | `opencode.ai/zen/v1` | `-free` 接尾辞の許可リスト **8 件**（一覧に pricing が無いため） | API key必須（未認証 401） | 一覧 **40 件**（キーで 200）・`-free` は 8 件。**この環境のキーは推論 403 `Model access is disabled`**（キー権利の問題。無料モデルも同じ） |
 
 ### 4.1.1 追加プロバイダの Free / 課金防護
+
+**v0.12.0 で 6 社を追加**（`cerebras` / `sambanova` / `novita` / `siliconflow` / `longcat` / `opencode`）。
+候補は GitHub の `freellmapi`（MIT）の provider 目録から取り、**無認証 `GET /models` で生存を実測**した
+（200＋JSON＝公開カタログ / 401・403＝存在してキーが要る / 404・例外＝廃止）。
+**非公式リレー（`xkiro` / `navy` / `ainative` / `llm7` / `kilo` / `routeway` / `requesty` / `unorouter` 等）は
+採用しない** — 利用条件と再配布の許諾が確認できず、規約 33（非公式・無文書の経路は採らない）に反する。
+5 社は `free_kind="credit"`（プラン/クレジットの確認変数が必須）、`opencode` だけは `-free` 接尾辞の
+許可リスト方式（一覧に pricing が無いため）。追加は `PROVIDER_ORDER` の**末尾**（オプトイン）。
+
 
 - Groq / Cloudflare / Gemini / Vercel / Ollama / Z.ai / Mistral / ModelScope はAPIからアカウントの課金tierを確実に判定できないため、必要なAPI資格情報に加えて専用の確認envを必須にする。確認envは文字列 `1` / `true` / `yes` / `on` のいずれかのみ有効。値は利用者の申告であり、実際の契約をAPI検証するものではない。プラン/Billing設定を変更したら確認envを外す。
 - 許可リスト方式のプロバイダ（Groq / Cloudflare / Gemini / Vercel / Z.ai）はモデル一覧のpricingが0でもFreeとはみなさず、`free_model_ids` の完全一致だけをFreeにする。`call_model` の明示model指定も同じ許可リストで拒否し、catalogに出た有料/未知モデルへ直接HTTPしない。

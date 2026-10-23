@@ -67,7 +67,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.11.0"
+SERVER_VERSION = "0.12.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -280,6 +280,74 @@ PROVIDER_SPECS: dict[str, dict] = {
                 "ためクレジット枠として扱い、対象は `probe` で確認します。Qwen / DeepSeek / GLM / Step など。"
                 "キーは MODELSCOPE_API_KEY（別名 MODELSCOPE_API_TOKEN）。キー発行に実名・SMS 確認が要る場合があります",
     },
+    # ---------------------------------------------------------------------------------------
+    # v0.12.0 で追加した 6 社（GitHub の freellmapi（MIT）の provider 目録を候補にして実測）。
+    # **無認証 GET /models の実測（2026-10-23）**: 401 = 生きている（キーが要る）。
+    # 無料枠の判定は API が返さないため、プラン/クレジット確認変数を必須にする（規約 31）。
+    # 非公式リレー（xkiro / navy / ainative / llm7 / kilo / routeway / requesty / unorouter 等）は
+    # **採用しない**（利用条件と再配布の許諾が確認できない。規約 33）。
+    "cerebras": {
+        "base_url": os.environ.get("FREEAGENT_CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1"),
+        "key": os.environ.get("CEREBRAS_API_KEY", ""),
+        "key_env": "CEREBRAS_API_KEY", "free_kind": "credit", "always_ready": False,
+        "required_env_flags": ("FREEAGENT_CEREBRAS_FREE_TRIAL",), "catalog_requires_ready": True,
+        "note": "Cerebras Inference。Free trial（$5 クレジット・カード登録・30 日）＋無料枠のレート制限。"
+                "一覧はキー必須（実測: 未認証 401 Wrong API Key）。クレジットは 30 日で失効し、"
+                "その後の従量課金は有料です。確認変数 FREEAGENT_CEREBRAS_FREE_TRIAL=1 が必須",
+    },
+    "sambanova": {
+        "base_url": os.environ.get("FREEAGENT_SAMBANOVA_BASE_URL", "https://api.sambanova.ai/v1"),
+        "key": os.environ.get("SAMBANOVA_API_KEY", ""),
+        "key_env": "SAMBANOVA_API_KEY", "free_kind": "credit", "always_ready": False,
+        "required_env_flags": ("FREEAGENT_SAMBANOVA_FREE_TIER",), "catalog_requires_ready": True,
+        "note": "SambaNova Cloud。**支払い方法を登録していないアカウントが Free tier**（公式レート制限表・"
+                "実測で一覧は未認証でも 200）。Free と Developer の区別は API が返さないため、"
+                "確認変数 FREEAGENT_SAMBANOVA_FREE_TIER=1 が必須。カードを登録したら解除してください",
+    },
+    "novita": {
+        "base_url": os.environ.get("FREEAGENT_NOVITA_BASE_URL", "https://api.novita.ai/v3/openai"),
+        "key": os.environ.get("NOVITA_API_KEY", ""),
+        "key_env": "NOVITA_API_KEY", "free_kind": "credit", "always_ready": False,
+        "required_env_flags": ("FREEAGENT_NOVITA_FREE_CREDITS",), "catalog_requires_ready": True,
+        "note": "Novita AI。新規アカウントの無料クレジット（$0.5〜$1 程度・期間限定）で試せます。"
+                "一覧は未認証でも 200（実測 95 件）。クレジットは**使い切ると課金**なので、"
+                "無料クレジットで使う場合だけ FREEAGENT_NOVITA_FREE_CREDITS=1 を設定してください",
+    },
+    "siliconflow": {
+        "base_url": os.environ.get("FREEAGENT_SILICONFLOW_BASE_URL", "https://api.siliconflow.com/v1"),
+        "key": os.environ.get("SILICONFLOW_API_KEY", ""),
+        "key_env": "SILICONFLOW_API_KEY", "free_kind": "credit", "always_ready": False,
+        "required_env_flags": ("FREEAGENT_SILICONFLOW_FREE_TIER",), "catalog_requires_ready": True,
+        "note": "SiliconFlow（硅基流动）。**無料モデル**（レート制限つき）と有料モデルが同居し、一覧は"
+                "未認証で 401（実測）。Free/paid を API が返さないので確認変数 "
+                "FREEAGENT_SILICONFLOW_FREE_TIER=1 が必須で、対象は `probe` で確認します。"
+                "中国版は FREEAGENT_SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1",
+    },
+    "longcat": {
+        "base_url": os.environ.get("FREEAGENT_LONGCAT_BASE_URL", "https://api.longcat.chat/openai/v1"),
+        "key": os.environ.get("LONGCAT_API_KEY", ""),
+        "key_env": "LONGCAT_API_KEY", "free_kind": "credit", "always_ready": False,
+        "required_env_flags": ("FREEAGENT_LONGCAT_FREE_PLAN",), "catalog_requires_ready": True,
+        "note": "Meituan LongCat（美团）。公開ベータの無料枠（公称 50 万トークン/日）があります。"
+                "一覧は未認証で 401（実測）。無料枠は予告なく変わるため確認変数 "
+                "FREEAGENT_LONGCAT_FREE_PLAN=1 を必須にし、対象は `probe` で確認します",
+    },
+    # opencode Zen は **-free 接尾辞のモデルだけ**を許可する（一覧に pricing が無いため）。
+    # 実測（2026-10-23・この環境のキー）: 一覧 200 / 40 件・-free は 8 件。ただし推論は
+    # 403 "Model access is disabled"（キーの権利の問題。無料モデルも同じ）。
+    "opencode": {
+        "base_url": os.environ.get("FREEAGENT_OPENCODE_BASE_URL", "https://opencode.ai/zen/v1"),
+        "key": os.environ.get("OPENCODE_ZEN_API_KEY") or os.environ.get("OPENCODE_GO_API_KEY", ""),
+        "key_env": "OPENCODE_ZEN_API_KEY", "free_kind": "allowlist", "always_ready": False,
+        "free_model_ids": ("deepseek-v4.1-flash-free", "glm-5.3-flash-free", "beam-free",
+                           "flint-40b-free", "mimo-v2.6-flash-free", "jev-1.13-free",
+                           "nemotron-3.5-lightning-free", "nemotron-3.5-super-vl-free"),
+        "required_env_flags": ("FREEAGENT_OPENCODE_FREE_TIER",), "catalog_requires_ready": True,
+        "note": "opencode Zen。**-free 接尾辞のモデルだけ**を許可リストで許可（一覧に pricing が無いため・"
+                "実測 40 件中 8 件）。キーは OPENCODE_ZEN_API_KEY（別名 OPENCODE_GO_API_KEY）。"
+                "実測: 一覧 200 でも推論は 403 Model access is disabled になるキーがある"
+                "（キーの権利の問題で、無料モデルも同じ）。確認変数 FREEAGENT_OPENCODE_FREE_TIER=1 が必須",
+    },
 }
 # MCP の `initialize` 応答に載せる `instructions`。**Hermes はこれを読まない**（実測: 旧実装で
 # 自発率が上がらず、現行版のソース `tools/mcp_tool_*.py` にも参照が無いことを確認）。それでも
@@ -302,7 +370,8 @@ PROACTIVE_INSTRUCTIONS = (
 
 PROVIDER_ORDER = [n.strip() for n in os.environ.get(
     "FREEAGENT_PROVIDER_ORDER",
-    "nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama,zai,mistral,modelscope").split(",")
+    "nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama,zai,mistral,modelscope,"
+    "cerebras,sambanova,novita,siliconflow,longcat,opencode").split(",")
     if n.strip() in PROVIDER_SPECS] or ["nous"]
 
 # 知識バックエンドの識別用 User-Agent。MediaWiki / OpenAlex / Crossref は連絡先入りの UA を求める。

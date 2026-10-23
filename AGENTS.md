@@ -418,6 +418,15 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     尊重する（短く指定されたら従う）。**冷えてから再度 429 なら 1 段目に戻す**。一律 60 秒だと
     「毎分 1 回叩いて毎回 429」になり、相手の枠を無駄に食う（実測: 8 モデルの panel で 1〜2 件の 429）。
 
+60. **外部プロバイダは「無認証 GET /models の実測」と「無料枠の文書」の両方を通ったものだけ足す**
+    （SPEC §4.1 / §4.1.1）。判定は 200＋JSON（公開カタログ）/ 401・403（存在してキーが要る）/
+    404・例外（廃止）。**200 は無料枠の証拠ではない**（実測: 有料リレーも 200 を返す）。
+    無料枠を API が返さない提供元は `free_kind="credit"` ＋ `required_env_flags` で**利用者の申告**にし、
+    対象は `probe` で確認する（規約 31）。**非公式リレー・再配布サービスは足さない**（規約 33。
+    実測: `freellmapi` の 47 実装のうち xkiro / navy / ainative / llm7 / kilo / routeway / requesty 等）。
+    追加は `PROVIDER_ORDER` の**末尾**（オプトイン）に置き、`tests/test_freeagent_bind.py` の
+    `test_registry_has_eighteen_providers` を同じ変更で更新する。
+
 ## ライセンス
 
 MIT。データは各提供元の条件に従い、回答には出典を表示すること。

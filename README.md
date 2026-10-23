@@ -612,6 +612,15 @@ v0.9.5 は**提供元別の同時実行ゲート**と**モデル数の上限の�
 枠待ちの説明を `description` に足したぶん。**ツールを増やさずに能力を足す**方針なので、増分は説明に寄る）。
 往復時間は 0.2282 秒。**8 モデルの panel で 429 が 0〜1 件**（枠 6）・回答 6〜7/8・壁 6.0〜6.3 秒。
 
+v0.12.0 は**外部プロバイダの追加**（SPEC §4.1）。GitHub の `freellmapi`（MIT）の provider 目録を
+候補にして、**無認証 `GET /models` で生存を実測**し、無料枠が文書化されている 6 社だけを採用しました:
+Cerebras / SambaNova / Novita / SiliconFlow / LongCat（いずれもクレジット枠＋確認変数）と
+opencode Zen（`-free` 接尾辞の 8 モデルを許可リスト化）。**非公式リレー（xkiro / navy / llm7 /
+routeway / requesty など）は利用条件が確認できないため不採用**です。既存の設定は変わりません
+（6 社とも確認変数が揃うまで通信しません）。プロバイダ数は 12 → 18。
+ツール定義は 11 のまま・文字数は 17,064 → **17,198**（+134。`freeagent_models` の provider 列挙が
+`PROVIDER_ORDER` からの生成なので、追加すると自動で伸びます）。
+
 v0.11.0 は**オーケストレーションの改善**（SPEC §5.2）: 選抜を Beta 事後（kind を n で重み付け・
 決定的）に、**クォータ窓**（宣言した上限を UTC 日境界で守る）を追加、**429 のクールダウンを
 はしご**（60→180→600 秒）に、**正答率の測定器** `scripts/measure_quality.py` を追加。
@@ -761,7 +770,7 @@ FREEAGENT_QIITA_TOKEN=
 | **Hugging Face** | `HF_TOKEN` | [Access Tokens](https://huggingface.co/settings/tokens)。**Make calls to Inference Providers** 権限と月次クレジット残が必要 |
 
 <details>
-<summary>追加の8プロバイダ：無料プラン・無料枠の確認が必要な接続先</summary>
+<summary>追加の14プロバイダ：無料プラン・無料枠の確認が必要な接続先</summary>
 
 API キーに加えて、契約プランやデータの扱いを確認したことを示す環境変数が必要です。
 
@@ -775,8 +784,14 @@ API キーに加えて、契約プランやデータの扱いを確認したこ�
 | **Mistral La Plateforme** | `MISTRAL_API_KEY` と `FREEAGENT_MISTRAL_FREE_PLAN=1` | [La Plateforme](https://console.mistral.ai)。無料の **Experiment plan**（月 約10億トークン・電話確認・RPM 低め）を使う場合の申告です。API は Free/paid を返さないため**クレジット枠**として扱い、対象は `probe` で確認します。**並列 fan-out には向かず、長文・少数リクエスト向き**です |
 | **ModelScope** | `MODELSCOPE_API_KEY`（別名 `MODELSCOPE_API_TOKEN`）と `FREEAGENT_MODELSCOPE_FREE_PLAN=1` | [ModelScope](https://modelscope.cn)。API-Inference の無料枠（公称 2,000 リクエスト/日・日次回復）の申告です。Qwen / DeepSeek / GLM / Step などが載ります（一覧は未認証でも読めます・実測 37 件）。キー発行に実名・SMS 確認が要る場合があります |
 | **Ollama Cloud** | `OLLAMA_API_KEY` と `FREEAGENT_OLLAMA_FREE_PLAN=1` | [API keys](https://ollama.com/settings/keys)。Free planはstarterモデル向けの月次クレジットで、**対象範囲は提供元が公表していません**（`probe`で実際に応答するモデルを確認）。同時1リクエスト。プロンプト/応答はログ・学習されないと提供元が明記しています |
+| **Cerebras** | `CEREBRAS_API_KEY` と `FREEAGENT_CEREBRAS_FREE_TRIAL=1` | [Cloud Console](https://cloud.cerebras.ai)。Free trial は **$5 クレジット（カード登録・30 日で失効）**＋無料枠のレート制限。一覧はキー必須（実測: 未認証 401）。クレジットが切れると従量課金になるので、無料で使う間だけ確認変数を設定してください |
+| **SambaNova Cloud** | `SAMBANOVA_API_KEY` と `FREEAGENT_SAMBANOVA_FREE_TIER=1` | [SambaNova Cloud](https://cloud.sambanova.ai)。**支払い方法を登録していないアカウントが Free tier**（公式レート制限表: 20 RPM / 20 RPD）。一覧は未認証でも読めます（実測 5 件）。カードを登録したら確認変数を外してください |
+| **Novita AI** | `NOVITA_API_KEY` と `FREEAGENT_NOVITA_FREE_CREDITS=1` | [Novita](https://novita.ai)。新規アカウントの無料クレジット（$0.5〜$1 程度・期間限定）。一覧は未認証でも読めます（実測 95 件）。**クレジットを使い切ると課金**なので、無料クレジットの間だけ有効にしてください |
+| **SiliconFlow** | `SILICONFLOW_API_KEY` と `FREEAGENT_SILICONFLOW_FREE_TIER=1` | [SiliconFlow](https://siliconflow.com)。無料モデル（レート制限固定）と有料モデルが同居し、一覧に pricing が無いため `probe` で対象を確認します。一覧はキー必須（実測: 未認証 401）。中国版は `FREEAGENT_SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1` |
+| **LongCat（Meituan）** | `LONGCAT_API_KEY` と `FREEAGENT_LONGCAT_FREE_PLAN=1` | [LongCat](https://longcat.chat)。公開ベータの無料枠（公称 **50 万トークン/日**）。一覧はキー必須（実測: 未認証 401）。無料枠は予告なく変わるため、対象は `probe` で確認してください |
+| **opencode Zen** | `OPENCODE_ZEN_API_KEY`（別名 `OPENCODE_GO_API_KEY`）と `FREEAGENT_OPENCODE_FREE_TIER=1` | [opencode](https://opencode.ai)。一覧に pricing が無いので **`-free` 接尾辞の 8 モデルだけ**を許可リストで許可します。実測: 一覧 40 件（キーで 200）・`-free` は 8 件。**キーの権利が無いと推論は 403 `Model access is disabled`**（無料モデルも同じ） |
 
-- Groq / Cloudflare / Gemini / Vercel / Ollama / Z.ai / Mistral / ModelScope は、確認変数がそろうまでモデル一覧取得も推論も行いません。これは契約プランをAPIから検証する仕組みではなく、利用者の明示確認です。プランやBilling設定を変更したら、確認変数を解除して再確認してください。
+- Groq / Cloudflare / Gemini / Vercel / Ollama / Z.ai / Mistral / ModelScope / Cerebras / SambaNova / Novita / SiliconFlow / LongCat / opencode は、確認変数がそろうまでモデル一覧取得も推論も行いません。これは契約プランをAPIから検証する仕組みではなく、利用者の明示確認です。プランやBilling設定を変更したら、確認変数を解除して再確認してください。
 - Groq / Cloudflare / Gemini / Vercel / Z.ai はコード側のFreeモデル許可リストに含まれるIDだけを呼び出し、明示指定でも有料・未許可モデルを拒否します。
 - Z.ai は**提供元の一覧 API が Free の ID を返さない**ため（実測: 有料の旗艦だけ 11 件）、公表された Free の ID を在庫として補います（許可リスト方式 + `synthesize_free_ids`）。他の許可リスト方式（Groq / Cloudflare / Gemini / Vercel）は一覧が ID を返すので補いません。Mistral / ModelScope は Free 判定を API が返さないのでクレジット枠＋プラン確認で扱い、対象は `probe` で確認します。
 - Ollama は無料対象の範囲が非公開でAPIから判定できないため許可リストを作らず、クレジット枠として扱います。**対象外のモデルは提供元が 402 を返し**、フォールバックします（モデルの失敗としては記録しません）。Vercel も同様に、無料対象はカタログのごく一部です。Free枠・モデルの提供条件は変更されるため、最新の提供元ページも確認してください。
@@ -1356,7 +1371,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_HARNESS` | 空 | 起動元の目印。Hermes から使うなら `hermes`（[Hermes 以外で使うとき](#-hermes-以外で使うとき)） |
 | `FREEAGENT_HARNESS_WARN` | 1 | `0` で Hermes 以外のときの警告を止める（判定結果は `structuredContent.harness` に残る） |
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |
-| `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama,zai,mistral,modelscope` | 一覧に出すプロバイダと優先順。オプション8社は契約確認変数が無い間は通信しない |
+| `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama,zai,mistral,modelscope,cerebras,sambanova,novita,siliconflow,longcat,opencode` | 一覧に出すプロバイダと優先順。**末尾の 6 社は v0.12.0 の追加分**（オプション）。確認変数が無い間は通信しない |
 | `FREEAGENT_AUTH_TTL` | 900 | 認証失敗を覚えて自動選抜から外す時間（秒） |
 | `FREEAGENT_PROBE_TIMEOUT` | 25.0 | 生存確認 1 件の読み取りタイムアウト（秒） |
 | `FREEAGENT_PROBE_WORKERS` | 8 | 生存確認の並列度（1〜8） |
@@ -1450,6 +1465,12 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_ZAI_BASE_URL` | `https://api.z.ai/api/paas/v4` | Z.aiのOpenAI互換接続先 |
 | `FREEAGENT_MISTRAL_BASE_URL` | `https://api.mistral.ai/v1` | Mistral La Plateformeの接続先 |
 | `FREEAGENT_MODELSCOPE_BASE_URL` | `https://api-inference.modelscope.cn/v1` | ModelScope API-Inferenceの接続先 |
+| `FREEAGENT_CEREBRAS_BASE_URL` | `https://api.cerebras.ai/v1` | Cerebras Inference の接続先 |
+| `FREEAGENT_SAMBANOVA_BASE_URL` | `https://api.sambanova.ai/v1` | SambaNova Cloud の接続先 |
+| `FREEAGENT_NOVITA_BASE_URL` | `https://api.novita.ai/v3/openai` | Novita AI の接続先（`/v3/openai` を含む） |
+| `FREEAGENT_SILICONFLOW_BASE_URL` | `https://api.siliconflow.com/v1` | SiliconFlow の接続先（中国版は `api.siliconflow.cn`） |
+| `FREEAGENT_LONGCAT_BASE_URL` | `https://api.longcat.chat/openai/v1` | LongCat（Meituan）の接続先 |
+| `FREEAGENT_OPENCODE_BASE_URL` | `https://opencode.ai/zen/v1` | opencode Zen の接続先 |
 
 **蓄積ストアのパス上書き**（既定は `FREEAGENT_STATE_DIR` 配下。**作業状態・統計が消えない場所**に置く）
 

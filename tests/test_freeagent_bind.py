@@ -1130,9 +1130,11 @@ class TestChatModelSelection(unittest.TestCase):
 class TestMultiProvider(unittest.TestCase):
     """推論プロバイダを同じ「検索→利用」に乗せるための契約。"""
 
-    def test_registry_has_twelve_providers(self):
+    def test_registry_has_eighteen_providers(self):
+        # v0.12.0 で 6 社追加（cerebras / sambanova / novita / siliconflow / longcat / opencode）。
         expected = ("nous", "openrouter", "nvidia", "huggingface", "groq", "cloudflare", "gemini",
-                    "vercel", "ollama", "zai", "mistral", "modelscope")
+                    "vercel", "ollama", "zai", "mistral", "modelscope",
+                    "cerebras", "sambanova", "novita", "siliconflow", "longcat", "opencode")
         for name in expected:
             self.assertIn(name, S.PROVIDER_SPECS)
             self.assertIn(name, S.PROVIDER_ORDER, "PROVIDER_ORDER に無いと一覧に出ない")
