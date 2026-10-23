@@ -243,7 +243,7 @@ freeagent_think で、この設計案を手順に分解してから検討して�
 | 複数の問いを複数モデルに当てる | `freeagent_fanout` | プロンプト×モデルの比較。プロンプトは最大 16 件、組合せは既定で最大 40 呼び出し（`FREEAGENT_MAX_CALLS_PER_RUN`）。超過分は**実行せず**、件数を `prompts_dropped` に返します |
 | 出典を読ませてから答えさせる | `freeagent_grounded` | 検索＋サブ LLM の回答 |
 | 出典つきの検索結果だけを取る | `freeagent_lookup` | LLM による生成なし。`limit` は各ソースの件数 |
-| 同じ指示で多数の要素を処理する | `freeagent_map` | 最大 64 件。`reduce` で追加の統合処理 |
+| 同じ指示で多数の要素を処理する | `freeagent_map` | 最大 64 件（`FREEAGENT_MAX_MAP_ITEMS`）。**超過分は実行せず**、件数を `items_dropped` に返します。`reduce` で追加の統合処理 |
 | 前提を更新しながら往復相談する | `freeagent_consult` | 1 回だけなら panel。深い討論は待ち時間が増えます |
 | 計画・仮説・改訂・別案を記録する | `freeagent_think` | [思考ノートの使い方](#-複雑な問題を段階的に考えるfreeagent_think) |
 | サブが自分で知識検索する | `freeagent_agent` | 読み取り専用の調査ループ。ステップ上限があります |
@@ -449,7 +449,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | 目的 | 引数 |
 |---|---|
 | 基本 | `thought`（ステップの内容・必須）、`session_id`（続けるノート。省略すると新規）、`question`（解いている問い） |
-| 分解 | `plan: ["…", …]`（最大 12・送り直すと計画の改訂。同じ文言の項目は達成済みのまま）、`subgoal: n`、`subgoal_done: true` |
+| 分解 | `plan: ["…", …]`（最大 12・送り直すと計画の改訂。同じ文言の項目は達成済みのまま。**超えるとエラー**）、`subgoal: n`、`subgoal_done: true` |
 | 改訂 | `revises_thought: n`（`is_revision: true` は付けても付けなくてもよい） |
 | 分岐 | `branch_from_thought: n`（新しい分岐では必須）、`branch_id`（省略すると `b1`、`b2`… を自動で付け、付けたことを表示） |
 | 分岐の決着 | `resolve_branch: "b1"` + `branch_status`（`adopted` 採用 / `abandoned` 棄却 / `merged` 統合 / `open` 再開） |
@@ -642,10 +642,17 @@ v0.9.5 は**提供元別の同時実行ゲート**と**モデル数の上限の�
 枠待ちの説明を `description` に足したぶん。**ツールを増やさずに能力を足す**方針なので、増分は説明に寄る）。
 往復時間は 0.2282 秒。**8 モデルの panel で 429 が 0〜1 件**（枠 6）・回答 6〜7/8・壁 6.0〜6.3 秒。
 
-#### 新しい版の内訳（v0.11.0〜v0.14.1・新しい順）
+#### 新しい版の内訳（v0.11.0〜v0.14.2・新しい順）
 
 上の表の列は v0.9.5 までです（v0.11.0 以降の文字数: v0.12.0 = 17,198 / v0.13.0 = 17,495 /
-v0.14.0 = 17,495 / v0.14.1 = 17,555）。以下は新しい順の内訳です。
+v0.14.0 = 17,495 / v0.14.1 = 17,555 / v0.14.2 = 17,666）。以下は新しい順の内訳です。
+
+v0.14.2 は**上限での切り捨ての残りを塞いだ**回。`map` の `items` は `items[:64]` と**黙って捨てて**
+いました（v0.14.1 で `fanout` の `prompts` を直したのと同じ穴）。実行しなかった件数を
+**`items_dropped`** で返し、本文に警告行を出し、schema に `maxItems` を宣言します
+（上限は `FREEAGENT_MAX_MAP_ITEMS`・1〜256）。あわせて警告行の生成を `_dropped_lines` に共通化。
+`think` の `plan` は**切り捨てずエラー**のまま（多すぎる入力をそのまま受け取らない契約）で、
+schema に `maxItems: 12` を宣言して事前に分かるようにしました。
 
 v0.14.1 は**README の総点検と、その過程で見つけた 1 件の挙動修正**。`fanout` の `prompts` 上限
 （16 件）は以前**黙って切り捨てて**いました（`prompts[:16]`）。切り捨てをやめずに、**実行しなかった件数を
@@ -1444,6 +1451,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_QUOTA` | 1 | クォータ窓を有効にする（`0` で宣言を無視・何も記録しない） |
 | `FREEAGENT_MAX_CALLS_PER_RUN` | 40 | fanout の組合せ上限（map 全体の制限ではありません） |
 | `FREEAGENT_MAX_PROMPTS_PER_CALL` | 16 | fanout の `prompts` の上限（1〜64）。超過分は実行せず、件数を `prompts_dropped` に返す |
+| `FREEAGENT_MAX_MAP_ITEMS` | 64 | map の `items` の上限（1〜256）。超過分は実行せず、件数を `items_dropped` に返す |
 | `FREEAGENT_KB_DEADLINE` | 8 | 知識取得全体の締め切り（秒・1〜120）。遅れたソースは `⏱` で脱落表示 |
 | `FREEAGENT_KB_LATENCY_PATH` | `kb_latency.jsonl` | `measure_kb.py` の記録先 |
 | `FREEAGENT_RELEVANCE_PATH` | `relevance.jsonl` | `measure_relevance.py` の記録先 |

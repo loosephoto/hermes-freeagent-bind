@@ -121,10 +121,19 @@ class ToolMapTest(unittest.TestCase):
 
     def test_items_are_capped_at_64(self):
         with mock.patch.object(S, "run_parallel", return_value=[]) as rp:
-            S.tool_map({"items": [f"i{i}" for i in range(100)],
-                        "instruction": "i", "model": "nous/a"})
+            r = S.tool_map({"items": [f"i{i}" for i in range(100)],
+                            "instruction": "i", "model": "nous/a"})
         prompts = rp.call_args[0][0]
         self.assertEqual(len(prompts), 64)
+        # **黙って捨てない**: 実行しなかった件数を返し、本文にも警告を出す（規約 63）。
+        self.assertEqual(r["items_dropped"], 36)
+        self.assertIn("上限 64 件", S.render("freeagent_map", r))
+
+    def test_no_drop_reports_zero(self):
+        with mock.patch.object(S, "run_parallel", return_value=[{"text": "o"}]):
+            r = S.tool_map({"items": ["a"], "instruction": "i", "model": "nous/a"})
+        self.assertEqual(r["items_dropped"], 0)
+        self.assertNotIn("上限", S.render("freeagent_map", r))
 
     def test_reduce_joins_outputs(self):
         with mock.patch.object(S, "run_parallel", return_value=[{"text": "o1"}, {"text": "o2"}]):

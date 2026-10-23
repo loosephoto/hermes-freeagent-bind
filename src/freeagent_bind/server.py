@@ -67,7 +67,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.14.1"
+SERVER_VERSION = "0.14.2"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -120,6 +120,8 @@ MAX_MODELS_PER_CALL = max(1, min(40, _env_int("FREEAGENT_MAX_MODELS_PER_CALL", 1
 #   MAX_PROMPTS_PER_CALL … fanout の `prompts` の上限（既定 16）。
 #     **切り捨ては黙ってやらない**（規約 8・56 と同じ理由で `prompts_dropped` に件数を返す）。
 MAX_PROMPTS_PER_CALL = max(1, min(64, _env_int("FREEAGENT_MAX_PROMPTS_PER_CALL", 16)))
+#   MAX_MAP_ITEMS … map の `items` の上限（既定 64）。切り捨ては件数を返す（規約 63）。
+MAX_MAP_ITEMS = max(1, min(256, _env_int("FREEAGENT_MAX_MAP_ITEMS", 64)))
 # サブエージェント起動（hermes chat -q）と Hermes 本体の委譲は明示オプトインのみ。既定 off。
 ALLOW_AGENT = _env_on("FREEAGENT_ALLOW_AGENT", False)
 HERMES_BIN = os.environ.get("FREEAGENT_HERMES_BIN") or shutil.which("hermes") or "hermes"
@@ -1764,6 +1766,9 @@ def _thought_apply_ops(row: dict, steps: list[dict], step: dict, old: dict | Non
         # 同じ文面は id と達成済みの印を引き継ぐ。新しい文面には**未使用の id**を割り当てる
         # （id を再利用すると、既存の subgoal 参照が別の項目を指すようになる）。
         plan, retired = _plan_merge(plan, retired, list(ops["plan"][:THOUGHT_PLAN_MAX]))
+        # ここに来る前に `_think_args` が上限超過を fail で止めるので、この切り詰めは
+        # **防御用**（呼び出し経路が増えても台帳が壊れないように）。規約 63 の対象は
+        # 「実行数を減らして黙って続行する」箇所で、ここは契約違反として拒否する側。
         row["plan_revised_at"] = n
     # `subgoal` は**解決済みの plan 項目の id**（§6.10 の `_think_structure` が解決する）。
     # id は差し替えをまたいで 12 を超えることがあるので上限を広く取る（THOUGHT_PLAN_MAX は位置数）。
@@ -6651,7 +6656,9 @@ def tool_map(args: dict) -> dict:
         return {"error": "items は必須です（文字列の配列）"}
     if not instruction:
         return {"error": "instruction は必須です（各要素へ適用する指示）"}
-    items = items[:64]
+    # **黙って捨てない**（規約 63）: 上限を超えた分は実行せず、件数を返す。
+    items_dropped = max(0, len(items) - MAX_MAP_ITEMS)
+    items = items[:MAX_MAP_ITEMS]
     model = as_str(args.get("model"))
     selection = {"requested": True, "models": [model]} if model else {}
     if not model:
@@ -6670,7 +6677,7 @@ def tool_map(args: dict) -> dict:
                      "error": res.get("error") or ""})
     ok = sum(1 for r in rows if not r["error"])
     data = {"model": model, "count": len(rows), "ok": ok, "failed": len(rows) - ok, "results": rows,
-            "selection": selection}
+            "items_dropped": items_dropped, "selection": selection}
     if as_flag(args.get("reduce")):
         joined = "\n".join(f"- {r['output']}" for r in rows if r["output"])
         if joined.strip():
@@ -7627,7 +7634,9 @@ def _think_structure(args: dict, steps: list[dict], n: int, row: dict) -> tuple[
     if tests and kind == "hypothesis":
         return fail("仮説の検証ステップは kind=test です（仮説そのものは kind=hypothesis で別に積みます）")
 
-    # 分解: 計画（サブ目標）は再送で改訂できる。上限超過は切り捨てずエラー。
+    # 分解: 計画（サブ目標）は再送で改訂できる。上限超過は切り捨てずエラー（規約 63 の例外ではなく
+    # 「多すぎる入力をそのまま受け取らない」契約なので、件数を返すのではなく fail で止める）。
+    # schema にも maxItems を宣言して、呼び出し側が事前に知れるようにする。
     plan = [truncate(p, 200) for p in as_str_list(args.get("plan"))]
     if len(plan) > THOUGHT_PLAN_MAX:
         return fail(f"plan は {THOUGHT_PLAN_MAX} 項目までです（{len(plan)} 項目）。粒度を上げて分けてください")
@@ -7968,7 +7977,9 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "items": {"type": "array", "items": {"type": "string"}},
+                "items": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_MAP_ITEMS,
+                          "description": f"処理する要素の配列（最大 {MAX_MAP_ITEMS} 件。"
+                                         f"超過分は実行せず、件数を `items_dropped` で返します）"},
                 "instruction": {"type": "string", "description": "各要素へ適用する指示"},
                 "model": {"type": "string"},
                 "reduce": {"type": "boolean", "description": "true なら全出力を統合する"},
@@ -8048,7 +8059,9 @@ TOOLS: list[dict] = [
                 "kind": {"type": "string", "enum": list(THOUGHT_KINDS),
                          "description": "思考の種類（既定 step。tests_hypothesis 指定時は test）"},
                 "plan": {"type": "array", "items": {"type": "string"},
-                         "description": f"サブ目標への分解（最大 {THOUGHT_PLAN_MAX}。再送で計画を改訂）"},
+                         "maxItems": THOUGHT_PLAN_MAX,
+                         "description": f"サブ目標への分解（最大 {THOUGHT_PLAN_MAX}。再送で計画を改訂。"
+                                        f"超えるとエラーになります）"},
                 "subgoal": {"type": "integer",
                             "description": "この思考が扱うサブ目標の番号。**plan 項目の id**（台帳の plan[].id と"
                                            "出力の「N.」に同じ数が出る）で指定する。id に一致する項目が無く"
@@ -8337,9 +8350,7 @@ def _render_fanout(data: dict) -> str:
             f"倍率 {data.get('speedup')}）")
     if data.get("slot_waited"):
         head += f" / 提供元の枠待ち {data['slot_waited']} 件（429 を踏まずに順番待ちで吸収）"
-    if data.get("prompts_dropped"):
-        head += (f"\n⚠️ prompts は上限 {MAX_PROMPTS_PER_CALL} 件までです"
-                 f"（{data['prompts_dropped']} 件は実行していません）")
+    head += "".join(f"\n{line}" for line in _dropped_lines(data, "prompts", MAX_PROMPTS_PER_CALL))
     body = ""
     for row in (data.get("results") or [])[:12]:
         text = row.get("answer") or row.get("error") or ""
@@ -8432,10 +8443,23 @@ def _render_grounded(data: dict) -> str:
     if credits:
         lines[1:1] = list(dict.fromkeys(credits))
     return "\n".join(lines[:40])
+def _dropped_lines(data: dict, label: str, cap: int) -> list[str]:
+    """上限で実行しなかった件数の警告行（規約 63・無ければ空）。
+
+    同じ穴を 4 回書き直さないよう 1 箇所に置く。**「切り捨てた」ことを必ず本文に出す**。
+    """
+    dropped = as_int(data.get(f"{label}_dropped"), 0, 0, 100000)
+    if not dropped:
+        return []
+    return [f"⚠️ {label} は上限 {cap} 件までです（{dropped} 件は使いませんでした。"
+            f"分割して呼び直してください）"]
+
+
 def _render_map(data: dict) -> str:
     """`freeagent_map` の本文（`content` = 人間向け日本語）。"""
     lines = [f"{data.get('count')} 件 / 成功 {data.get('ok')} / 失敗 {data.get('failed')}"
              f"（モデル {data.get('model')}）"]
+    lines.extend(_dropped_lines(data, "items", MAX_MAP_ITEMS))
     for row in (data.get("results") or [])[:10]:
         text = row.get("output") or f"✗ {row.get('error', '')}"
         lines.append(f"  • {truncate(row.get('item') or '', 60)} → {truncate(text, 160)}")

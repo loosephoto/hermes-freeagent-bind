@@ -672,6 +672,10 @@ class TestThinkStructure(unittest.TestCase):
                                  "plan": [f"p{i}" for i in range(S.THOUGHT_PLAN_MAX + 1)]})
         self.assertIn("まで", too_many["error"], "上限超過を黙って切り捨ててはいけない")
         self.assertEqual(self._steps(sid), 1, "エラーの呼び出しで台帳を書いてはいけない")
+        # schema にも上限を宣言する（呼び出し側が事前に知れる＝規約 63 の趣旨）
+        think_tool = next(t for t in S.TOOLS if t["name"] == "freeagent_think")
+        plan_schema = think_tool["inputSchema"]["properties"]["plan"]
+        self.assertEqual(plan_schema["maxItems"], S.THOUGHT_PLAN_MAX)
 
     # ---- 改訂
     def test_revision_marks_original_and_drops_it_from_active_path(self):

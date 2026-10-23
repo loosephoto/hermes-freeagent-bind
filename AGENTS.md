@@ -443,11 +443,14 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     **二値の正答率で 15 ポイント未満の差を主張しない**（10pt 差は 300〜400 ケース必要。連続指標なら
     30〜50）。比較は必ず対応のある差＋95% 信頼区間＋McNemar の p 値で示す。
 
-63. **上限で切り捨てるときは件数を返す**（v0.14.1）。`fanout` の `prompts` は 16 件で切っていたが、
-    `prompts[:16]` と**黙って捨てていた**（規約 8 と同じ穴）。切り捨て自体は残してよいが、
-    `prompts_dropped` に件数を返し、本文にも警告を出す。schema にも `maxItems` を宣言する。
-    上限は `FREEAGENT_MAX_PROMPTS_PER_CALL`（1〜64）。同種の穴（`truncate()` で切る箇所）を
-    見つけたら同じ扱いにする。
+63. **上限で切り捨てるときは件数を返す**（v0.14.1・v0.14.2）。`fanout` の `prompts` は `prompts[:16]` と、
+    `map` の `items` は `items[:64]` と、どちらも**黙って捨てていた**（規約 8 と同じ穴）。
+    切り捨て自体は残してよいが、`prompts_dropped` / `items_dropped` に件数を返し、本文にも警告を
+    出す（`_dropped_lines` を共有）。schema にも `maxItems` を宣言する。上限は
+    `FREEAGENT_MAX_PROMPTS_PER_CALL`（1〜64）/ `FREEAGENT_MAX_MAP_ITEMS`（1〜256）。
+    **例外**: `think` の `plan` は切り捨てず**エラー**にする（多すぎる入力をそのまま受け取らない契約。
+    schema に `maxItems: 12` を宣言）。どちらの扱いにするかは「件数が減っても目的を達せるか」で決める
+    （map/fanout は分割して呼び直せる／plan は黙って減ると計画そのものが嘘になる）。
 
 ## ライセンス
 

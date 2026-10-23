@@ -1127,10 +1127,13 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   候補も含みうる。自動選抜は別途認証記憶を考慮する。「実応答できるモデル数」と同一視しない。
 - `tool_map` は `items[:64]`、`tool_fanout` は `prompts[:16]` で入力を切り詰める。
   `MAX_CALLS_PER_RUN` は fanout の組合せ上限であり、map 全体に適用される上限ではない。
-  fanout の `prompts` は `FREEAGENT_MAX_PROMPTS_PER_CALL`（既定 16・1〜64）で切るが、
-  **切った件数を `prompts_dropped` に返す**（v0.14.1・規約 63。以前は `prompts[:16]` と黙って捨てていた）。
-  上限を超える入力は利用者側で分割する。**map の切り詰めには追加警告が無く、fanout には
-  `prompts_dropped` と本文の警告がある**（非対称は既知。map 側を直すなら規約 63 に従う）。
+  **切り詰めた件数は必ず返す**（v0.14.1/v0.14.2・規約 63）: map は `items_dropped`
+  （`FREEAGENT_MAX_MAP_ITEMS`・既定 64・1〜256）、fanout は `prompts_dropped`
+  （`FREEAGENT_MAX_PROMPTS_PER_CALL`・既定 16・1〜64）。どちらも本文に警告行が出る
+  （`_dropped_lines` を共有）し、schema に `maxItems` を宣言する。
+  以前は `items[:64]` / `prompts[:16]` と**黙って捨てていた**。
+- `tool_think` の `plan` は上限 12 を**超えたらエラー**（切り捨てではない。多すぎる入力を
+  そのまま受け取らない契約で、schema にも `maxItems: 12` を宣言）。台帳側の切り詰めは防御用。
 - 知識検索は LLM による生成を介さないが、提供元の誤り・古さ・検索の関連性不足は防げない。
   `summary` は導入部・説明・取得可能なアブストラクトなどであり、原典の全文とは限らない。
   締め切り後の結果が次回すぐ返るのは、同じプロセス・同じ検索条件で取得が成功しキャッシュに入った場合のみ。
