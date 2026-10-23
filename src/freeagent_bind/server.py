@@ -67,7 +67,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.9.4"
+SERVER_VERSION = "0.9.5"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -106,9 +106,17 @@ def _env_on(name: str, default: bool = True) -> bool:
 
 CONNECT_TIMEOUT = _env_float("FREEAGENT_CONNECT_TIMEOUT", 10.0)
 READ_TIMEOUT = _env_float("FREEAGENT_READ_TIMEOUT", 180.0)
-MAX_WORKERS = max(1, min(16, _env_int("FREEAGENT_MAX_WORKERS", 4)))
+# 推論の同時実行数。**429 を踏まない責任は提供元別ゲート（§3.4）が持つ**ので、ここは
+# 「同時に走らせたい本数」の上限として置く。実測（nous へ 12 呼び出し・2026-10-23）: 4 並列 13.13 秒 /
+# 8 並列 8.08 秒 / 12 並列 13.78 秒（1 件の最大遅延 4.5→12.2 秒）。膝は 8 本。
+MAX_WORKERS = max(1, min(32, _env_int("FREEAGENT_MAX_WORKERS", 8)))
 # 1 相談あたりの呼び出し上限（暴走・課金の歯止め）。超過したらラウンドを打ち切る。
 MAX_CALLS_PER_RUN = max(1, _env_int("FREEAGENT_MAX_CALLS_PER_RUN", 40))
+# 1 回のツール呼び出しに参加させるモデル数の 2 段の上限。
+#   MAX_SUB_MODELS     … `size` の上限（自動選抜の目標本数。既定 8）
+#   MAX_MODELS_PER_CALL … `models` 配列・`models: ["all"]` の展開上限（既定 16）
+MAX_SUB_MODELS = max(1, min(32, _env_int("FREEAGENT_MAX_SUB_MODELS", 8)))
+MAX_MODELS_PER_CALL = max(1, min(40, _env_int("FREEAGENT_MAX_MODELS_PER_CALL", 16)))
 # サブエージェント起動（hermes chat -q）と Hermes 本体の委譲は明示オプトインのみ。既定 off。
 ALLOW_AGENT = _env_on("FREEAGENT_ALLOW_AGENT", False)
 HERMES_BIN = os.environ.get("FREEAGENT_HERMES_BIN") or shutil.which("hermes") or "hermes"
@@ -1105,7 +1113,10 @@ def select_models(size: int, requested: list[str] | None = None, *,
         ex = set(exclude)
         chosen = [r for r in chosen if r not in ex]
 
-    chosen = chosen[:size]
+    # **明示指定は size で切り落とさない**。実測: `models` に 8 件渡しても size=3 で 3 件に切られ、
+    # 「在庫のモデルを全部走らせる」ができなかった。`size` は**自動選抜の目標本数**として扱う。
+    explicit_kept = len([r for r in as_str_list(requested) if r in chosen])
+    chosen = chosen[:max(size, explicit_kept)]
     info = {
         "requested": bool(requested),
         "prefer": as_str_list(prefer),
@@ -2348,6 +2359,213 @@ def _is_known_paid_model(provider: str, model: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------- §3.4 提供元別の同時実行ゲート
+#
+# **429 を踏まないための一次防護**。従来は「プロセス全体の `MAX_WORKERS`」しか無く、429 の防護は
+# 事後のクールダウン（そのモデルを数分避ける）だけだった。Free の在庫が 1 提供元に偏ると
+# 「並列度を上げる＝同じ提供元へ同時に投げる」になるので、上流の枠を超えて 429 を踏む。
+#   * 提供元ごとに「同時に投げてよい本数（枠）」を持ち、超える呼び出しは**待つ**（429 にしない）
+#   * 429 を受けたらその提供元の枠を 1 本減らし（最低 1 本）、連続成功が `_GATE_RESTORE_AFTER`
+#     回続いたら 1 本戻す（上限は実測値または `FREEAGENT_PROVIDER_LIMITS` の明示）
+#   * 待ちには上限（`FREEAGENT_GATE_WAIT_S` 既定 20 秒）を置き、取れない呼び出しは
+#     **脱落として返す**（無限待ちを作らない。規約 8 / 規約 27）
+# 実測（2026-10-23・nous）:
+#   * 生の並列度（同一プロンプト × 12 呼び出し・fallback 無し）: 429 は 0 件、壁時計は 4 並列 13.13 秒 /
+#     8 並列 8.08 秒 / 12 並列 13.78 秒（最大 1 件の遅延 12.2 秒）→ **並列は 8 本まで効く**
+#   * 8 モデルの panel（max_tokens 128）: 枠 8 だと HTTP 429 が 1〜2 件（`The requested model is
+#     temporarily at capacity upstream`）／枠 6 なら 0〜1 件。**429 の主因はモデル単位の upstream
+#     capacity** で、こちらの同時数を下げても 0 にはならない。だから枠は「自爆を減らす」一次防護で
+#     あって万能ではない（受けたら縮めて、次から待ちに変える）
+# 提供元ごとに枠を分けるのは、**別ホストの提供元なら同時に走らせてよい**（上流の枠は提供元ごとに
+# 独立）ためで、全体の並列度 1 本ではそれを表現できない。
+
+class ProviderBusyError(Exception):
+    """提供元の同時実行枠が取れなかった（＝429 を踏む代わりに待って諦めた）。"""
+
+
+_PROVIDER_LIMIT_DEFAULT = max(1, min(16, _env_int("FREEAGENT_PROVIDER_LIMIT", 4)))
+# 実測が取れている提供元だけ個別の既定を持つ。未実測の提供元は保守的に `_PROVIDER_LIMIT_DEFAULT`。
+# nous の実測（8 モデルの panel・max_tokens 128・各条件 2〜3 回）:
+#   枠 8 → HTTP 429 が 1〜2 件 / 回答 4〜5/8 / 壁 11.3 秒
+#   枠 6 → HTTP 429 が 0〜1 件 / 回答 6〜7/8 / 壁 6.0〜6.3 秒
+#   枠 4 → HTTP 429 が 1 件 / 回答 6/8 / 壁 4.4〜6.7 秒
+# → 6 を既定にする（膝の内側。**429 の主因はモデル単位の upstream capacity** で、
+#   こちらの同時数を下げても 0 にはならない。だから枠は「自爆を減らす」ためのもの）。
+_PROVIDER_LIMIT_MEASURED = {"nous": 6}
+GATE_WAIT_S = max(1.0, min(120.0, _env_float("FREEAGENT_GATE_WAIT_S", 20.0)))
+_GATE_RESTORE_AFTER = max(1, _env_int("FREEAGENT_GATE_RESTORE_AFTER", 3))
+_GATE_COUNT_WAIT_S = 0.05      # これ以上待ったら「枠待ちが起きた」として数える
+
+
+def _parse_provider_limits(raw: str, valid) -> dict[str, int]:
+    """`FREEAGENT_PROVIDER_LIMITS=openrouter=2,huggingface=1` を読む（未知の名前は無視）。"""
+    out: dict[str, int] = {}
+    for part in (raw or "").split(","):
+        name, sep, value = part.partition("=")
+        name = name.strip().lower()
+        if not sep or name not in valid:
+            continue
+        try:
+            out[name] = max(1, min(16, int(value.strip())))
+        except ValueError:
+            continue
+    return out
+
+
+_PROVIDER_LIMITS = _parse_provider_limits(os.environ.get("FREEAGENT_PROVIDER_LIMITS", ""),
+                                          set(PROVIDER_SPECS))
+
+
+def provider_slot_cap(provider: str) -> int:
+    """その提供元の同時実行枠の上限（`FREEAGENT_PROVIDER_LIMITS` > 実測既定 > 全体既定）。"""
+    if provider in _PROVIDER_LIMITS:
+        return _PROVIDER_LIMITS[provider]
+    if provider in _PROVIDER_LIMIT_MEASURED:
+        return _PROVIDER_LIMIT_MEASURED[provider]
+    return _PROVIDER_LIMIT_DEFAULT
+
+
+def _gate_provider_names(items) -> list[str]:
+    """提供元名の一覧を作る。**ref（provider/model）でも受ける**（呼び出し側で迷わないため）。"""
+    out: list[str] = []
+    for item in items or []:
+        name = as_str(item)
+        if not name:
+            continue
+        head, sep, _ = name.partition("/")
+        if sep and head in PROVIDER_SPECS:
+            name = head
+        if name not in out:
+            out.append(name)
+    return out
+
+
+class _ProviderGate:
+    """提供元ごとの同時実行枠。**429 で縮み、成功が続けば戻る**（固定のセマフォでは足りない）。"""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._in_flight: dict[str, int] = {}
+        self._limit: dict[str, int] = {}
+        self._success: dict[str, int] = {}
+        self._reduced: dict[str, int] = {}
+        self._waited: dict[str, int] = {}
+        self._timeouts: dict[str, int] = {}
+
+    def limit(self, provider: str) -> int:
+        with self._cond:
+            return self._limit.get(provider) or provider_slot_cap(provider)
+
+    def acquire(self, provider: str, timeout: float | None = None) -> float | None:
+        """枠を取る。取れたら**待ち秒**（待たなければ 0.0）、取れなければ None を返す。"""
+        budget = GATE_WAIT_S if timeout is None else max(0.0, float(timeout))
+        started = time.monotonic()
+        end = started + budget
+        with self._cond:
+            cap = provider_slot_cap(provider)
+            while self._in_flight.get(provider, 0) >= (self._limit.get(provider) or cap):
+                remain = end - time.monotonic()
+                if remain <= 0:
+                    self._timeouts[provider] = self._timeouts.get(provider, 0) + 1
+                    return None
+                self._cond.wait(min(remain, 0.25))
+            self._in_flight[provider] = self._in_flight.get(provider, 0) + 1
+        waited = time.monotonic() - started
+        if waited >= _GATE_COUNT_WAIT_S:
+            with self._cond:
+                self._waited[provider] = self._waited.get(provider, 0) + 1
+        return round(waited, 3)
+
+    def release(self, provider: str) -> None:
+        with self._cond:
+            left = self._in_flight.get(provider, 0) - 1
+            if left > 0:
+                self._in_flight[provider] = left
+            else:
+                self._in_flight.pop(provider, None)
+            self._cond.notify_all()
+
+    def note_success(self, provider: str) -> None:
+        """連続成功で枠を 1 本ずつ戻す（429 で縮んだ提供元を、踏まなくなったら回復させる）。"""
+        with self._cond:
+            cap = provider_slot_cap(provider)
+            cur = self._limit.get(provider)
+            if cur is None or cur >= cap:
+                return
+            self._success[provider] = self._success.get(provider, 0) + 1
+            if self._success[provider] >= _GATE_RESTORE_AFTER:
+                self._success[provider] = 0
+                self._limit[provider] = cur + 1
+
+    def note_rate_limited(self, provider: str) -> tuple[int, int]:
+        """429。枠を 1 本減らして (前, 後) を返す（待ち行列の呼び出しはそのまま進む）。"""
+        with self._cond:
+            cap = provider_slot_cap(provider)
+            cur = self._limit.get(provider) or cap
+            new = max(1, cur - 1)
+            self._limit[provider] = new
+            self._success[provider] = 0
+            if new < cap:
+                self._reduced[provider] = self._reduced.get(provider, 0) + 1
+            self._cond.notify_all()
+            return cur, new
+
+    def report(self, providers: list[str] | None = None) -> dict:
+        """今の枠と待ちの実績（返り値に載せて「429 を踏まずに待った」ことを示す）。
+
+        `providers` は**提供元名でも ref（provider/model）でも受ける**（実測: 参加モデルの ref を
+        そのまま渡すと、キーが提供元名でなく ref になり `nous/…` という架空の提供元が並んだ）。
+        """
+        with self._cond:
+            names = _gate_provider_names(providers if providers is not None else list(PROVIDER_ORDER))
+            per = {}
+            for name in names:
+                cap = provider_slot_cap(name)
+                per[name] = {"limit": self._limit.get(name) or cap, "cap": cap,
+                             "in_flight": self._in_flight.get(name, 0)}
+            return {"per_provider": per, "waited_total": sum(self._waited.values()),
+                    "reduced_total": sum(self._reduced.values()),
+                    "timeouts_total": sum(self._timeouts.values()),
+                    "scope": "このプロセスの累計"}
+
+    def reset(self) -> None:
+        """テスト用。学習した枠と実績を初期化する。"""
+        with self._cond:
+            self._in_flight.clear()
+            self._limit.clear()
+            self._success.clear()
+            self._reduced.clear()
+            self._waited.clear()
+            self._timeouts.clear()
+            self._cond.notify_all()
+
+
+PROVIDER_GATE = _ProviderGate()
+
+
+def _gated_call_once(provider: str, model: str, prompt: str, system: str,
+                     max_tokens: int, temperature: float | None,
+                     timeout: float | None = None,
+                     wait_budget: float | None = None) -> tuple[dict, float]:
+    """提供元の枠を取って `_call_once` する。`(結果, 待ち秒)` を返す。
+
+    枠が取れないときは **429 を踏む代わりに待って諦める**（`ProviderBusyError`）。
+    `wait_budget` は 1 つの `call_model` が候補を回るあいだに使ってよい待ち時間の残り。
+    """
+    waited = PROVIDER_GATE.acquire(provider, timeout=wait_budget)
+    if waited is None:
+        raise ProviderBusyError(
+            f"提供元 {provider} の同時実行枠（{PROVIDER_GATE.limit(provider)} 本）が埋まったままで、"
+            f"{GATE_WAIT_S:g} 秒待っても取れませんでした。size を減らす／`FREEAGENT_PROVIDER_LIMITS` で"
+            "枠を上げる／別の提供元を有効にする、のいずれかで解消します")
+    try:
+        result = _call_once(provider, model, prompt, system, max_tokens, temperature,
+                            timeout=timeout)
+    finally:
+        PROVIDER_GATE.release(provider)
+    return result, waited
+
+
 def _call_once(provider: str, model: str, prompt: str, system: str,
                max_tokens: int, temperature: float | None,
                timeout: float | None = None) -> dict:
@@ -2515,6 +2733,10 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
     last_error = ""
     skipped: list[str] = []
     avoided: list[str] = []
+    # 提供元の枠を待つ予算は **1 回の `call_model` で共有する**。候補ごとに満額待つと、枠が
+    # 全部埋まっているときに「候補の数 × GATE_WAIT_S」待ってしまう（規約 27 を推論側にも適用）。
+    wait_left = GATE_WAIT_S
+    gate_wait = 0.0
     for idx, cand in enumerate(attempts):
         if claims is not None and cand != ref and not claims.take(cand):
             avoided.append(cand)   # 他の枠が使用中／除外済み。独立性を守るため取らない
@@ -2523,12 +2745,24 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
         if not c_model:
             continue
         try:
-            result = _call_once(c_provider, c_model, prompt, system, max_tokens, temperature,
-                                timeout=timeout)
+            result, waited = _gated_call_once(c_provider, c_model, prompt, system, max_tokens,
+                                              temperature, timeout=timeout, wait_budget=wait_left)
+            wait_left = max(0.0, wait_left - waited)
+            gate_wait += waited
+        except ProviderBusyError as exc:
+            # **429 を踏む代わりに待って諦めた**ケース。隠さず脱落として返し、以後は待たない。
+            last_error = str(exc)
+            wait_left = 0.0
+            skipped.append(cand)
+            _debug("provider_busy", {"ref": cand})
+            continue
         except HttpStatusError as exc:
             last_error = f"HTTP {exc.status}: {exc.body[:200]}"
             if exc.status == 429:
                 until = note_rate_limited(cand, exc.retry_after)
+                was, now = PROVIDER_GATE.note_rate_limited(c_provider)
+                if now < was:
+                    _debug("gate_reduced", {"provider": c_provider, "from": was, "to": now})
                 skipped.append(cand)
                 _debug("rate_limited", {"ref": cand, "until": until})
             elif exc.status in (404, 410):
@@ -2564,8 +2798,11 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
             if max_tokens < _EMPTY_RETRY_CAP:
                 bumped = min(max(max_tokens * 3, _EMPTY_TOKEN_FLOOR), _EMPTY_RETRY_CAP)
                 try:
-                    retry = _call_once(c_provider, c_model, prompt, system, bumped, temperature,
-                                       timeout=timeout)
+                    retry, retry_wait = _gated_call_once(c_provider, c_model, prompt, system,
+                                                         bumped, temperature, timeout=timeout,
+                                                         wait_budget=wait_left)
+                    wait_left = max(0.0, wait_left - retry_wait)
+                    gate_wait += retry_wait
                     if (retry.get("text") or "").strip():
                         result, text = retry, retry["text"]
                 except Exception:
@@ -2581,7 +2818,9 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
                "text": text, "latency_s": result["latency_s"],
                "truncated": result["truncated"], "tokens": result["tokens"],
                "cot_leak": _cot_leak(text), "kind": kind,
+               "gate_wait_s": round(gate_wait, 3) if gate_wait else None,
                "fallback": cand != ref, "skipped_cooling": skipped or None}
+        PROVIDER_GATE.note_success(c_provider)   # 枠が縮んでいたら 1 本ずつ戻す
         clear_provider_auth(c_provider)   # 通ったら「認証で駄目」の記憶を消す
         observe_call(out, kind, text)
         return out
@@ -5534,17 +5773,46 @@ def _no_models() -> dict:
     }
 
 
+def _expand_models(names: list[str]) -> tuple[list[str], bool]:
+    """`models: ["all"]`（または `*` / `全部`）を**在庫の全 chat Free** へ展開する。
+
+    戻り値は (refs, 上限で切り詰めたか)。名指しした ref を先に残し、そのうえで在庫を足す。
+    上限は `FREEAGENT_MAX_MODELS_PER_CALL`（既定 16）。`freeagent_models` の `ref` を並べる代わりに
+    「今 使える Free を全部」を 1 語で指定するための入口（ツールを増やさずに済ませる）。
+    """
+    wildcard = ("all", "*", "全部", "すべて")
+    toks = [n.strip() for n in names if isinstance(n, str) and n.strip()]
+    if any(t.lower() in wildcard for t in toks):
+        out = [t for t in toks if t.lower() not in wildcard]
+        for ref in free_model_refs(free_only=True, chat_only=True):
+            if ref not in out:
+                out.append(ref)
+    else:
+        out = toks
+    return out[:MAX_MODELS_PER_CALL], len(out) > MAX_MODELS_PER_CALL
+
+
 def _select_or_error(args: dict, default_size: int = 3) -> tuple[list[str], dict]:
-    size = as_int(args.get("size"), default_size, 1, 6)
-    return select_models(size, as_str_list(args.get("models")) or None,
-                         prefer=as_str_list(args.get("prefer")) or None,
-                         exclude=as_str_list(args.get("exclude")) or None)
+    """`models`（`all` 展開つき）→ `prefer` → 品質統計の順に参加モデルを決める。"""
+    requested, cut = _expand_models(as_str_list(args.get("models")))
+    size = as_int(args.get("size"), default_size, 1, MAX_SUB_MODELS)
+    if requested:
+        size = max(size, len(requested))     # 明示指定は size で切り落とさない
+    refs, info = select_models(size, requested or None,
+                               prefer=as_str_list(args.get("prefer")) or None,
+                               exclude=as_str_list(args.get("exclude")) or None)
+    if cut:
+        info.setdefault("notes", []).append(
+            f"models は上限 {MAX_MODELS_PER_CALL} 件で切りました（FREEAGENT_MAX_MODELS_PER_CALL）")
+    return refs, info
 
 
 def _rate_limit_report(answers: list[dict]) -> dict:
     limited = [a for a in answers if a.get("rate_limited")]
     skipped = sorted({ref for a in answers for ref in (a.get("skipped_cooling") or [])})
-    return {"rate_limited": len(limited), "skipped_cooling": skipped}
+    # 「429 を踏まずに枠待ちで吸収した」件数（0 なら提供元の枠に余裕があった）。
+    return {"rate_limited": len(limited), "skipped_cooling": skipped,
+            "slot_waited": sum(1 for a in answers if (a.get("gate_wait_s") or 0) > 0)}
 
 
 def _consensus_groups(entries: list[dict]) -> list[dict]:
@@ -5762,12 +6030,14 @@ def tool_fanout(args: dict) -> dict:
     if not prompts:
         return {"error": "prompts（または prompt）は必須です"}
     prompts = prompts[:16]
-    explicit = as_str_list(args.get("models"))
+    explicit, cut = _expand_models(as_str_list(args.get("models")))
     if explicit:
         refs = explicit
-        info = {"requested": True, "models": refs}
+        info = {"requested": True, "models": refs,
+                "notes": [f"models は上限 {MAX_MODELS_PER_CALL} 件で切りました"
+                          "（FREEAGENT_MAX_MODELS_PER_CALL）"] if cut else []}
     else:
-        size = as_int(args.get("size"), 2, 1, 4)
+        size = as_int(args.get("size"), 2, 1, MAX_SUB_MODELS)
         refs, info = select_models(size, None)
     if not refs:
         return _no_models()
@@ -5797,7 +6067,8 @@ def tool_fanout(args: dict) -> dict:
         "calls": len(rows), "ok": ok, "failed": len(rows) - ok,
         "wall_s": wall, "sequential_estimate_s": sequential,
         "speedup": round(sequential / wall, 2) if wall > 0 else None,
-        "results": rows, "selection": info, **_rate_limit_report(results),
+        "results": rows, "selection": info, "concurrency": PROVIDER_GATE.report(refs),
+        **_rate_limit_report(results),
     }
 
 
@@ -5839,6 +6110,7 @@ def tool_panel(args: dict) -> dict:
         "open_questions": [{"model": a["model"], "question": a["question"]}
                            for a in good if a.get("question")],
         "answers": answers,
+        "concurrency": PROVIDER_GATE.report(refs),
         **_rate_limit_report(results),
         "agreement_note": "合意度は解析済みの結論の表層類似度であり、正しさの確率ではありません。",
     }
@@ -5959,6 +6231,7 @@ def tool_grounded(args: dict) -> dict:
         "evidence_citation_count": len(window["numbers"]),
         "unsupported_citations": sorted({n for row in good for n in row.get("unsupported_citations", [])}),
         "models": refs, "selection": info, "answers": answers,
+        "concurrency": PROVIDER_GATE.report(refs),
         "agreement": agreement_of([a.get("answer") or "" for a in good]),
         "answers_with_citations": sum(1 for a in good if a.get("cited_ok")),
         "answered": len(good), "failed": len(answers) - len(good),
@@ -6171,6 +6444,7 @@ def tool_consult(args: dict) -> dict:
         "rounds_run": len(rounds),
         "question": truncate(question, 400),
         "models": refs, "selection": info,
+        "concurrency": PROVIDER_GATE.report(refs),
         "agreement": agreement_of([row.get("conclusion") or "" for row in last]),
         "agreement_note": "表層合意度。正しさの確率ではありません。",
         "confidence_mean": round(sum(conf) / len(conf), 1) if conf else None,
@@ -7109,6 +7383,8 @@ TOOLS: list[dict] = [
             "`Free候補` は**サブLLM に使えるモデルだけ**（埋め込み・分類器・画像/音声生成は自動選抜から外す。"
             "件数は `non_chat_candidates`）。"
             "【使わない条件】通常は不要（panel/consult 等が自動で選ぶ）。"
+            "**個別の ref を並べる代わりに、他ツールの `models` へ `[\"all\"]` を渡せる**"
+            "（在庫の全 Free・対話モデルのみが対象）。"
         ),
         "inputSchema": {
             "type": "object",
@@ -7156,14 +7432,23 @@ TOOLS: list[dict] = [
             "【使う条件】複数のプロンプト×複数モデルを並列に当てて相互検証・ベストオブN・多数決をしたい。"
             "【競合より優先】`deliberation` の ask_* を N 回並べるより速い（1 ターンを待たずに同時に走る）。"
             "【差分】速度と失敗の集計（wall と逐次見積り）付き。合意度が要るなら panel。"
+            "**`models: [\"all\"]` で在庫の全 Free を束ねられる**（プロンプト 1 本なら全部が 1 回で走る。"
+            "合計呼び出しは FREEAGENT_MAX_CALLS_PER_RUN・既定 40 で打ち切る）。"
+            "**提供元ごとの同時実行枠を超える呼び出しは 429 を踏まずに順番待ちする**"
+            "（枠と枠待ちは `concurrency` に出る）。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "prompts": {"type": "array", "items": {"type": "string"}, "description": "依頼文の配列"},
                 "prompt": {"type": "string", "description": "単一の依頼文（prompts の代わり）"},
-                "models": {"type": "array", "items": {"type": "string"}},
-                "size": {"type": "integer", "description": "自動選択するモデル数（既定 2）"},
+                "models": {"type": "array", "items": {"type": "string"},
+                           "description": "明示するモデル（provider/model）。[\"all\"] を渡すと在庫の"
+                                          "全 Free（対話モデルのみ）へ展開する（上限は "
+                                          "FREEAGENT_MAX_MODELS_PER_CALL・既定 16）。"
+                                          "明示した件数は size で切り落とさない"},
+                "size": {"type": "integer",
+                         "description": f"自動選択するモデル数（既定 2・最大 {MAX_SUB_MODELS}）"},
                 "system": {"type": "string"},
                 "max_tokens": {"type": "integer"},
             },
@@ -7176,13 +7461,21 @@ TOOLS: list[dict] = [
             "【競合より優先】`delegate_task`（同じモデルの分身＝多様性ゼロ）／`deliberation`（単発集約で"
             "合意度の推移・少数意見の保持が無い）。"
             "【差分】合意度・不一致・確信度平均・「メインに確認したい点」を構造化して返す。"
+            "`models: [\"all\"]` で在庫の全 Free を参加させる（`size` は既定 3・最大 "
+            + str(MAX_SUB_MODELS) + "）。"
+            "**提供元ごとの同時実行枠を超える呼び出しは 429 を踏まずに順番待ちする**"
+            "（枠と枠待ち件数は `concurrency` に出る）。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "question": {"type": "string"},
-                "models": {"type": "array", "items": {"type": "string"}},
-                "size": {"type": "integer", "description": "参加モデル数（既定 3）"},
+                "models": {"type": "array", "items": {"type": "string"},
+                           "description": "明示するモデル（provider/model）。[\"all\"] を渡すと在庫の"
+                                          "全 Free（対話モデルのみ）へ展開する。"
+                                          "明示した件数は size で切り落とさない"},
+                "size": {"type": "integer",
+                         "description": f"参加モデル数（既定 3・最大 {MAX_SUB_MODELS}）"},
                 "prefer": {"type": "array", "items": {"type": "string"}},
                 "exclude": {"type": "array", "items": {"type": "string"}},
                 "max_tokens": {"type": "integer"},
@@ -7238,8 +7531,12 @@ TOOLS: list[dict] = [
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
                 "limit": {"type": "integer"},
                 "lang": {"type": "string", "description": "Wikipedia / Wikidata の言語。**wikipedia は省略時に問いから自動**（日本語・中国語・韓国語なら ja、それ以外は en）。**wikidata は既定 ja 固定**（明示すればその言語で引く）"},
-                "models": {"type": "array", "items": {"type": "string"}},
-                "size": {"type": "integer", "description": "参加モデル数（既定 2）"},
+                "models": {"type": "array", "items": {"type": "string"},
+                           "description": "明示するモデル（provider/model）。[\"all\"] を渡すと在庫の"
+                                          "全 Free（対話モデルのみ）へ展開する。"
+                                          "明示した件数は size で切り落とさない"},
+                "size": {"type": "integer",
+                         "description": f"参加モデル数（既定 2・最大 {MAX_SUB_MODELS}）"},
                 "max_tokens": {"type": "integer"},
             },
             "required": ["question"],
@@ -7284,8 +7581,12 @@ TOOLS: list[dict] = [
                 "mode": {"type": "string", "description": "discuss / review（review は draft を査読）"},
                 "draft": {"type": "string", "description": "mode=review のときの査読対象"},
                 "debate_depth": {"type": "string", "description": "normal / deep"},
-                "models": {"type": "array", "items": {"type": "string"}},
-                "size": {"type": "integer"},
+                "models": {"type": "array", "items": {"type": "string"},
+                           "description": "明示するモデル（provider/model）。[\"all\"] を渡すと在庫の"
+                                          "全 Free（対話モデルのみ）へ展開する。"
+                                          "明示した件数は size で切り落とさない"},
+                "size": {"type": "integer",
+                         "description": f"参加モデル数（既定 3・最大 {MAX_SUB_MODELS}）"},
                 "prefer": {"type": "array", "items": {"type": "string"}},
                 "exclude": {"type": "array", "items": {"type": "string"}},
                 "max_tokens": {"type": "integer"},
@@ -7618,6 +7919,8 @@ def _render_fanout(data: dict) -> str:
     head = (f"{data.get('calls')} 呼び出し / 成功 {data.get('ok')} / 失敗 {data.get('failed')}"
             f" / wall {data.get('wall_s')}s（逐次なら約 {data.get('sequential_estimate_s')}s、"
             f"倍率 {data.get('speedup')}）")
+    if data.get("slot_waited"):
+        head += f" / 提供元の枠待ち {data['slot_waited']} 件（429 を踏まずに順番待ちで吸収）"
     body = ""
     for row in (data.get("results") or [])[:12]:
         text = row.get("answer") or row.get("error") or ""
@@ -7630,6 +7933,8 @@ def _render_panel(data: dict) -> str:
     lines = [f"回答 {data.get('answered')}/{len(data.get('models') or [])} 体"
              f" / 独立した実モデル {data.get('independent_sources', data.get('answered'))} 体"
              f" / 合意度 {data.get('agreement')}{conf_note}"]
+    if data.get("slot_waited"):
+        lines.append(f"ℹ️ 提供元の枠待ち {data['slot_waited']} 件（429 を踏まずに順番待ちで吸収しました）")
     for group in (data.get("consensus") or [])[:5]:
         lines.append(f"  • {', '.join(group['models'])}: {truncate(group['excerpt'], 160)}")
     if data.get("open_questions"):

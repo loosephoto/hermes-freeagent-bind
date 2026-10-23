@@ -1455,6 +1455,12 @@ class TestOfflineTolerance(unittest.TestCase):
             "FREEAGENT_COOLDOWN_PATH": os.path.join(self.tmp, "cooldowns.json"),
         })
         self.env.start()
+        # **メモリ上の統計をこのテストの観測だけで数える**。`_STATS` はモジュール全体で 1 つで、
+        # 一度ロードされると `FREEAGENT_STATS_PATH` を差し替えても読み直さない。共有の一時ストア
+        # （`%TEMP%/fa-*`）に前回の実行の行が残っていると、`observe_call` 1 回でも件数が 1 にならない
+        # （実測: フルスイートで 2.999〜3.999。単体では 1）。監査系テストと同じ隔離をする。
+        S._STATS["models"].clear()
+        S._STATS_LOADED = False
 
     def tearDown(self):
         self.env.stop()
