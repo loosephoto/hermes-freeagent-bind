@@ -67,7 +67,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.9.2"
+SERVER_VERSION = "0.9.3"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -226,6 +226,52 @@ PROVIDER_SPECS: dict[str, dict] = {
         "note": "Ollama Cloud Free plan確認が必須（FREEAGENT_OLLAMA_FREE_PLAN=1）。無料は starter モデルだけで"
                 "範囲は非公開 → probe で確認。同時 1 リクエスト。クレジットを購入すると全モデルが使えますが課金対象です",
     },
+    # Z.ai（Zhipu GLM）。公式価格表で $0 の Flash 系だけを許可する。
+    # 実測（2026-10-23・この環境のキー）: glm-4.7-flash / glm-4.5-flash / glm-4.6v-flash は 200、
+    # 有料の glm-5.3-flash / glm-4.5 は 429 {"code":"1113","message":"Insufficient balance..."}。
+    # **一覧（/api/paas/v4/models）は Free の 3 件を返さない**（有料の旗艦 11 件だけ）ので、
+    # 許可リストの ID を在庫として補う（`_with_allowlisted_rows`）。
+    "zai": {
+        "base_url": os.environ.get("FREEAGENT_ZAI_BASE_URL", "https://api.z.ai/api/paas/v4"),
+        "key": (os.environ.get("GLM_API_KEY") or os.environ.get("ZAI_API_KEY")
+                or os.environ.get("ZHIPUAI_API_KEY") or ""),
+        "key_env": "GLM_API_KEY", "free_kind": "allowlist", "always_ready": False,
+        "free_model_ids": ("glm-4.7-flash", "glm-4.5-flash", "glm-4.6v-flash"),
+        # 一覧が Free ID を返さない提供元なので、許可リストを在庫として補う（下の関数）。
+        "synthesize_free_ids": True,
+        "required_env_flags": ("FREEAGENT_ZAI_FREE_TIER",), "catalog_requires_ready": True,
+        "note": "Z.ai（Zhipu GLM）。公式価格表で $0 の GLM-4.7-Flash / 4.5-Flash / 4.6V-Flash だけを許可"
+                "（一覧 API はこの 3 件を返さないため許可リストから在庫を補います）。Free tier確認が必須"
+                "（FREEAGENT_ZAI_FREE_TIER=1）。キーは GLM_API_KEY（別名 ZAI_API_KEY / ZHIPUAI_API_KEY）。"
+                "有料モデルは残高が無いと 429 を返します。Flash 系は**思考モデル**なので max_tokens に余裕を"
+                "（実測: glm-4.5-flash は 256 で思考 202 トークンの後に本文。64 では本文が空になり、"
+                "サーバーの空応答リトライが上限を引き上げます）",
+    },
+    # Mistral La Plateforme。Experiment plan（無料・月 約10億トークン・電話確認）は API から
+    # Free/paid を判定できないので、クレジット型（プラン確認 + 枠）として扱う（規約 31）。
+    "mistral": {
+        "base_url": os.environ.get("FREEAGENT_MISTRAL_BASE_URL", "https://api.mistral.ai/v1"),
+        "key": os.environ.get("MISTRAL_API_KEY", ""),
+        "key_env": "MISTRAL_API_KEY", "free_kind": "credit", "always_ready": False,
+        "required_env_flags": ("FREEAGENT_MISTRAL_FREE_PLAN",), "catalog_requires_ready": True,
+        "note": "Mistral La Plateforme。Experiment plan（無料・月 約10億トークン・電話確認）の確認が必須"
+                "（FREEAGENT_MISTRAL_FREE_PLAN=1）。API は Free/paid を返さないのでクレジット枠として扱い、"
+                "対象は `probe` で確認します。RPM が低いので並列 fan-out より長文・少数リクエスト向きです。"
+                "有料プランへ変更したらこのフラグを外してください",
+    },
+    # ModelScope（魔搭社区）。API-Inference は無料枠（公称 2,000 リクエスト/日・日次回復）だが、
+    # 一覧 37 件は pricing を持たないのでクレジット型として扱う（実測 2026-10-23: 未認証で 200）。
+    "modelscope": {
+        "base_url": os.environ.get("FREEAGENT_MODELSCOPE_BASE_URL",
+                                  "https://api-inference.modelscope.cn/v1"),
+        "key": (os.environ.get("MODELSCOPE_API_KEY") or os.environ.get("MODELSCOPE_API_TOKEN") or ""),
+        "key_env": "MODELSCOPE_API_KEY", "free_kind": "credit", "always_ready": False,
+        "required_env_flags": ("FREEAGENT_MODELSCOPE_FREE_PLAN",), "catalog_requires_ready": True,
+        "note": "ModelScope API-Inference（魔搭社区）。無料枠（公称 2,000 リクエスト/日・日次回復）の確認が"
+                "必須（FREEAGENT_MODELSCOPE_FREE_PLAN=1）。一覧（未認証でも 200・37 件）は pricing を持たない"
+                "ためクレジット枠として扱い、対象は `probe` で確認します。Qwen / DeepSeek / GLM / Step など。"
+                "キーは MODELSCOPE_API_KEY（別名 MODELSCOPE_API_TOKEN）。キー発行に実名・SMS 確認が要る場合があります",
+    },
 }
 # MCP の `initialize` 応答に載せる `instructions`。**Hermes はこれを読まない**（実測: 旧実装で
 # 自発率が上がらず、現行版のソース `tools/mcp_tool_*.py` にも参照が無いことを確認）。それでも
@@ -247,7 +293,8 @@ PROACTIVE_INSTRUCTIONS = (
 )
 
 PROVIDER_ORDER = [n.strip() for n in os.environ.get(
-    "FREEAGENT_PROVIDER_ORDER", "nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama").split(",")
+    "FREEAGENT_PROVIDER_ORDER",
+    "nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama,zai,mistral,modelscope").split(",")
     if n.strip() in PROVIDER_SPECS] or ["nous"]
 
 # 知識バックエンドの識別用 User-Agent。MediaWiki / OpenAlex / Crossref は連絡先入りの UA を求める。
@@ -1935,12 +1982,34 @@ def _fetch_provider_catalog(provider: str, spec: dict) -> list[dict]:
                 "pricing": raw.get("pricing") or {},
                 "access": raw.get("access"),
             })
+        rows = _with_allowlisted_rows(provider, spec, rows)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     _models_store(provider, rows, error)
     if rows:
         _catalog_disk_store(provider, rows)
     return rows
+
+
+def _with_allowlisted_rows(provider: str, spec: dict, rows: list[dict]) -> list[dict]:
+    """一覧が返さない Free ID を在庫として補う（spec の `synthesize_free_ids` が真のときだけ）。
+
+    実測（2026-10-23）: Z.ai の `/models` は有料の旗艦 11 件だけを返し、公式価格表で $0 の
+    `glm-4.7-flash` などは載らない。載っていないことを理由に Free を隠すと、その提供元は
+    自動選抜に永久に入らず、`freeagent_models` も「Free 0 件」という嘘を返す。
+    公表された Free ID は**呼べる在庫**なので、一覧に無いときだけ足す（既存行は触らない）。
+
+    **既定では足さない**: 一覧が許可リストの ID を返す提供元では、一覧が唯一の在庫の根拠
+    （許可リストは「有料を呼ばない」ための門番）なので、勝手に行を増やすと在庫の意味が変わる。
+    """
+    allowed = spec.get("free_model_ids")
+    if not allowed or not spec.get("synthesize_free_ids"):
+        return rows
+    known = {as_str(row.get("id")) for row in rows}
+    extra = [{"id": model, "provider": provider, "free": True, "chat": True, "free_via": [],
+              "context_length": None, "pricing": {}, "access": None, "synthesized": True}
+             for model in allowed if model not in known]
+    return rows + extra if extra else rows
 
 
 def fetch_provider_models(provider: str, ttl: float = CATALOG_TTL) -> list[dict]:
@@ -7034,7 +7103,8 @@ TOOLS: list[dict] = [
         "description": (
             "【使う条件】使えるモデルを**検索**したい（どのプロバイダにどんな Free モデルがあるか）／"
             "品質統計やクールダウンを確認したいとき。"
-            "【差分】`query`（ID の部分一致）と `provider`（nous / openrouter / nvidia / huggingface / groq / cloudflare / gemini）で絞り込む。"
+            "【差分】`query`（ID の部分一致）と `provider`（" + " / ".join(PROVIDER_ORDER)
+            + "）で絞り込む。"
             "返る `ref` は他ツールの `models` 引数にそのまま渡せる（HF は `:提供元` を付けて経路を固定できる）。"
             "`Free候補` は**サブLLM に使えるモデルだけ**（埋め込み・分類器・画像/音声生成は自動選抜から外す。"
             "件数は `non_chat_candidates`）。"

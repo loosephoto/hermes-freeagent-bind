@@ -60,6 +60,7 @@ DEFAULT_INTERVAL_MINUTES = 5
 SERVICE_DIR_NAME = "freeagent-service"
 LOG_NAME = "freeagent-autostart.log"
 LAUNCHER_NAME = "run_server.pyw"
+ENV_NAME = "freeagent.env"
 WORKER_NAME = "Hermes_Freeagent.vbs"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -101,19 +102,25 @@ def discover_python(hermes_home: str) -> tuple[str, str]:
     return "", ""
 
 
-def service_paths(hermes_home: str) -> dict:
+def service_paths(hermes_home: str, startup_dir: str = "") -> dict:
+    """生成物のパス。`startup_dir` を与えるとログオン起動の launcher をそこへ置く。
+
+    **テストでは必ず与える**。与えないと実機の `%APPDATA% の Startup フォルダ` を書き換えてしまい、
+    実測では実機の launcher が一時ディレクトリを指す状態になり、ログオン起動が壊れた。
+    """
     service = os.path.join(hermes_home, SERVICE_DIR_NAME)
+    startup_root = startup_dir or os.path.join(
+        os.environ.get("APPDATA") or os.path.expanduser("~"),
+        "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
     return {
         "service_dir": service,
         "launcher": os.path.join(service, LAUNCHER_NAME),
         "worker": os.path.join(service, WORKER_NAME),
         "log": os.path.join(hermes_home, "logs", LOG_NAME),
+        "service_env": os.path.join(service, ENV_NAME),
         "apply": os.path.join(service, "apply_freeagent_http.sh"),
         "revert": os.path.join(service, "revert_freeagent_stdio.sh"),
-        "startup": os.path.join(
-            os.environ.get("APPDATA") or os.path.expanduser("~"),
-            "Microsoft", "Windows", "Start Menu", "Programs", "Startup", WORKER_NAME,
-        ),
+        "startup": os.path.join(startup_root, WORKER_NAME),
     }
 
 
@@ -138,6 +145,10 @@ HOME = os.path.expandvars(r"__HERMES_HOME__")
 REPO = r"__REPO__"
 LOG = os.path.join(HOME, "logs", "__LOG_NAME__")
 PORT = __PORT__
+# 常駐サーバーは別プロセスなので Hermes の MCP `env` が届かない。起動時に .env を読む。
+# `FREEAGENT_ENV_FILE` があればそれを最優先（テスト・別プロファイル用）。
+ENV_FILES = [os.environ.get("FREEAGENT_ENV_FILE") or os.path.join(HOME, ".env"),
+             os.path.join(HOME, "__SERVICE_DIR__", "__ENV_NAME__")]
 
 os.chdir(REPO)
 sys.path.insert(0, os.path.join(REPO, "src"))
@@ -146,11 +157,53 @@ _stream = open(LOG, "a", encoding="utf-8", errors="replace", buffering=1)
 sys.stdout = _stream
 sys.stderr = _stream
 
+def _load_env_file(path):
+    """KEY=VALUE を os.environ へ入れる（**既にある値を上書きしない**）。
+
+    Hermes の `.env` は `export KEY=VALUE` や引用符つきの行も混ざるので寛容に読む。
+    値は絶対にログへ出さない（返すのは名前だけ）。
+    """
+    names = []
+    if not path or not os.path.isfile(path):
+        return names
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.lower().startswith("export "):
+                    line = line[7:].lstrip()
+                key, sep, value = line.partition("=")
+                key = key.strip()
+                if not sep or not key or key in os.environ:
+                    continue
+                value = value.strip()
+                # インラインコメント（KEY=1  # 説明）を値に混ぜない（python-dotenv と同じ扱い）。
+                if value[:1] not in ('"', "'"):
+                    value = value.split(" #", 1)[0].strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                if not value:
+                    continue
+                os.environ[key] = value
+                names.append(key)
+    except OSError:
+        return names
+    return names
+
+
+_loaded = []
+for _env_path in ENV_FILES:
+    _loaded.extend(_load_env_file(_env_path))
+print("[env] loaded %d vars: %s" % (len(_loaded), ", ".join(_loaded) or "none"))
+
 sys.argv = ["server.py", "--transport", "http", "--host", "__HOST__", "--port", str(PORT)]
 runpy.run_path(os.path.join(REPO, "src", "freeagent_bind", "server.py"), run_name="__main__")
 '''.replace("__HERMES_HOME__", cfg["hermes_home"]).replace("__REPO__", cfg["repo"]).replace(
         "__LOG_NAME__", LOG_NAME).replace("__PORT__", str(cfg["port"])).replace(
-        "__HOST__", cfg["host"]).replace("__MARKER__", cfg["marker"]).lstrip("\n")
+        "__HOST__", cfg["host"]).replace("__MARKER__", cfg["marker"]).replace(
+        "__SERVICE_DIR__", SERVICE_DIR_NAME).replace("__ENV_NAME__", ENV_NAME).lstrip("\n")
 
 
 def render_worker(cfg: dict) -> str:
@@ -313,10 +366,44 @@ echo '--- 接続テスト ---' && hermes mcp test freeagent-bind
         "__PORT__", str(cfg["port"]))
 
 
+def render_service_env(cfg: dict) -> str:
+    """常駐サーバー専用の環境変数ファイルの雛形（**無いときだけ**作る）。
+
+    キーは Hermes の `.env`（launcher が読む）にあり、ここへ書くのは**確認フラグ**です。
+    フラグは「自分がそのプラン／データ条件で使う」という利用者の申告なので、雛形は
+    すべてコメントアウトしておきます（規約 31）。
+    """
+    return """# freeagent-bind 常駐サーバー専用の環境変数（このファイルは常駐プロセスだけが読みます）。
+# 生成: scripts/install_resident_windows.py（**既存ファイルは上書きしません**）。
+#
+# launcher（run_server.pyw）が起動時に読む順序:
+#   1. %LOCALAPPDATA%/hermes/.env        … Hermes のキー（OPENROUTER_API_KEY / NVIDIA_API_KEY /
+#                                            HF_TOKEN / GEMINI_API_KEY / OLLAMA_API_KEY など）
+#   2. このファイル                        … 常駐サーバー固有の設定・確認フラグ
+# すでに環境にある値は上書きしません（launcher は名前だけをログに出します。値は出ません）。
+# 反映には常駐サーバーの再起動が要ります（見張りは生存確認だけで、動いているプロセスの
+# 環境は読み直しません）。
+#
+# 書き方: 1 行 1 つ `KEY=VALUE`。値の後ろにインラインコメントを書かないでください
+# （`KEY=1  # 説明` は値に混ざります）。`export KEY=VALUE` と引用符は受け付けます。
+#
+# ここに書くのは「確認フラグ」です。キーだけでは有効化されない提供元と、必要なフラグ:
+#   FREEAGENT_GROQ_FREE_TIER=1            # Groq の Free プランであることの申告
+#   FREEAGENT_CLOUDFLARE_FREE_PLAN=1      # Workers Free プランであることの申告
+#   FREEAGENT_VERCEL_FREE_TIER=1          # Vercel AI Gateway の Free tier であることの申告
+#   FREEAGENT_OLLAMA_FREE_PLAN=1          # Ollama Cloud の Free プラン（starter クレジット）
+#   FREEAGENT_GEMINI_FREE_TIER=1          # Gemini の Free tier
+#   FREEAGENT_GEMINI_UNPAID_DATA_ACK=1    # 非機密データ限定の同意（未払い枠は人手レビュー対象）
+"""
+
+
 def build_config(hermes_home: str, repo: str, host: str, port: int,
-                 python: str = "", pythonw: str = "") -> dict:
-    """生成に必要な値一式（見つかった python を含む）。"""
-    paths = service_paths(hermes_home)
+                 python: str = "", pythonw: str = "", startup_dir: str = "") -> dict:
+    """生成に必要な値一式（見つかった python を含む）。
+
+    `startup_dir` を空にすると**実機の Startup フォルダ**を使う。テストは必ず与える。
+    """
+    paths = service_paths(hermes_home, startup_dir)
     found_py, found_pyw = discover_python(hermes_home)
     return {
         "hermes_home": hermes_home,
@@ -386,12 +473,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true", help="既存ファイルを上書きする")
     parser.add_argument("--dry-run", action="store_true", help="書き込むパスだけ表示する")
     parser.add_argument("--task", action="store_true", help="見張りタスクも登録する（--write と併用）")
+    parser.add_argument("--startup-dir", default=os.environ.get("FREEAGENT_STARTUP_DIR", ""),
+                        help="ログオン起動 launcher を置くフォルダ（既定: %%APPDATA%%\\...\\Startup）。"
+                             "テストは必ず一時ディレクトリを渡す")
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--interval-minutes", type=int, default=DEFAULT_INTERVAL_MINUTES)
     args = parser.parse_args(argv)
 
     cfg = build_config(args.hermes_home, args.repo, args.host, args.port,
-                       args.python, args.pythonw)
+                       args.python, args.pythonw, args.startup_dir)
     plan = build_plan(cfg)
 
     print("hermes home : %s" % cfg["hermes_home"])
@@ -405,6 +495,10 @@ def main(argv: list[str] | None = None) -> int:
         for path, text in plan:
             state = "overwrite" if os.path.exists(path) else "new"
             print("[%s] %s (%d bytes)" % (state, path, len(text.encode("utf-8"))))
+        # 常駐サーバー専用の env は**無いときだけ**作る（--force でも利用者のフラグを消さない）。
+        _env_path = cfg["paths"]["service_env"]
+        print("[%s] %s (%d bytes)" % ("exists" if os.path.exists(_env_path) else "new",
+                                      _env_path, len(render_service_env(cfg).encode("utf-8"))))
         if not args.write:
             print("\n(表示のみ。--write で生成します)")
             return 0
@@ -412,6 +506,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.write:
         for line in write_plan(plan, force=args.force):
             print(line)
+        _env_path = cfg["paths"]["service_env"]
+        if os.path.exists(_env_path):
+            print("skipped (exists): %s" % _env_path)
+        else:
+            os.makedirs(os.path.dirname(_env_path), exist_ok=True)
+            with open(_env_path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(render_service_env(cfg))
+            print("wrote: %s" % _env_path)
         if args.task:
             print(register_task(cfg, args.task_name, args.interval_minutes))
     return 0

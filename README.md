@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud の 9 プロバイダ、検索は **24 ソース（既定6＋明示指定18）** に対応します。
+- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope の 12 プロバイダ、検索は **24 ソース（既定6＋明示指定18）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 **対象分野は科学（物理・数学・計算機）とプログラミングです。医学・生物学は対象外です。**
@@ -614,7 +614,7 @@ HTTP の待受までは 463ms（4 回のうち初回を除く中央値）でし�
 **全社の設定は不要です。** Nous のプロキシか、既に利用できる提供元を1つ選んで始めてください。
 
 別の AI に答えさせる機能（`ask` / `panel` / `consult` / `grounded` / `agent` / `map` / `fanout`、
-`think` の `verify` / `propose_alternatives`）で使います。**9 プロバイダのうち、使うものを 1 つ以上**用意します。
+`think` の `verify` / `propose_alternatives`）で使います。**12 プロバイダのうち、使うものを 1 つ以上**用意します。
 
 | プロバイダ | 必要なもの | 入手先・注意点 |
 |---|---|---|
@@ -624,7 +624,7 @@ HTTP の待受までは 463ms（4 回のうち初回を除く中央値）でし�
 | **Hugging Face** | `HF_TOKEN` | [Access Tokens](https://huggingface.co/settings/tokens)。**Make calls to Inference Providers** 権限と月次クレジット残が必要 |
 
 <details>
-<summary>追加の5プロバイダ：無料プランの確認が必要な接続先</summary>
+<summary>追加の8プロバイダ：無料プラン・無料枠の確認が必要な接続先</summary>
 
 API キーに加えて、契約プランやデータの扱いを確認したことを示す環境変数が必要です。
 
@@ -634,10 +634,14 @@ API キーに加えて、契約プランやデータの扱いを確認したこ�
 | **Cloudflare Workers AI** | `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`、`FREEAGENT_CLOUDFLARE_FREE_PLAN=1` | [API Tokens](https://dash.cloudflare.com/profile/api-tokens)。Workers **Free** planの利用者向け。10,000 Neurons/日の共有枠を超えるとFreeでは停止しますが、Workers Paidでは超過分が課金されます。CloudflareはCustomer Contentをモデル学習・サービス改善に使わないとしています（別途ストレージ連携時は保存の可能性あり）。Paid planなら確認変数を設定しないでください |
 | **Gemini Developer API** | `GEMINI_API_KEY`（別名 `GOOGLE_API_KEY`）と2つの確認変数 | [Google AI Studio API key](https://aistudio.google.com/apikey)。Free/unpaid tierの入力・出力は製品改善や人手レビューに使われる場合があります。**機密・個人情報は送らず**、Free tierとデータ用途を確認した場合だけ有効にしてください |
 | **Vercel AI Gateway** | `AI_GATEWAY_API_KEY` と `FREEAGENT_VERCEL_FREE_TIER=1` | [AI Gateway](https://vercel.com/ai-gateway)。Free tierは**月 $5 のクレジット**で、使えるのはFree Tier対象モデルだけです（実測15件を許可リスト化）。**クレジットを購入するとpaid tierに移り、月次の無料クレジットは消えます** |
+| **Z.ai（GLM）** | `GLM_API_KEY`（別名 `ZAI_API_KEY` / `ZHIPUAI_API_KEY`）と `FREEAGENT_ZAI_FREE_TIER=1` | [Z.ai](https://z.ai)。公式価格表で **$0** の `glm-4.7-flash` / `glm-4.5-flash` / `glm-4.6v-flash` だけを許可リストで許可します。**提供元の一覧 API はこの 3 件を返しません**（有料の旗艦 11 件だけ。実測）ので、Free の在庫は許可リストから補います（`synthesize_free_ids`）。有料モデルは残高が無いと 429 を返します（実測）。**Flash 系は思考モデル**なので `max_tokens` に余裕を持たせてください（実測: `glm-4.5-flash` は 256 で思考 202 トークンの後に本文。空応答はサーバーが上限を上げて 1 回だけ再試行します） |
+| **Mistral La Plateforme** | `MISTRAL_API_KEY` と `FREEAGENT_MISTRAL_FREE_PLAN=1` | [La Plateforme](https://console.mistral.ai)。無料の **Experiment plan**（月 約10億トークン・電話確認・RPM 低め）を使う場合の申告です。API は Free/paid を返さないため**クレジット枠**として扱い、対象は `probe` で確認します。**並列 fan-out には向かず、長文・少数リクエスト向き**です |
+| **ModelScope** | `MODELSCOPE_API_KEY`（別名 `MODELSCOPE_API_TOKEN`）と `FREEAGENT_MODELSCOPE_FREE_PLAN=1` | [ModelScope](https://modelscope.cn)。API-Inference の無料枠（公称 2,000 リクエスト/日・日次回復）の申告です。Qwen / DeepSeek / GLM / Step などが載ります（一覧は未認証でも読めます・実測 37 件）。キー発行に実名・SMS 確認が要る場合があります |
 | **Ollama Cloud** | `OLLAMA_API_KEY` と `FREEAGENT_OLLAMA_FREE_PLAN=1` | [API keys](https://ollama.com/settings/keys)。Free planはstarterモデル向けの月次クレジットで、**対象範囲は提供元が公表していません**（`probe`で実際に応答するモデルを確認）。同時1リクエスト。プロンプト/応答はログ・学習されないと提供元が明記しています |
 
-- Groq / Cloudflare / Gemini / Vercel / Ollama は、確認変数がそろうまでモデル一覧取得も推論も行いません。これは契約プランをAPIから検証する仕組みではなく、利用者の明示確認です。プランやBilling設定を変更したら、確認変数を解除して再確認してください。
-- Groq / Cloudflare / Gemini / Vercel はコード側のFreeモデル許可リストに含まれるIDだけを呼び出し、明示指定でも有料・未許可モデルを拒否します。
+- Groq / Cloudflare / Gemini / Vercel / Ollama / Z.ai / Mistral / ModelScope は、確認変数がそろうまでモデル一覧取得も推論も行いません。これは契約プランをAPIから検証する仕組みではなく、利用者の明示確認です。プランやBilling設定を変更したら、確認変数を解除して再確認してください。
+- Groq / Cloudflare / Gemini / Vercel / Z.ai はコード側のFreeモデル許可リストに含まれるIDだけを呼び出し、明示指定でも有料・未許可モデルを拒否します。
+- Z.ai は**提供元の一覧 API が Free の ID を返さない**ため（実測: 有料の旗艦だけ 11 件）、公表された Free の ID を在庫として補います（許可リスト方式 + `synthesize_free_ids`）。他の許可リスト方式（Groq / Cloudflare / Gemini / Vercel）は一覧が ID を返すので補いません。Mistral / ModelScope は Free 判定を API が返さないのでクレジット枠＋プラン確認で扱い、対象は `probe` で確認します。
 - Ollama は無料対象の範囲が非公開でAPIから判定できないため許可リストを作らず、クレジット枠として扱います。**対象外のモデルは提供元が 402 を返し**、フォールバックします（モデルの失敗としては記録しません）。Vercel も同様に、無料対象はカタログのごく一部です。Free枠・モデルの提供条件は変更されるため、最新の提供元ページも確認してください。
 </details>
 
@@ -664,9 +668,27 @@ osv / ietf / inspirehep / oeis / hfhub / hn / swh / ia / qiita はキー不要�
 
 ### 📤 キーの渡し方
 
-**このサーバーは `.env` を自動で読みません。** Hermes の MCP `env` へ渡してください。
+**stdio（既定）では、このサーバーは `.env` を自動で読みません。** Hermes の MCP `env` へ渡してください。
 最近の Hermes は [環境変数参照](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference#environment-variable-references)
 を解決できるので、キーを Hermes のアクティブプロファイルの秘密情報として保存済みなら、値を重複保存せず参照を設定できます。
+
+#### 常駐 HTTP のとき（MCP `env` は届きません）
+
+常駐 HTTP（上の「Windows で常駐させる」）では、サーバーは**ログオン時に起動される別プロセス**
+なので MCP `env` は届きません。launcher（`run_server.pyw`）が起動時に次の 2 つを読みます
+（**すでに環境にある値は上書きしません**。値はログに出ず、名前だけが出ます）。
+
+| ファイル | 何を書くか |
+|---|---|
+| `%LOCALAPPDATA%\hermes\.env` | Hermes が使っているキー（`OPENROUTER_API_KEY` / `NVIDIA_API_KEY` / `HF_TOKEN` / `GEMINI_API_KEY` / `OLLAMA_API_KEY` / `GLM_API_KEY` / `GH_TOKEN` …） |
+| `%LOCALAPPDATA%\hermes\freeagent-service\freeagent.env` | 常駐サーバー固有の確認フラグ（`FREEAGENT_*`）。`install_resident_windows.py --write` が**無いときだけ**作ります |
+
+- 反映には**常駐サーバーの再起動**が要ります（見張りタスクは生存確認だけで、動いている
+  プロセスの環境は読み直しません）。
+- 読み込むファイルを差し替えたいときは `FREEAGENT_ENV_FILE` を設定します。
+- **値の後ろにインラインコメントを書かないでください**（`KEY=1  # 説明` は値に混ざり、
+  確認フラグが有効になりません。launcher はコメントを落としますが、他の読み手では落ちません）。
+  説明は行を分けて書きます。
 
 ```bash
 # Bash / Git Bash 用。シングルクォートでシェルによる ${...} 展開を防ぐ。
@@ -1184,7 +1206,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_HARNESS` | 空 | 起動元の目印。Hermes から使うなら `hermes`（[Hermes 以外で使うとき](#-hermes-以外で使うとき)） |
 | `FREEAGENT_HARNESS_WARN` | 1 | `0` で Hermes 以外のときの警告を止める（判定結果は `structuredContent.harness` に残る） |
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |
-| `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama` | 一覧に出すプロバイダと優先順。オプション5社は契約確認変数が無い間は通信しない |
+| `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama,zai,mistral,modelscope` | 一覧に出すプロバイダと優先順。オプション8社は契約確認変数が無い間は通信しない |
 | `FREEAGENT_AUTH_TTL` | 900 | 認証失敗を覚えて自動選抜から外す時間（秒） |
 | `FREEAGENT_PROBE_TIMEOUT` | 25.0 | 生存確認 1 件の読み取りタイムアウト（秒） |
 | `FREEAGENT_PROBE_WORKERS` | 8 | 生存確認の並列度（1〜8） |
@@ -1239,12 +1261,18 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `GEMINI_API_KEY`（別名 `GOOGLE_API_KEY`） | 空 | Gemini Developer API。Free対象の2モデルのみ。Free tier確認とデータ利用同意を個別に設定 |
 | `AI_GATEWAY_API_KEY` | 空 | Vercel AI Gatewayの推論。Free Tier対象の15モデルのみ許可。Free tier確認は`FREEAGENT_VERCEL_FREE_TIER=1` |
 | `OLLAMA_API_KEY` | 空 | Ollama Cloudの推論。無料対象は非公開のため`probe`で確認。Free plan確認は`FREEAGENT_OLLAMA_FREE_PLAN=1` |
+| `GLM_API_KEY`（別名 `ZAI_API_KEY` / `ZHIPUAI_API_KEY`） | 空 | Z.ai（GLM）の推論。Freeは`glm-4.7-flash` / `glm-4.5-flash` / `glm-4.6v-flash`の3 IDのみ。Free tier確認は`FREEAGENT_ZAI_FREE_TIER=1` |
+| `MISTRAL_API_KEY` | 空 | Mistral La Plateformeの推論。Experiment planの確認は`FREEAGENT_MISTRAL_FREE_PLAN=1`。対象モデルは`probe`で確認 |
+| `MODELSCOPE_API_KEY`（別名 `MODELSCOPE_API_TOKEN`） | 空 | ModelScope API-Inferenceの推論。無料枠の確認は`FREEAGENT_MODELSCOPE_FREE_PLAN=1`。対象モデルは`probe`で確認 |
 | `FREEAGENT_GROQ_FREE_TIER` | 未設定（無効） | GroqアカウントがFree tierであることを明示確認。Developer tierは従量課金 |
 | `FREEAGENT_CLOUDFLARE_FREE_PLAN` | 未設定（無効） | Workers Free planであることを明示確認。Workers Paidでは日次割当超過分が課金される |
 | `FREEAGENT_GEMINI_FREE_TIER` | 未設定（無効） | GeminiプロジェクトのFree/unpaid tierを明示確認 |
 | `FREEAGENT_GEMINI_UNPAID_DATA_ACK` | 未設定（無効） | Gemini Free tierの入力・出力がGoogleの製品改善や人手レビューに使われる可能性を理解した確認 |
 | `FREEAGENT_VERCEL_FREE_TIER` | 未設定（無効） | Vercel AI GatewayがFree tier（クレジット未購入）であることを明示確認。クレジット購入でpaid tierに移る |
 | `FREEAGENT_OLLAMA_FREE_PLAN` | 未設定（無効） | Ollama CloudがFree planであることを明示確認。クレジット購入で全モデルが課金対象になる |
+| `FREEAGENT_ZAI_FREE_TIER` | 未設定（無効） | Z.aiがFree tierであることを明示確認。有料モデルは残高が無いと429を返す |
+| `FREEAGENT_MISTRAL_FREE_PLAN` | 未設定（無効） | MistralのExperiment plan（無料枠）であることを明示確認 |
+| `FREEAGENT_MODELSCOPE_FREE_PLAN` | 未設定（無効） | ModelScopeの無料枠であることを明示確認 |
 | `FREEAGENT_API_KEY` | `proxy-attaches-real-credentials` | `nous` プロキシ用のダミー（実資格情報はプロキシが付与） |
 
 **知識検索（検索ソース）のキー・連絡先**
@@ -1269,6 +1297,9 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` | Gemini APIのOpenAI互換接続先（Beta） |
 | `FREEAGENT_VERCEL_BASE_URL` | `https://ai-gateway.vercel.sh/v1` | Vercel AI GatewayのOpenAI互換接続先 |
 | `FREEAGENT_OLLAMA_BASE_URL` | `https://ollama.com/v1` | Ollama CloudのOpenAI互換接続先 |
+| `FREEAGENT_ZAI_BASE_URL` | `https://api.z.ai/api/paas/v4` | Z.aiのOpenAI互換接続先 |
+| `FREEAGENT_MISTRAL_BASE_URL` | `https://api.mistral.ai/v1` | Mistral La Plateformeの接続先 |
+| `FREEAGENT_MODELSCOPE_BASE_URL` | `https://api-inference.modelscope.cn/v1` | ModelScope API-Inferenceの接続先 |
 
 **蓄積ストアのパス上書き**（既定は `FREEAGENT_STATE_DIR` 配下。**作業状態・統計が消えない場所**に置く）
 

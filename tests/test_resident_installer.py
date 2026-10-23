@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 import shutil
@@ -53,12 +54,14 @@ class InstallerCase(unittest.TestCase):
         for path in (self.python, self.pythonw):
             with open(path, "w", encoding="ascii") as fh:
                 fh.write("stub")
+        self.startup_dir = os.path.join(self.tmp, "Startup")
         self.repo = os.path.join(self.tmp, "hermes-freeagent-bind")
         os.makedirs(os.path.join(self.repo, "src", "freeagent_bind"))
         with open(os.path.join(self.repo, "src", "freeagent_bind", "server.py"),
                   "w", encoding="utf-8") as fh:
             fh.write("# stub\n")
-        self.cfg = self.m.build_config(self.home, self.repo, "127.0.0.1", 8790)
+        self.cfg = self.m.build_config(self.home, self.repo, "127.0.0.1", 8790,
+                                       startup_dir=self.startup_dir)
 
     # --- 生成物の契約 ---------------------------------------------------
 
@@ -84,12 +87,14 @@ class InstallerCase(unittest.TestCase):
         vbs = self.m.render_worker(self.cfg)
         self.assertIn(self.m.marker_for(8790), vbs, "pythonw + run_server.pyw のプロセスに当たること")
         self.assertIn('InStr(cl, "--port 8790")', vbs, "旧来の server.py 起動にも当たること")
-        other = self.m.build_config(self.home, self.repo, "127.0.0.1", 8801)
+        other = self.m.build_config(self.home, self.repo, "127.0.0.1", 8801,
+                                    startup_dir=self.startup_dir)
         self.assertIn(self.m.marker_for(8801), self.m.render_worker(other))
         self.assertNotIn(self.m.marker_for(8790), self.m.render_worker(other))
 
     def test_worker_honours_host_and_port(self):
-        cfg = self.m.build_config(self.home, self.repo, "127.0.0.1", 8802)
+        cfg = self.m.build_config(self.home, self.repo, "127.0.0.1", 8802,
+                                  startup_dir=self.startup_dir)
         vbs = self.m.render_worker(cfg)
         self.assertIn("http://127.0.0.1:8802/", vbs)
         self.assertIn("--port 8802", vbs)
@@ -165,30 +170,123 @@ class InstallerCase(unittest.TestCase):
     def test_plan_targets_the_expected_locations(self):
         paths = self.cfg["paths"]
         self.assertEqual(paths["service_dir"], os.path.join(self.home, "freeagent-service"))
+        self.assertEqual(paths["startup"], os.path.join(self.startup_dir,
+                                                        self.m.WORKER_NAME))
         self.assertTrue(paths["worker"].endswith(os.path.join("freeagent-service",
                                                              "Hermes_Freeagent.vbs")))
-        self.assertTrue(paths["startup"].endswith(os.path.join("Programs", "Startup",
-                                                               "Hermes_Freeagent.vbs")))
+        # startup_dir を与えないとき（実機）だけ %APPDATA% の Startup を指す。
+        default = self.m.build_config(self.home, self.repo, "127.0.0.1", 8790)
+        self.assertTrue(default["paths"]["startup"].endswith(
+            os.path.join("Programs", "Startup", "Hermes_Freeagent.vbs")))
+        self.assertNotEqual(paths["startup"], default["paths"]["startup"],
+                            "テストは一時ディレクトリを使う")
         self.assertEqual([p for p, _ in self.m.build_plan(self.cfg)],
                          [paths["launcher"], paths["worker"], paths["startup"],
                           paths["apply"], paths["revert"]])
 
+    def test_write_never_touches_the_real_startup_folder(self):
+        """実機の `%APPDATA% の Startup フォルダ` を書き換えない（実測の事故の回帰テスト）。
+
+        一時 home で `--write` すると、実機の launcher が**一時ディレクトリを指す**内容で
+        上書きされ、ログオン起動が黙って壊れた。
+        """
+        real_dir = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
+                                "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+        real_launcher = os.path.join(real_dir, self.m.WORKER_NAME)
+        before = open(real_launcher, "rb").read() if os.path.exists(real_launcher) else None
+        self.m.main(["--hermes-home", self.home, "--repo", self.repo,
+                     "--startup-dir", self.startup_dir, "--write", "--force"])
+        after = open(real_launcher, "rb").read() if os.path.exists(real_launcher) else None
+        self.assertEqual(before, after, "テストが実機の Startup を書き換えた")
+        self.assertTrue(os.path.exists(os.path.join(self.startup_dir, self.m.WORKER_NAME)))
+
     def test_default_invocation_writes_nothing(self):
         """引数なしの実行は表示だけ（実機の配線を勝手に触らない）。"""
-        rc = self.m.main(["--hermes-home", self.home, "--repo", self.repo])
+        rc = self.m.main(["--hermes-home", self.home, "--repo", self.repo,
+                          "--startup-dir", self.startup_dir])
         self.assertEqual(rc, 0)
         self.assertFalse(os.path.exists(self.cfg["paths"]["worker"]))
-        rc = self.m.main(["--hermes-home", self.home, "--repo", self.repo, "--dry-run"])
+        rc = self.m.main(["--hermes-home", self.home, "--repo", self.repo,
+                          "--startup-dir", self.startup_dir, "--dry-run"])
         self.assertEqual(rc, 0)
         self.assertFalse(os.path.exists(self.cfg["paths"]["worker"]))
 
     def test_write_and_task_registration_are_opt_in(self):
-        rc = self.m.main(["--hermes-home", self.home, "--repo", self.repo, "--write"])
+        rc = self.m.main(["--hermes-home", self.home, "--repo", self.repo,
+                          "--startup-dir", self.startup_dir, "--write"])
         self.assertEqual(rc, 0)
         self.assertTrue(os.path.exists(self.cfg["paths"]["worker"]))
         self.assertTrue(os.path.exists(self.cfg["paths"]["startup"]))
         # --task を付けない限り schtasks は呼ばれない。
         self.assertEqual(self.m.register_task.__module__, "install_resident_windows")
+
+
+    # --- 常駐サーバーへのキーの渡し方（別プロセスなので MCP env が届かない） ----
+
+    def test_launcher_loads_env_files(self):
+        """常駐はログオン時の別プロセスなので、launcher が .env を読むこと。"""
+        pyw = self.m.render_launcher(self.cfg)
+        self.assertIn('os.path.join(HOME, ".env")', pyw)
+        self.assertIn("freeagent.env", pyw, "常駐サーバー専用の上書きファイルも読むこと")
+        self.assertNotIn("__ENV_NAME__", pyw, "プレースホルダが残っていないこと")
+        self.assertIn("_load_env_file", pyw)
+
+    def test_env_loader_strips_inline_comments_and_keeps_real_env(self):
+        """`KEY=1  # 説明` は値に混ぜない（実測: 混ざると確認フラグが有効化されない）。
+
+        launcher の中の関数だけを取り出して実行する（サーバーは起動しない）。
+        """
+        source = self.m.render_launcher(self.cfg)
+        tree = ast.parse(source)
+        node = next(n for n in tree.body
+                    if isinstance(n, ast.FunctionDef) and n.name == "_load_env_file")
+        namespace = {"os": os}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<launcher>", "exec"), namespace)
+        loader = namespace["_load_env_file"]
+
+        path = os.path.join(self.tmp, "sample.env")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("# comment\n\nexport A=1\nB=\"two\"\nC=3  # 説明\nD='quo ted'\nE=from-file\n")
+        os.environ["E"] = "keep"
+        self.addCleanup(os.environ.pop, "E", None)
+        for name in ("A", "B", "C", "D"):
+            self.addCleanup(os.environ.pop, name, None)
+
+        self.assertEqual(loader(path), ["A", "B", "C", "D"])
+        self.assertEqual(os.environ["C"], "3", "インラインコメントが値に混ざっている")
+        self.assertEqual(os.environ["B"], "two")
+        self.assertEqual(os.environ["D"], "quo ted")
+        self.assertEqual(os.environ["E"], "keep", "実環境の値を上書きしないこと")
+        self.assertEqual(loader(os.path.join(self.tmp, "missing.env")), [])
+        self.assertEqual(loader(""), [])
+
+    def test_service_env_template_is_opt_in(self):
+        """雛形は確認フラグの名前を示すが、**有効化はしない**（申告は利用者がする・規約 31）。"""
+        text = self.m.render_service_env(self.cfg)
+        for name in ("FREEAGENT_GROQ_FREE_TIER", "FREEAGENT_CLOUDFLARE_FREE_PLAN",
+                     "FREEAGENT_VERCEL_FREE_TIER", "FREEAGENT_OLLAMA_FREE_PLAN",
+                     "FREEAGENT_GEMINI_FREE_TIER", "FREEAGENT_GEMINI_UNPAID_DATA_ACK"):
+            self.assertIn(name, text)
+        for line in text.splitlines():
+            self.assertFalse(line.startswith("FREEAGENT_"),
+                             "テンプレートに有効化済みのフラグがある: %r" % line)
+
+    def test_write_creates_but_never_overwrites_the_service_env(self):
+        """--write は雛形を作る。--dry-run は書かない。--force でも利用者のフラグを消さない。"""
+        env_path = self.cfg["paths"]["service_env"]
+        base = ["--hermes-home", self.home, "--repo", self.repo,
+                "--startup-dir", self.startup_dir]
+        self.m.main(base + ["--dry-run"])
+        self.assertFalse(os.path.exists(env_path), "--dry-run は書かない")
+        self.m.main(base + ["--write", "--force"])
+        with open(env_path, encoding="utf-8") as fh:
+            self.assertIn("FREEAGENT_GEMINI_FREE_TIER", fh.read())
+        with open(env_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("FREEAGENT_OLLAMA_FREE_PLAN=1\n")
+        self.m.main(base + ["--write", "--force"])
+        with open(env_path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "FREEAGENT_OLLAMA_FREE_PLAN=1\n",
+                             "--force でも利用者のフラグを消さないこと")
 
 
 if __name__ == "__main__":

@@ -189,7 +189,7 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     既存ソースと重複するもの、医学・生物学（対象外。§5.19）、レートが8秒締切と不整合なもの（PLOS 10req/min）、
     条件曖昧なもの（HAL 非商用条項）は登録しない。DOAJはパス埋め込み検索なので検索語を必ずURLエスケープする。
 
-31. **Free推論プロバイダは課金tierを推測しない**。APIがFree/paid tierを返さない場合は、モデルID allowlist・明示確認env・厳密な未許可model拒否を組み合わせる。確認envは利用者申告であり、契約そのものは検証できないとREADME/SPECに明記し、課金プラン変更後に解除するよう案内する。Google Unpaid tierのデータ利用/人手レビューなどプライバシー条件がある場合は別の明示確認を要求し、既定有効にしない。**クレジット型（Vercel AI Gateway / Ollama Cloud）はモデル単位の Free 判定ができず、無料枠はカタログのサブセット**（Vercel は認証付きの `include_availability` でしか対象を列挙できず、Ollama は starter の範囲を公表していない）ので、**公式に対象一覧を出しているものは許可リスト（Vercel = 実測 15 件）、出していないものはクレジット枠＋プラン確認 env**（Ollama）で扱い、サブセットである旨と 402 の扱い（フォールバック・記憶しない）を README/SPEC に明記する。
+31. **Free推論プロバイダは課金tierを推測しない**。APIがFree/paid tierを返さない場合は、モデルID allowlist・明示確認env・厳密な未許可model拒否を組み合わせる。確認envは利用者申告であり、契約そのものは検証できないとREADME/SPECに明記し、課金プラン変更後に解除するよう案内する。Google Unpaid tierのデータ利用/人手レビューなどプライバシー条件がある場合は別の明示確認を要求し、既定有効にしない。許可リスト方式で**提供元の一覧が当該 ID を返さない**場合（実測: Z.ai の `/models` は有料の旗艦だけを返し、$0 の Flash を返さない）は、公表された Free ID を**在庫として補う**（`synthesize_free_ids` + `_with_allowlisted_rows`。**既定は無効**で、一覧が許可リストの ID を返す提供元では補わない）。一覧に無いことを理由に Free を隠すと、その提供元は自動選抜に永久に入らない。**クレジット型（Vercel AI Gateway / Ollama Cloud / Mistral / ModelScope）はモデル単位の Free 判定ができず、無料枠はカタログのサブセット**（Vercel は認証付きの `include_availability` でしか対象を列挙できず、Ollama は starter の範囲を公表していない）ので、**公式に対象一覧を出しているものは許可リスト（Vercel = 実測 15 件）、出していないものはクレジット枠＋プラン確認 env**（Ollama）で扱い、サブセットである旨と 402 の扱い（フォールバック・記憶しない）を README/SPEC に明記する。
 
 32. **第6段階は「検索できる公認 API」＋「利用条件が明確」の 2 条件を満たすものだけ**（§5.18/§5.19）。
     第6段階で採った 13 種のうち、**2026-10-05 の方針変更で生命・医学系 9 種（europepmc / uniprot /
