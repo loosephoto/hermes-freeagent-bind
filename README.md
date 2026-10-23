@@ -609,6 +609,92 @@ HTTP の待受までは 463ms（4 回のうち初回を除く中央値）でし�
 **キーは「推論（サブ LLM）用」と「知識検索用」の 2 系統に分かれます。** 使う提供元だけ設定してください。
 キーがあること、モデル一覧が見えること、実際に推論できることは別です。
 
+### 📝 どこに書くか（Hermes Agent の `.env`）
+
+**キーは Hermes Agent の `.env` に書きます。** Windows では `%LOCALAPPDATA%\hermes\.env`、
+1 行 1 つ `KEY=VALUE` の書式です。
+
+| 使い方 | キーの置き場所 |
+|---|---|
+| **常駐 HTTP**（`install_resident_windows.py` で配線した場合・推奨） | 上記の `.env`。launcher（`run_server.pyw`）が起動時に読みます。常駐サーバー固有の確認フラグだけを `%LOCALAPPDATA%\hermes\freeagent-service\freeagent.env` に分けても構いません（同じ書式） |
+| **stdio**（既定） | Hermes の MCP `env`（`hermes config set mcp_servers.freeagent-bind.env.<変数名> …`）。**この場合はサーバーが `.env` を自動で読みません** |
+
+- 反映には**常駐サーバーの再起動**が要ります（見張りタスクは生存確認だけで、動いている
+  プロセスの環境は読み直しません）。
+- **値の後ろにインラインコメントを書かないでください**（`KEY=1  # 説明` は値に混ざり、確認フラグが
+  効きません）。説明は行を分けて書きます。
+- 手順の詳細は [📤 キーの渡し方](#-キーの渡し方) にあります。
+
+#### キー名の一覧（推論＝サブ LLM）
+
+| 変数名 | 別名 | 提供元 |
+|---|---|---|
+| `OPENROUTER_API_KEY` | — | OpenRouter |
+| `NVIDIA_API_KEY` | — | NVIDIA NIM |
+| `HF_TOKEN` | `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` | Hugging Face |
+| `GEMINI_API_KEY` | `GOOGLE_API_KEY` | Gemini Developer API |
+| `GLM_API_KEY` | `ZAI_API_KEY` / `ZHIPUAI_API_KEY` | Z.ai（Zhipu GLM） |
+| `OLLAMA_API_KEY` | — | Ollama Cloud |
+| `GROQ_API_KEY` | — | Groq |
+| `CLOUDFLARE_API_TOKEN` ＋ `CLOUDFLARE_ACCOUNT_ID` | — | Cloudflare Workers AI（ID は 32 桁 hex） |
+| `AI_GATEWAY_API_KEY` | — | Vercel AI Gateway |
+| `MISTRAL_API_KEY` | — | Mistral La Plateforme |
+| `MODELSCOPE_API_KEY` | `MODELSCOPE_API_TOKEN` | ModelScope |
+
+```bash
+# Hermes Agent の .env に置く行（使う提供元の行だけ値と一緒に残し、他は消すかコメントアウト）
+OPENROUTER_API_KEY=
+NVIDIA_API_KEY=
+HF_TOKEN=
+GEMINI_API_KEY=
+GLM_API_KEY=
+OLLAMA_API_KEY=
+GROQ_API_KEY=
+CLOUDFLARE_API_TOKEN=
+CLOUDFLARE_ACCOUNT_ID=
+AI_GATEWAY_API_KEY=
+MISTRAL_API_KEY=
+MODELSCOPE_API_KEY=
+```
+
+**キーだけでは有効にならない提供元があります**（契約プラン・データ条件の利用者申告）。
+プラン内容を確認してから、次の行を `=1` で有効にしてください
+（未設定＝無効。詳細は下の表と [環境変数](#-環境変数)）。
+
+```bash
+FREEAGENT_GROQ_FREE_TIER=
+FREEAGENT_CLOUDFLARE_FREE_PLAN=
+FREEAGENT_GEMINI_FREE_TIER=
+FREEAGENT_GEMINI_UNPAID_DATA_ACK=
+FREEAGENT_VERCEL_FREE_TIER=
+FREEAGENT_OLLAMA_FREE_PLAN=
+FREEAGENT_ZAI_FREE_TIER=
+FREEAGENT_MISTRAL_FREE_PLAN=
+FREEAGENT_MODELSCOPE_FREE_PLAN=
+```
+
+#### キー名の一覧（知識検索）
+
+| 変数名 | 別名 | 対象 |
+|---|---|---|
+| `OPENALEX_API_KEY` | — | openalex |
+| `GITHUB_TOKEN` | `GH_TOKEN` | github（コード検索は必須） |
+| `FREEAGENT_MAILTO` | — | crossref / openalex / datacite（キーではなく連絡先） |
+| `FREEAGENT_CINII_APPID` | — | cinii（このソースを使うなら必須） |
+| `FREEAGENT_LIBRARIESIO_KEY` | — | librariesio（このソースを使うなら必須） |
+| `FREEAGENT_QIITA_TOKEN` | — | qiita（任意。60 → 1,000 回/時） |
+
+```bash
+OPENALEX_API_KEY=
+GITHUB_TOKEN=
+FREEAGENT_MAILTO=
+FREEAGENT_CINII_APPID=
+FREEAGENT_LIBRARIESIO_KEY=
+FREEAGENT_QIITA_TOKEN=
+```
+
+接続先を差し替えたいときだけ `FREEAGENT_<提供元>_BASE_URL`（例 `FREEAGENT_ZAI_BASE_URL`）も使えます。
+
 ### 🖥 推論バックエンド（サブ LLM）の接続
 
 **全社の設定は不要です。** Nous のプロキシか、既に利用できる提供元を1つ選んで始めてください。
