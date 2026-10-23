@@ -67,7 +67,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.12.0"
+SERVER_VERSION = "0.13.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -6407,6 +6407,62 @@ def tool_fanout(args: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------- §6.12 panel の統合（MoA 1 層）
+#
+# Mixture-of-Agents（Wang et al. 2024 / togethercomputer/MoA の手法）の**1 層だけ**を実装する。
+# 参加モデルの回答を**別のモデル**が 1 つに統合する。論文は多層だが、層数だけ呼び出しが倍になるので
+# Free の枠とクォータ（§3.5）を考えると 1 層（提案 N → 統合 1）が現実的（実測: 8 体 + 統合 1 = 9 呼び出し）。
+# **統合は「平均」ではなく「事実確認して決める」**（平均すると誤りが薄まって残る）。
+_REFINE_PROMPT = (
+    "あなたは複数の独立した回答を統合する編集者です。平均せず、対立点は事実確認して決めてください。\n\n"
+    "【問い】\n{question}\n\n【候補の回答】\n{candidates}\n\n"
+    "次の形式だけで答えてください。\n"
+    "結論: （統合した最終回答）\n"
+    "確信度: （0-100 の整数）\n"
+    "根拠: （候補のうち、どの番号の主張を採用し、どれを却下したか）"
+)
+
+
+def _refine_answers(question: str, answers: list[dict], refs: list[str], args: dict) -> dict:
+    """参加者の回答を 1 つの答えに統合する（MoA の集約層）。失敗も dict で返す（規約 1）。"""
+    good = [a for a in answers if not a.get("error")]
+    if not good:
+        return {"model": None, "calls": 0, "error": "統合できる回答がありません（全員脱落）"}
+    requested = as_str(args.get("refine_model"))
+    if requested:
+        model, why = requested, "refine_model の指定"
+    else:
+        # 統合役は**参加していないモデル**を優先する。同じモデルに自分の答えを統合させると
+        # 合意度が上がるだけで新しい情報が入らない。全員参加しているときだけ最上位が兼務する。
+        pool = [r for r in free_model_refs(free_only=True, chat_only=True) if r not in refs]
+        if pool:
+            model, why = rank_models(pool)[0], "参加していないモデルの最上位"
+        else:
+            model, why = rank_models(refs)[0], "全員参加のため最上位が兼務"
+    candidates = "\n".join(
+        f"[{i + 1}] {a['model']}: {truncate(a.get('answer') or a.get('conclusion') or '', 900)}"
+        for i, a in enumerate(good))
+    res = call_model(model, _REFINE_PROMPT.format(question=question, candidates=candidates),
+                     max_tokens=as_int(args.get("max_tokens"), 500, 16, 4000),
+                     temperature=0.0, kind="panel_refine")
+    out: dict = {"model": model, "calls": 1, "reason": why, "from_panel": model in refs}
+    if res.get("error"):
+        out["error"] = truncate(res["error"], 240)
+        return out
+    parsed = parse_labeled(res["text"])
+    out.update({
+        "served_by": res.get("served_by"),
+        "text": truncate(res["text"], 2000),
+        "conclusion": parsed["conclusion"] or truncate(res["text"], 400),
+        "confidence": parsed["confidence"],
+        "cot_leak": res.get("cot_leak"),
+        "truncated": res.get("truncated"),
+        "rate_limited": res.get("rate_limited"),
+        "gate_wait_s": res.get("gate_wait_s"),
+    })
+    return out
+
+
 def tool_panel(args: dict) -> dict:
     """同じ問いを複数モデルへ投げ、合意度・不一致・CoT混入つきで返す。"""
     question = as_str(args.get("question") or args.get("prompt"))
@@ -6435,6 +6491,9 @@ def tool_panel(args: dict) -> dict:
     good = [a for a in answers if not a.get("error")]
     independent = independent_answers(good)
     conf = [a["confidence"] for a in independent if isinstance(a.get("confidence"), int)]
+    # `refine: true` で MoA の集約層（§6.12）。統合役の呼び出しも枠・クォータ・統計を通る。
+    refine = _refine_answers(question, answers, refs, args) if as_flag(args.get("refine")) else None
+    reported = results + ([refine] if refine and refine.get("calls") else [])
     data = {
         "question": question, "models": refs, "selection": info,
         "answered": len(good), "independent_sources": len(independent), "failed": len(answers) - len(good),
@@ -6447,9 +6506,12 @@ def tool_panel(args: dict) -> dict:
         "answers": answers,
         "concurrency": PROVIDER_GATE.report(refs),
         "quota": quota_report(refs),
-        **_rate_limit_report(results),
+        **_rate_limit_report(reported),
         "agreement_note": "合意度は解析済みの結論の表層類似度であり、正しさの確率ではありません。",
     }
+    if refine is not None:
+        data["refined"] = refine
+        data["calls"] = len(results) + int(refine.get("calls") or 0)
     return data
 
 
@@ -7803,6 +7865,8 @@ TOOLS: list[dict] = [
             + str(MAX_SUB_MODELS) + "）。"
             "**提供元ごとの同時実行枠を超える呼び出しは 429 を踏まずに順番待ちする**"
             "（枠と枠待ち件数は `concurrency` に出る）。"
+            "**`refine: true` で MoA の集約**: 参加者の回答を別のモデルが 1 つに統合し `refined` に返す"
+            "（呼び出し +1。統合役は参加していないモデルを優先する）。"
         ),
         "inputSchema": {
             "type": "object",
@@ -7816,6 +7880,12 @@ TOOLS: list[dict] = [
                          "description": f"参加モデル数（既定 3・最大 {MAX_SUB_MODELS}）"},
                 "prefer": {"type": "array", "items": {"type": "string"}},
                 "exclude": {"type": "array", "items": {"type": "string"}},
+                "refine": {"type": "boolean",
+                           "description": "true で参加者の回答を 1 つに統合する（MoA の集約層）。"
+                                          "モデルを 1 回余分に呼ぶので枠を 1 つ使います"},
+                "refine_model": {"type": "string",
+                                 "description": "統合役のモデル（省略時は**参加していない**モデルの最上位。"
+                                                "全員参加しているときは最上位が兼務）"},
                 "max_tokens": {"type": "integer"},
             },
             "required": ["question"],
@@ -8279,6 +8349,12 @@ def _render_panel(data: dict) -> str:
         lines.append("⚠️ メインに確認したい点:")
         for row in data["open_questions"][:5]:
             lines.append(f"  - {row['model']}: {truncate(row['question'], 160)}")
+    refined = data.get("refined")
+    if isinstance(refined, dict):
+        if refined.get("error"):
+            lines.append(f"⚠️ 統合に失敗: {truncate(refined['error'], 120)}")
+        elif refined.get("conclusion"):
+            lines.append(f"🔗 統合（{refined.get('model')}）: {truncate(refined['conclusion'], 220)}")
     lines.append("ℹ️ 合意度は表層の一致であって正しさの保証ではありません。")
     return "\n".join(lines)
 def _render_lookup(data: dict) -> str:

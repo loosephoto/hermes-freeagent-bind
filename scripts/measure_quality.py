@@ -161,6 +161,18 @@ def run_strategy(name: str, refs: list[str], case: dict, max_tokens: int) -> dic
             text = agg.get("text") or ""
         detail = f"{len(texts)} 票を統合"
 
+    elif name == "refine":
+        # **出荷済みの機能をそのまま測る**（panel + MoA の集約層）。moa との違いは、統合役の選択・
+        # 許可リスト・枠・クォータがすべてサーバー側の実装を通ること。
+        data = S.tool_panel({"question": case["question"], "models": list(refs),
+                             "refine": True, "max_tokens": max_tokens})
+        refined = data.get("refined") or {}
+        calls = int(data.get("calls") or len(refs))
+        text = refined.get("text") or ""
+        detail = f"統合役 {refined.get('model')}"
+        if refined.get("error"):
+            detail += f" ({str(refined['error'])[:50]})"
+
     elif name == "cascade":
         # 2 体で一致したら止める（FrugalGPT のカスケード）。一致しなければ全員に広げる。
         head = refs[:2] if len(refs) > 2 else refs
@@ -191,8 +203,8 @@ def run_strategy(name: str, refs: list[str], case: dict, max_tokens: int) -> dic
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="戦略ごとの正答率を測る（Free の枠を使う）")
     parser.add_argument("--cases", default="6", help="使うケース数（既定 6・all で全件）")
-    parser.add_argument("--strategies", default="single,panel,moa,cascade",
-                        help="カンマ区切り（single / panel / moa / cascade）")
+    parser.add_argument("--strategies", default="single,panel,moa,refine,cascade",
+                        help="カンマ区切り（single / panel / moa / refine=サーバーの MoA / cascade）")
     parser.add_argument("--pool", type=int, default=8, help="参加モデル数の上限（既定 8）")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--repeat", type=int, default=1, help="各ケースの繰り返し回数")

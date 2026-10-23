@@ -427,6 +427,13 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     追加は `PROVIDER_ORDER` の**末尾**（オプトイン）に置き、`tests/test_freeagent_bind.py` の
     `test_registry_has_eighteen_providers` を同じ変更で更新する。
 
+61. **`panel` の `refine` は「参加していないモデル」を統合役にする**（SPEC §5.3）。同じモデルに
+    自分の回答を統合させると**合意度が上がるだけで新しい情報が入らない**。全員参加のときだけ最上位が
+    兼務し、どちらだったかを `reason` に書く。明示 `refine_model` は `call_model` の許可リストに通す。
+    統合が失敗してもパネルの結果は返し、`refined.error` に残す（規約 8）。**既定 false**
+    （呼び出し +1）。品質上の優位は未証明なので、既定を変える前に
+    `scripts/measure_quality.py --strategies refine --cases all --repeat 2` で示す。
+
 ## ライセンス
 
 MIT。データは各提供元の条件に従い、回答には出典を表示すること。
