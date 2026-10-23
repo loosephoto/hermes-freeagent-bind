@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 11 個のツール。推論は Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope の 12 プロバイダ、検索は **24 ソース（既定6＋明示指定18）** に対応します。
+- 11 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社）、検索は **24 ソース（既定 6 ＋ 明示指定 18）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 **対象分野は科学（物理・数学・計算機）とプログラミングです。医学・生物学は対象外です。**
@@ -27,7 +27,7 @@
 
 - [🎯 できること・できないこと](#-できることできないこと)
 - [🚀 はじめに設定する](#-はじめに設定する)
-- [🖧 1 プロセスを共有する（HTTP モード）](#5-複数クライアントで-1-プロセスを共有するhttp-モード任意)
+- [🖧 5. 複数クライアントで 1 プロセスを共有する（HTTP モード・任意）](#5-複数クライアントで-1-プロセスを共有するhttp-モード任意)
 - [💬 会話での頼み方](#-会話での頼み方)
 - [🧰 どのツールを使うか](#-どのツールを使うか)
 - [🧠 複雑な問題を段階的に考える（freeagent_think）](#-複雑な問題を段階的に考えるfreeagent_think)
@@ -141,8 +141,10 @@ freeagent_ask で「接続できました」と一言だけ答えさせて。
 
 KANBAN のワーカーや複数の Bot から同時に使うと、stdio では**クライアントごとに別プロセス**が立ちます。
 するとプロセス内に持っているものが分割されます: ホストごとのアクセス間隔、クールダウン、品質統計、
-モデル一覧のキャッシュ（600 秒）、同時実行の上限。同じホストへ二重に投げたり、統計が上書きされたりします（**モデル一覧だけは v0.9.0 からディスクにも載ります**＝プロセスを入れ替えても温かく、起動直後の選抜が待たされません。SPEC §4.4）
-（`AGENTS.md` 規約 28 が警告している状態そのものです）。HTTP モードでは **1 プロセスを複数クライアントが共有**します。
+モデル一覧のキャッシュ（600 秒）、同時実行の上限です。同じホストへ二重に投げたり、統計が上書きされたりします。
+**ただしモデル一覧だけは v0.9.0 からディスクにも載ります**（プロセスを入れ替えても温かく、起動直後の
+選抜が待たされません・SPEC §4.4）。これは `AGENTS.md` 規約 28 が警告している状態そのものです。
+HTTP モードでは **1 プロセスを複数クライアントが共有**します。
 
 ```bash
 # サーバーを HTTP モードで起動する（動かしたままにする）
@@ -238,7 +240,7 @@ freeagent_think で、この設計案を手順に分解してから検討して�
 | モデルを探す・応答できるか確かめる | `freeagent_models` | `probe=true` は実際の推論を行い、利用枠を消費します |
 | 1 モデルに下読み・下書きを頼む | `freeagent_ask` | 第二意見を 1 回だけ欲しいとき |
 | 同じ問いを複数モデルに聞く | `freeagent_panel` | 一致点・食い違いを知りたいとき |
-| 複数の問いを複数モデルに当てる | `freeagent_fanout` | プロンプト×モデルの比較。プロンプトは最大 16 件、組合せは既定で最大 40 呼び出し |
+| 複数の問いを複数モデルに当てる | `freeagent_fanout` | プロンプト×モデルの比較。プロンプトは最大 16 件、組合せは既定で最大 40 呼び出し（`FREEAGENT_MAX_CALLS_PER_RUN`）。超過分は**実行せず**、件数を `prompts_dropped` に返します |
 | 出典を読ませてから答えさせる | `freeagent_grounded` | 検索＋サブ LLM の回答 |
 | 出典つきの検索結果だけを取る | `freeagent_lookup` | LLM による生成なし。`limit` は各ソースの件数 |
 | 同じ指示で多数の要素を処理する | `freeagent_map` | 最大 64 件。`reduce` で追加の統合処理 |
@@ -480,7 +482,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | `未設定 → 検索のみ` | 一覧は取れるが、推論用のキーがない | キーを入れた後に実際に回答できるか |
 | `到達不可` | 一覧を取得できない。理由を表示する | 「モデルが存在しない」とは限らない |
 | `Free候補` / `usable_now`（今すぐ使用可） | キーなどの条件を満たす**サブLLM に使える**候補数。`usable_now` はクールダウン中を除いた数 | **未検証モデルを含むため、実際に答えられる数ではない** |
-| `non_chat_candidates` | 埋め込み・ガード/安全分類器・画像/音声生成など、サブLLM に使えないモデルの件数 | 自動選抜からは外れるが、一覧には表示する（実測: Free 102 件中 30 件） |
+| `non_chat_candidates` | 埋め込み・ガード/安全分類器・画像/音声生成など、サブLLM に使えないモデルの件数 | 自動選抜からは外れるが、一覧には表示する（実測例: 複数プロバイダを設定した環境で Free 102 件中 30 件。キーを設定したプロバイダが増えるほど増えます） |
 | `probe=alive` | 生存確認で実際に回答した | 次の呼び出しでも成功するとは限らない |
 
 生存確認は会話で「Free 候補を少数だけ `probe=true` で確認して」と頼めます。
@@ -640,6 +642,19 @@ v0.9.5 は**提供元別の同時実行ゲート**と**モデル数の上限の�
 枠待ちの説明を `description` に足したぶん。**ツールを増やさずに能力を足す**方針なので、増分は説明に寄る）。
 往復時間は 0.2282 秒。**8 モデルの panel で 429 が 0〜1 件**（枠 6）・回答 6〜7/8・壁 6.0〜6.3 秒。
 
+#### 新しい版の内訳（v0.11.0〜v0.14.1・新しい順）
+
+上の表の列は v0.9.5 までです（v0.11.0 以降の文字数: v0.12.0 = 17,198 / v0.13.0 = 17,495 /
+v0.14.0 = 17,495 / v0.14.1 = 17,555）。以下は新しい順の内訳です。
+
+v0.14.1 は**README の総点検と、その過程で見つけた 1 件の挙動修正**。`fanout` の `prompts` 上限
+（16 件）は以前**黙って切り捨てて**いました（`prompts[:16]`）。切り捨てをやめずに、**実行しなかった件数を
+`prompts_dropped` で返す**ようにして、本文にも警告を出します（規約 8・56 と同じ理由。schema にも
+`maxItems` を宣言）。上限は `FREEAGENT_MAX_PROMPTS_PER_CALL`（1〜64）で変更できます。
+README 側は、プロバイダ数 12 → 18 の反映漏れ、追加 6 社の**キー名と確認変数の記載漏れ**、
+`think` の引数名の誤記（`prompt` → `thought`）、開発者向け計測記録の並びの整理、
+ライセンス欄の検索ソース一覧の漏れ（Qiita）を直しました。
+
 v0.14.0 は**評価基盤の作り直し**（SPEC §5.4）。測定器が天井（全戦略 100%）に当たって「改善した」と
 言えない状態だったので、測り方そのものを直しました。**言及と回答の区別**（旧採点は本文の全数値を
 走査するので、誤答でも正解値を言及すれば合格していた。9 例のプローブで **4 件誤判定**）→
@@ -668,6 +683,8 @@ v0.11.0 は**オーケストレーションの改善**（SPEC §5.2）: 選抜�
 はしご**（60→180→600 秒）に、**正答率の測定器** `scripts/measure_quality.py` を追加。
 **ツール定義は変えていない**（11 のまま・文字数 17,064 のまま・往復 0.2282 秒）。
 `structuredContent` には `quota` が増える（宣言が無ければ `null`）。
+
+#### v0.9.0〜v0.9.2 の内訳（v0.9.5 より前の版・古い順）
 
 v0.9.0 は**モデル一覧の取得の高速化**（並列・締め切り・プロセス間キャッシュ・SPEC §4.4）。
 ツール定義は変わらない（文字数 15,972 のまま）ので上表の列は増やしていない。実測（2026-10-21・この環境）:
@@ -742,6 +759,12 @@ HTTP の待受までは 463ms（4 回のうち初回を除く中央値）でし�
 | `AI_GATEWAY_API_KEY` | — | Vercel AI Gateway |
 | `MISTRAL_API_KEY` | — | Mistral La Plateforme |
 | `MODELSCOPE_API_KEY` | `MODELSCOPE_API_TOKEN` | ModelScope |
+| `CEREBRAS_API_KEY` | — | Cerebras Inference |
+| `SAMBANOVA_API_KEY` | — | SambaNova Cloud |
+| `NOVITA_API_KEY` | — | Novita AI |
+| `SILICONFLOW_API_KEY` | — | SiliconFlow |
+| `LONGCAT_API_KEY` | — | LongCat（Meituan） |
+| `OPENCODE_ZEN_API_KEY` | `OPENCODE_GO_API_KEY` | opencode Zen |
 
 ```bash
 # Hermes Agent の .env に置く行（使う提供元の行だけ値と一緒に残し、他は消すかコメントアウト）
@@ -757,6 +780,12 @@ CLOUDFLARE_ACCOUNT_ID=
 AI_GATEWAY_API_KEY=
 MISTRAL_API_KEY=
 MODELSCOPE_API_KEY=
+CEREBRAS_API_KEY=
+SAMBANOVA_API_KEY=
+NOVITA_API_KEY=
+SILICONFLOW_API_KEY=
+LONGCAT_API_KEY=
+OPENCODE_ZEN_API_KEY=
 ```
 
 **キーだけでは有効にならない提供元があります**（契約プラン・データ条件の利用者申告）。
@@ -773,6 +802,12 @@ FREEAGENT_OLLAMA_FREE_PLAN=
 FREEAGENT_ZAI_FREE_TIER=
 FREEAGENT_MISTRAL_FREE_PLAN=
 FREEAGENT_MODELSCOPE_FREE_PLAN=
+FREEAGENT_CEREBRAS_FREE_TRIAL=
+FREEAGENT_SAMBANOVA_FREE_TIER=
+FREEAGENT_NOVITA_FREE_CREDITS=
+FREEAGENT_SILICONFLOW_FREE_TIER=
+FREEAGENT_LONGCAT_FREE_PLAN=
+FREEAGENT_OPENCODE_FREE_TIER=
 ```
 
 #### キー名の一覧（知識検索）
@@ -802,7 +837,7 @@ FREEAGENT_QIITA_TOKEN=
 **全社の設定は不要です。** Nous のプロキシか、既に利用できる提供元を1つ選んで始めてください。
 
 別の AI に答えさせる機能（`ask` / `panel` / `consult` / `grounded` / `agent` / `map` / `fanout`、
-`think` の `verify` / `propose_alternatives`）で使います。**12 プロバイダのうち、使うものを 1 つ以上**用意します。
+`think` の `verify` / `propose_alternatives`）で使います。**18 プロバイダのうち、使うものを 1 つ以上**用意します。
 
 | プロバイダ | 必要なもの | 入手先・注意点 |
 |---|---|---|
@@ -874,7 +909,7 @@ osv / ietf / inspirehep / oeis / hfhub / hn / swh / ia / qiita はキー不要�
 
 | ファイル | 何を書くか |
 |---|---|
-| `%LOCALAPPDATA%\hermes\.env` | Hermes が使っているキー（`OPENROUTER_API_KEY` / `NVIDIA_API_KEY` / `HF_TOKEN` / `GEMINI_API_KEY` / `OLLAMA_API_KEY` / `GLM_API_KEY` / `GH_TOKEN` …） |
+| `%LOCALAPPDATA%\hermes\.env` | Hermes が使っているキー（`OPENROUTER_API_KEY` / `NVIDIA_API_KEY` / `HF_TOKEN` / `GEMINI_API_KEY` / `OLLAMA_API_KEY` / `GLM_API_KEY` / `GH_TOKEN`、追加プロバイダなら `CEREBRAS_API_KEY` / `SAMBANOVA_API_KEY` / `NOVITA_API_KEY` / `SILICONFLOW_API_KEY` / `LONGCAT_API_KEY` / `OPENCODE_ZEN_API_KEY` など） |
 | `%LOCALAPPDATA%\hermes\freeagent-service\freeagent.env` | 常駐サーバー固有の確認フラグ（`FREEAGENT_*`）。`install_resident_windows.py --write` が**無いときだけ**作ります |
 
 - 反映には**常駐サーバーの再起動**が要ります（見張りタスクは生存確認だけで、動いている
@@ -1216,7 +1251,8 @@ python scripts/measure_relevance.py --report
 [Hacker News Search（Algolia）](https://hn.algolia.com/api)（**帰属表示が必須**・10,000 req/h/IP） /
 [Software Heritage API](https://www.softwareheritage.org/legal/api-terms-of-use/)（ポイントアクセス可・大量抽出不可） /
 [Libraries.io](https://libraries.io/terms)（**利用者自身の無料APIキーが必要**・60 req/min。§6.10） /
-[Internet Archive](https://archive.org/developers/bots.html)（読み取りはキー不要。`robots.txt` の Disallow は `/control/` と `/report/` のみ。AI エージェントを含む自動アクセスに説明的 User-Agent と間隔・429 の尊重を IA が明示。**日本語クエリは不可**。§6.11）。
+[Internet Archive](https://archive.org/developers/bots.html)（読み取りはキー不要。`robots.txt` の Disallow は `/control/` と `/report/` のみ。AI エージェントを含む自動アクセスに説明的 User-Agent と間隔・429 の尊重を IA が明示。**日本語クエリは不可**。§6.11） /
+[Qiita](https://qiita.com/terms)（記事の著作権は投稿者に帰属。未認証は 60 回/時、`FREEAGENT_QIITA_TOKEN` で 1,000 回/時）。
 
 リンク先全文・パッケージ本体の利用条件はメタデータの条件とは別です。
 
@@ -1299,7 +1335,7 @@ hermes -p reviewer config get mcp_servers.freeagent-bind
 freeagent_lookup(query="大規模言語モデル", sources=["wikipedia"], limit=3)
   → items 3 件 / llm_used=false / 先頭は「大規模言語モデル」(ja.wikipedia)
 
-freeagent_think(prompt="…", thought_number=1, total_thoughts=3, card="t_a7558ce8")
+freeagent_think(thought="…", thought_number=1, total_thoughts=3, card="t_a7558ce8")
   → session_id=t92171190316844fc45b9293 / 返り値の card が t_a7558ce8 と一致
 ```
 
@@ -1407,6 +1443,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_QUOTA_LIMITS` | 空 | 提供元の上限を**宣言**する（例: `openrouter:rpd=1000+nous:rpm=60`。単位は `rpm` / `rpd` / `tpm` / `tpd`）。宣言した提供元だけ使用量を記録し、超える前に止める |
 | `FREEAGENT_QUOTA` | 1 | クォータ窓を有効にする（`0` で宣言を無視・何も記録しない） |
 | `FREEAGENT_MAX_CALLS_PER_RUN` | 40 | fanout の組合せ上限（map 全体の制限ではありません） |
+| `FREEAGENT_MAX_PROMPTS_PER_CALL` | 16 | fanout の `prompts` の上限（1〜64）。超過分は実行せず、件数を `prompts_dropped` に返す |
 | `FREEAGENT_KB_DEADLINE` | 8 | 知識取得全体の締め切り（秒・1〜120）。遅れたソースは `⏱` で脱落表示 |
 | `FREEAGENT_KB_LATENCY_PATH` | `kb_latency.jsonl` | `measure_kb.py` の記録先 |
 | `FREEAGENT_RELEVANCE_PATH` | `relevance.jsonl` | `measure_relevance.py` の記録先 |
@@ -1471,6 +1508,12 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `GLM_API_KEY`（別名 `ZAI_API_KEY` / `ZHIPUAI_API_KEY`） | 空 | Z.ai（GLM）の推論。Freeは`glm-4.7-flash` / `glm-4.5-flash` / `glm-4.6v-flash`の3 IDのみ。Free tier確認は`FREEAGENT_ZAI_FREE_TIER=1` |
 | `MISTRAL_API_KEY` | 空 | Mistral La Plateformeの推論。Experiment planの確認は`FREEAGENT_MISTRAL_FREE_PLAN=1`。対象モデルは`probe`で確認 |
 | `MODELSCOPE_API_KEY`（別名 `MODELSCOPE_API_TOKEN`） | 空 | ModelScope API-Inferenceの推論。無料枠の確認は`FREEAGENT_MODELSCOPE_FREE_PLAN=1`。対象モデルは`probe`で確認 |
+| `CEREBRAS_API_KEY` | 空 | Cerebras Inferenceの推論。Free trial（$5・カード登録・30日）の確認は`FREEAGENT_CEREBRAS_FREE_TRIAL=1`。クレジット失効後は従量課金 |
+| `SAMBANOVA_API_KEY` | 空 | SambaNova Cloudの推論。支払い方法を登録していないアカウント（Free tier・20 RPM/20 RPD）の確認は`FREEAGENT_SAMBANOVA_FREE_TIER=1` |
+| `NOVITA_API_KEY` | 空 | Novita AIの推論。新規アカウントの無料クレジットの確認は`FREEAGENT_NOVITA_FREE_CREDITS=1`。使い切ると課金 |
+| `SILICONFLOW_API_KEY` | 空 | SiliconFlowの推論。無料モデルの確認は`FREEAGENT_SILICONFLOW_FREE_TIER=1`。対象モデルは`probe`で確認 |
+| `LONGCAT_API_KEY` | 空 | LongCat（Meituan）の推論。公開ベータの無料枠（公称50万トークン/日）の確認は`FREEAGENT_LONGCAT_FREE_PLAN=1` |
+| `OPENCODE_ZEN_API_KEY`（別名 `OPENCODE_GO_API_KEY`） | 空 | opencode Zenの推論。`-free` 接尾辞の8モデルだけを許可リストで許可。確認は`FREEAGENT_OPENCODE_FREE_TIER=1` |
 | `FREEAGENT_GROQ_FREE_TIER` | 未設定（無効） | GroqアカウントがFree tierであることを明示確認。Developer tierは従量課金 |
 | `FREEAGENT_CLOUDFLARE_FREE_PLAN` | 未設定（無効） | Workers Free planであることを明示確認。Workers Paidでは日次割当超過分が課金される |
 | `FREEAGENT_GEMINI_FREE_TIER` | 未設定（無効） | GeminiプロジェクトのFree/unpaid tierを明示確認 |
@@ -1480,6 +1523,12 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_ZAI_FREE_TIER` | 未設定（無効） | Z.aiがFree tierであることを明示確認。有料モデルは残高が無いと429を返す |
 | `FREEAGENT_MISTRAL_FREE_PLAN` | 未設定（無効） | MistralのExperiment plan（無料枠）であることを明示確認 |
 | `FREEAGENT_MODELSCOPE_FREE_PLAN` | 未設定（無効） | ModelScopeの無料枠であることを明示確認 |
+| `FREEAGENT_CEREBRAS_FREE_TRIAL` | 未設定（無効） | CerebrasのFree trial（$5クレジット）を使っていることを明示確認。切れると従量課金 |
+| `FREEAGENT_SAMBANOVA_FREE_TIER` | 未設定（無効） | SambaNovaのFree tier（支払い方法を登録していない）ことを明示確認。カード登録したら外す |
+| `FREEAGENT_NOVITA_FREE_CREDITS` | 未設定（無効） | Novitaの無料クレジットを使っていることを明示確認。使い切ると課金 |
+| `FREEAGENT_SILICONFLOW_FREE_TIER` | 未設定（無効） | SiliconFlowの無料モデルを使っていることを明示確認 |
+| `FREEAGENT_LONGCAT_FREE_PLAN` | 未設定（無効） | LongCatの公開ベータ無料枠であることを明示確認 |
+| `FREEAGENT_OPENCODE_FREE_TIER` | 未設定（無効） | opencode Zenの`-free`モデルを使っていることを明示確認（キーの権利が無いと403） |
 | `FREEAGENT_API_KEY` | `proxy-attaches-real-credentials` | `nous` プロキシ用のダミー（実資格情報はプロキシが付与） |
 
 **知識検索（検索ソース）のキー・連絡先**
@@ -1553,6 +1602,8 @@ python scripts/check_integrity.py
 python -m unittest discover -s tests
 python scripts/smoke_stdio.py
 python scripts/check_offline.py
+python scripts/gen_cases.py
+python scripts/measure_quality.py --cases builtin --strategies single
 python scripts/measure_adoption.py
 python scripts/measure_kb.py --report
 python scripts/apply_proactive.py

@@ -72,11 +72,20 @@ class ToolFanoutTest(unittest.TestCase):
     def test_prompts_are_capped_at_16(self):
         with mock.patch.object(S, "ask_map", return_value=[]) as am:
             with mock.patch.object(S, "select_models", return_value=(["nous/a"], {})):
-                S.tool_fanout({"prompts": [f"p{i}" for i in range(30)],
-                               "models": ["nous/a"]})
+                r = S.tool_fanout({"prompts": [f"p{i}" for i in range(30)],
+                                   "models": ["nous/a"]})
         # 16 プロンプト × 1 モデル = 16 呼び出し
         pairs = am.call_args[0][0]
         self.assertEqual(len(pairs), 16)
+        # **黙って捨てない**: 何件を実行しなかったかを返す（規約 8）。
+        self.assertEqual(r["prompts_dropped"], 14)
+        self.assertIn("上限", S.render("freeagent_fanout", r))
+
+    def test_no_drop_reports_zero(self):
+        with mock.patch.object(S, "ask_map", return_value=[{"text": "a"}]):
+            with mock.patch.object(S, "select_models", return_value=(["nous/a"], {})):
+                r = S.tool_fanout({"prompts": ["p1", "p2"], "models": ["nous/a"]})
+        self.assertEqual(r["prompts_dropped"], 0)
 
     def test_call_cap_is_enforced(self):
         with mock.patch.object(S, "ask_map") as am:

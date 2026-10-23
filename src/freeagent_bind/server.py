@@ -67,7 +67,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.14.0"
+SERVER_VERSION = "0.14.1"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -117,6 +117,9 @@ MAX_CALLS_PER_RUN = max(1, _env_int("FREEAGENT_MAX_CALLS_PER_RUN", 40))
 #   MAX_MODELS_PER_CALL … `models` 配列・`models: ["all"]` の展開上限（既定 16）
 MAX_SUB_MODELS = max(1, min(32, _env_int("FREEAGENT_MAX_SUB_MODELS", 8)))
 MAX_MODELS_PER_CALL = max(1, min(40, _env_int("FREEAGENT_MAX_MODELS_PER_CALL", 16)))
+#   MAX_PROMPTS_PER_CALL … fanout の `prompts` の上限（既定 16）。
+#     **切り捨ては黙ってやらない**（規約 8・56 と同じ理由で `prompts_dropped` に件数を返す）。
+MAX_PROMPTS_PER_CALL = max(1, min(64, _env_int("FREEAGENT_MAX_PROMPTS_PER_CALL", 16)))
 # サブエージェント起動（hermes chat -q）と Hermes 本体の委譲は明示オプトインのみ。既定 off。
 ALLOW_AGENT = _env_on("FREEAGENT_ALLOW_AGENT", False)
 HERMES_BIN = os.environ.get("FREEAGENT_HERMES_BIN") or shutil.which("hermes") or "hermes"
@@ -6363,7 +6366,8 @@ def tool_fanout(args: dict) -> dict:
         prompts = [single] if single else []
     if not prompts:
         return {"error": "prompts（または prompt）は必須です"}
-    prompts = prompts[:16]
+    prompts_dropped = max(0, len(prompts) - MAX_PROMPTS_PER_CALL)
+    prompts = prompts[:MAX_PROMPTS_PER_CALL]
     explicit, cut = _expand_models(as_str_list(args.get("models")))
     if explicit:
         refs = explicit
@@ -6403,6 +6407,7 @@ def tool_fanout(args: dict) -> dict:
         "speedup": round(sequential / wall, 2) if wall > 0 else None,
         "results": rows, "selection": info, "concurrency": PROVIDER_GATE.report(refs),
         "quota": quota_report(refs),
+        "prompts_dropped": prompts_dropped,
         **_rate_limit_report(results),
     }
 
@@ -7840,7 +7845,10 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "prompts": {"type": "array", "items": {"type": "string"}, "description": "依頼文の配列"},
+                "prompts": {"type": "array", "items": {"type": "string"},
+                            "maxItems": MAX_PROMPTS_PER_CALL,
+                            "description": f"依頼文の配列（最大 {MAX_PROMPTS_PER_CALL} 件。"
+                                           f"超過分は切り捨て、件数を `prompts_dropped` で返します）"},
                 "prompt": {"type": "string", "description": "単一の依頼文（prompts の代わり）"},
                 "models": {"type": "array", "items": {"type": "string"},
                            "description": "明示するモデル（provider/model）。[\"all\"] を渡すと在庫の"
@@ -8329,6 +8337,9 @@ def _render_fanout(data: dict) -> str:
             f"倍率 {data.get('speedup')}）")
     if data.get("slot_waited"):
         head += f" / 提供元の枠待ち {data['slot_waited']} 件（429 を踏まずに順番待ちで吸収）"
+    if data.get("prompts_dropped"):
+        head += (f"\n⚠️ prompts は上限 {MAX_PROMPTS_PER_CALL} 件までです"
+                 f"（{data['prompts_dropped']} 件は実行していません）")
     body = ""
     for row in (data.get("results") or [])[:12]:
         text = row.get("answer") or row.get("error") or ""
