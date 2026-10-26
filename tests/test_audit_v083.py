@@ -170,7 +170,11 @@ class TestSharedBudgetKey(unittest.TestCase):
 
     def test_code_search_keeps_its_own_quota(self):
         """code 検索は枠が違うので別キーのまま。"""
-        src = open(os.path.join(ROOT, "src/freeagent_bind/server.py"), encoding="utf-8").read()
+        # ソース実装は v0.15.0 で src/freeagent_bind/sources/ へ分割された（Phase 1）。
+        # 主張（別の budget_key を持つ）は分割先のファイルで確認する。
+        src_dir = os.path.join(ROOT, "src/freeagent_bind")
+        src = open(os.path.join(src_dir, "server.py"), encoding="utf-8").read()
+        src += open(os.path.join(src_dir, "sources/github.py"), encoding="utf-8").read()
         self.assertIn("api.github.com/search/code", src)
 
 

@@ -1,15 +1,23 @@
 # AGENTS.md — hermes-freeagent-bind
 
 Hermes Agent の **Free モデルをサブ LLM として並列に走らせる** MCP サーバー（Python 3.11+ / 実行時依存ゼロ /
-単一ファイルのモノリス）。メイン LLM の知識補助として **arXiv / Crossref / OpenAlex / Wikipedia /
+モジュラーモノリス＝本体 1 ファイル＋`sources/` パッケージ）。メイン LLM の知識補助として **arXiv / Crossref / OpenAlex / Wikipedia /
 Wikidata / GitHub** を既定で引き、**DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates / CiNii /
 OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Libraries.io /
 Internet Archive / Qiita** は
 明示指定で追加する。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は対象外**。
 
 - 全体像は `README.md`、**実装の契約は `SPEC.md`**（変更時は両方を同一変更内で更新する）。
-- 本体は `src/freeagent_bind/server.py` の 1 ファイルで、**§0〜§10 の区画**に分かれている。
+- 本体は `src/freeagent_bind/server.py` で、**§0〜§10 の区画**に分かれている。
   機能追加は既存の行を書き換えるのではなく**新しい§を立てる**形で行い、冒頭 docstring の目次も更新する。
+- **知識ソースだけは `src/freeagent_bind/sources/<name>.py`（1 ソース 1 ファイル）**。追加は
+  (1) ファイルを作る (2) `sources/__init__.py` の import 一覧に足す (3) 既定には入れない（規約 28）、の 3 手。
+  `SOURCES` / `KB_BACKENDS` はレジストリが import 順に組み立てるので、`server.py` の該当行は触らない。
+- ソース実装は共有ヘルパーを **`S.<name>` の属性参照で呼ぶ**（`from .. import server as S`）。
+  直接 `as_str(...)` と呼ぶと `patch.object(server, ...)` が届かなくなる（テスト 472 箇所が
+  server の名前を差し替えている）。`server.py` 側の名前は `globals().update(sources.EXPORTS)` で互換を保つ。
+- `python src/freeagent_bind/server.py` / `runpy.run_path(...)` の**直接実行を壊さない**（配布形態）。
+  冒頭の互換シムがパッケージ版の `main()` へ渡す。ゲートの `smoke_http` / `check_offline` はこの経路で走る。
 
 ## セットアップ
 

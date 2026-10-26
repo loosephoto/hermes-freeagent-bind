@@ -9,10 +9,21 @@
 - 知識の**蓄積**はしない（蓄積するのは品質統計・クールダウン・進行中の相談・進行中の思考台帳だけ）。
 - `freeagent_delegate` を除き、外部データを書き換えない。ローカルの作業状態への書き込みと、推論プロンプト・検索語の外部送信はある（§2）。
 
-## 1. 構成（モノリス）
+## 1. 構成（モジュラーモノリス）
 
-`src/freeagent_bind/server.py` の 1 ファイル。肥大化を前提に **§区画**で分ける。区画の追加は「行を足す」
-ではなく「新§を立てる」で行い、冒頭 docstring の目次も同時に更新する（目次が古いと全体が見えなくなる）。
+本体は `src/freeagent_bind/server.py`（§0〜§4・§5 の横断部・§6〜§10）。**知識ソース 24 種だけは
+`sources/<name>.py`（1 ソース 1 ファイル）**に置き、`sources/__init__.py` のレジストリが
+`SOURCES` と `KB_BACKENDS` を import 順に 1 回だけ組み立てる。区画の追加は「行を足す」ではなく
+「新§を立てる」で行い、冒頭 docstring の目次も同時に更新する（目次が古いと全体が見えなくなる）。
+
+- **ソース追加は 3 手**: (1) `sources/<name>.py` を作る (2) `sources/__init__.py` の import に足す
+  (3) 既定には入れない（規約 28）。`server.py` の `SOURCES` / `KB_BACKENDS` 行はもう存在しない。
+- **ソースは共有ヘルパーを `S.<name>` の属性参照で呼ぶ**。テスト 472 箇所が `patch.object(server, ...)`
+  で server の名前（`kb_json` 105・`provider_http` 40・`_kb_rate_acquire` 22 …）を差し替えるので、
+  直接名で呼ぶと差し替えが届かず「テストは緑のまま本物を叩く」状態になる。`server.py` 側の互換は
+  `globals().update(sources.EXPORTS)` が担う（定数・専用ヘルパーも含む）。
+- **直接実行を壊さない**: `python server.py` / `runpy.run_path(server.py)` は冒頭の互換シムが
+  パッケージ版の `main()` を呼ぶ（配布物は今も stdio スクリプト 1 本）。
 
 | 区画 | 内容 |
 |---|---|
@@ -21,7 +32,7 @@
 | §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳） |
 | §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
-| §5 | 知識バックエンド24種（既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須） / §5.21 Internet Archive（明示指定のみ） / §5.22 Qiita（明示指定のみ）） |
+| §5 | 知識バックエンド24種（**実装は `sources/<name>.py`**。ここには横断検索・締め切り・引用統合・ホスト予算だけを残す）＝既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須） / §5.21 Internet Archive（明示指定のみ） / §5.22 Qiita（明示指定のみ）） |
 | §6 | ツール実装（11本、§6.11 本文の注入番号・引用認定） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |

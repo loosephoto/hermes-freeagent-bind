@@ -6,10 +6,13 @@ Internet Archive / Qiita）で
 根拠づける MCP サーバー。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は
 対象外**（第6段階で採った生命・医学系ソースは 2026-10-05 に方針変更で削除。§5.19 に記録）。
 
-これは **モノリス**（単一ファイル）として書く。理由: 配布物が 1 つの stdio スクリプトで完結し、
-遅延 import や相対 import の取り回しでクライアント側の起動が壊れる事故が無い（実測: stdio 起動後に
-ネイティブ拡張を import すると無応答になる環境がある）。肥大化は前提なので、増築は「§区画の追加」で
-行い、目次をこの docstring に保つ。目次が実装とずれたら、それは設計が崩れた合図。
+**モジュラーモノリス**として書く。本体はこの 1 ファイル（§0〜§4・§5 の横断部・§6〜§10）で、
+知識ソース 24 種だけを `sources/<name>.py`（1 ソース 1 ファイル）に置く。配布物は今も
+**stdio スクリプト 1 本**で完結する（`python server.py` / `runpy.run_path(server.py)` の直接実行は、
+冒頭の互換シムがパッケージ版を import して `main()` を呼ぶ。実測: stdio 起動後にネイティブ拡張を
+import すると無応答になる環境があるため、起動経路は増やさない）。肥大化は前提なので、増築は
+「§区画の追加」（ソースなら `sources/` に 1 ファイル＋レジストリ 1 行）で行い、目次をこの docstring に保つ。
+目次が実装とずれたら、それは設計が崩れた合図。
 
 目次
   §0 定数・設定        §1 ユーティリティ     §2 永続ストア（§2.1 クールダウン / §2.2 品質統計 /
@@ -64,10 +67,24 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# `python server.py` / `runpy.run_path(server.py)` で**直接実行される配布形態**を保つ。
+# ソース実装を `sources/` へ分割したので、相対 import の効くパッケージ文脈で動かす必要がある。
+# __main__ として起動されたときは、パッケージ版の server モジュールを import して main() を呼ぶ
+# （プロセスは増えない・argv と cwd はそのまま・状態は 1 つのモジュールに閉じる）。
+if __package__ in (None, ""):
+    import importlib as _importlib
+    import pathlib as _pathlib
+
+    _pkg_root = str(_pathlib.Path(__file__).resolve().parents[1])
+    if _pkg_root not in sys.path:
+        sys.path.insert(0, _pkg_root)
+    _importlib.import_module("freeagent_bind.server").main()
+    raise SystemExit(0)
+
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.14.2"
+SERVER_VERSION = "0.15.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -3524,35 +3541,8 @@ def _plain_text(text: str, limit: int = 600) -> str:
     return truncate(" ".join(re.sub(r"<[^>]+>", " ", text or "").split()), limit)
 
 
-def _code_excerpt(text: str, limit: int = 400) -> str:
-    """コード断片を引用用に整える。**`_plain_text` は使わない**。
-
-    `_plain_text` は `<[^>]+>` を落とすので、Java / C# / TypeScript のジェネリクス
-    （`List<String>` など）が消えて意味が変わる。改行とインデントは保つ。
-    """
-    lines = [ln.rstrip() for ln in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")]
-    return truncate("\n".join(lines).strip(), limit)
 
 
-def _openalex_abstract(row: dict, limit: int = 500) -> str:
-    """OpenAlex は本文を `abstract_inverted_index`（語 → 位置の配列）で返すので復元する。
-
-    そのままでは人間にもサブLLMにも読めず、citation の summary が空になっていた。
-    """
-    inv = row.get("abstract_inverted_index")
-    if not isinstance(inv, dict):
-        return ""
-    placed: dict[int, str] = {}
-    for word, positions in inv.items():
-        if not isinstance(positions, (list, tuple)):
-            continue
-        for pos in positions:
-            index = as_int(pos, -1, 0, 10**6)
-            if index >= 0:
-                placed.setdefault(index, str(word))
-    if not placed:
-        return ""
-    return truncate(" ".join(placed[k] for k in sorted(placed)), limit)
 
 
 def _cite(source: str, title: str, url: str, **extra) -> dict:
@@ -3565,193 +3555,10 @@ def _cite(source: str, title: str, url: str, **extra) -> dict:
 
 # ---------------------------------------------------------------- §5.1 Wikipedia
 
-# CJK（かな・漢字・ハングル）を含むかどうかだけを見る。言語判定器は使わない（決定的・依存ゼロ）。
-_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
-
-
-def _kb_auto_lang(query: str, lang: str = "") -> str:
-    """ソースの言語を決める。明示があればそれを尊重し、無ければ問いから決める（CJK を含む→ja、それ以外→en）。
-
-    実測（2026-10-17）: **ASCII の問いを ja 索引に投げると無関係な記事が返る**。
-    `Transformer` は ja で「トランスフォーマー (曖昧さ回避) / ASUS Eee Pad TF101 / TF201」、
-    en では「Transformer / Transformer (deep learning) / Generative pre-trained transformer」。
-    `diffusion model` も ja は「フィジカル・レビュー / 拡散律速凝集」で en は「Diffusion model」。
-    逆に日本語の問いは ja が正しい（`強化学習` は ja 1 位、en は「安倍晋三暗殺」）。混在（`LLM 大規模言語モデル`）は
-    CJK があるので ja。**wikidata は ja のままが良い**（実測: `Transformer` は ja の 2 件目に
-    「トランスフォーマー（機械学習アーキテクチャ）」が出るが、en は変圧器とメディア作品）ので、
-    この規則は wikipedia にだけ適用する。
-    """
-    explicit = as_str(lang).strip().lower()
-    if explicit:
-        return explicit
-    return "ja" if _CJK_RE.search(as_str(query)) else "en"
-
-
-def _wiki_exact_hit(data) -> dict | None:
-    """`titles=` の応答から「存在し、中身のある」1 件を返す（無ければ None）。
-
-    実測（ja.wikipedia, 2026-10-17）: 「大規模言語モデル」は記事があるのに素の検索では 20 件中 **19 位**で、
-    既定の `gsrlimit=3` では窓の外に落ちて無関係な項目（マークアップ言語・機械翻訳）だけが返っていた
-    （`intitle:大規模言語モデル` なら 1 位、`pageid:4769449` も一致＝索引には載っている）。
-    完全一致だけを先頭へ昇格させれば順位に依存せずに済む。
-    **中身が空の extract は昇格させない**（実測: 「大規模言語モデルの一覧」は記事があるのに intro が 0 文字で、
-    そのまま昇格させると空の項目が先頭に来る）。`missing` / `invalid` はキーの有無で判定する
-    （値は空文字で返るため、値の真偽では見分けられない）。
-    """
-    pages = ((data or {}).get("query") or {}).get("pages") or {}
-    for page in pages.values():
-        if not isinstance(page, dict) or "missing" in page or "invalid" in page:
-            continue
-        title = as_str(page.get("title"))
-        extract = as_str(page.get("extract"))
-        if title and re.sub(r"<[^>]+>", "", extract).strip():
-            return {"title": title, "extract": extract}
-    return None
-
-
-def kb_wikipedia(query: str, lang: str = "", limit: int = 3) -> dict:
-    """本文の要約＋検索結果。出典 URL 付き（LLM 不使用）。
-
-    - 検索（`generator=search`）と**タイトル完全一致の lookup（`titles=`）を並列**に投げ、完全一致があれば
-      先頭に置く（§5.1 の順位対策）。演算子や引用符を含む問いでは lookup を投げない。
-    - `lang` 省略時は**問いから自動**（`_kb_auto_lang`: CJK→ja、それ以外→en）。明示すればそれを尊重する。
-    """
-    lang = _kb_auto_lang(query, lang)
-    if not re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", lang):
-        return {"source": "wikipedia", "lang": lang, "items": [], "citations": [],
-                "error": "lang は有効な Wikipedia 言語コードで指定してください"}
-    limit = as_int(limit, 3, 1, 8)
-    # 検索演算子・引用符を含む問いはタイトルではない（`intitle:` 等をタイトルとして引くと無関係な記事に当たる）。
-    # 長すぎる問いもタイトルではない。このときは lookup を投げず、リクエストを増やさない。
-    exact_lookup = bool(query) and len(query) <= 80 and not re.search(r'["~:]', query)
-
-    def produce() -> dict:
-        base = f"https://{lang}.wikipedia.org"
-
-        def search_request() -> dict:
-            q = urllib.parse.urlencode({
-                "action": "query", "format": "json", "generator": "search",
-                "gsrsearch": query, "gsrlimit": limit, "prop": "extracts",
-                "exintro": 1, "explaintext": 1, "exchars": 1200,
-            })
-            data, err = kb_json(f"{base}/w/api.php?{q}")
-            return {"data": data, "error": err}
-
-        def exact_request() -> dict:
-            """完全一致の記事を引く（`redirects=1` で転送も解決する）。投げない条件では data=None。"""
-            if not exact_lookup:
-                return {"data": None, "error": ""}
-            q = urllib.parse.urlencode({
-                "action": "query", "format": "json", "titles": query, "redirects": 1,
-                "prop": "extracts", "exintro": 1, "explaintext": 1, "exchars": 1200,
-            })
-            data, err = kb_json(f"{base}/w/api.php?{q}")
-            return {"data": data, "error": err}
-
-        # 2 本を**並列**に投げる（実測: 逐次 1.15 秒 → 並列 0.58 秒。wikipedia は `kb_json` 経由で
-        # ホスト間隔の制御が無く、同一ホストへの 2 並列でローカル 429 にならないことも実測で確認した）。
-        search, exact = run_parallel([search_request, exact_request], lambda job: job())
-        if not isinstance(search, dict):
-            search = {"data": None, "error": "検索の実行に失敗しました"}
-        if search.get("error") and not search.get("data"):
-            return {"source": "wikipedia", "error": search["error"]}
-        data = search.get("data")
-        pages = ((data or {}).get("query") or {}).get("pages") or {}
-        hits = sorted((page for page in pages.values() if isinstance(page, dict)),
-                      key=lambda page: as_int(page.get("index"), 999999, 0, 999999))
-        # 完全一致を先頭へ（検索側にも同じタイトルがあれば重複を落とす）。失敗しても検索結果は変えない。
-        promo = _wiki_exact_hit(exact.get("data") if isinstance(exact, dict) else None)
-        if promo:
-            hits = [{"title": promo["title"], "extract": promo["extract"]}] + [
-                hit for hit in hits if as_str(hit.get("title")) != promo["title"]]
-        items, cites = [], []
-        for hit in hits[:limit]:
-            title = as_str(hit.get("title"))
-            if not title:
-                continue
-            page_url = f"{base}/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
-            summary = re.sub(r"<[^>]+>", "", as_str(hit.get("extract")))
-            items.append({"title": title, "url": page_url, "summary": truncate(summary, 1200),
-                          "snippet": truncate(summary, 300)})
-            cites.append(_cite("wikipedia", title, page_url, lang=lang,
-                               summary=_plain_text(summary, 600)))
-        return {"source": "wikipedia", "lang": lang, "items": items, "citations": cites,
-                "error": "" if items else "該当なし"}
-
-    return _kb_cached(f"wiki:{lang}:{query}:{limit}", produce)
 
 
 # ---------------------------------------------------------------- §5.2 Wikidata
 
-def kb_wikidata(query: str, lang: str = "ja", limit: int = 3) -> dict:
-    """項目を検索し、代表的な主張（P31 分類 / P17 国 / P569 生年月日 など）を**ラベル解決つき**で返す。"""
-    lang = as_str(lang, "ja")[:8]
-    limit = as_int(limit, 3, 1, 5)
-    # 値を読むときに意味が取れる代表プロパティだけを出す（全主張を並べても読めない）
-    PROPS = {"P31": "分類", "P279": "上位分類", "P17": "国", "P569": "生年月日", "P570": "没年月日",
-             "P106": "職業", "P361": "一部", "P159": "本社所在地", "P571": "設立", "P50": "著者"}
-
-    def produce() -> dict:
-        q = urllib.parse.urlencode({"action": "wbsearchentities", "format": "json", "language": lang,
-                                    "uselang": lang, "search": query, "limit": limit})
-        data, err = kb_json_keepalive(f"https://www.wikidata.org/w/api.php?{q}")
-        if err:
-            return {"source": "wikidata", "error": err}
-        hits = (data or {}).get("search") or []
-        ids = [h.get("id") for h in hits if h.get("id")]
-        items, cites, ref_ids = [], [], set()
-        entities: dict = {}
-        if ids:
-            q2 = urllib.parse.urlencode({"action": "wbgetentities", "format": "json",
-                                         "ids": "|".join(ids[:limit]), "props": "claims"})
-            e_data, _ = kb_json_keepalive(f"https://www.wikidata.org/w/api.php?{q2}")
-            entities = ((e_data or {}).get("entities") or {})
-        claims_out: dict[str, list] = {}
-        for qid in ids[:limit]:
-            ent = entities.get(qid) or {}
-            claims = ent.get("claims") or {}
-            rows = []
-            for prop, label in PROPS.items():
-                for claim in (claims.get(prop) or [])[:2]:
-                    value = (((claim.get("mainsnak") or {}).get("datavalue") or {}).get("value"))
-                    if isinstance(value, dict):
-                        if "id" in value:
-                            rows.append({"property": prop, "label": label, "value": value["id"]})
-                            ref_ids.add(value["id"])
-                        elif "time" in value:
-                            rows.append({"property": prop, "label": label,
-                                         "value": value["time"].lstrip("+")[:10]})
-                        elif "text" in value:
-                            rows.append({"property": prop, "label": label, "value": value["text"]})
-                    elif value is not None:
-                        rows.append({"property": prop, "label": label, "value": str(value)})
-            claims_out[qid] = rows
-        # 参照した QID のラベルを 1 回の追加呼び出しでまとめて解決する
-        labels: dict[str, str] = {}
-        if ref_ids:
-            q3 = urllib.parse.urlencode({"action": "wbgetentities", "format": "json",
-                                         "ids": "|".join(sorted(ref_ids)[:40]), "props": "labels",
-                                         "languages": lang})
-            l_data, _ = kb_json_keepalive(f"https://www.wikidata.org/w/api.php?{q3}")
-            for qid, ent in ((l_data or {}).get("entities") or {}).items():
-                lab = (((ent.get("labels") or {}).get(lang) or {}).get("value"))
-                if lab:
-                    labels[qid] = lab
-        for hit in hits[:limit]:
-            qid = hit.get("id")
-            if not qid:
-                continue
-            rows = [dict(row, value_text=labels.get(str(row.get("value")), "")) for row in claims_out.get(qid, [])]
-            url = f"https://www.wikidata.org/wiki/{qid}"
-            items.append({"id": qid, "label": hit.get("label") or "",
-                          "description": hit.get("description") or "",
-                          "url": url, "claims": rows})
-            cites.append(_cite("wikidata", hit.get("label") or qid, url, qid=qid,
-                               summary=_plain_text(hit.get("description") or "", 300)))
-        return {"source": "wikidata", "lang": lang, "items": items, "citations": cites,
-                "error": "" if items else "該当なし"}
-
-    return _kb_cached(f"wd:{lang}:{query}:{limit}", produce)
 
 
 # ---------------------------------------------------------------- §5.2.1 接続の再利用（wikidata の api.php）
@@ -4019,163 +3826,14 @@ def _arxiv_throttle() -> None:
         _ARXIV_LAST = now_ts()
 
 
-def kb_arxiv(query: str, limit: int = 5) -> dict:
-    """プレプリント検索（Atom XML）。検索語は `all:` に寄せる（フィールド指定はそのまま活かす）。"""
-    limit = as_int(limit, 5, 1, 20)
-    field_q = query if re.search(r"\b(all|ti|au|abs|cat):", query) else f"all:{query}"
-
-    def produce() -> dict:
-        # **https でなければならない**（実測: http は 301 を返し、urllib のリダイレクト処理の先で
-        # 406 になる。https なら 200）。
-        url = ("https://export.arxiv.org/api/query?" + urllib.parse.urlencode(
-            {"search_query": field_q, "start": 0, "max_results": limit,
-             "sortBy": "relevance", "sortOrder": "descending"}))
-        status, body = 0, ""
-        for attempt in range(3):
-            _arxiv_throttle()
-            status, body = kb_http(url, accept="application/atom+xml")
-            if status != 406:
-                break
-        if status != 200:
-            return {"source": "arxiv", "error": f"HTTP {status}: {body[:200]}" if status else body}
-        ns = {"a": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
-        try:
-            root = ET.fromstring(body)
-        except ET.ParseError as exc:
-            return {"source": "arxiv", "error": f"XML 解析失敗: {exc}"}
-        items, cites = [], []
-        for entry in root.findall("a:entry", ns)[:limit]:
-            link = ""
-            for ln in entry.findall("a:link", ns):
-                if ln.get("rel") == "alternate" or not link:
-                    link = ln.get("href") or link
-            title = " ".join((entry.findtext("a:title", "", ns) or "").split())
-            summary = " ".join((entry.findtext("a:summary", "", ns) or "").split())
-            authors = [a.findtext("a:name", "", ns) for a in entry.findall("a:author", ns)]
-            items.append({
-                "id": entry.findtext("a:id", "", ns),
-                "title": truncate(title, 300),
-                "summary": truncate(summary, 1200),
-                "published": (entry.findtext("a:published", "", ns) or "")[:10],
-                "updated": (entry.findtext("a:updated", "", ns) or "")[:10],
-                "authors": authors[:8],
-                "primary_category": (entry.find("arxiv:primary_category", ns).get("term")
-                                     if entry.find("arxiv:primary_category", ns) is not None else ""),
-                "doi": entry.findtext("arxiv:doi", "", ns),
-                "url": link,
-            })
-            cites.append(_cite("arxiv", title, link,
-                               year=(entry.findtext("a:published", "", ns) or "")[:4],
-                               authors=authors[:3],
-                               summary=_plain_text(summary, 600)))
-        return {"source": "arxiv", "items": items, "citations": cites,
-                "error": "" if items else "該当なし"}
-
-    return _kb_cached(f"arxiv:{field_q}:{limit}", produce)
 
 
 # ---------------------------------------------------------------- §5.4 Crossref
 
-# Crossref のローカル予算（秒）。**実測に基づく**（2026-10-20）:
-# 429 は**レート制限ではなく共有プールのTransientな拒否**で、間隔（0.4/0.6/0.8/1.0 秒）不管で
-# 10 回中 1〜3 回出る。→ 間隔では直らない。**再試行で直る**（§5.8 の 429 再試行）。
-# よって予算は「詰まらせない」程度に緩くする（0.5 秒だと 429 の原因を作ってしまう）。
-_CROSSREF_INTERVAL = max(0.0, _env_float("FREEAGENT_CROSSREF_INTERVAL", 0.1))
-
-
-def kb_crossref(query: str, limit: int = 5, need_evidence: bool = False) -> dict:
-    """DOI 登録機関のメタデータ（書誌）。`mailto` を付けると polite pool に入る。
-
-    **`need_evidence=True`（= `grounded` の場面）なら `filter=has-abstract:true` を付ける**（§6.18）。
-    実測: Crossref の abstract の充填率は**平均 27%**（9 クエリ × 5 件 = 45 件中 12 件）。
-    → そのままでは「引用は返るのに本文根拠 0 件」になる（= grounded の根拠が尽きる）。
-    `has-abstract:true` を付けると **9 クエリすべてで 5/5（100%）** になる。
-    代償は関連度が少し落ちる（上位に別の論文が混ざる）が、
-    **根拠が要る場面では「根拠が無い書誌」より「少し関連度の落ちた根拠」の方が有用**。
-    `need_evidence=False`（= `lookup` の場面）は**書誌の網羅性**を優先するのでフィルタしない。
-    """
-    limit = as_int(limit, 5, 1, 20)
-
-    def produce() -> dict:
-        params = {"query": query, "rows": limit,
-                  "select": "DOI,title,author,issued,container-title,type,URL,abstract,is-referenced-by-count,publisher"}
-        if KB_MAILTO:
-            params["mailto"] = KB_MAILTO
-        if need_evidence:
-            params["filter"] = "has-abstract:true"
-        data, err = _kb_new_json("https://api.crossref.org/works?" + urllib.parse.urlencode(params),
-                                 _CROSSREF_INTERVAL)
-        if err:
-            return {"source": "crossref", "error": err}
-        rows = ((data or {}).get("message") or {}).get("items") or []
-        items, cites = [], []
-        for row in rows[:limit]:
-            title = (row.get("title") or [""])[0]
-            year = ""
-            parts = ((row.get("issued") or {}).get("date-parts") or [[]])[0]
-            if parts:
-                year = str(parts[0])
-            authors = [" ".join(x for x in (a.get("given"), a.get("family")) if x)
-                       for a in (row.get("author") or [])]
-            url = row.get("URL") or (f"https://doi.org/{row.get('DOI')}" if row.get("DOI") else "")
-            items.append({"title": truncate(title, 300), "doi": row.get("DOI") or "",
-                          "year": year, "type": row.get("type") or "",
-                          "container": (row.get("container-title") or [""])[0],
-                          "publisher": row.get("publisher") or "",
-                          "cited_by": row.get("is-referenced-by-count"),
-                          "authors": authors[:8], "url": url})
-            cites.append(_cite("crossref", title, url, year=year, doi=row.get("DOI") or "",
-                               summary=_plain_text(row.get("abstract") or "", 500)))
-        return {"source": "crossref", "items": items, "citations": cites,
-                "error": "" if items else "該当なし"}
-
-    # キャッシュキーに**根拠の有無を入れる**（同じクエリでも返すべき引用が違う。§6.18）。
-    return _kb_cached(f"crossref:{query}:{limit}:{'evi' if need_evidence else 'bib'}", produce)
 
 
 # ---------------------------------------------------------------- §5.5 OpenAlex
 
-def kb_openalex(query: str, limit: int = 5) -> dict:
-    """書誌＋被引用数＋OA リンク。`mailto` を付けると polite pool に入る（任意）。"""
-    limit = as_int(limit, 5, 1, 20)
-
-    def produce() -> dict:
-        params = {"search": query, "per-page": limit}
-        if KB_MAILTO:
-            params["mailto"] = KB_MAILTO
-        if OPENALEX_API_KEY:
-            params["api_key"] = OPENALEX_API_KEY
-        data, err = kb_json("https://api.openalex.org/works?" + urllib.parse.urlencode(params))
-        if err:
-            # 提供元側の一時停止は「自分のバグ」と区別して伝える（再試行の判断が変わる）
-            low = err.lower()
-            if "temporarily unavailable" in low or "paused" in low or "503" in low:
-                return {"source": "openalex", "items": [], "citations": [],
-                        "provider_status": "paused",
-                        "error": "OpenAlex の検索基盤が提供元側で一時停止中です（匿名検索の停止）。"
-                                 "OPENALEX_API_KEY を設定すると回避できます"}
-            return {"source": "openalex", "error": err}
-        items, cites = [], []
-        for row in (data or {}).get("results") or []:
-            title = row.get("title") or row.get("display_name") or ""
-            authors = [(a.get("author") or {}).get("display_name")
-                       for a in (row.get("authorships") or [])]
-            authors = [a for a in authors if a]
-            source_name = (((row.get("primary_location") or {}).get("source") or {}).get("display_name")) or ""
-            url = row.get("doi") or row.get("id") or ""
-            oa = row.get("open_access") or {}
-            items.append({"title": truncate(title, 300), "year": row.get("publication_year"),
-                          "cited_by": row.get("cited_by_count"), "container": source_name,
-                          "authors": authors[:8], "url": url,
-                          "oa_url": oa.get("oa_url") or "", "is_oa": bool(oa.get("is_oa")),
-                          "type": row.get("type") or ""})
-            cites.append(_cite("openalex", title, url, year=row.get("publication_year"),
-                               cited_by=row.get("cited_by_count"),
-                               summary=_openalex_abstract(row)))
-        return {"source": "openalex", "items": items, "citations": cites,
-                "error": "" if items else "該当なし"}
-
-    return _kb_cached(f"openalex:{query}:{limit}", produce)
 
 
 # ---------------------------------------------------------------- §5.6 GitHub
@@ -4183,96 +3841,6 @@ def kb_openalex(query: str, limit: int = 5) -> dict:
 # GitHub の検索枠はエンドポイント別に分かれている（実測: search 30/分・code_search 10/分・
 # 未認証は 10/分）。予算キーをサービス単位に分けないと、code の 10/分に repo / issue が
 # 巻き込まれて片方だけが先に落ちる（AGENTS 規約 32 と同じ理由）。
-_GH_SEARCH_INTERVAL = 2.0          # repo / issue（認証あり・30/分）
-_GH_SEARCH_INTERVAL_UNAUTH = 6.0   # repo / issue（未認証・10/分）
-_GH_CODE_INTERVAL = 6.0            # code（10/分・認証必須）
-
-
-def _gh_fragment(row: dict) -> str:
-    """code 検索の `text_matches` から一致断片を取り出す（同じファイルで最大 2 件まで返る）。"""
-    matches = row.get("text_matches")
-    if not isinstance(matches, list):
-        return ""
-    parts = [as_str(m.get("fragment"), "") for m in matches[:2] if isinstance(m, dict)]
-    return "\n…\n".join(p for p in parts if p)
-
-
-def kb_github(query: str, kind: str = "repo", limit: int = 5) -> dict:
-    """リポジトリ / コード / Issue の検索。**コード検索はトークン必須**（未設定なら理由を返す）。
-
-    `kind="code"` で返るのは **ファイルへのポインタと一致箇所の断片**だけで、
-    **ライセンス情報を含まない**（取り込む前に `kind="repo"` などで別途確認する）。
-    GitHub 側の索引も default branch のみ・384KB 未満・直近 1 年に活動のあるリポジトリなどに
-    限られるので、「探して出ない」は「存在しない」を意味しない。
-    """
-    kind = as_str(kind, "repo")
-    if kind not in ("repo", "code", "issue"):
-        kind = "repo"
-    limit = as_int(limit, 5, 1, 20)
-
-    def produce() -> dict:
-        headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-        if GITHUB_TOKEN:
-            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-        if kind == "code":
-            if not GITHUB_TOKEN:
-                return {"source": "github", "kind": kind, "items": [], "citations": [],
-                        "error": "コード検索は GITHUB_TOKEN（または GH_TOKEN）が必要です。"
-                                 "トークンを設定するか kind=\"repo\"/\"issue\" を使ってください"}
-            # 一致箇所の断片（text_matches.fragment）を受け取る。付けないと本文が一切返らない。
-            headers["Accept"] = "application/vnd.github.text-match+json"
-        endpoint = {"repo": "repositories", "code": "code", "issue": "issues"}[kind]
-        sort = "&sort=stars&order=desc" if kind == "repo" else ""
-        url = (f"https://api.github.com/search/{endpoint}?"
-               + urllib.parse.urlencode({"q": query, "per_page": limit}) + sort)
-        interval = (_GH_CODE_INTERVAL if kind == "code" else
-                    (_GH_SEARCH_INTERVAL if GITHUB_TOKEN else _GH_SEARCH_INTERVAL_UNAUTH))
-        # **予算キーは search 全体で 1 枠**（実測 2026-10-20: repo と issue はどちらも
-        # `X-RateLimit-Resource: search` で、交互に叩くと Remaining が 9→9→8→8 と減る＝枠が共通）。
-        # エンドポイントごとに別のキーにすると、**同じホストの枠を奪い合う**
-        # （fan-out で成功 1/4 になっていた）。`code` 検索は枠が違うので別キーにする。
-        budget_key = "api.github.com/search/code" if kind == "code" else "api.github.com/search"
-        data, err = _kb_new_json(url, interval, budget_key=budget_key,
-                                 extra_headers=headers)
-        if err:
-            return {"source": "github", "kind": kind, "error": err}
-        rows = (data or {}).get("items") or []
-        items, cites = [], []
-        for row in rows[:limit]:
-            if kind == "repo":
-                title = row.get("full_name") or ""
-                items.append({"title": title, "url": row.get("html_url") or "",
-                              "description": truncate(row.get("description") or "", 400),
-                              "stars": row.get("stargazers_count"), "language": row.get("language"),
-                              "updated_at": row.get("updated_at"), "topics": (row.get("topics") or [])[:8],
-                              "license": ((row.get("license") or {}).get("spdx_id"))})
-            elif kind == "issue":
-                title = row.get("title") or ""
-                items.append({"title": truncate(title, 300), "url": row.get("html_url") or "",
-                              "state": row.get("state"), "comments": row.get("comments"),
-                              "created_at": row.get("created_at"),
-                              "repository_url": row.get("repository_url") or ""})
-            else:
-                repo = row.get("repository") or {}
-                title = row.get("name") or ""
-                fragment = _code_excerpt(_gh_fragment(row), 400)
-                items.append({"title": title, "url": row.get("html_url") or "",
-                              "repository": repo.get("full_name") or "",
-                              "repo_url": repo.get("html_url") or "",
-                              "path": row.get("path") or "",
-                              "snippet": fragment})
-            if kind == "repo":
-                summary = _plain_text(row.get("description") or "", 400)
-            elif kind == "issue":
-                summary = _plain_text(row.get("body") or "", 400)
-            else:
-                # 断片はコードなので _plain_text を通さない（ジェネリクスが消える）。
-                summary = fragment or f"{((row.get('repository') or {}).get('full_name')) or ''} {row.get('path') or ''}"
-            cites.append(_cite("github", title, row.get("html_url") or "", kind=kind, summary=summary))
-        return {"source": "github", "kind": kind, "items": items, "citations": cites,
-                "error": "" if items else "該当なし"}
-
-    return _kb_cached(f"gh:{kind}:{query}:{limit}:{bool(GITHUB_TOKEN)}", produce)
 
 
 # ---------------------------------------------------------------- §5.7 横断検索
@@ -4416,65 +3984,9 @@ def _kb_new_cached(key: str, source: str, producer) -> dict:
     return _kb_cached(key, safe)
 
 
-def kb_datacite(query: str, limit: int = 5, kind: str = "all") -> dict:
-    """公開 DOI メタデータ。all / arxiv / dataset。版・arXiv検索式の互換は保証しない。"""
-    query = as_str(query)
-    kind = as_str(kind, "all")
-    limit = as_int(limit, 5, 1, 20)
-    if not query or kind not in ("all", "arxiv", "dataset"):
-        return {"source": "datacite", "error": "query と有効な datacite_kind（all / arxiv / dataset）が必要です"}
-
-    def produce() -> dict:
-        params = {"query": _literal_search(query), "sort": "relevance", "page[size]": limit}
-        if kind == "arxiv":
-            params["client-id"] = "arxiv.content"
-        elif kind == "dataset":
-            params["resource-type-id"] = "dataset"
-        if KB_MAILTO:
-            params["mailto"] = KB_MAILTO
-        data, err = _kb_new_json("https://api.datacite.org/dois?" + urllib.parse.urlencode(params), 0.61)
-        if err:
-            return {"source": "datacite", "error": err}
-        rows = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(rows, list):
-            return {"source": "datacite", "error": "DataCite の応答形式が不正です"}
-        items, cites = [], []
-        for record in rows[:limit]:
-            row = record.get("attributes") if isinstance(record, dict) else None
-            if not isinstance(row, dict):
-                continue
-            title = next((as_str(t.get("title")) for t in (row.get("titles") or [])
-                          if isinstance(t, dict) and as_str(t.get("title"))), "")
-            doi = as_str(row.get("doi"))
-            link = as_str(row.get("url")) or (f"https://doi.org/{doi}" if doi else "")
-            if not title or not link:
-                continue
-            descriptions = [d for d in (row.get("descriptions") or []) if isinstance(d, dict)]
-            abstract = next((as_str(d.get("description")) for d in descriptions
-                             if d.get("descriptionType") == "Abstract" and as_str(d.get("description"))), "")
-            summary = _plain_text(abstract, 600)
-            authors = [as_str(a.get("name")) for a in (row.get("creators") or []) if isinstance(a, dict)]
-            year = row.get("publicationYear")
-            item = {"title": truncate(title, 300), "url": link, "doi": doi, "year": year,
-                    "authors": [a for a in authors if a][:8], "summary": summary,
-                    "type": (row.get("types") or {}).get("resourceTypeGeneral"),
-                    "metadata_only": not bool(summary)}
-            items.append(item)
-            cite = _cite("datacite", title, link, year=year, doi=doi,
-                         repository="arxiv" if kind == "arxiv" else "", metadata_only=not bool(summary))
-            cite["summary"] = summary
-            cite["year"] = year or ""
-            cite["resource_type"] = item.get("type") or ""
-            cites.append(cite)
-        return {"source": "datacite", "datacite_kind": kind, "items": items, "citations": cites,
-                "error": "" if items else "該当なし"}
-
-    return _kb_new_cached(f"datacite:{kind}:{query}:{limit}", "datacite", produce)
 
 
 DEFAULT_SOURCES = SOURCES
-SOURCES = (*DEFAULT_SOURCES, "datacite")
-KB_BACKENDS["datacite"] = lambda q, limit, opts: kb_datacite(q, limit, opts.get("datacite_kind", "all"))
 
 
 # ---------------------------------------------------------------- §5.10 明示許可した arXiv の代替取得（同じ締め切り内）
@@ -4672,55 +4184,8 @@ def _kb_paper_result(source: str, items: list[dict], **extra) -> dict:
             "error": "" if items else "該当なし", **extra}
 
 
-def kb_openaire(query: str, limit: int = 5) -> dict:
-    """Graph V3の論文メタデータ。匿名枠60/hをプロセス内60.1秒間隔で守る。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "openaire", "error": "query は必須です"}
-    def produce():
-        params = {"search": query, "type": "publication", "pageSize": limit}
-        data, err = _kb_new_json("https://api.openaire.eu/graph/v3/research-products?"
-                                + urllib.parse.urlencode(params), 60.1)
-        if err:
-            return {"source": "openaire", "error": err}
-        rows = data.get("results") if isinstance(data, dict) else None
-        if not isinstance(rows, list):
-            return {"source": "openaire", "error": "OpenAIRE の応答形式が不正です"}
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict) or not as_str(row.get("mainTitle")):
-                continue
-            doi = next((as_str(p.get("value")) for p in (row.get("pids") or [])
-                        if isinstance(p, dict) and p.get("scheme") == "doi"), "")
-            instances = _kb_array(row.get("instances"), "instances")
-            if any(not isinstance(i, dict) for i in instances):
-                raise ValueError("instances の要素がオブジェクトではありません")
-            urls = [_kb_http_url(u) for i in instances
-                    for u in _kb_array(i.get("urls"), "instances.urls")]
-            record_id = as_str(row.get("id"))
-            link = f"https://doi.org/{doi}" if doi else (urls[0] if urls else
-                   "https://api.openaire.eu/graph/v3/research-products/" + urllib.parse.quote(record_id, safe=""))
-            if not doi and not urls and not record_id:
-                continue
-            descriptions = _kb_array(row.get("descriptions"), "descriptions")
-            if any(not isinstance(d, str) for d in descriptions):
-                raise ValueError("descriptions の要素が文字列ではありません")
-            summary = _plain_text(" ".join(d for d in descriptions if isinstance(d, str)), 600)
-            authors = [as_str(a.get("fullName")) for a in (row.get("authors") or []) if isinstance(a, dict)]
-            items.append({"title": truncate(row["mainTitle"], 300), "summary": summary, "url": link,
-                          "doi": doi, "id": record_id, "year": as_str(row.get("publicationDate"))[:4],
-                          "authors": [a for a in authors if a][:8],
-                          "licenses": list(dict.fromkeys(as_str(i.get("license")) for i in instances if as_str(i.get("license")))),
-                          "cited_by": (((row.get("indicators") or {}).get("citationImpact") or {}).get("citationCount")),
-                          "metadata_only": not bool(summary)})
-        return _kb_paper_result("openaire", items,
-                               attribution="データ提供: OpenAIRE（CC-BY） https://graph.openaire.eu/")
-    return _kb_new_cached(f"openaire:{query}:{limit}", "openaire", produce)
 
 
-SOURCES = (*SOURCES, "openaire")
-KB_BACKENDS.update({"openaire": lambda q, limit, opts: kb_openaire(q, limit)})
 
 
 # ---------------------------------------------------------------- §5.13 同一識別子の引用統合（独立した裏付けには数えない）
@@ -4861,138 +4326,13 @@ def _open_metadata_text(value, limit: int = 600) -> str:
     return truncate(" ".join(text.split()), limit)
 
 
-def kb_zenodo(query: str, limit: int = 3) -> dict:
-    """Zenodoの説明/注記はメタデータ。ファイルライセンスとは分離し全文・ファイルは取得しない。"""
-    query = as_str(query)
-    limit = as_int(limit, 3, 1, 10)
-    if not query:
-        return {"source": "zenodo", "error": "query は必須です"}
-    def produce():
-        params = {"q": _literal_search(query), "size": limit, "sort": "bestmatch"}
-        data, err = _kb_new_json("https://zenodo.org/api/records/?" + urllib.parse.urlencode(params), 2.01)
-        if err:
-            return {"source": "zenodo", "error": err}
-        hits = _kb_object(data, "Zenodo応答").get("hits")
-        rows = _kb_object(hits, "hits").get("hits")
-        if not isinstance(rows, list):
-            raise ValueError("Zenodo hits.hits は配列ではありません")
-        items, cites = [], []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("Zenodo record はオブジェクトではありません")
-            meta = _kb_object(row.get("metadata"), "metadata")
-            title = _open_metadata_text(meta.get("title"), 300)
-            if not title:
-                continue
-            doi = as_str(row.get("doi")) or as_str(meta.get("doi"))
-            links = _kb_object(row.get("links"), "links")
-            link = as_str(links.get("self_html")) or ("https://doi.org/" + doi if doi else "")
-            if not link:
-                continue
-            description = " ".join(as_str(meta.get(k)) for k in ("description", "notes"))
-            summary = _open_metadata_text(description)
-            year = as_str(meta.get("publication_date"))[:4]
-            authors = [_open_metadata_text(a.get("name"), 100) for a in _kb_array(meta.get("creators"), "creators")
-                       if isinstance(a, dict)]
-            resource_type = as_str(_kb_object(meta.get("resource_type"), "resource_type").get("type"))
-            file_license = as_str(_kb_object(meta.get("license"), "license").get("id"))
-            item = {"title": title, "url": link, "doi": doi, "year": year, "summary": summary,
-                    "authors": [a for a in authors if a][:8], "resource_type": resource_type,
-                    "access_right": as_str(meta.get("access_right")), "file_license": file_license,
-                    "license": "CC0-1.0", "summary_kind": "metadata_description", "metadata_only": not bool(summary)}
-            cite = _cite("zenodo", title, link, doi=doi, attribution="データ提供: Zenodo（メタデータCC0・ファイル条件は別） https://zenodo.org/")
-            cite.update({k: v for k, v in item.items() if k != "authors"})
-            items.append(item)
-            cites.append(cite)
-        return {"source": "zenodo", "items": items, "citations": cites,
-                "attribution": "データ提供: Zenodo（メタデータCC0・ファイル条件は別） https://zenodo.org/",
-                "error": "" if items else "該当なし"}
-    return _kb_new_cached(f"zenodo:{query}:{limit}", "zenodo", produce)
 
 
 # ---------------------------------------------------------------- §5.15 ROR v2（研究機関の構造化メタデータ・機関同定を確定しない）
 
 
-def _ror_id_valid(value: str) -> bool:
-    """Crockford Base32 + ROR公式のMOD 97-10。誤ったIDは修復しない。"""
-    match = re.fullmatch(r"https://ror[.]org/0([0-9a-hjkmnp-tv-z]{6})([0-9]{2})", value)
-    if not match:
-        return False
-    alphabet = "0123456789abcdefghjkmnpqrstvwxyz"
-    number = 0
-    for char in match.group(1):
-        number = number * 32 + alphabet.index(char)
-    return int(match.group(2)) == 98 - ((number * 100) % 97)
 
 
-def kb_ror(query: str, limit: int = 3) -> dict:
-    """論文検索ではなく機関候補検索。登録された属性だけを根拠文にする。"""
-    query = as_str(query)
-    limit = as_int(limit, 3, 1, 10)
-    if not query:
-        return {"source": "ror", "error": "query は必須です"}
-    def produce():
-        data, err = _kb_new_json("https://api.ror.org/v2/organizations?" + urllib.parse.urlencode({"query": query}), 6.1)
-        if err:
-            return {"source": "ror", "error": err}
-        rows = _kb_object(data, "ROR応答").get("items")
-        if not isinstance(rows, list):
-            raise ValueError("ROR items は配列ではありません")
-        items, cites = [], []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("ROR record はオブジェクトではありません")
-            names = _kb_array(row.get("names"), "names")
-            if any(not isinstance(n, dict) for n in names):
-                raise ValueError("ROR names の要素はオブジェクトではありません")
-            title = next((_open_metadata_text(n.get("value"), 300) for n in names
-                          if "ror_display" in _kb_array(n.get("types"), "names.types")), "")
-            link = as_str(row.get("id"))
-            if not title or not _ror_id_valid(link):
-                raise ValueError("ROR の表示名またはIDの形式が不正です")
-            types = [as_str(v) for v in _kb_array(row.get("types"), "types") if as_str(v)]
-            locations = [_kb_object(l, "location") for l in _kb_array(row.get("locations"), "locations")]
-            countries, cities = [], []
-            for location in locations:
-                geo = _kb_object(location.get("geonames_details"), "geonames_details")
-                countries.append(as_str(geo.get("country_name")))
-                cities.append(as_str(geo.get("name")))
-            countries = list(dict.fromkeys(c for c in countries if c))
-            cities = list(dict.fromkeys(c for c in cities if c))
-            established = row.get("established")
-            if type(established) is not int or not 1 <= established <= 9999:
-                established = None
-            status = as_str(row.get("status"))
-            facts = []
-            for label, value in (("機関種別", ", ".join(types)), ("国", ", ".join(countries)),
-                                 ("都市", ", ".join(cities)), ("状態", status)):
-                if value:
-                    facts.append(label + ": " + value)
-            if established is not None:
-                facts.append("設立年（出版年ではない）: " + str(established))
-            summary = _open_metadata_text("; ".join(facts))
-            sites = [as_str(_kb_object(v, "link").get("value")) for v in _kb_array(row.get("links"), "links")
-                     if _kb_object(v, "link").get("type") == "website"]
-            for site in sites:
-                _kb_http_url(site)
-            item = {"title": title, "url": link, "year": "", "summary": summary,
-                    "name_variants": [_open_metadata_text(n.get("value"), 300) for n in names],
-                    "organization_types": types, "countries": countries, "cities": cities,
-                    "established": established, "status": status, "websites": sites,
-                    "license": "CC0-1.0", "summary_kind": "structured_metadata", "metadata_only": not bool(summary)}
-            cite = _cite("ror", title, link, attribution="データ提供: ROR（CC0・研究機関候補） https://ror.org/")
-            cite.update({k: v for k, v in item.items() if k not in ("name_variants", "websites")})
-            items.append(item)
-            cites.append(cite)
-        return {"source": "ror", "items": items, "citations": cites, "search_candidates": True,
-                "attribution": "データ提供: ROR（CC0・研究機関候補） https://ror.org/",
-                "error": "" if items else "該当なし"}
-    return _kb_new_cached(f"ror:{query}:{limit}", "ror", produce)
-
-
-SOURCES = (*SOURCES, "zenodo", "ror")
-KB_BACKENDS.update({"zenodo": lambda q, limit, opts: kb_zenodo(q, limit),
-                    "ror": lambda q, limit, opts: kb_ror(q, limit)})
 
 
 # ---------------------------------------------------------------- §5.16 第4段階: DOAJ / npm / crates.io（明示指定のみ）
@@ -5008,46 +4348,6 @@ KB_BACKENDS.update({"zenodo": lambda q, limit, opts: kb_zenodo(q, limit),
 # で 8 秒締切と不整合、HAL は商用利用条項が曖昧なため保留（規約 29 の保留群と同じ扱い）。
 
 
-def kb_doaj(query: str, limit: int = 5) -> dict:
-    """DOAJ のオープンアクセス記事メタデータ（CC0）。抄録を本文根拠に使う。全文は取得しない。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "doaj", "error": "query は必須です"}
-    def produce():
-        path = urllib.parse.quote(_literal_search(query), safe="")
-        data, err = _kb_new_json("https://doaj.org/api/search/articles/" + path
-                                + "?" + urllib.parse.urlencode({"pageSize": limit}), 0.51)
-        if err:
-            return {"source": "doaj", "error": err}
-        rows = _kb_array(_kb_object(data, "DOAJ応答").get("results"), "results")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("DOAJ record はオブジェクトではありません")
-            bib = _kb_object(row.get("bibjson"), "bibjson")
-            title = _plain_text(as_str(bib.get("title")), 300)
-            if not title:
-                continue
-            doi = next((as_str(i.get("id")) for i in _kb_array(bib.get("identifier"), "identifier")
-                        if isinstance(i, dict) and as_str(i.get("type")).lower() == "doi"), "")
-            link = next((as_str(l.get("url")) for l in _kb_array(bib.get("link"), "link")
-                         if isinstance(l, dict) and as_str(l.get("url"))), "")
-            if doi:
-                link = "https://doi.org/" + doi
-            if not link:
-                continue
-            journal = _kb_object(bib.get("journal"), "journal")
-            authors = [as_str(a.get("name")) for a in _kb_array(bib.get("author"), "author")
-                       if isinstance(a, dict)]
-            summary = _plain_text(as_str(bib.get("abstract")), 600)
-            items.append({"title": title, "url": link, "doi": doi, "year": as_str(bib.get("year")),
-                          "summary": summary, "authors": [a for a in authors if a][:8],
-                          "journal": _plain_text(as_str(journal.get("title")), 200),
-                          "metadata_only": not bool(summary)})
-        return _kb_paper_result("doaj", items,
-                               attribution="データ提供: DOAJ（記事メタデータCC0） https://doaj.org/")
-    return _kb_new_cached(f"doaj:{query}:{limit}", "doaj", produce)
 
 
 def _kb_package_result(source: str, items: list[dict], attribution: str) -> dict:
@@ -5067,67 +4367,8 @@ def _kb_package_result(source: str, items: list[dict], attribution: str) -> dict
             "error": "" if items else "該当なし"}
 
 
-def kb_npm(query: str, limit: int = 5) -> dict:
-    """npm 公式レジストリのパッケージ検索。説明は登録者の自己申告（審査結果ではない）。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "npm", "error": "query は必須です"}
-    def produce():
-        data, err = _kb_new_json("https://registry.npmjs.org/-/v1/search?"
-                                + urllib.parse.urlencode({"text": query, "size": limit}), 1.0)
-        if err:
-            return {"source": "npm", "error": err}
-        rows = _kb_array(_kb_object(data, "npm応答").get("objects"), "objects")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("npm object はオブジェクトではありません")
-            pkg = _kb_object(row.get("package"), "package")
-            name = as_str(pkg.get("name"))
-            if not name:
-                continue
-            links = _kb_object(pkg.get("links"), "links")
-            link = as_str(links.get("npm")) or "https://www.npmjs.com/package/" + urllib.parse.quote(name, safe="")
-            summary = _plain_text(as_str(pkg.get("description")), 400)
-            keywords = [as_str(k) for k in _kb_array(pkg.get("keywords"), "keywords") if as_str(k)]
-            items.append({"title": name, "url": link, "version": as_str(pkg.get("version")),
-                          "year": as_str(pkg.get("date"))[:4], "summary": summary,
-                          "repository_url": as_str(links.get("repository")),
-                          "keywords": keywords[:8], "metadata_only": not bool(summary)})
-        return _kb_package_result("npm", items,
-                                  "データ提供: npm public registry https://registry.npmjs.org/")
-    return _kb_new_cached(f"npm:{query}:{limit}", "npm", produce)
 
 
-def kb_crates(query: str, limit: int = 5) -> dict:
-    """crates.io のクレート検索。Crawler Policy（1 req/s・識別UA）に従う。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "crates", "error": "query は必須です"}
-    def produce():
-        data, err = _kb_new_json("https://crates.io/api/v1/crates?"
-                                + urllib.parse.urlencode({"q": query, "per_page": limit}), 1.01)
-        if err:
-            return {"source": "crates", "error": err}
-        rows = _kb_array(_kb_object(data, "crates.io応答").get("crates"), "crates")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("crates.io record はオブジェクトではありません")
-            name = as_str(row.get("name"))
-            if not name:
-                continue
-            summary = _plain_text(as_str(row.get("description")), 400)
-            items.append({"title": name, "url": "https://crates.io/crates/" + urllib.parse.quote(name, safe=""),
-                          "version": as_str(row.get("max_stable_version")) or as_str(row.get("max_version")),
-                          "year": as_str(row.get("updated_at"))[:4], "summary": summary,
-                          "repository_url": as_str(row.get("repository")),
-                          "downloads": row.get("downloads") if type(row.get("downloads")) is int else None,
-                          "metadata_only": not bool(summary)})
-        return _kb_package_result("crates", items, "データ提供: crates.io https://crates.io/")
-    return _kb_new_cached(f"crates:{query}:{limit}", "crates", produce)
 
 
 # ---------------------------------------------------------------- §5.17 CiNii Research（明示指定のみ・appid 必須）
@@ -5149,79 +4390,8 @@ def kb_crates(query: str, limit: int = 5) -> dict:
 #   * レートは公表が無いため 1 ホスト 2.0 秒間隔に自制する（同 第6条3 の短時間大量アクセス回避）。
 
 
-def _cinii_creators(row: dict) -> list[str]:
-    """dc:creator は配列で来る（文字列のときもある）。辞書キーや文字列を走査しない。"""
-    value = row.get("dc:creator")
-    if isinstance(value, str):
-        return [value.strip()] if value.strip() else []
-    return [as_str(v) for v in _kb_array(value, "dc:creator") if as_str(v)]
 
 
-def _cinii_identifiers(row: dict) -> dict[str, str]:
-    """dc:identifier の配列から種別ごとの値を取り出す（同じ種別は最初の1件）。"""
-    out: dict[str, str] = {}
-    for entry in _kb_array(row.get("dc:identifier"), "dc:identifier"):
-        if not isinstance(entry, dict):
-            continue
-        kind, value = as_str(entry.get("@type")), as_str(entry.get("@value"))
-        if kind and value and kind not in out:
-            out[kind] = value
-    return out
-
-
-def kb_cinii(query: str, limit: int = 5) -> dict:
-    """CiNii Research の日本語文献メタデータ（書誌のみ・抄録は返らない）。利用者自身の appid が必要。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "cinii", "error": "query は必須です"}
-    if not CINII_APPID:
-        return {"source": "cinii",
-                "error": "appid 未設定: CiNii Research は利用登録（アプリケーションID）が必要です。"
-                         "https://support.nii.ac.jp/ja/cinii/api/developer で取得し、環境変数 "
-                         "FREEAGENT_CINII_APPID に設定してください（利用目的に当たるかの判断は利用者。"
-                         "設定するまで HTTP は出しません）"}
-
-    def produce() -> dict:
-        params = {"q": _literal_search(query), "format": "json", "count": limit, "appid": CINII_APPID}
-        data, err = _kb_new_json("https://cir.nii.ac.jp/opensearch/all?"
-                                 + urllib.parse.urlencode(params), 2.0)
-        if err:
-            return {"source": "cinii", "error": err}
-        rows = _kb_array(_kb_object(data, "CiNii応答").get("items"), "items")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("CiNii item はオブジェクトではありません")
-            title = _plain_text(as_str(row.get("title")), 300)
-            page = as_str(_kb_object(row.get("link"), "link").get("@id")) or as_str(row.get("@id"))
-            if not title or not page:
-                continue
-            ident = _cinii_identifiers(row)
-            doi = ident.get("cir:DOI", "")
-            doc_type = as_str(row.get("dc:type"))
-            items.append({"title": title, "url": _kb_http_url("https://doi.org/" + doi if doi else page),
-                          "cir_uri": _kb_http_url(page), "doi": doi,
-                          "year": as_str(row.get("prism:publicationDate"))[:4],
-                          "container": _plain_text(as_str(row.get("prism:publicationName")), 200),
-                          "publisher": _plain_text(as_str(row.get("dc:publisher")), 200),
-                          "authors": _cinii_creators(row)[:8],
-                          "publication_types": [doc_type] if doc_type else [],
-                          "identifier": ident.get("cir:NAID") or ident.get("cir:NCID")
-                                        or ident.get("cir:ISBN", ""),
-                          "metadata_only": True})
-        return _kb_paper_result("cinii", items,
-                                attribution="データ提供: CiNii Research（国立情報学研究所） "
-                                            "https://cir.nii.ac.jp/")
-
-    return _kb_new_cached(f"cinii:{query}:{limit}", "cinii", produce)
-
-
-SOURCES = (*SOURCES, "doaj", "npm", "crates", "cinii")
-KB_BACKENDS.update({"doaj": lambda q, limit, opts: kb_doaj(q, limit),
-                    "npm": lambda q, limit, opts: kb_npm(q, limit),
-                    "crates": lambda q, limit, opts: kb_crates(q, limit),
-                    "cinii": lambda q, limit, opts: kb_cinii(q, limit)})
 
 
 # ---------------------------------------------------------------- §5.18 第6段階: プログラミング・標準（明示指定のみ）
@@ -5254,14 +4424,6 @@ KB_BACKENDS.update({"doaj": lambda q, limit, opts: kb_doaj(q, limit),
 #       「商用インフラ利用（商用サービス・ツール・スキャナ等の一部としての利用）」を事前許諾なしに禁止する。
 #     - grep.app: 429 のボットチャレンジ。searchcode.com: API が 404（廃止/移設）。
 
-_OSV_ECOSYSTEMS = ("PyPI", "npm", "crates.io", "Go", "Maven", "RubyGems", "NuGet", "Packagist",
-                   "Hex", "Pub")
-_OSV_ID_PATTERNS = (
-    re.compile(r"^CVE-\d{4}-\d{4,7}$", re.I),
-    re.compile(r"^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$", re.I),
-    re.compile(r"^[A-Z]{2,12}-\d{4}-\d{2,6}$"),
-    re.compile(r"^[A-Z]{2,12}-\d{3,6}$"),
-)
 
 
 def _kb_generic_result(source: str, items: list[dict], attribution: str, **extra) -> dict:
@@ -5284,90 +4446,8 @@ def _kb_generic_result(source: str, items: list[dict], attribution: str, **extra
             "error": "" if items else "該当なし", **extra}
 
 
-def _osv_ecosystem(name: str) -> str:
-    """1 リクエストで全生態系を照合し、最初に該当したものを返す（無ければ空文字）。"""
-    payload = {"queries": [{"package": {"name": name, "ecosystem": eco}} for eco in _OSV_ECOSYSTEMS]}
-    data, err = _kb_new_json("https://api.osv.dev/v1/querybatch", 0.5, payload=payload,
-                             budget_key="api.osv.dev/v1/querybatch")
-    if err or not isinstance(data, dict):
-        return ""
-    rows = data.get("results")
-    if not isinstance(rows, list):
-        return ""
-    for eco, row in zip(_OSV_ECOSYSTEMS, rows):
-        vulns = row.get("vulns") if isinstance(row, dict) else None
-        if isinstance(vulns, list) and vulns:
-            return eco
-    return ""
 
 
-def _osv_item(row: dict) -> dict | None:
-    vid = as_str(row.get("id"))
-    if not vid:
-        return None
-    summary = _plain_text(as_str(row.get("summary")) or as_str(row.get("details")), 600)
-    aliases = [as_str(a) for a in _kb_array(row.get("aliases"), "aliases") if as_str(a)]
-    packages = []
-    for affected in _kb_array(row.get("affected"), "affected"):
-        pkg = _kb_object(affected.get("package") if isinstance(affected, dict) else None, "package")
-        pname, peco = as_str(pkg.get("name")), as_str(pkg.get("ecosystem"))
-        if pname:
-            packages.append(f"{peco}/{pname}" if peco else pname)
-    severity = ""
-    for sev in _kb_array(row.get("severity"), "severity"):
-        if isinstance(sev, dict) and as_str(sev.get("score")):
-            severity = as_str(sev.get("score"))
-            break
-    if not severity:
-        severity = as_str(_kb_object(row.get("database_specific"), "database_specific").get("severity"))
-    return {"title": f"{vid}: {summary[:160]}" if summary else vid,
-            "url": "https://osv.dev/vulnerability/" + urllib.parse.quote(vid, safe=""),
-            "summary": summary, "identifier": vid, "aliases": aliases[:6],
-            "package": sorted(set(packages))[:6], "severity": severity,
-            "year": as_str(row.get("published"))[:4], "kind": "vulnerability"}
-
-
-def kb_osv(query: str, limit: int = 5) -> dict:
-    """OSV.dev の既知脆弱性。パッケージ名（生態系を自動照合）か脆弱性ID（CVE-/GHSA-/PYSEC- 等）。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "osv", "error": "query は必須です"}
-    attribution = "データ提供: OSV.dev（OpenSSF OSV スキーマの集約） https://osv.dev/"
-
-    def produce() -> dict:
-        if any(pattern.match(query) for pattern in _OSV_ID_PATTERNS):
-            data, err = _kb_new_json("https://api.osv.dev/v1/vulns/"
-                                     + urllib.parse.quote(query, safe=""), 0.5,
-                                     budget_key="api.osv.dev/v1/vulns")
-            if err:
-                return {"source": "osv", "error": err}
-            rows, ecosystem = [data], ""
-        else:
-            ecosystem = _osv_ecosystem(query)
-            if not ecosystem:
-                return {"source": "osv", "error":
-                        "該当なし: OSV に登録されたパッケージ名（PyPI / npm / crates.io / Go / Maven / "
-                        "RubyGems / NuGet / Packagist / Hex / Pub の順に照合）か、CVE- / GHSA- / PYSEC- 等の"
-                        "脆弱性IDを指定してください。Maven は groupId:artifactId の形（例 "
-                        "org.apache.logging.log4j:log4j-core）で指定します"}
-            data, err = _kb_new_json("https://api.osv.dev/v1/query", 0.5,
-                                     payload={"package": {"name": query, "ecosystem": ecosystem}},
-                                     budget_key="api.osv.dev/v1/query")
-            if err:
-                return {"source": "osv", "error": err}
-            rows = _kb_array(_kb_object(data, "OSV応答").get("vulns"), "vulns")
-        items = [item for item in (_osv_item(row) for row in rows[:limit]
-                                   if isinstance(row, dict)) if item]
-        return _kb_generic_result("osv", items, attribution, ecosystem=ecosystem)
-
-    return _kb_new_cached(f"osv:{query}:{limit}", "osv", produce)
-
-
-def _ietf_slug(value) -> str:
-    """datatracker は std_level を `/api/v1/name/stdlevelname/ps/` の形で返す。末尾だけ残す。"""
-    parts = [p for p in as_str(value).split("/") if p]
-    return parts[-1] if parts else ""
 
 
 def _ietf_terms(query: str) -> list[str]:
@@ -5375,67 +4455,6 @@ def _ietf_terms(query: str) -> list[str]:
     return [w for w in re.split(r"[^\w./-]+", query) if len(w) >= 2]
 
 
-def _ietf_term(query: str) -> str:
-    """API へ渡す 1 語。タイトルの部分一致は AND できない（実測: 2 語指定は 0 件）ので最長語。"""
-    words = _ietf_terms(query)
-    return max(words, key=len) if words else query.strip()
-
-
-def kb_ietf(query: str, limit: int = 5) -> dict:
-    """IETF の RFC / Internet-Draft（書誌＋抄録）。検索はタイトルの部分一致（複数語は最長語 1 つ）。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "ietf", "error": "query は必須です"}
-    attribution = "データ提供: IETF Datatracker https://datatracker.ietf.org/"
-    terms = _ietf_terms(query)
-    term = _ietf_term(query)
-
-    def produce() -> dict:
-        # RFC 番号（"RFC 9110" / "rfc9110" / "9110"）と Internet-Draft 名は name で直引きできる
-        # （実測 2026-10-05: name=rfc9110 が HTTP Semantics を返す）。
-        stripped = query.strip()
-        number = re.fullmatch(r"(?:rfc[\s-]*)?(\d{3,5})", stripped, re.I)
-        if number:
-            params = {"format": "json", "limit": limit, "name": f"rfc{number.group(1)}"}
-        elif re.fullmatch(r"draft-[a-z0-9-]+", stripped, re.I):
-            params = {"format": "json", "limit": limit,
-                      "name__contains": stripped.lower()}
-        else:
-            # 実測: type__in で draft と rfc に限定できる（slides や chairs を除く）。
-            # 複数語はサーバー側で AND できないので多めに取り、全語がタイトルに載るものを優先する。
-            params = {"format": "json", "limit": max(limit, min(limit * 5, 25)),
-                      "title__contains": term, "type__in": "draft,rfc"}
-        data, err = _kb_new_json("https://datatracker.ietf.org/api/v1/doc/document/?"
-                                 + urllib.parse.urlencode(params), 1.0)
-        if err:
-            return {"source": "ietf", "error": err}
-        rows = [r for r in _kb_array(_kb_object(data, "IETF応答").get("objects"), "objects")
-                if isinstance(r, dict)]
-        if len(terms) > 1 and "title__contains" in params:
-            exact = [r for r in rows
-                     if all(w.lower() in as_str(r.get("title")).lower() for w in terms)]
-            rows = exact or rows
-        items = []
-        for row in rows[:limit]:
-            name = as_str(row.get("name"))
-            title = _plain_text(as_str(row.get("title")), 300)
-            if not name or not title:
-                continue
-            number = as_int(row.get("rfc_number"), 0, 0, 99999)
-            items.append({"title": title,
-                          "url": (f"https://datatracker.ietf.org/doc/rfc{number}/" if number
-                                  else "https://datatracker.ietf.org/doc/"
-                                       + urllib.parse.quote(name, safe="") + "/"),
-                          "summary": _plain_text(as_str(row.get("abstract")), 600),
-                          "identifier": f"RFC {number}" if number else name,
-                          "kind": "RFC" if number else "Internet-Draft",
-                          "version": as_str(row.get("rev")), "year": as_str(row.get("time"))[:4],
-                          "extra": {"std_level": _ietf_slug(row.get("std_level")), "term": term,
-                                    "pages": row.get("pages") if type(row.get("pages")) is int else None}})
-        return _kb_generic_result("ietf", items, attribution, term=term)
-
-    return _kb_new_cached(f"ietf:{query}:{limit}", "ietf", produce)
 
 
 # ---------------------------------------------------------------- §5.19 科学（明示指定のみ）
@@ -5453,160 +4472,12 @@ def kb_ietf(query: str, limit: int = 5) -> dict:
 #     SciELO（403 チャレンジ）/ OpenML（HF Hub と重複）/ PubChem・AlphaFold DB・Ensembl・STRING
 #     （名前直引きでキーワード検索 API が無い）/ NASA Exoplanet（ADQL を組み立てる必要がある）。
 
-def kb_inspirehep(query: str, limit: int = 5) -> dict:
-    """INSPIRE-HEP の素粒子物理文献（CC0）。DOI があれば DOI を出典 URL にする。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "inspirehep", "error": "query は必須です"}
-    attribution = "データ提供: INSPIRE-HEP（CC0） https://inspirehep.net/"
-
-    def produce() -> dict:
-        params = {"q": query, "size": limit,
-                  "fields": "titles,dois,arxiv_eprints,earliest_date,authors,abstracts,citation_count"}
-        data, err = _kb_new_json("https://inspirehep.net/api/literature?"
-                                 + urllib.parse.urlencode(params), 1.0)
-        if err:
-            return {"source": "inspirehep", "error": err}
-        hits = _kb_object(_kb_object(data, "INSPIRE応答").get("hits"), "hits")
-        items = []
-        for hit in _kb_array(hits.get("hits"), "hits"):
-            if not isinstance(hit, dict):
-                continue
-            meta = _kb_object(hit.get("metadata"), "metadata")
-            title = next((_plain_text(as_str(t.get("title")), 300)
-                          for t in _kb_array(meta.get("titles"), "titles")
-                          if isinstance(t, dict) and as_str(t.get("title"))), "")
-            if not title:
-                continue
-            doi = next((as_str(d.get("value")) for d in _kb_array(meta.get("dois"), "dois")
-                        if isinstance(d, dict) and as_str(d.get("value"))), "")
-            record_id = as_str(hit.get("id"))
-            url = ("https://doi.org/" + doi) if doi else (
-                "https://inspirehep.net/literature/" + urllib.parse.quote(record_id, safe="")
-                if record_id else "")
-            if not url:
-                continue
-            abstract = next((_plain_text(as_str(a.get("value")), 600)
-                             for a in _kb_array(meta.get("abstracts"), "abstracts")
-                             if isinstance(a, dict) and as_str(a.get("value"))), "")
-            arxiv = next((as_str(e.get("value")) for e in _kb_array(meta.get("arxiv_eprints"),
-                                                                   "arxiv_eprints")
-                          if isinstance(e, dict) and as_str(e.get("value"))), "")
-            authors = [as_str(a.get("full_name")) for a in _kb_array(meta.get("authors"), "authors")
-                       if isinstance(a, dict)]
-            count = meta.get("citation_count")
-            items.append({"title": title, "url": url, "summary": abstract, "doi": doi,
-                          "identifier": arxiv or record_id, "kind": "paper",
-                          "year": as_str(meta.get("earliest_date"))[:4],
-                          "authors": [a for a in authors if a][:8],
-                          "extra": {"arxiv": arxiv,
-                                    "citation_count": count if type(count) is int else None}})
-        return _kb_generic_result("inspirehep", items, attribution)
-
-    return _kb_new_cached(f"inspirehep:{query}:{limit}", "inspirehep", produce)
 
 
-def kb_oeis(query: str, limit: int = 5) -> dict:
-    """OEIS の整数列（CC BY-SA 4.0・出典表示必須）。数列そのものでも語でも引ける。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "oeis", "error": "query は必須です"}
-    attribution = ("データ提供: The Online Encyclopedia of Integer Sequences（CC BY-SA 4.0） "
-                   "https://oeis.org/")
-
-    def produce() -> dict:
-        data, err = _kb_new_json("https://oeis.org/search?"
-                                 + urllib.parse.urlencode({"q": query, "fmt": "json"}), 1.0)
-        if err:
-            return {"source": "oeis", "error": err}
-        if data is None:
-            rows = []
-        elif isinstance(data, list):
-            rows = data
-        else:
-            rows = _kb_array(_kb_object(data, "OEIS応答").get("results"), "results")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("OEIS の結果はオブジェクトではありません")
-            # 実測: `id` は旧 M/N 識別子（例 "M0692 N0256"）で、A 番号は `number`（45 → A000045）。
-            number = as_int(row.get("number"), 0, 0, 999999)
-            sid = f"A{number:06d}" if number else ""
-            name = _plain_text(as_str(row.get("name")), 300)
-            if not sid or not name:
-                continue
-            terms = _plain_text(as_str(row.get("data")), 200)
-            comments = [as_str(c) for c in _kb_array(row.get("comment"), "comment") if as_str(c)]
-            items.append({"title": f"{sid}: {name}",
-                          "url": "https://oeis.org/" + urllib.parse.quote(sid, safe=""),
-                          "summary": _plain_text(" ".join([name] + comments[:2]), 600),
-                          "identifier": sid, "kind": "integer-sequence",
-                          "extra": {"terms": terms, "old_id": as_str(row.get("id")),
-                                    "keywords": [k.strip() for k in
-                                                 as_str(row.get("keyword")).split(",")
-                                                 if k.strip()]}})
-        return _kb_generic_result("oeis", items, attribution)
-
-    return _kb_new_cached(f"oeis:{query}:{limit}", "oeis", produce)
 
 
-def kb_hfhub(query: str, limit: int = 5) -> dict:
-    """Hugging Face Hub のモデル検索。モデルのライセンス・品質はリポジトリごとに異なる。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "hfhub", "error": "query は必須です"}
-    attribution = "データ提供: Hugging Face Hub https://huggingface.co/（各モデルの条件に従う）"
-
-    def produce() -> dict:
-        params = {"search": query, "limit": limit, "sort": "downloads", "direction": -1,
-                  "full": "false"}
-        data, err = _kb_new_json("https://huggingface.co/api/models?"
-                                 + urllib.parse.urlencode(params), 1.0)
-        if err:
-            return {"source": "hfhub", "error": err}
-        rows = _kb_array(data, "models")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("Hugging Face の結果はオブジェクトではありません")
-            model_id = as_str(row.get("id")) or as_str(row.get("modelId"))
-            if not model_id:
-                continue
-            facts = [f"モデル {model_id}"]
-            if as_str(row.get("pipeline_tag")):
-                facts.append("タスク " + as_str(row.get("pipeline_tag")))
-            if as_str(row.get("library_name")):
-                facts.append("ライブラリ " + as_str(row.get("library_name")))
-            downloads, likes = row.get("downloads"), row.get("likes")
-            if type(downloads) is int:
-                facts.append(f"ダウンロード {downloads}")
-            if type(likes) is int:
-                facts.append(f"likes {likes}")
-            tags = [as_str(t) for t in _kb_array(row.get("tags"), "tags") if as_str(t)]
-            items.append({"title": model_id,
-                          "url": "https://huggingface.co/" + urllib.parse.quote(model_id, safe="/"),
-                          "summary": "／".join(facts), "identifier": model_id,
-                          "summary_kind": "structured_record", "kind": "model",
-                          "year": as_str(row.get("createdAt"))[:4],
-                          "authors": tags[:8],
-                          "extra": {"license": next((t.split(":", 1)[1] for t in tags
-                                                     if t.startswith("license:")), "")}})
-        return _kb_generic_result("hfhub", items, attribution)
-
-    return _kb_new_cached(f"hfhub:{query}:{limit}", "hfhub", produce)
 
 
-SOURCES = (*SOURCES, "osv", "ietf", "inspirehep", "oeis", "hfhub")
-KB_BACKENDS.update({
-    "osv": lambda q, limit, opts: kb_osv(q, limit),
-    "ietf": lambda q, limit, opts: kb_ietf(q, limit),
-    "inspirehep": lambda q, limit, opts: kb_inspirehep(q, limit),
-    "oeis": lambda q, limit, opts: kb_oeis(q, limit),
-    "hfhub": lambda q, limit, opts: kb_hfhub(q, limit),
-})
 
 
 # ---------------------------------------------------------------- §5.20 第7段階: プログラミング特化（明示指定のみ）
@@ -5628,167 +4499,12 @@ KB_BACKENDS.update({
 #     pkg.go.dev（キーワード検索 API 無し）/ Homebrew・Go module index（一括ダンプ）/ Zenn（非公式 API）。
 
 
-def kb_hn(query: str, limit: int = 5, need_evidence: bool = False) -> dict:
-    """Hacker News（Algolia 検索）の投稿。帰属表示が必要。本文は投稿者による議論テキスト。
-
-    `need_evidence=True`（= `grounded` の場面）なら**コメントも検索する**（§6.18）。
-    実測: `tags=story` の `story_text` はほぼ空（リンク投稿）→ 根拠 0 件。
-    `tags=comment` の `comment_text` には議論本文が入る（実測 263〜1607 文字）。
-    """
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "hn", "error": "query は必須です"}
-    attribution = ("データ提供: Hacker News（Algolia HN Search。帰属表示必須） "
-                   "https://hn.algolia.com/")
-
-    def produce() -> dict:
-        # **story と comment の両方を検索する**（§6.18）。
-        # 実測: `tags=story` の `story_text` は**ほぼ空**（リンク投稿のため）→ 根拠 0 件。
-        # 一方 `tags=comment` の `comment_text` には**議論本文**が入る（実測 263〜1607 文字）。
-        # Algolia は `tags` を複数指定できない（実測: `(story,comment)` は story と同じ結果）。
-        # → **別のクエリとして 2 回**取り、コメントを先に（本文が根拠になるため）、story を後に置く。
-        params = {"query": query, "tags": "story", "hitsPerPage": limit}
-        data, err = _kb_new_json("https://hn.algolia.com/api/v1/search?"
-                                 + urllib.parse.urlencode(params), 0.4)
-        if err:
-            return {"source": "hn", "error": err}
-        rows = _kb_array(_kb_object(data, "HN応答").get("hits"), "hits")
-        comment_rows: list = []
-        if need_evidence:
-            cparams = {"query": query, "tags": "comment", "hitsPerPage": limit}
-            # **予算キーを分ける**（同じホストの別エンドポイント。`_kb_new_json` の逃げ道）。
-            # 分けないと 2 連打で 2 番目が「HTTP 429: ローカルのアクセス間隔制御」で落ち、
-            # comment 側の結果が 0 件になっていた（実測）。
-            cdata, cerr = _kb_new_json("https://hn.algolia.com/api/v1/search?"
-                                       + urllib.parse.urlencode(cparams), 0.4,
-                                       budget_key="hn.algolia.com/search-comment")
-            if cerr:
-                # comment が落ちても story は生かす（**片方の失敗で全部dropsさせない**）。
-                comment_rows = []
-            else:
-                comment_rows = _kb_array(_kb_object(cdata, "HN応答").get("hits"), "hits")
-        items = []
-        # コメント → story の順（**本文が根拠になる方を先に**出す）。
-        for row, is_comment in [(r, True) for r in comment_rows] + [(r, False) for r in rows]:
-            if not isinstance(row, dict):
-                raise ValueError("HN の hit はオブジェクトではありません")
-            oid = as_str(row.get("objectID"))
-            title = _plain_text(as_str(row.get("title") or row.get("story_title")), 300)
-            if not oid or not title:
-                continue
-            body = as_str(row.get("comment_text") if is_comment else row.get("story_text"))
-            points, comments = row.get("points"), row.get("num_comments")
-            extra = {"points": points if type(points) is int else None,
-                     "comments": comments if type(comments) is int else None,
-                     "article_url": as_str(row.get("url"))}
-            if is_comment:
-                # コメントは**属する story の ID** を残す（上位 story へ辿れるように）。
-                extra["story_id"] = as_str(row.get("story_id")) or None
-                extra["parent_id"] = as_str(row.get("parent_id")) or None
-            items.append({"title": title,
-                          "url": "https://news.ycombinator.com/item?id=" + urllib.parse.quote(oid, safe=""),
-                          "summary": _plain_text(body, 600),
-                          "identifier": oid, "kind": "hn-comment" if is_comment else "hn-story",
-                          "summary_kind": "discussion",
-                          "year": as_str(row.get("created_at"))[:4], "container": "Hacker News",
-                          "authors": [as_str(row.get("author"))] if as_str(row.get("author")) else [],
-                          "extra": extra})
-            if len(items) >= limit:
-                break
-        return _kb_generic_result("hn", items, attribution)
-
-    # キャッシュキーに**根拠の有無を入れる**（コメント検索の有無で結果が違う。§6.18）。
-    return _kb_new_cached(f"hn:{query}:{limit}:{'evi' if need_evidence else 'bib'}", "hn", produce)
 
 
-def kb_swh(query: str, limit: int = 5) -> dict:
-    """Software Heritage の公開コードアーカイブ。リポジトリ（origin）の存在・URL・取得方式を引く。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "swh", "error": "query は必須です"}
-    attribution = ("データ提供: Software Heritage（Inria。API 利用規約に従う） "
-                   "https://www.softwareheritage.org/")
-
-    def produce() -> dict:
-        pattern = urllib.parse.quote(query.strip(), safe="")
-        data, err = _kb_new_json("https://archive.softwareheritage.org/api/1/origin/search/"
-                                 + pattern + "/?" + urllib.parse.urlencode({"limit": limit}), 1.0)
-        if err:
-            return {"source": "swh", "error": err}
-        rows = _kb_array(data, "origins")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("Software Heritage の origin はオブジェクトではありません")
-            origin = as_str(row.get("url"))
-            if not origin:
-                continue
-            visit_types = [as_str(v) for v in _kb_array(row.get("visit_types"), "visit_types")
-                           if as_str(v)]
-            facts = [f"アーカイブ済み origin: {origin}"]
-            if visit_types:
-                facts.append("取得方式 " + ", ".join(visit_types[:3]))
-            items.append({"title": origin, "url": origin, "summary": "／".join(facts),
-                          "identifier": origin, "kind": "software-origin",
-                          "summary_kind": "structured_record",
-                          "extra": {"visit_types": visit_types,
-                                    "browse_url": "https://archive.softwareheritage.org/browse/origin/"
-                                                  "?origin_url=" + urllib.parse.quote(origin, safe="")}})
-        return _kb_generic_result("swh", items, attribution)
-
-    return _kb_new_cached(f"swh:{query}:{limit}", "swh", produce)
 
 
-def kb_librariesio(query: str, limit: int = 5) -> dict:
-    """Libraries.io のパッケージ検索（19+ 登録簿を横断）。説明は登録者の自己申告。利用者自身のキーが必要。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "librariesio", "error": "query は必須です"}
-    if not LIBRARIESIO_KEY:
-        return {"source": "librariesio",
-                "error": "API キー未設定: Libraries.io は無料の登録キーが必要です。"
-                         "https://libraries.io/account で取得し、環境変数 FREEAGENT_LIBRARIESIO_KEY に"
-                         "設定してください（設定するまで HTTP は出しません）"}
-    attribution = "データ提供: Libraries.io https://libraries.io/（各登録簿の条件に従う）"
-
-    def produce() -> dict:
-        params = {"q": query, "per_page": limit, "api_key": LIBRARIESIO_KEY}
-        data, err = _kb_new_json("https://libraries.io/api/search?"
-                                 + urllib.parse.urlencode(params), 1.0)
-        if err:
-            return {"source": "librariesio", "error": err}
-        rows = _kb_array(data, "projects")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("Libraries.io の project はオブジェクトではありません")
-            name, platform = as_str(row.get("name")), as_str(row.get("platform"))
-            if not name or not platform:
-                continue
-            downloads = row.get("downloads")
-            items.append({"title": f"{platform}/{name}",
-                          "url": "https://libraries.io/" + urllib.parse.quote(platform, safe="")
-                                 + "/" + urllib.parse.quote(name, safe=""),
-                          "summary": _plain_text(as_str(row.get("description")), 400),
-                          "identifier": name, "version": as_str(row.get("latest_release_number")),
-                          "year": as_str(row.get("latest_release_published_at"))[:4],
-                          "repository_url": as_str(row.get("repository_url")),
-                          "downloads": downloads if type(downloads) is int else None,
-                          "keywords": [as_str(k) for k in _kb_array(row.get("keywords"), "keywords")
-                                       if as_str(k)][:8]})
-        return _kb_package_result("librariesio", items, attribution)
-
-    return _kb_new_cached(f"librariesio:{query}:{limit}", "librariesio", produce)
 
 
-SOURCES = (*SOURCES, "hn", "swh", "librariesio")
-KB_BACKENDS.update({"hn": lambda q, limit, opts: kb_hn(q, limit,
-                                                    need_evidence=opts.get("need_evidence") is True),
-                    "swh": lambda q, limit, opts: kb_swh(q, limit),
-                    "librariesio": lambda q, limit, opts: kb_librariesio(q, limit)})
 
 # ---------------------------------------------------------------- §5.21 第8段階: Internet Archive（明示指定のみ）
 #
@@ -5814,157 +4530,24 @@ KB_BACKENDS.update({"hn": lambda q, limit, opts: kb_hn(q, limit,
 #     IA 自身が「Bots, LLMs, and Automated Access」で AI エージェントを含む自動アクセスに説明的な
 #     User-Agent と間隔・429 の尊重を求めている（数値レートは非公表 → 1 req/s で自粛する）。
 
-_IA_CJK = re.compile(r"[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]")
-IA_INTERVAL = 1.0                                  # IA は数値レートを公表していない（自粛の間隔）
-IA_SEARCH_BUDGET = "archive.org/advancedsearch"    # 同一ホストの metadata API と予算を分ける（規約 32）
-_IA_SORTS = ("downloads desc", "week desc", "publicdate desc", "title asc")
 
 
-def _ia_query(query: str) -> str:
-    """自然語を `title:(語 AND 語)` に組み直す。素の語だと順位が崩れる（実測）。"""
-    words = [word for word in re.split(r"\s+", query.strip()) if word]
-    if len(words) == 1:
-        return f"title:({words[0]})"
-    return "title:(" + " AND ".join(words) + ")"
 
 
-def kb_internetarchive(query: str, limit: int = 5, sort: str = "downloads desc") -> dict:
-    """Internet Archive のアイテム検索（メタデータのみ）。query は**英語の語**で指定する。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    sort = as_str(sort, "downloads desc")
-    if not query:
-        return {"source": "ia", "error": "query は必須です"}
-    if _IA_CJK.search(query):
-        return {"source": "ia", "items": [], "citations": [],
-                "error": "Internet Archive のメタデータ検索は日本語（CJK）クエリを受け付けません"
-                         "（実測 10/10 が QUERY_NOT_READY）。英語の語に直して指定してください"}
-    attribution = "データ提供: Internet Archive https://archive.org/（各アイテムの条件に従う）"
-
-    def produce() -> dict:
-        params = [("q", _ia_query(query)), ("rows", limit), ("page", 1), ("output", "json")]
-        for field in ("identifier", "title", "creator", "year", "mediatype", "description",
-                      "downloads", "licenseurl"):
-            params.append(("fl[]", field))
-        if sort in _IA_SORTS:
-            params.append(("sort[]", sort))
-        data, err = _kb_new_json("https://archive.org/advancedsearch.php?"
-                                 + urllib.parse.urlencode(params), IA_INTERVAL,
-                                 budget_key=IA_SEARCH_BUDGET)
-        if err:
-            return {"source": "ia", "error": err}
-        # 上流は構文エラーも QUERY_NOT_READY も **HTTP 200 で** {"error": "..."} として返す。
-        # 状態コードではなく応答の形で判定する（実測）。
-        if not isinstance(data, dict) or "response" not in data:
-            detail = as_str(data.get("error"))[:200] if isinstance(data, dict) else ""
-            return {"source": "ia", "items": [], "citations": [],
-                    "error": "Internet Archive の検索が失敗しました: " + (detail or "応答形式が不正です")}
-        response = data.get("response")
-        rows = response.get("docs") if isinstance(response, dict) else None
-        if not isinstance(rows, list):
-            return {"source": "ia", "error": "Internet Archive の応答形式が不正です"}
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("Internet Archive の doc はオブジェクトではありません")
-            identifier, title = as_str(row.get("identifier")), as_str(row.get("title"))
-            if not identifier or not title:
-                continue
-            description = row.get("description")
-            if isinstance(description, list):
-                description = " ".join(as_str(part) for part in description)
-            creator = row.get("creator")
-            if isinstance(creator, list):
-                creator = ", ".join(as_str(part) for part in creator if as_str(part))
-            downloads = row.get("downloads")
-            mediatype, year = as_str(row.get("mediatype")), as_str(row.get("year"))
-            items.append({"title": _plain_text(title, 300),
-                          "url": "https://archive.org/details/" + urllib.parse.quote(identifier, safe=""),
-                          "summary": _plain_text(as_str(description), 600),
-                          "identifier": identifier, "kind": "archive-item",
-                          "summary_kind": "structured_record", "year": year, "container": mediatype,
-                          "extra": {"mediatype": mediatype, "creator": as_str(creator),
-                                    "downloads": downloads if type(downloads) is int else None,
-                                    "licenseurl": as_str(row.get("licenseurl"))}})
-        return _kb_generic_result("ia", items, attribution)
-
-    return _kb_new_cached(f"ia:{_ia_query(query)}:{limit}:{sort}", "ia", produce)
 
 
-SOURCES = (*SOURCES, "ia")
-KB_BACKENDS.update({"ia": lambda q, limit, opts: kb_internetarchive(q, limit)})
 
 
-# ---------------------------------------------------------------- §5.22 第9段階: 日本語の技術記事（Qiita・明示指定のみ）
+# ---------------------------------------------------------------- §5.99 ソース実装の読み込み
 #
-# Qiita API v2 の `/api/v2/items?query=` はキー不要で動くキーワード検索。実測 0.18〜0.36 秒（6 サンプル）で
-# 8 秒の締め切りに余裕で載る。**23 ソース中、日本語のプログラミング記事を返すものが 1 つも無い**
-# （cinii は日本語だが学術文献）ので、既存ソースと重複しない。
-#   * 絞り込み構文がそのまま使える（実測）: `tag:Python` / `user:foo` / `created:>2026-10-01` / `stocks:>50`。
-#     日本語の語もそのまま引ける（実測 0.30 秒）。
-#   * **間隔はトークンの有無で 2 定数**（github と同じ型）。公称レートは認証 1,000 回/時（≒16.7/分 → 3.6 秒）、
-#     未認証 60 回/時（= 1/分 → 60.0 秒）。未認証では**同じ問いの再実行だけがキャッシュで即返り**（実測 0.000 秒）、
-#     別の問いは 1 分待つ。これは Qiita の実クォータそのものなので隠さずエラーで見せる（規約 8）。
-#   * **本文は `rendered_body`（HTML）を使い `_plain_text` に通す**。`body`（Markdown）だと `_plain_text` は
-#     `<[^>]+>` しか落とさないので画像記法が引用文に残る（実測: `body` は画像 1・リンク 1 が残存、
-#     `rendered_body` は 0/0 で本文だけ）。
-#   * 証拠の種類は `discussion`（HN と同じユーザー生成の解説。査読論文ではない）。
-#   * 見送り（実測）: Reddit（未認証は全経路 403 で遮断。Responsible Builder Policy が事前承認と
-#     AI 目的の利用を要求）/ openBD（キーワード検索 API が無く ISBN 直引きのみ。実測 `isbn=abc` は `[null]`）/
-#     Botipedia（公開 API が無い。全パスが同一 HTML の catch-all）/ Free Dictionary API（オリジン停止で 522）。
-QIITA_INTERVAL = 3.6 if QIITA_TOKEN else 60.0     # 認証 1000/時 / 未認証 60/時（公称レートで割る）
-QIITA_BUDGET = "qiita.com/api/v2/items"           # 同一ホストの別エンドポイントと予算を分ける（規約 32）
+# 各ソース実装は `sources/<name>.py`（v0.15.0 で分割）。レジストリが SOURCES と KB_BACKENDS を
+# 1 回だけ組み立てる（従来の `SOURCES = (*SOURCES, ...)` の連鎖は廃止）。ソースは共有ヘルパーを
+# `S.<name>` の属性参照で呼ぶので、`patch.object(server, ...)` は分割後もそのまま効く。
+from . import sources as _kb_sources  # noqa: E402  定数・横断ヘルパーの定義後に読む
 
-
-def kb_qiita(query: str, limit: int = 5) -> dict:
-    """Qiita の日本語技術記事。query は Qiita の検索構文（tag:Python user:foo created:>2026-01-01）。"""
-    query = as_str(query)
-    limit = as_int(limit, 5, 1, 20)
-    if not query:
-        return {"source": "qiita", "error": "query は必須です"}
-    attribution = "データ提供: Qiita（Qiita API v2。記事の著作権は投稿者に帰属） https://qiita.com/"
-
-    def produce() -> dict:
-        params = {"query": query, "per_page": limit}
-        headers = {"Authorization": f"Bearer {QIITA_TOKEN}"} if QIITA_TOKEN else None
-        data, err = _kb_new_json("https://qiita.com/api/v2/items?"
-                                 + urllib.parse.urlencode(params), QIITA_INTERVAL,
-                                 budget_key=QIITA_BUDGET, extra_headers=headers)
-        if err:
-            return {"source": "qiita", "error": err}
-        rows = _kb_array(data, "Qiita応答")
-        items = []
-        for row in rows[:limit]:
-            if not isinstance(row, dict):
-                raise ValueError("Qiita の item はオブジェクトではありません")
-            title = _plain_text(as_str(row.get("title")), 300)
-            url = as_str(row.get("url"))
-            if not title or not url:
-                continue
-            user = row.get("user") if isinstance(row.get("user"), dict) else {}
-            tags = [as_str(tag.get("name")) for tag in _kb_array(row.get("tags"), "tags")
-                    if isinstance(tag, dict) and as_str(tag.get("name"))]
-            likes, stocks = row.get("likes_count"), row.get("stocks_count")
-            comments = row.get("comments_count")
-            items.append({"title": title, "url": url,
-                          # `body` は Markdown で、`_plain_text` は画像記法を落とせない（実測）。
-                          "summary": _plain_text(as_str(row.get("rendered_body")), 600),
-                          "identifier": as_str(row.get("id")), "kind": "qiita-item",
-                          "summary_kind": "discussion",
-                          "year": as_str(row.get("created_at"))[:4], "container": "Qiita",
-                          "authors": [as_str(user.get("id"))] if as_str(user.get("id")) else [],
-                          "extra": {"tags": tags[:8],
-                                    "likes_count": likes if type(likes) is int else None,
-                                    "stocks_count": stocks if type(stocks) is int else None,
-                                    "comments_count": comments if type(comments) is int else None,
-                                    "updated_at": as_str(row.get("updated_at"))}})
-        return _kb_generic_result("qiita", items, attribution)
-
-    return _kb_new_cached(f"qiita:{query}:{limit}", "qiita", produce)
-
-
-SOURCES = (*SOURCES, "qiita")
-KB_BACKENDS.update({"qiita": lambda q, limit, opts: kb_qiita(q, limit)})
+globals().update(_kb_sources.EXPORTS)  # `server.kb_*` / `server._ia_query` 等の互換（テストが参照）
+KB_BACKENDS.update(_kb_sources.BACKENDS)
+SOURCES = tuple(dict.fromkeys((*SOURCES, *_kb_sources.NAMES)))
 
 
 # ================================================================ §6 ツール実装
