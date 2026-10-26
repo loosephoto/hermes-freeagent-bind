@@ -129,6 +129,35 @@
   （停止中の提供元を数えると「無料で使える」と嘘をつく）。文脈長は提供元の最大値。
 
 
+### 4.1.2 キーと確認変数（`providers/<name>.py` の `key_env` / `required_env_flags` と一致させる）
+
+| プロバイダ | キー（`key_env`・別名） | 必須の確認変数 |
+|---|---|---|
+| `nous` | 不要（プロキシが資格情報を付与） | — |
+| `openrouter` | `OPENROUTER_API_KEY` | — |
+| `nvidia` | `NVIDIA_API_KEY` | — |
+| `huggingface` | `HF_TOKEN`（別名 `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN`） | — |
+| `groq` | `GROQ_API_KEY` | `FREEAGENT_GROQ_FREE_TIER` |
+| `cloudflare` | `CLOUDFLARE_API_TOKEN` ＋ `CLOUDFLARE_ACCOUNT_ID`（32 桁 hex） | `FREEAGENT_CLOUDFLARE_FREE_PLAN` |
+| `gemini` | `GEMINI_API_KEY`（別名 `GOOGLE_API_KEY`） | `FREEAGENT_GEMINI_FREE_TIER` / `FREEAGENT_GEMINI_UNPAID_DATA_ACK` |
+| `vercel` | `AI_GATEWAY_API_KEY` | `FREEAGENT_VERCEL_FREE_TIER` |
+| `ollama` | `OLLAMA_API_KEY` | `FREEAGENT_OLLAMA_FREE_PLAN` |
+| `zai` | `GLM_API_KEY` | `FREEAGENT_ZAI_FREE_TIER` |
+| `mistral` | `MISTRAL_API_KEY` | `FREEAGENT_MISTRAL_FREE_PLAN` |
+| `modelscope` | `MODELSCOPE_API_KEY` | `FREEAGENT_MODELSCOPE_FREE_PLAN` |
+| `cerebras` | `CEREBRAS_API_KEY` | `FREEAGENT_CEREBRAS_FREE_TRIAL` |
+| `sambanova` | `SAMBANOVA_API_KEY` | `FREEAGENT_SAMBANOVA_FREE_TIER` |
+| `novita` | `NOVITA_API_KEY` | `FREEAGENT_NOVITA_FREE_CREDITS` |
+| `siliconflow` | `SILICONFLOW_API_KEY` | `FREEAGENT_SILICONFLOW_FREE_TIER` |
+| `longcat` | `LONGCAT_API_KEY` | `FREEAGENT_LONGCAT_FREE_PLAN` |
+| `opencode` | `OPENCODE_ZEN_API_KEY`（別名 `OPENCODE_GO_API_KEY`） | `FREEAGENT_OPENCODE_FREE_TIER` |
+
+- 接続先は `FREEAGENT_<提供元名>_BASE_URL` で上書きできる（`nous` だけは `FREEAGENT_BASE_URL`。
+  実測: `*_BASE_URL` を別名で用意すると、どの変数が効くのか分からなくなるため 1 つに絞っている）。
+- 確認変数は**利用者の申告**で、契約を API で検証したものではない（§4.1.1）。プランを変えたら外す。
+- この表は `providers/<name>.py` の `SPEC` から写している。**追加・変更したら実装を正**にして直す
+  （`tests/test_docs_provider_table.py` が名前・キー・確認変数の一致を検査する）。
+
 ### 4.2 一覧は実態と乖離する（`probe`）
 
 - `freeagent_models` の `probe: true` は候補を**実際に呼ぶ**（空応答時は予算を上げた再試行がある）。判定は 5 分類:
