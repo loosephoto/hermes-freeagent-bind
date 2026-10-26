@@ -312,9 +312,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="確信度も答えさせて Brier/ECE（校正誤差）を出す")
     parser.add_argument("--json", action="store_true", help="JSON だけを出す（機械処理用）")
     parser.add_argument("--no-write", action="store_true", help="quality.jsonl に書かない")
+    parser.add_argument("--select-strategy", default=None,
+                        choices=list(S.SELECT_STRATEGIES),
+                        help="この実行だけ自動選抜の並べ方を変える（quality / catalog / least_busy）。"
+                             "指定すると `select_models` を通して**サーバーが実際に選ぶモデル**で測る"
+                             "（未指定なら従来どおり一覧の先頭から pool 件）")
     args = parser.parse_args(argv)
 
-    refs = S.free_model_refs(free_only=True, chat_only=True)[: max(1, args.pool)]
+    if args.select_strategy:
+        os.environ[S.SELECT_STRATEGY_ENV] = args.select_strategy
+        refs = S.select_models(max(1, args.pool))[0]
+        print(f"選抜 strategy={args.select_strategy} / 参加 {len(refs)} 体: {', '.join(refs)}")
+    else:
+        refs = S.free_model_refs(free_only=True, chat_only=True)[: max(1, args.pool)]
     if not refs:
         print("推論可能な Free モデルが 0 件です（`hermes proxy start` か各社のキーを確認）")
         return 2

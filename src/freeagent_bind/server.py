@@ -85,7 +85,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.16.0"
+SERVER_VERSION = "0.17.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -982,6 +982,42 @@ def diverse_order(refs: list[str]) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------- §3.6 自動選抜の strategy
+#
+# 「誰を働かせるか」の**並べ方**を差し替え可能にする（プロバイダの巡回 `diverse_order` は共通の
+# 後段なので、多様性はどの strategy でも保たれる）。既定は `quality`（品質統計＋探索ボーナス）で、
+# **v0.16.0 までの挙動と同一**。
+#   * quality    … `rank_models`（Beta 事後 mean + 0.25·sd、観測の少ないモデルを試す）
+#   * catalog    … 一覧が返した順（提供元の並びをそのまま使う。比較・切り分け用）
+#   * least_busy … 提供元の**実行中本数**が少ない順（同時実行の詰まりを避ける。litellm の
+#                  least_busy と同じ発想で、こちらは `_ProviderGate` の in_flight を使う）
+SELECT_STRATEGIES = ("quality", "catalog", "least_busy")
+SELECT_STRATEGY_ENV = "FREEAGENT_SELECT_STRATEGY"
+
+
+def selection_strategy() -> str:
+    """`FREEAGENT_SELECT_STRATEGY` を読む。未知の値は `quality` に落とす（起動を止めない）。"""
+    want = (os.environ.get(SELECT_STRATEGY_ENV) or "quality").strip().lower()
+    return want if want in SELECT_STRATEGIES else "quality"
+
+
+def _order_for_selection(refs: list[str]) -> list[str]:
+    """自動選抜の並び順を strategy ごとに決める（`diverse_order` は呼び出し側で共通）。"""
+    strategy = selection_strategy()
+    if strategy == "catalog":
+        return list(refs)
+    if strategy == "least_busy":
+        per = (PROVIDER_GATE.report(list(PROVIDER_ORDER)).get("per_provider") or {})
+        quality_index = {ref: i for i, ref in enumerate(rank_models(refs))}
+        def busy_key(ref: str):
+            provider = ref.split("/", 1)[0]
+            in_flight = (per.get(provider) or {}).get("in_flight") or 0
+            # 空きが同じなら品質順（決定的。乱数を使わない）
+            return (in_flight, quality_index.get(ref, len(refs)), ref)
+        return sorted(refs, key=busy_key)
+    return rank_models(refs)
+
+
 def select_models(size: int, requested: list[str] | None = None, *,
                   prefer: list[str] | None = None, exclude: list[str] | None = None,
                   free_only: bool = True) -> tuple[list[str], dict]:
@@ -1037,9 +1073,9 @@ def select_models(size: int, requested: list[str] | None = None, *,
         ready = [r for r in pool if r not in cooling]
         waiting = [r for r in pool if r in cooling]
         need = size - len(chosen)
-        picked = diverse_order(rank_models(ready))[:need]
+        picked = diverse_order(_order_for_selection(ready))[:need]
         if len(picked) < need and waiting:
-            picked += diverse_order(rank_models(waiting))[:need - len(picked)]
+            picked += diverse_order(_order_for_selection(waiting))[:need - len(picked)]
             notes.append(f"空きが足りずクールダウン中から補充: {', '.join(waiting[:3])}")
         chosen.extend(picked)
     if exclude:
@@ -1056,6 +1092,7 @@ def select_models(size: int, requested: list[str] | None = None, *,
         "exclude": as_str_list(exclude),
         "available": len(available),
         "ranking": RANK_ENABLED,
+        "selection_strategy": selection_strategy(),
         "status": {r: model_status(r) for r in chosen},
         "notes": notes,
     }

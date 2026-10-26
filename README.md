@@ -1459,6 +1459,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_HARNESS` | 空 | 起動元の目印。Hermes から使うなら `hermes`（[Hermes 以外で使うとき](#-hermes-以外で使うとき)） |
 | `FREEAGENT_HARNESS_WARN` | 1 | `0` で Hermes 以外のときの警告を止める（判定結果は `structuredContent.harness` に残る） |
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |
+| `FREEAGENT_SELECT_STRATEGY` | `quality` | 自動選抜の**並べ方**（`quality` / `catalog` / `least_busy`）。プロバイダ巡回の多様性は全 strategy 共通。`least_busy` は提供元の実行中本数が少ない順 |
 | `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama,zai,mistral,modelscope,cerebras,sambanova,novita,siliconflow,longcat,opencode` | 一覧に出すプロバイダと優先順。**末尾の 6 社は v0.12.0 の追加分**（オプション）。確認変数が無い間は通信しない |
 | `FREEAGENT_AUTH_TTL` | 900 | 認証失敗を覚えて自動選抜から外す時間（秒） |
 | `FREEAGENT_PROBE_TIMEOUT` | 25.0 | 生存確認 1 件の読み取りタイムアウト（秒） |

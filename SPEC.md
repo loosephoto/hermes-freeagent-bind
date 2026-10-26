@@ -185,6 +185,22 @@
   名指ししたモデルはこれまでどおり試す。`freeagent_models` は `non_chat_candidates` に件数を出し、
   一覧では見えるままにする。
 
+#### 4.3.1 並べ方の strategy（v0.17.0）
+
+「誰を働かせるか」の**並べ方**だけを差し替え可能にした（`FREEAGENT_SELECT_STRATEGY`）。
+`diverse_order`（プロバイダ巡回）は共通の後段なので、どの strategy でも 1 社が独占しない。
+
+| strategy | 並べ方 | 用途 |
+|---|---|---|
+| `quality`（既定） | `rank_models`＝Beta 事後 mean + 0.25·sd（観測の少ないモデルを試す） | 通常運用。**v0.16.0 までと同一** |
+| `catalog` | 一覧が返した順 | 切り分け・比較（品質統計を効かせない） |
+| `least_busy` | 提供元の実行中本数（`_ProviderGate` の in_flight）が少ない順。同点は品質順 | 同時実行が詰まるとき |
+
+未知の値は `quality` に落ちる（起動を止めない）。選んだ根拠は `select_models` の info の
+`selection_strategy` に載る。`scripts/measure_quality.py --select-strategy <name>` で
+**サーバーが実際に選ぶモデル**のまま A/B できる（未指定は従来どおり一覧の先頭から）。
+回帰は `tests/test_selection_strategies.py`（7 件・同点で揺れないことと多様性の維持を含む）。
+
 ### 4.4 一覧の取得（§3.3・並列・締め切り・プロセス間キャッシュ）
 
 `fetch_provider_models` / `all_models` / `provider_status` は選抜の入口で、**サブLLM のツール
