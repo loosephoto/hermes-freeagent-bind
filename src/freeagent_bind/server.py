@@ -85,7 +85,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.17.0"
+SERVER_VERSION = "0.18.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -790,6 +790,11 @@ def _stats_save() -> bool:
 def classify_error(err: str) -> str:
     """エラー文字列を分類する（集計の粒度を揃えるため、ここで語彙を固定する）。"""
     t = (err or "").lower()
+    # **空応答は「壊れている」ではなく「予算で落ちた」**（実測: 思考モデルが max_tokens を使い切ると
+    # 本文が空で返る。自動の再試行で床まで上げても空のことがある）。ハード失敗と混ぜると
+    # 「キーが無い・廃止された」と同じ扱いになり、復旧可能な失敗の内訳が見えなくなる（v0.18.0）。
+    if "空応答" in (err or "") or "empty response" in t or "no output" in t:
+        return "no_output"
     if any(part.strip(".,:;()[]") == "429" for part in t.split()) or "rate limit" in t or "rate_limit" in t or "rate-limit" in t or "too many requests" in t or "quota" in t:
         return "rate_limited"
     if "timeout" in t or "timed out" in t:
@@ -869,7 +874,15 @@ def note_observation(ref: str, kind: str, *, error: str = "", leak: bool = False
 
 
 def _kind_quality(row: dict) -> tuple[float, float]:
-    """(品質 0〜1, 観測数) を返す。切断・CoT混入・空を減点し、エラー率を掛ける。"""
+    """(品質 0〜1, 観測数) を返す。切断・CoT混入・空を減点し、エラー率を掛ける。
+
+    **空応答（`no_output`）はハード失敗の半分の重み**で減点する（v0.18.0・実測にもとづく）。
+    思考トークンで予算を使い切っただけの失敗は、`max_tokens` を上げれば回復する種類であり、
+    「廃止（404）」「権限（403）」「5xx」と同じ重みで沈めると、**大きい予算でなら正しく答える
+    モデルが永久に選ばれなくなる**。かといって無視はしない（実測: 床 512・上限 2048 まで上げても
+    空のままのモデルがいる＝その用途では実質使えない）。減点の重みが半分なだけで、
+    成功が 1 件も無ければ品質は 0 のまま（選抜で上に来ることはない）。
+    """
     n = as_float(row.get("n"), 0.0)
     if n <= 0:
         return 0.0, 0.0
@@ -880,8 +893,12 @@ def _kind_quality(row: dict) -> tuple[float, float]:
     score = (ok + 0.5 * trunc + 0.3 * leak) / n
     score *= (1.0 - min(1.0, empty / n))
     err = row.get("err") or {}
-    err_total = sum(as_float(v, 0.0) for v in err.values()) if isinstance(err, dict) else 0.0
-    score *= max(0.0, 1.0 - err_total / n)
+    if isinstance(err, dict):
+        soft = as_float(err.get("no_output"), 0.0)
+        hard = sum(as_float(v, 0.0) for k, v in err.items() if k != "no_output")
+    else:
+        soft, hard = 0.0, 0.0
+    score *= max(0.0, 1.0 - min(1.0, (hard + 0.5 * soft) / n))
     return round(max(0.0, min(1.0, score)), 4), n
 
 
