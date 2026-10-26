@@ -80,24 +80,43 @@ def marker_for(port: int) -> str:
     return "freeagent-resident-%d" % port
 
 
+def _interpreter_ok(exe: str) -> bool:
+    """その `python.exe` が**実際に起動して式を評価できる**か。
+
+    実測（2026-10-27）: `tools/python-3.14.7+<build>` が残骸で、`python.exe --version` は返るのに
+    `sys.base_prefix` が**カレントディレクトリ**になり `Could not find platform independent libraries` で
+    即死した。`os.path.isfile` だけの判定はこれを通してしまい、**目印の無い pythonw 起動で無言の即死**になる
+    （起動ログには `starting` だけが残り、サーバーは LISTENING しない）。だから実行して確かめる。
+    """
+    try:
+        proc = subprocess.run([exe, "-c", "import sys;print(sys.version_info[0])"],
+                              capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    out = (proc.stdout or "").strip()
+    return proc.returncode == 0 and out[:1].isdigit()
+
+
 def discover_python(hermes_home: str) -> tuple[str, str]:
     """`<hermes-home>\\tools\\python-*` から `(python.exe, pythonw.exe)` を探す。
 
     フォルダ名はインストールごとに変わる（版＋ビルド番号。例 `python-3.14.7+<build>-win32-x64`）ので、
-    **名前を書かずに `tools` を列挙して `python-` で始まる最初のものを使う**。
+    **名前を書かずに `tools` を列挙する**。選び方は 2 段:
+      1. **新しい版から**見る（`sorted(..., reverse=True)`。旧実装は昇順で最古の残骸を選んでいた）
+      2. `_interpreter_ok()` で**起動できることを確かめる**（stdlib が欠けた残骸を飛ばす）
     見つからなければ空文字を返す（生成側で明示指定を促す）。
     """
     tools = os.path.join(hermes_home, "tools")
     if not os.path.isdir(tools):
         return "", ""
     candidates = sorted(
-        name for name in os.listdir(tools)
-        if name.startswith("python-") and os.path.isdir(os.path.join(tools, name))
-    )
+        (name for name in os.listdir(tools)
+         if name.startswith("python-") and os.path.isdir(os.path.join(tools, name))),
+        reverse=True)
     for name in candidates:
         exe = os.path.join(tools, name, "python.exe")
         exe_w = os.path.join(tools, name, "pythonw.exe")
-        if os.path.isfile(exe):
+        if os.path.isfile(exe) and _interpreter_ok(exe):
             return exe, (exe_w if os.path.isfile(exe_w) else "")
     return "", ""
 
@@ -225,7 +244,7 @@ def render_worker(cfg: dict) -> str:
 '   - the server itself is started with pythonw.exe (GUI subsystem: no console).
 ' ASCII only: Windows Script Host reads a .vbs without a UTF-16 BOM as ANSI.
 Option Explicit
-Dim sh, fso, hermesHome, repo, logDir, logFile, running, py, pyw, tools, f
+Dim sh, fso, hermesHome, repo, logDir, logFile, running, py, pyw, bestName, tools, f
 Dim http, lf, ts, svc, procs, p, cl, wmiOk
 
 Set sh = CreateObject("WScript.Shell")
@@ -280,13 +299,21 @@ On Error GoTo 0
 ' build number), so enumerate the tools folder instead of hardcoding a path.
 py = ""
 pyw = ""
+bestName = ""
 tools = hermesHome & "\\tools"
 If fso.FolderExists(tools) Then
   For Each f In fso.GetFolder(tools).SubFolders
     If Left(f.Name, 7) = "python-" Then
-      If fso.FileExists(f.Path & "\\python.exe") Then py = f.Path & "\\python.exe"
-      If fso.FileExists(f.Path & "\\pythonw.exe") Then pyw = f.Path & "\\pythonw.exe"
-      If py <> "" Then Exit For
+      ' Pick the NEWEST python-* folder (greatest name). Enumerating in folder order
+      ' selected the oldest one; a stale install (python-3.14.7 without its stdlib)
+      ' then died silently: pythonw has no console and the log showed only "starting".
+      ' We cannot verify the interpreter here (WshShell.Exec would spawn a console),
+      ' so choose by name instead.
+      If fso.FileExists(f.Path & "\python.exe") And StrComp(f.Name, bestName, vbTextCompare) > 0 Then
+        bestName = f.Name
+        py = f.Path & "\python.exe"
+        pyw = f.Path & "\pythonw.exe"
+      End If
     End If
   Next
 End If

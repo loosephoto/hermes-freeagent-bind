@@ -18,6 +18,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -60,17 +61,68 @@ class InstallerCase(unittest.TestCase):
         with open(os.path.join(self.repo, "src", "freeagent_bind", "server.py"),
                   "w", encoding="utf-8") as fh:
             fh.write("# stub\n")
-        self.cfg = self.m.build_config(self.home, self.repo, "127.0.0.1", 8790,
-                                       startup_dir=self.startup_dir)
+        # テストの `python.exe` は中身が "stub" のテキストなので、`_interpreter_ok` は当然 False になる。
+        # 配線の生成（パスを埋める）を検査したいので、ここだけ「起動できる」扱いにする。
+        with mock.patch.object(self.m, "_interpreter_ok", return_value=True):
+            self.cfg = self.m.build_config(self.home, self.repo, "127.0.0.1", 8790,
+                                           startup_dir=self.startup_dir)
 
     # --- 生成物の契約 ---------------------------------------------------
 
     def test_discover_python_enumerates_tools_folder(self):
         """フォルダ名はインストールごとに変わるので、名前を書かずに列挙して見つけること。"""
-        found, found_w = self.m.discover_python(self.home)
+        with mock.patch.object(self.m, "_interpreter_ok", return_value=True):
+            found, found_w = self.m.discover_python(self.home)
         self.assertEqual(found, self.python)
         self.assertEqual(found_w, self.pythonw)
         self.assertEqual(self.m.discover_python(os.path.join(self.tmp, "missing")), ("", ""))
+
+    def test_discover_python_prefers_the_newest(self):
+        """昇順で最古を選ぶと、残骸の python を掴んで無言で即死する（実測）。"""
+        home = os.path.join(self.tmp, "hermes-order")
+        old = os.path.join(home, "tools", "python-3.14.7+old-win32-x64")
+        new = os.path.join(home, "tools", "python-3.14.9+new-win32-x64")
+        for folder in (old, new):
+            os.makedirs(folder, exist_ok=True)
+            for exe in ("python.exe", "pythonw.exe"):
+                with open(os.path.join(folder, exe), "w", encoding="ascii") as fh:
+                    fh.write("stub")
+        with mock.patch.object(self.m, "_interpreter_ok", return_value=True):
+            found, _ = self.m.discover_python(home)
+        self.assertIn("3.14.9", found, found)
+
+    def test_discover_python_skips_an_interpreter_that_cannot_start(self):
+        """`python.exe` があっても起動できない残骸は飛ばす（stdlib 欠落の実例がある）。"""
+        home = os.path.join(self.tmp, "hermes-broken")
+        old = os.path.join(home, "tools", "python-3.14.7+old-win32-x64")
+        new = os.path.join(home, "tools", "python-3.14.9+new-win32-x64")
+        for folder in (old, new):
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, "python.exe"), "w", encoding="ascii") as fh:
+                fh.write("stub")
+        with mock.patch.object(self.m, "_interpreter_ok", side_effect=lambda exe: "3.14.7" in exe):
+            found, _ = self.m.discover_python(home)
+        self.assertIn("3.14.7", found, found)
+
+    def test_a_text_stub_is_not_treated_as_an_interpreter(self):
+        """実行できないファイルを `python.exe` として置いても通さない（実測の再現）。"""
+        self.assertFalse(self.m._interpreter_ok(self.python))
+
+    def test_worker_declares_every_variable_it_uses(self):
+        """`Option Explicit` なので、宣言漏れは**無言の即死**になる（実測: bestName で踏んだ）。"""
+        vbs = self.m.render_worker(self.cfg)
+        dims = ""
+        for line in vbs.splitlines():
+            if line.strip().startswith("Dim "):
+                dims += line.split("Dim ", 1)[1]
+        for name in ("bestName", "py", "pyw", "tools"):
+            self.assertIn(name, dims, f"{name} が Dim に無い（Option Explicit で即死する）")
+
+    def test_worker_picks_the_newest_python(self):
+        """最古の python-*（stdlib 欠落の残骸）を掴むと pythonw が無言で即死する。"""
+        vbs = self.m.render_worker(self.cfg)
+        self.assertIn("StrComp(f.Name, bestName", vbs)
+        self.assertIn('bestName = ""', vbs)
 
     def test_worker_never_spawns_a_console(self):
         vbs = self.m.render_worker(self.cfg)
