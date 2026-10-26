@@ -1441,6 +1441,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_STATE_DIR` | `%LOCALAPPDATA%\hermes-freeagent-bind` | 蓄積ストア（統計・クールダウン・相談セッション）。**一時領域に置かない** |
 | `FREEAGENT_DEFAULT_MODEL` | 空（自動選抜） | 既定モデル（`provider/model`） |
 | `FREEAGENT_MAX_WORKERS` | 8 | 推論の並列度＝同時に走らせる本数（1〜32）。**429 の抑止は提供元の枠が担う**（下の 3 行） |
+| `FREEAGENT_CALL_BUDGET` | 240 | **ツール 1 回の並列実行の壁時計予算**（秒・0 で無制限）。MCP クライアントの待ち（実測 300 秒）より短くしておく——300 秒で切られると**取れていた結果も失われる**。打ち切った分は `dropped: true` の脱落として返り、まだ走っていない呼び出しは取り消す |
 | `FREEAGENT_MAX_SUB_MODELS` | 8 | `size` の上限（1 呼び出しで参加させるモデル数・1〜32） |
 | `FREEAGENT_MAX_MODELS_PER_CALL` | 16 | `models` 配列・`models: ["all"]` の展開上限（1〜40） |
 | `FREEAGENT_PROVIDER_LIMIT` | 4 | 提供元ごとの同時実行枠の既定（実測済みの `nous` は 6） |

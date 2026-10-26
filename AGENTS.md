@@ -17,6 +17,8 @@ Internet Archive / Qiita** は
   直接 `as_str(...)` と呼ぶと `patch.object(server, ...)` が届かなくなる（テスト 472 箇所が
   server の名前を差し替えている）。`server.py` 側の名前は `globals().update(sources.EXPORTS)` で互換を保つ。
 - `python src/freeagent_bind/server.py` / `runpy.run_path(...)` の**直接実行を壊さない**（配布形態）。
+- 並列実行は `run_parallel(jobs, worker, max_workers, deadline)` の 1 本。`deadline` は**回収の打ち切り**で、
+  未回収は `dropped: true` で返す（スレッドは強制終了できない）。予算は `FREEAGENT_CALL_BUDGET`（既定 240 秒）。
   冒頭の互換シムがパッケージ版の `main()` へ渡す。ゲートの `smoke_http` / `check_offline` はこの経路で走る。
 
 ## セットアップ

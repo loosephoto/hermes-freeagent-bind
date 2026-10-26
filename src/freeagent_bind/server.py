@@ -66,6 +66,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 
 # `python server.py` / `runpy.run_path(server.py)` で**直接実行される配布形態**を保つ。
 # ソース実装を `sources/` へ分割したので、相対 import の効くパッケージ文脈で動かす必要がある。
@@ -84,7 +85,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.15.0"
+SERVER_VERSION = "0.16.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -127,6 +128,10 @@ READ_TIMEOUT = _env_float("FREEAGENT_READ_TIMEOUT", 180.0)
 # 「同時に走らせたい本数」の上限として置く。実測（nous へ 12 呼び出し・2026-10-23）: 4 並列 13.13 秒 /
 # 8 並列 8.08 秒 / 12 並列 13.78 秒（1 件の最大遅延 4.5→12.2 秒）。膝は 8 本。
 MAX_WORKERS = max(1, min(32, _env_int("FREEAGENT_MAX_WORKERS", 8)))
+# ツール 1 回の並列実行の**壁時計予算**（秒）。0 で無効。
+# MCP クライアントの待ち（実測 300 秒）より短くしておく: 300 秒で切られると**取れていた結果も
+# 失われる**。打ち切った分は `dropped: true` の脱落として返す（規約 8・63 と同じ「黙って捨てない」）。
+CALL_BUDGET_S = max(0.0, _env_float("FREEAGENT_CALL_BUDGET", 240.0))
 # 1 相談あたりの呼び出し上限（暴走・課金の歯止め）。超過したらラウンドを打ち切る。
 MAX_CALLS_PER_RUN = max(1, _env_int("FREEAGENT_MAX_CALLS_PER_RUN", 40))
 # 1 回のツール呼び出しに参加させるモデル数の 2 段の上限。
@@ -154,223 +159,11 @@ DEBUG_LOG = os.environ.get("FREEAGENT_DEBUG_LOG", "")
 
 # プロバイダ登録。キーが無くても **一覧取得は通る**ものがあるので、一覧は常に集め、
 # 推論可否は key の有無で分ける（ready）。
-PROVIDER_SPECS: dict[str, dict] = {
-    "nous": {
-        "base_url": os.environ.get("FREEAGENT_BASE_URL", "http://127.0.0.1:8645/v1"),
-        "key": os.environ.get("FREEAGENT_API_KEY", "proxy-attaches-real-credentials"),
-        "key_env": None, "free_kind": "pricing", "always_ready": True,
-        "note": "hermes proxy（Nous Portal の資格情報を代理付与・キー不要）",
-    },
-    "openrouter": {
-        "base_url": os.environ.get("FREEAGENT_OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-        "key": os.environ.get("OPENROUTER_API_KEY", ""),
-        "key_env": "OPENROUTER_API_KEY", "free_kind": "pricing", "always_ready": False,
-        "note": "OpenRouter の :free SKU（一覧は未認証でも取得可・推論はキー必須）",
-    },
-    "nvidia": {
-        "base_url": os.environ.get("FREEAGENT_NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
-        "key": os.environ.get("NVIDIA_API_KEY", ""),
-        "key_env": "NVIDIA_API_KEY", "free_kind": "credit", "always_ready": False,
-        # 実測: 一覧 82 件の大半が 410（EOL）や 404（アカウントで未有効）で、**一覧を信じると呼べない**。
-        # `freeagent_models` の `probe: true` で生存確認してから使うこと。
-        "note": "NVIDIA NIM（無料クレジット枠。一覧には廃止・未有効のモデルが混在 → probe で確認）",
-    },
-    # Hugging Face は OpenAI 互換の **Inference Providers router** を使う。料金はモデルではなく
-    # **提供元（novita / together 等）ごと**に付くので、free 判定は提供元単位で行う（実測: 一覧の
-    # 各モデルが providers[] を持ち、各要素に pricing と is_free がある）。
-    "huggingface": {
-        "base_url": os.environ.get("FREEAGENT_HF_BASE_URL", "https://router.huggingface.co/v1"),
-        "key": (os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY")
-                or os.environ.get("HUGGINGFACEHUB_API_TOKEN") or ""),
-        "key_env": "HF_TOKEN", "free_kind": "hf_providers", "always_ready": False,
-        "note": "Hugging Face Inference Providers（router。一覧は未認証でも取得可・推論はトークン必須）",
-    },
-    # GroqのFree-plan表に掲載されたチャットモデルだけを許可する。
-    # Free契約かどうかはAPIから確認できないため、利用者の明示確認を必須にする。
-    "groq": {
-        "base_url": os.environ.get("FREEAGENT_GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
-        "key": os.environ.get("GROQ_API_KEY", ""),
-        "key_env": "GROQ_API_KEY", "free_kind": "allowlist", "always_ready": False,
-        "free_model_ids": ("openai/gpt-oss-120b", "openai/gpt-oss-20b",
-                            "qwen/qwen3.8-27b"),
-        "required_env_flags": ("FREEAGENT_GROQ_FREE_TIER",), "catalog_requires_ready": True,
-        "note": "Groq Free tier確認が必須（FREEAGENT_GROQ_FREE_TIER=1）。Free対象モデルだけ許可。Developer tierは有料です",
-    },
-    "cloudflare": {
-        "base_url": ("https://api.cloudflare.com/client/v4/accounts/"
-                     + os.environ.get("CLOUDFLARE_ACCOUNT_ID", "") + "/ai"),
-        "key": os.environ.get("CLOUDFLARE_API_TOKEN", ""),
-        "key_env": "CLOUDFLARE_API_TOKEN", "free_kind": "allowlist", "always_ready": False,
-        "free_model_ids": ("@cf/openai/gpt-oss-20b", "@cf/zai-org/glm-4.7-flash"),
-        "required_env_values": ("CLOUDFLARE_ACCOUNT_ID",),
-        "required_env_patterns": {"CLOUDFLARE_ACCOUNT_ID": r"[0-9a-fA-F]{32}"},
-        "required_env_flags": ("FREEAGENT_CLOUDFLARE_FREE_PLAN",), "catalog_requires_ready": True,
-        "models_path": "/models/search?format=openrouter&hide_experimental=true&per_page=100",
-        "chat_path": "/v1/chat/completions", "catalog_format": "cloudflare_openrouter",
-        "note": "Workers Free plan確認が必須（FREEAGENT_CLOUDFLARE_FREE_PLAN=1）。Neuronsは10,000/日を全用途で共有。有料専用モデルは許可しません",
-    },
-    # GeminiのFree対象は、公式pricing表で入力・出力がFreeのモデルだけを絞る。
-    # Unpaid Servicesはプロンプト/応答を製品改善や人手レビューに使うため、 tierとデータ用途の二重明示確認を要求。
-    "gemini": {
-        "base_url": os.environ.get("FREEAGENT_GEMINI_BASE_URL",
-                                  "https://generativelanguage.googleapis.com/v1beta/openai"),
-        "key": os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", ""),
-        "key_env": "GEMINI_API_KEY", "free_kind": "allowlist", "always_ready": False,
-        "free_model_ids": ("gemini-3.8-flash", "gemini-3.7-flash"),
-        "required_env_flags": ("FREEAGENT_GEMINI_FREE_TIER", "FREEAGENT_GEMINI_UNPAID_DATA_ACK"),
-        "catalog_requires_ready": True,
-        "note": "Gemini Free tierと非機密データ利用の両確認が必須。Unpaid prompts/outputs may be reviewed and used to improve Google products; OpenAI compatibility is Beta",
-    },
-    # Vercel AI Gateway。Free tier は「月 $5 のクレジット」で、使えるのは **Free Tier 対象モデル**だけ
-    # （カタログ 406 件すべてではない）。対象は公式のモデル一覧の freeTier フィルタから 15 件を実測採取した
-    # （2026-10）。$0 価格のモデルとは一致しない（実測: 15 件中 $0 は 3 件だけで、残りは有料価格だが
-    # クレジット対象）。対象は増減するので `freeagent_models` の `probe: true` で生存を確かめ、外れたら
-    # この許可リストを更新する。クレジットを購入すると paid tier に移り、月次の無料クレジットは消える。
-    "vercel": {
-        "base_url": os.environ.get("FREEAGENT_VERCEL_BASE_URL", "https://ai-gateway.vercel.sh/v1"),
-        "key": os.environ.get("AI_GATEWAY_API_KEY", ""),
-        "key_env": "AI_GATEWAY_API_KEY", "free_kind": "allowlist", "always_ready": False,
-        "free_model_ids": ("openai/gpt-oss-120b", "openai/gpt-5-mini", "openai/gpt-5-mini-fast",
-                            "openai/gpt-5-nano", "openai/gpt-4o-mini",
-                            "google/gemini-2.5-flash-lite",
-                            "inclusionai/ling-3.1-flash", "inclusionai/ling-3.1-flash-free",
-                            "alibaba/qwen3.7-flash", "stepfun/step-3.7-flash",
-                            "poolside/laguna-s-2.1-free",
-                            "nvidia/nemotron-3-ultra-550b-a55b",
-                            "xiaomi/mimo-v2.5", "xiaomi/mimo-v2.5-pro",
-                            "xiaomi/mimo-v2.6-flash"),
-        "required_env_flags": ("FREEAGENT_VERCEL_FREE_TIER",), "catalog_requires_ready": True,
-        "note": "Vercel AI GatewayのFree tier（月 $5 クレジット）確認が必須（FREEAGENT_VERCEL_FREE_TIER=1）。"
-                "無料枠の対象は Free Tier 対象モデルのサブセット（実測 15 件だけを許可）。"
-                "クレジットを購入すると paid tier に移り、月次の無料クレジットは適用されません",
-    },
-    # Ollama Cloud。Free plan は「starter モデル向けの月次 starter クレジット」で、全モデルは対象外。
-    # どの ID が starter かは提供元が公表しておらず、一覧 17 件も pricing を持たない（実測）ので
-    # 許可リストを作れない → クレジット枠＋プラン確認で扱い、`probe` で実際に応答するモデルを確かめる。
-    # 対象外のモデルは 402 を返すが、402 はフォールバック対象でプロバイダ記憶には入れない（§3）。
-    "ollama": {
-        "base_url": os.environ.get("FREEAGENT_OLLAMA_BASE_URL", "https://ollama.com/v1"),
-        "key": os.environ.get("OLLAMA_API_KEY", ""),
-        "key_env": "OLLAMA_API_KEY", "free_kind": "credit", "always_ready": False,
-        "required_env_flags": ("FREEAGENT_OLLAMA_FREE_PLAN",), "catalog_requires_ready": True,
-        "note": "Ollama Cloud Free plan確認が必須（FREEAGENT_OLLAMA_FREE_PLAN=1）。無料は starter モデルだけで"
-                "範囲は非公開 → probe で確認。同時 1 リクエスト。クレジットを購入すると全モデルが使えますが課金対象です",
-    },
-    # Z.ai（Zhipu GLM）。公式価格表で $0 の Flash 系だけを許可する。
-    # 実測（2026-10-23・この環境のキー）: glm-4.7-flash / glm-4.5-flash / glm-4.6v-flash は 200、
-    # 有料の glm-5.3-flash / glm-4.5 は 429 {"code":"1113","message":"Insufficient balance..."}。
-    # **一覧（/api/paas/v4/models）は Free の 3 件を返さない**（有料の旗艦 11 件だけ）ので、
-    # 許可リストの ID を在庫として補う（`_with_allowlisted_rows`）。
-    "zai": {
-        "base_url": os.environ.get("FREEAGENT_ZAI_BASE_URL", "https://api.z.ai/api/paas/v4"),
-        "key": (os.environ.get("GLM_API_KEY") or os.environ.get("ZAI_API_KEY")
-                or os.environ.get("ZHIPUAI_API_KEY") or ""),
-        "key_env": "GLM_API_KEY", "free_kind": "allowlist", "always_ready": False,
-        "free_model_ids": ("glm-4.7-flash", "glm-4.5-flash", "glm-4.6v-flash"),
-        # 一覧が Free ID を返さない提供元なので、許可リストを在庫として補う（下の関数）。
-        "synthesize_free_ids": True,
-        "required_env_flags": ("FREEAGENT_ZAI_FREE_TIER",), "catalog_requires_ready": True,
-        "note": "Z.ai（Zhipu GLM）。公式価格表で $0 の GLM-4.7-Flash / 4.5-Flash / 4.6V-Flash だけを許可"
-                "（一覧 API はこの 3 件を返さないため許可リストから在庫を補います）。Free tier確認が必須"
-                "（FREEAGENT_ZAI_FREE_TIER=1）。キーは GLM_API_KEY（別名 ZAI_API_KEY / ZHIPUAI_API_KEY）。"
-                "有料モデルは残高が無いと 429 を返します。Flash 系は**思考モデル**なので max_tokens に余裕を"
-                "（実測: glm-4.5-flash は 256 で思考 202 トークンの後に本文。64 では本文が空になり、"
-                "サーバーの空応答リトライが上限を引き上げます）",
-    },
-    # Mistral La Plateforme。Experiment plan（無料・月 約10億トークン・電話確認）は API から
-    # Free/paid を判定できないので、クレジット型（プラン確認 + 枠）として扱う（規約 31）。
-    "mistral": {
-        "base_url": os.environ.get("FREEAGENT_MISTRAL_BASE_URL", "https://api.mistral.ai/v1"),
-        "key": os.environ.get("MISTRAL_API_KEY", ""),
-        "key_env": "MISTRAL_API_KEY", "free_kind": "credit", "always_ready": False,
-        "required_env_flags": ("FREEAGENT_MISTRAL_FREE_PLAN",), "catalog_requires_ready": True,
-        "note": "Mistral La Plateforme。Experiment plan（無料・月 約10億トークン・電話確認）の確認が必須"
-                "（FREEAGENT_MISTRAL_FREE_PLAN=1）。API は Free/paid を返さないのでクレジット枠として扱い、"
-                "対象は `probe` で確認します。RPM が低いので並列 fan-out より長文・少数リクエスト向きです。"
-                "有料プランへ変更したらこのフラグを外してください",
-    },
-    # ModelScope（魔搭社区）。API-Inference は無料枠（公称 2,000 リクエスト/日・日次回復）だが、
-    # 一覧 37 件は pricing を持たないのでクレジット型として扱う（実測 2026-10-23: 未認証で 200）。
-    "modelscope": {
-        "base_url": os.environ.get("FREEAGENT_MODELSCOPE_BASE_URL",
-                                  "https://api-inference.modelscope.cn/v1"),
-        "key": (os.environ.get("MODELSCOPE_API_KEY") or os.environ.get("MODELSCOPE_API_TOKEN") or ""),
-        "key_env": "MODELSCOPE_API_KEY", "free_kind": "credit", "always_ready": False,
-        "required_env_flags": ("FREEAGENT_MODELSCOPE_FREE_PLAN",), "catalog_requires_ready": True,
-        "note": "ModelScope API-Inference（魔搭社区）。無料枠（公称 2,000 リクエスト/日・日次回復）の確認が"
-                "必須（FREEAGENT_MODELSCOPE_FREE_PLAN=1）。一覧（未認証でも 200・37 件）は pricing を持たない"
-                "ためクレジット枠として扱い、対象は `probe` で確認します。Qwen / DeepSeek / GLM / Step など。"
-                "キーは MODELSCOPE_API_KEY（別名 MODELSCOPE_API_TOKEN）。キー発行に実名・SMS 確認が要る場合があります",
-    },
-    # ---------------------------------------------------------------------------------------
-    # v0.12.0 で追加した 6 社（GitHub の freellmapi（MIT）の provider 目録を候補にして実測）。
-    # **無認証 GET /models の実測（2026-10-23）**: 401 = 生きている（キーが要る）。
-    # 無料枠の判定は API が返さないため、プラン/クレジット確認変数を必須にする（規約 31）。
-    # 非公式リレー（xkiro / navy / ainative / llm7 / kilo / routeway / requesty / unorouter 等）は
-    # **採用しない**（利用条件と再配布の許諾が確認できない。規約 33）。
-    "cerebras": {
-        "base_url": os.environ.get("FREEAGENT_CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1"),
-        "key": os.environ.get("CEREBRAS_API_KEY", ""),
-        "key_env": "CEREBRAS_API_KEY", "free_kind": "credit", "always_ready": False,
-        "required_env_flags": ("FREEAGENT_CEREBRAS_FREE_TRIAL",), "catalog_requires_ready": True,
-        "note": "Cerebras Inference。Free trial（$5 クレジット・カード登録・30 日）＋無料枠のレート制限。"
-                "一覧はキー必須（実測: 未認証 401 Wrong API Key）。クレジットは 30 日で失効し、"
-                "その後の従量課金は有料です。確認変数 FREEAGENT_CEREBRAS_FREE_TRIAL=1 が必須",
-    },
-    "sambanova": {
-        "base_url": os.environ.get("FREEAGENT_SAMBANOVA_BASE_URL", "https://api.sambanova.ai/v1"),
-        "key": os.environ.get("SAMBANOVA_API_KEY", ""),
-        "key_env": "SAMBANOVA_API_KEY", "free_kind": "credit", "always_ready": False,
-        "required_env_flags": ("FREEAGENT_SAMBANOVA_FREE_TIER",), "catalog_requires_ready": True,
-        "note": "SambaNova Cloud。**支払い方法を登録していないアカウントが Free tier**（公式レート制限表・"
-                "実測で一覧は未認証でも 200）。Free と Developer の区別は API が返さないため、"
-                "確認変数 FREEAGENT_SAMBANOVA_FREE_TIER=1 が必須。カードを登録したら解除してください",
-    },
-    "novita": {
-        "base_url": os.environ.get("FREEAGENT_NOVITA_BASE_URL", "https://api.novita.ai/v3/openai"),
-        "key": os.environ.get("NOVITA_API_KEY", ""),
-        "key_env": "NOVITA_API_KEY", "free_kind": "credit", "always_ready": False,
-        "required_env_flags": ("FREEAGENT_NOVITA_FREE_CREDITS",), "catalog_requires_ready": True,
-        "note": "Novita AI。新規アカウントの無料クレジット（$0.5〜$1 程度・期間限定）で試せます。"
-                "一覧は未認証でも 200（実測 95 件）。クレジットは**使い切ると課金**なので、"
-                "無料クレジットで使う場合だけ FREEAGENT_NOVITA_FREE_CREDITS=1 を設定してください",
-    },
-    "siliconflow": {
-        "base_url": os.environ.get("FREEAGENT_SILICONFLOW_BASE_URL", "https://api.siliconflow.com/v1"),
-        "key": os.environ.get("SILICONFLOW_API_KEY", ""),
-        "key_env": "SILICONFLOW_API_KEY", "free_kind": "credit", "always_ready": False,
-        "required_env_flags": ("FREEAGENT_SILICONFLOW_FREE_TIER",), "catalog_requires_ready": True,
-        "note": "SiliconFlow（硅基流动）。**無料モデル**（レート制限つき）と有料モデルが同居し、一覧は"
-                "未認証で 401（実測）。Free/paid を API が返さないので確認変数 "
-                "FREEAGENT_SILICONFLOW_FREE_TIER=1 が必須で、対象は `probe` で確認します。"
-                "中国版は FREEAGENT_SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1",
-    },
-    "longcat": {
-        "base_url": os.environ.get("FREEAGENT_LONGCAT_BASE_URL", "https://api.longcat.chat/openai/v1"),
-        "key": os.environ.get("LONGCAT_API_KEY", ""),
-        "key_env": "LONGCAT_API_KEY", "free_kind": "credit", "always_ready": False,
-        "required_env_flags": ("FREEAGENT_LONGCAT_FREE_PLAN",), "catalog_requires_ready": True,
-        "note": "Meituan LongCat（美团）。公開ベータの無料枠（公称 50 万トークン/日）があります。"
-                "一覧は未認証で 401（実測）。無料枠は予告なく変わるため確認変数 "
-                "FREEAGENT_LONGCAT_FREE_PLAN=1 を必須にし、対象は `probe` で確認します",
-    },
-    # opencode Zen は **-free 接尾辞のモデルだけ**を許可する（一覧に pricing が無いため）。
-    # 実測（2026-10-23・この環境のキー）: 一覧 200 / 40 件・-free は 8 件。ただし推論は
-    # 403 "Model access is disabled"（キーの権利の問題。無料モデルも同じ）。
-    "opencode": {
-        "base_url": os.environ.get("FREEAGENT_OPENCODE_BASE_URL", "https://opencode.ai/zen/v1"),
-        "key": os.environ.get("OPENCODE_ZEN_API_KEY") or os.environ.get("OPENCODE_GO_API_KEY", ""),
-        "key_env": "OPENCODE_ZEN_API_KEY", "free_kind": "allowlist", "always_ready": False,
-        "free_model_ids": ("deepseek-v4.1-flash-free", "glm-5.3-flash-free", "beam-free",
-                           "flint-40b-free", "mimo-v2.6-flash-free", "jev-1.13-free",
-                           "nemotron-3.5-lightning-free", "nemotron-3.5-super-vl-free"),
-        "required_env_flags": ("FREEAGENT_OPENCODE_FREE_TIER",), "catalog_requires_ready": True,
-        "note": "opencode Zen。**-free 接尾辞のモデルだけ**を許可リストで許可（一覧に pricing が無いため・"
-                "実測 40 件中 8 件）。キーは OPENCODE_ZEN_API_KEY（別名 OPENCODE_GO_API_KEY）。"
-                "実測: 一覧 200 でも推論は 403 Model access is disabled になるキーがある"
-                "（キーの権利の問題で、無料モデルも同じ）。確認変数 FREEAGENT_OPENCODE_FREE_TIER=1 が必須",
-    },
-}
+# プロバイダ定義は `providers/<name>.py`（1 社 1 ファイル・v0.16.0）。`SPECS` の挿入順が
+# そのまま既定の巡回順で、`PROVIDER_ORDER` の既定値もそこから生成する（手書きの列挙を持たない）。
+from . import providers as _providers  # noqa: E402
+
+PROVIDER_SPECS: dict[str, dict] = dict(_providers.SPECS)
 # MCP の `initialize` 応答に載せる `instructions`。**Hermes はこれを読まない**（実測: 旧実装で
 # 自発率が上がらず、現行版のソース `tools/mcp_tool_*.py` にも参照が無いことを確認）。それでも
 # 他クライアント（Claude Desktop 等）は読むため返すが、**Hermes で効かせる唯一のレバーは
@@ -391,9 +184,7 @@ PROACTIVE_INSTRUCTIONS = (
 )
 
 PROVIDER_ORDER = [n.strip() for n in os.environ.get(
-    "FREEAGENT_PROVIDER_ORDER",
-    "nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama,zai,mistral,modelscope,"
-    "cerebras,sambanova,novita,siliconflow,longcat,opencode").split(",")
+    "FREEAGENT_PROVIDER_ORDER", ",".join(_providers.NAMES)).split(",")
     if n.strip() in PROVIDER_SPECS] or ["nous"]
 
 # 知識バックエンドの識別用 User-Agent。MediaWiki / OpenAlex / Crossref は連絡先入りの UA を求める。
@@ -3215,28 +3006,85 @@ class _ModelClaims:
             return True
 
 
-def run_parallel(jobs: list, worker, max_workers: int | None = None) -> list:
-    """jobs を並列に処理して**入力順**で返す。並列化が効くのは I/O 待ち（API 待ち）である点に注意。"""
+class Deadline:
+    """並列実行の壁時計予算。`run_parallel` が**残り時間で回収を打ち切る**ために使う。
+
+    Python のスレッドは強制終了できない（anyio の文書も「shutdown にはコード側の完全な協力が要る」と
+    明記している）。したがって打ち切りは「**回収をやめる**」であり、投入済みの呼び出しは裏で完了する
+    （結果は捨てるが、キャッシュ・統計・クォータには正しく残る）。打ち切った分は `dropped: true` として
+    呼び出し側に返す（規約 8・63「黙って捨てない」）。
+    """
+
+    def __init__(self, seconds: float):
+        self.total = max(0.0, float(seconds))
+        self._until = time.monotonic() + self.total
+
+    def remaining(self) -> float:
+        return max(0.0, self._until - time.monotonic())
+
+    @property
+    def expired(self) -> bool:
+        return self.remaining() <= 0.0
+
+    def __repr__(self) -> str:
+        return f"Deadline(total={self.total:.1f}s, remaining={self.remaining():.1f}s)"
+
+
+def call_budget() -> "Deadline | None":
+    """ツール 1 回ぶんの予算を作る（`FREEAGENT_CALL_BUDGET` が 0 なら None＝無制限）。"""
+    return Deadline(CALL_BUDGET_S) if CALL_BUDGET_S > 0 else None
+
+
+def run_parallel(jobs: list, worker, max_workers: int | None = None,
+                 deadline: "Deadline | None" = None) -> list:
+    """jobs を並列に処理して**入力順**で返す。並列化が効くのは I/O 待ち（API 待ち）である点に注意。
+
+    `deadline` を渡すと、**残り時間で回収を打ち切る**（未回収の位置は `dropped: true` の dict で埋める）。
+    `cancel_futures=True` で**まだ走っていない**ジョブは取り消す（枠・クォータを無駄に使わない）。
+    """
     if not jobs:
         return []
+    # 予算が既に尽きているなら**投入しない**（枠・クォータを使わずに脱落として返す）。
+    if deadline is not None and deadline.expired:
+        return [_dropped_result(deadline, "未実行") for _ in jobs]
     out: list = [None] * len(jobs)
     workers = max(1, min(max_workers or MAX_WORKERS, len(jobs)))
     if workers == 1:
         for i, job in enumerate(jobs):
+            if deadline is not None and deadline.expired:
+                out[i] = _dropped_result(deadline, "未実行")
+                continue
             try:
                 out[i] = worker(job)
             except Exception as exc:  # worker 側の例外もここで吸収する
                 out[i] = {"error": f"{type(exc).__name__}: {exc}"}
         return out
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(worker, job): i for i, job in enumerate(jobs)}
-        for fut in as_completed(futures):
+    pool = ThreadPoolExecutor(max_workers=workers)
+    futures = {pool.submit(worker, job): i for i, job in enumerate(jobs)}
+    timed_out = False
+    try:
+        for fut in as_completed(futures, timeout=None if deadline is None else deadline.remaining()):
             i = futures[fut]
             try:
                 out[i] = fut.result()
             except Exception as exc:
                 out[i] = {"error": f"{type(exc).__name__}: {exc}"}
+    except FuturesTimeout:
+        timed_out = True
+    finally:
+        pool.shutdown(wait=not timed_out, cancel_futures=timed_out)
+    if timed_out:
+        for i, value in enumerate(out):
+            if value is None:
+                out[i] = _dropped_result(deadline, "回収を打ち切り")
     return out
+
+
+def _dropped_result(deadline: "Deadline | None", why: str) -> dict:
+    """予算切れの位置を埋める dict（`dropped` を機械可読に立てる）。"""
+    total = f"{deadline.total:.0f} 秒" if deadline is not None else "予算"
+    return {"error": f"並列実行の予算（{total}）で{why}になりました（この結果は脱落です）",
+            "dropped": True, "timed_out": True}
 
 
 def ask_many(refs: list[str], prompt: str, *, system: str = "", max_tokens: int = 800,
@@ -3252,7 +3100,7 @@ def ask_many(refs: list[str], prompt: str, *, system: str = "", max_tokens: int 
         list(refs),
         lambda ref: call_model(ref, prompt, system=system, max_tokens=max_tokens,
                                temperature=temperature, kind=kind, claims=claims),
-        max_workers=min(len(refs), MAX_WORKERS))
+        max_workers=min(len(refs), MAX_WORKERS), deadline=call_budget())
 
 
 def ask_map(pairs: list[tuple[str, str]], *, system: str = "", max_tokens: int = 800,
@@ -3262,7 +3110,7 @@ def ask_map(pairs: list[tuple[str, str]], *, system: str = "", max_tokens: int =
         list(pairs),
         lambda pair: call_model(pair[0], pair[1], system=system, max_tokens=max_tokens,
                                 temperature=temperature, kind=kind),
-        max_workers=min(len(pairs), MAX_WORKERS))
+        max_workers=min(len(pairs), MAX_WORKERS), deadline=call_budget())
 
 
 # ================================================================ §5 知識バックエンド
