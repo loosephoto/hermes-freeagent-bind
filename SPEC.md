@@ -955,7 +955,7 @@ subgoal=1 を送る → **位置 1 の B(id=2) は未完了のまま、廃止済
 → 解決の順番を 1 つに固定した（`_think_structure`）:
 1. 現在の plan の**id**に一致 → その項目（同一性。差し替えをまたいでも不変）
 2. 現在の plan の**1 始まりの位置** → その項目（id が一致しない番号は位置として扱う）
-3. **廃止済み項目**の id → その項目（記録は残すが、達成済みには-mark しない）
+3. **廃止済み項目**の id → その項目（記録は残すが、達成済みの印は付けない）
 どれにも当たらなければ**エラー**（推測で繋がない）。
 
 `plan_progress` は**現在の plan の項目だけ**を数える（廃止項目の印と表示が矛盾しないよう）。
@@ -1084,6 +1084,63 @@ Crossref は `filter=has-abstract:true` を公式にサポートしている。
 
 **規約**: 11 ツールの描画は「1 ツール 1 関数」に分ける（描画表で dispatch する）。
 新ツールを足すときは `_RENDERERS` に**必ず登録する**（テストが漏れを検出する）。
+
+### 6.20 健全性監査（2026-10-27・v0.18.4）
+
+v0.18.3 を対象に 5 軸（ドキュメント / 説明文 / 状態機械 / 境界 / 配備）で監査した記録。
+ゲートは全部緑（`unittest` 717・`check_integrity`・`smoke_stdio`・`smoke_http`・`check_offline` 15 検査・
+`apply_proactive --check` 空振り 0・`probe_knowledge_stdio` 実 API 出典 6 件）で、**それでも出た**不都合だけを書く。
+
+- **日本語テキストの混入 8 箇所**（規約 64）。`patch` のバイト境界ずれで、docstring / コメントの日本語が
+  別の字に化けていた。うち 1 箇所は**利用者に見える警告行**（`subgoal` が廃止済みのときの本文）で、
+  ASCII の継ぎ跡 `-mark` が残っていた。→ 全 8 箇所を修正し、**機械的な検出を
+  `tests/test_audit_v0184.py::JapaneseTextIntegrityTest` に置いた**（cp932 で表せない CJK とハングル、
+  `和字-英字` の継ぎ跡。許すのは提供元の中国語表記と 熵 だけ）。同じ型の検出は
+  **`scripts/` にも置くと良い**（今は tests 側だけ）。
+- **部分的な HTTP config で全リクエストが無言で切れる**。`_http_make_handler` が `config["path"]` を
+  直引きしていたため、`_http_build_server({"host":…,"port":…})` のように **`path` の無い config** を
+  渡すと、`_path_ok` が `KeyError` を出し、クライアントからは `RemoteDisconnected`（**応答が 1 バイトも
+  返らない**）に見える。実測 7/7 リクエストが失敗。→ `_http_path` / `_http_host` / `_http_port` を新設し、
+  **キーが無い / `None` / 空のときだけ**既定へ落とす。回帰は `PartialHttpConfigTest`（200 を実測）。
+- **その修正の初版が「明示された不正値」まで既定へ読み替えていた**（退行を自分で入れた例）。
+  `_http_port` を `as_int(...)` で丸めていたため、`port="not-a-port"` は既定の 8765 になり、
+  `serve_http` が**要求と違うポートで黙って待ち受けた**（クライアントは指定ポートへ繋ぐので気づけない）。
+  さらに、`tests/test_audit_v086.py` の検証テスト（`assertRaises((ValueError, TypeError, KeyError))`）は
+  もともと `config["host"]` の **KeyError で通っていた**（＝実装の不具合に依存した弱いテスト）ため、
+  読み替えを入れた瞬間に 8765 で `serve_forever` に入り、**テストスイートが 51 分ハング**した
+  （検知は WMI で `python -m unittest` の CPU 時間を見て、`faulthandler.dump_traceback_later` で
+  スタックを取って特定）。→ **「値が無い」と「値が不正」を混ぜない**（不正は `ValueError`）。
+  入口（`serve_http`）は `(TypeError, ValueError)` を捕まえて `SystemExit(2)` にする（起動前に止める）。
+  回帰は `test_helpers_reject_explicit_bad_values` と、書き直した `ServeHttpTest`
+  （**`_http_build_server` を直接見る形**＝`serve_forever` に入らない）。
+- **`serve_http` をテストから呼ばない**（規約 65）。`serve_forever` で戻らないので、テストが
+  ハングする唯一の入口になる。HTTP の検証は `_http_build_server`（`port: 0` で OS に選ばせて
+  `server_address[1]` を読む）と `shutdown()` で行う。
+- **plan から達成済みの項目を外すと進捗が減って見える**。`plan_progress` は今の plan の項目だけを
+  数える契約なので、`plan=["A","B","C"]`（A 達成）→ `plan=["B","C"]` で **1/3 → 0/2** になる
+  （達成の記録は `plan_retired` に残っているのに、見出しの数字からは消える）。→ 台帳に
+  `plan_retired_done` を足し、本文を `計画: 0/2 達成（廃止した達成済み 1 件は含みません）` と描く。
+  **数え方を変えずに、消えないようにする**側の修正（`plan_progress` の契約は据え置き）。
+- **`audit_probes.py` の 2 つの判定が偽陽性**（監査道具側の不具合）。
+  (1) 「grounded の根拠 0 件になるソース」は `opts={}`（= `lookup` の経路）で呼んでいたため crossref / hn が
+  引っかかるが、**`grounded` が使う `need_evidence=True` では crossref 5/5・hn 5/5（100%）**（実測）。
+  (2) 「README のツールスキーマ文字数が HEAD と違う」は `TOOLS` だけを測っていたため 10 文字ずれる。
+  README の数字は **`{"tools": TOOLS}` の封筒込み**で、この方法なら**全 7 点が完全一致**する（実測:
+  v0.9.5/0.11.0/0.12.0/0.13.0/0.14.0/0.14.1/0.14.2 のいずれも README 値 = 実測 + 10）。
+  → 道具を README と同じ式に揃え、README 側にも**計測方法を明記**した（読者が +10 の差で迷わないため）。
+- **`ci.yml` のコメントが二重に不正確**だった（「ゲート一覧の検査を**全部** CI でも回す（規約 51）」。
+  規約 51 は 429 の再試行の話で番号が誤り、かつ `measure_quality.py` は CI に無い）。→ 例外 2 つ
+  （`measure_quality.py` / `FREEAGENT_PROBE_NET=1 smoke_stdio.py`）を名指しし、AGENTS のゲート節にも
+  「ゲート一覧＝CI の一覧ではない」と書いた。
+
+**監査で問題が無いことを実測で確かめた軸**（再監査の手間を減らすため残す）: 3 マーカーは 11 ツールで
+欠落 0・重複 0／`provider` 説明の列挙 = `PROVIDER_ORDER` 18 社／Origin 悪意 403・Origin null 403・
+同一オリジン 200・Host 悪意 403・誤パス 404・トークン無し 401／drip 応答が `KB_TIMEOUT`（20 秒）
+ちょうどで切れる（旧版は 98 秒）／plan の追加・同文面再送・置換・縮小・終端で id と `done` が壊れない／
+`next_thought_needed=false` で `next_call` が `null`／fanout 20 件で `prompts_dropped=4`＋本文警告、
+map 70 件で `items_dropped=6`／`freeagent_models` は `models` と `free_models` を常に両方返す／
+README のレート間隔 14 種が実装のリテラルと一致／常駐 HTTP は `serverInfo` と tools JSON の内容が
+HEAD と一致／作業ツリーはクリーン・`state_dir()` は `FREEAGENT_STATE_DIR` を尊重（監査で本番ストアを汚さない）。
 
 ## 7. ツールの規約（§6–§8）
 

@@ -55,6 +55,11 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py   # モデル�
 
 終了コード 0 が正常。1 は失敗（レジストリ不一致・版不一致・例外漏れ・UTF-8 破綻・プロトコル破綻）。
 
+推論（`hermes proxy` / Free の枠）が要る `measure_quality.py` と `FREEAGENT_PROBE_NET=1 smoke_stdio.py` は
+**CI では回さない**（CI はキーもモデルも無い環境で通ることを保証する側。`.github/workflows/ci.yml` に
+コメントで例外として明記してある）。**「ゲート一覧＝CI の一覧」ではない**ので、CI が緑でも
+この 2 つは走っていない。
+
 スクリプトは起動直後に `sys.stdout/stderr` を **UTF-8 に reconfigure** する（日本語 Windows の cp932 や
 CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になりゲート自体が落ちる — 実測）。
 `tests/test_freeagent_bind.py::TestHostEncodingTolerance` が再発を防ぐ。
@@ -358,7 +363,7 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
 50. **`subgoal` の番号は 1 つに決める**（§6.10）。`subgoal` は**plan 項目の `id`**を指す
     （同一性。差し替えをまたいでも変わらない）。id に一致する項目が無く**1 始まりの位置**に当たる
     場合は、その位置の項目として扱う（差し替えで id が飛び番号になるため）。**廃止済み項目**の id も
-    参照できる（記録は残す）が、達成済みには-mark しない。どれにも当たらなければ**エラー**。
+    参照できる（記録は残す）が、達成済みの印は付けない。どれにも当たらなければ**エラー**。
     旧実装は id だけで照合していたため、差し替えの後は**位置 1 の項目ではなく廃止済み項目を
     完了扱い**にしていた（実測: 20 回反復で 20 回再現）。→ 解決は `_think_structure` が一箇所で
     行う（`plan` 出力の `id` と `position` の両方を出すので、利用者はどちら。だから指示できるか分かる）。
@@ -461,6 +466,27 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     **例外**: `think` の `plan` は切り捨てず**エラー**にする（多すぎる入力をそのまま受け取らない契約。
     schema に `maxItems: 12` を宣言）。どちらの扱いにするかは「件数が減っても目的を達せるか」で決める
     （map/fanout は分割して呼び直せる／plan は黙って減ると計画そのものが嘘になる）。
+
+64. **日本語テキストに日本語でない字を混ぜない**（v0.18.4）。`patch` で日本語の docstring / コメントを
+    編集すると、稀に**バイト境界がずれて別の字が混入する**（実測 2026-10-27: 動詞が簡体字混じりに
+    なった行 2・「現在」がハングルに化けた行 1・類義の簡体字 3、加えて**利用者に見える文字列**に
+    ASCII の継ぎ跡 `-mark` が残っていた（正: 「達成済みの印は付けません」。本文に警告行として出る箇所）。
+    計 8 箇所がそのまま出荷直前まで残っていた）。`tests/test_audit_v0184.py` が **cp932 で表せない CJK と
+    ハングル**、および `和字-英字` の継ぎ跡を機械的に検査する（許すのは提供元の中国語表記と、意図して
+    使っている 熵 だけ。**壊れた実例そのものは同じテストの docstring に書いてある＝検査対象外の 1 ファイル**）。
+    **日本語の docstring / コメントを書いた直後はその領域を読み返す**（気づかないまま次へ進むと、
+    どこで壊れたか分からなくなる）。
+
+65. **HTTP のテストは `_http_build_server` を使い、`serve_http` を呼ばない**（v0.18.4）。
+    `serve_http` は `serve_forever` で戻らないので、**テストが例外で止まらずハングする唯一の入口**になる
+    （実測 2026-10-27: 不正な port を既定へ読み替える退行を入れた瞬間、`serve_http({"port": "not-a-port"})` を
+    呼んでいた検証テストが 8765 で待ち受け、スイートが **51 分ハング**した）。検証は
+    `port: 0` で OS にポートを選ばせ、`server_address[1]` を読んで `shutdown()` する形にする。
+    **長いゲートを回すときは時間制限を付ける**（`python -X faulthandler -c "import faulthandler;
+    faulthandler.dump_traceback_later(300, exit=True); import unittest;
+    unittest.main(module=None, argv=['unittest','discover','-s','tests'])"`）＝ハングしたときに
+    **どのテストかをスタックで名指しできる**（付けないと「無言で止まる」だけが残る）。
+    `config` の値は**「無い（`None` / キー無し / 空）」と「不正」を混ぜない**（不正は `ValueError`）。
 
 ## ライセンス
 

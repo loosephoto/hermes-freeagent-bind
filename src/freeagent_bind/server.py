@@ -85,7 +85,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.18.3"
+SERVER_VERSION = "0.18.4"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -432,7 +432,7 @@ def _load_json(path: str, default):
 
 
 def _file_mtime(path: str) -> float | None:
-    """ファイルの更新時刻（無ければ None）。**別プロセスの更新を察觉する**ために使う。"""
+    """ファイルの更新時刻（無ければ None）。**別プロセスの更新を検知する**ために使う。"""
     try:
         return os.path.getmtime(path)
     except OSError:
@@ -1285,7 +1285,7 @@ def session_drop(sid: str) -> None:
 
 _THOUGHTS: dict[str, dict] = {}
 _THOUGHTS_LOADED = False
-# ディスクの最終読み込み時刻（**別プロセスの更新を察觉する**ために使う）。
+# ディスクの最終読み込み時刻（**別プロセスの更新を検知する**ために使う）。
 _THOUGHTS_MTIME = 0.0
 _THOUGHTS_LOCK = threading.RLock()
 THOUGHTS_ENABLED = _env_on("FREEAGENT_THOUGHTS", True)
@@ -1369,7 +1369,7 @@ def _thoughts_write_locked(path: str, chains: dict) -> bool:
 def _ensure_thoughts_loaded() -> None:
     """台帳をメモリへ読み込む。**別プロセスが更新していたら読み直す**（陳腐化の解消）。
 
-    一度读过だけでは、別プロセス（MCP 子プロセス = KANBAN ワーカーなど）が足した思考を
+    一度読んだだけでは、別プロセス（MCP 子プロセス = KANBAN ワーカーなど）が足した思考を
     永久に見えない（実測: ワーカーの 2 手目が常駐プロセスから見えず、親の保存で
     ファイル上から消えた）。更新時刻が変わっていればディスクから取り直す。
     """
@@ -5653,6 +5653,10 @@ def _think_ledger_view(steps: list[dict], *, keep: int = 8, row: dict | None = N
                                     if as_int(s.get("subgoal"), 0, 0, 999) == p.get("id")]}
                          for p in retired],
         "plan_progress": {"done": sum(1 for p in plan if p.get("done_at")), "total": len(plan)},
+        # 廃止した達成済みの件数。`plan_progress` は**今の plan の項目だけ**を数えるので、
+        # 達成済みの項目を plan から外すと進捗が減って見える（実測: 1/3 → 0/3）。
+        # 数を消さずに別枠で出し、描画側でも明示する（§6.16）。
+        "plan_retired_done": sum(1 for p in retired if p.get("done_at")),
         "hypotheses": [{"n": as_int(s.get("n"), 0, 0, 9999), "text": truncate(s.get("text") or "", 200),
                         "status": s.get("hypothesis_status") or "open",
                         "tested_by": s.get("tested_by") or [],
@@ -6134,8 +6138,8 @@ def _think_structure(args: dict, steps: list[dict], n: int, row: dict) -> tuple[
         plan_now = old_plan
     # `subgoal` の解決（§6.10）。**番号の解釈は 1 つだけ**にする:
     #   1) 現在の plan の**id**に一致 → その項目（同一性。差し替えをまたいでも不変）
-    #   2)  현재 plan の**1 始まりの位置** → その項目（id が一致しない番号は位置として扱う）
-    #   3) 廃止済み項目の id → その項目（記録は残す。達成済みには-mark しない）
+    #   2) 現在の plan の**1 始まりの位置** → その項目（id が一致しない番号は位置として扱う）
+    #   3) 廃止済み項目の id → その項目（記録は残す。達成済みの印は付けない）
     # どれにも当たらなければエラー（推測で繋がない）。
     # 旧実装は id だけで照合していたため、差し替えの後は位置と id がずれて
     # **位置 1 の項目ではなく廃止済み項目を完了扱い**にしていた（実測: 20 回反復で 20 回再現）。
@@ -6158,7 +6162,7 @@ def _think_structure(args: dict, steps: list[dict], n: int, row: dict) -> tuple[
             notes.append(f"subgoal={sub_raw} は plan の {sub_raw} 番目（id={sub}）として解決しました。")
         elif sub_kind == "retired":
             notes.append(f"subgoal={sub_raw} は計画から廃止済みの項目（id={sub}）です。"
-                         "記録は残しますが、達成済みには-markしません。")
+                         "記録は残しますが、達成済みの印は付けません。")
     sub_done = as_flag(args.get("subgoal_done"))
     if sub_done and not sub:
         return fail("subgoal_done には subgoal（達成したサブ目標の番号）が必要です")
@@ -7002,7 +7006,11 @@ def _render_think(data: dict) -> str:
     plan = ledger.get("plan") or []
     if plan:
         prog = ledger.get("plan_progress") or {}
-        lines.append(f"計画: {prog.get('done', 0)}/{prog.get('total', len(plan))} 達成")
+        retired_done = as_int(ledger.get("plan_retired_done"), 0, 0, 999)
+        # 進捗は**今の plan の項目だけ**で数える。廃止した達成済みは減って見えるので、
+        # 消さずに別枠で明示する（実測: 1/3 だった達成が plan の差し替えで 0/3 に見えた）。
+        note = f"（廃止した達成済み {retired_done} 件は含みません）" if retired_done else ""
+        lines.append(f"計画: {prog.get('done', 0)}/{prog.get('total', len(plan))} 達成{note}")
         for item in plan:
             mark = "✅" if item.get("done") else "□"
             refs = "".join(f" #{x}" for x in (item.get("steps") or []))
@@ -7810,7 +7818,7 @@ def _http_make_handler(config: dict):
     else:
         allowed_hosts = {bind_host, "127.0.0.1", "localhost", "::1"}
         allowed_hosts.discard("")
-    # 空集合のときは「制限なし」なので判定を缓める（allowed_hosts が空なら常に通す）。
+    # 空集合のときは「制限なし」なので判定を緩める（allowed_hosts が空なら常に通す）。
     def _origin_allowed(headers) -> tuple[bool, str]:
         if not allowed_hosts:
             return True, ""
@@ -7848,12 +7856,12 @@ def _http_make_handler(config: dict):
 
         def _path_ok(self) -> bool:
             path = urllib.parse.urlparse(self.path).path
-            return path.rstrip("/") == config["path"].rstrip("/")
+            return path.rstrip("/") == _http_path(config).rstrip("/")
 
         def _guard(self) -> bool:
             """パス・認証・Origin/Host。通れば True、拒否したら応答を書いて False。"""
             if not self._path_ok():
-                self._error(404, -32601, f"unknown path: {self.path}（待受は {config['path']}）")
+                self._error(404, -32601, f"unknown path: {self.path}（待受は {_http_path(config)}）")
                 return False
             # Origin / Host の検証（MCP StreamableHTTP の仕様 MUST・DNS rebinding の防御）。
             # ブラウザからのクロスサイト呼び出しを体外から起こせないようにする（実測: 検証前は
@@ -7963,6 +7971,58 @@ def _http_make_handler(config: dict):
     return Handler
 
 
+def _http_path(config: dict) -> str:
+    """待受パス（キーが無い / None / 空 のときだけ既定）。
+
+    部分的な config（`{"host","port"}` だけ）でも **KeyError で全リクエストを無言で切らない**
+    ために、`config["path"]` の直引きはしない（実測: 直引きだと全リクエストが
+    `RemoteDisconnected` になり、サーバー側には traceback だけが残る）。
+    **明示された不正値は既定へ読み替えず例外にする**（下の `_http_port` と同じ理由）。
+    """
+    raw = config.get("path")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return HTTP_DEFAULT_PATH
+    if not isinstance(raw, str):
+        raise ValueError(f"path が不正です: {raw!r}（文字列。省略時は {HTTP_DEFAULT_PATH}）")
+    path = raw.strip()
+    return path if path.startswith("/") else "/" + path
+
+
+def _http_host(config: dict) -> str:
+    """待受ホスト（キーが無い / None / 空 のときだけ既定）。"""
+    raw = config.get("host")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return HTTP_DEFAULT_HOST
+    if not isinstance(raw, str):
+        raise ValueError(f"host が不正です: {raw!r}（文字列。省略時は {HTTP_DEFAULT_HOST}）")
+    return raw.strip()
+
+
+def _http_port(config: dict) -> int:
+    """待受ポート（キーが無い / None のときだけ既定。0 は OS に選ばせる正当な値）。
+
+    **明示された不正値を既定へ読み替えない**。`"not-a-port"` を既定（8765）で読み替えると、
+    利用者が指定したのと**違うポートで黙って待ち受ける**（クライアントは指定したポートへ繋ぐので
+    気づけない。実測 2026-10-27: この読み替えのせいで既存テストが 8765 で `serve_forever` に入り、
+    テストスイートが 51 分ハングした）。
+    """
+    raw = config.get("port")
+    if raw is None:
+        return HTTP_DEFAULT_PORT
+    bad = ValueError(f"port が不正です: {raw!r}（0〜65535 の整数。省略時は {HTTP_DEFAULT_PORT}）")
+    if isinstance(raw, bool):                       # bool は int の派生なので先に弾く
+        raise bad
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str) and raw.strip().isdigit():   # 全角数字は isdigit も int() も受ける
+        value = int(raw.strip())
+    else:                                           # "8765.7" / [] / "not-a-port" は切り捨てず拒否
+        raise bad
+    if not 0 <= value <= 65535:                     # 範囲外も**丸めずに拒否**（70000 → 65535 にしない）
+        raise bad
+    return value
+
+
 def _http_build_server(config: dict):
     """待受ソケットを作って返す（`serve_forever` は呼び出し側。テストが自前で止められるように分ける）。"""
     import http.server
@@ -7973,16 +8033,26 @@ def _http_build_server(config: dict):
         allow_reuse_address = False
         daemon_threads = True
 
-    return _Server((config["host"], config["port"]), _http_make_handler(config))
+    return _Server((_http_host(config), _http_port(config)), _http_make_handler(config))
 
 
 def serve_http(config: dict) -> None:
     """HTTP モードで待ち受ける（1 プロセスを複数クライアントで共有する）。"""
     try:
         server = _http_build_server(config)
+    except (TypeError, ValueError) as exc:
+        # 設定の不正は**起動前に**止める（不正値を既定へ読み替えて別のポートで待ち受けない）。
+        try:
+            sys.stderr.write(f"[{SERVER_NAME}] HTTP の設定が不正です: {exc}\n"
+                             f"  --host / --port / --path（または {HTTP_HOST_ENV} / {HTTP_PORT_ENV} / "
+                             f"{HTTP_PATH_ENV}）を確認してください。\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        raise SystemExit(2)
     except OSError as exc:
         try:
-            sys.stderr.write(f"[{SERVER_NAME}] HTTP を {config['host']}:{config['port']} で開始できません: {exc}\n"
+            sys.stderr.write(f"[{SERVER_NAME}] HTTP を {_http_host(config)}:{_http_port(config)} で開始できません: {exc}\n"
                              f"  同じポートで既に動いていませんか（1 プロセス共有が目的なので二重起動は不要です）。"
                              f"別ポートは --port / {HTTP_PORT_ENV} で指定できます。\n")
             sys.stderr.flush()
@@ -7991,7 +8061,7 @@ def serve_http(config: dict) -> None:
         raise SystemExit(2)
     host, port = server.server_address[0], server.server_address[1]
     try:
-        sys.stderr.write(f"[{SERVER_NAME}] HTTP 待受 http://{host}:{port}{config['path']}"
+        sys.stderr.write(f"[{SERVER_NAME}] HTTP 待受 http://{host}:{port}{_http_path(config)}"
                          f"（token {'あり' if config.get('token') else 'なし'}・pid {os.getpid()}）\n")
         sys.stderr.flush()
     except Exception:

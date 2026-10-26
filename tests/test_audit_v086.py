@@ -221,9 +221,16 @@ class ServeHttpTest(unittest.TestCase):
     """`serve_http`（常駐 HTTP の入口）。"""
 
     def test_http_config_validation_rejects_bad_input(self):
-        """不正な設定でサーバーを立てない（例外が外へ漏れない）。"""
-        with self.assertRaises((ValueError, TypeError, KeyError)):
-            S.serve_http({"port": "not-a-port"})
+        """不正な設定でサーバーを立てない（例外が外へ漏れない）。
+
+        **`serve_http` は `serve_forever` で戻らない**ので、判定は入口の検証と SystemExit の両方で行う。
+        実測 2026-10-27: 不正な port を既定へ読み替える実装になっていたため、このテストが 8765 で
+        待ち受けて**テストスイートが 51 分ハング**した（`_http_build_server` を直接見る形に変えた）。
+        """
+        with self.assertRaises(ValueError):
+            S._http_build_server({"port": "not-a-port"})       # ソケットを作る前に落ちる
+        with self.assertRaises(SystemExit):
+            S.serve_http({"port": "not-a-port"})               # 入口は SystemExit(2) で止める
 
 
 class RenderSplitTest(unittest.TestCase):

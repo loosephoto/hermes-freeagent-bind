@@ -100,7 +100,7 @@ class EvidenceFillRateTest(unittest.TestCase):
         self.assertNotEqual(keys[0], keys[1], keys)
 
     def test_knowledge_lookup_passes_need_evidence_through(self):
-        """knowledge_lookup が need_evidence を opts 传到 backend へ渡す。"""
+        """knowledge_lookup が need_evidence を opts を backend へ渡す。"""
         seen = {}
 
         def fake(q, limit, opts):

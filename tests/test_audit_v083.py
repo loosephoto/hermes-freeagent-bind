@@ -10,7 +10,7 @@
 
 2. **fan-out で脱落する**（P3）: 同じホストのソースが 2 本以上あると、ローカル予算の
    取り合いで片方が落ちる（実測: 成功 1/4）。かつ GitHub の search 枠は
-   **repo/issue で共通**（`X-RateLimit-Resource: search`）なのに、予算キーが別였다。
+   **repo/issue で共通**（`X-RateLimit-Resource: search`）なのに、予算キーが別だった。
    → 予算キーは search 全体で 1 枠に揃える。
 
 3. **inflight の待ちに上限が無い**（P6-部分）: 同一キーの 2 番目が無制限に待つと、

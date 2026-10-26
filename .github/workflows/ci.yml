@@ -59,7 +59,9 @@ jobs:
       - name: Adoption meter runs
         run: python scripts/measure_adoption.py --sessions 5 || true
 
-      # AGENTS.md のゲート一覧に載っている検査を**全部** CI でも回す（規約 51）。
+      # AGENTS.md のゲート一覧のうち、**ネットワークとモデルを要さないもの**を CI でも回す。
+      # 例外は 2 つ（どちらもプロキシ / Free の枠が要るので CI では回さない）:
+      #   `measure_quality.py`（正答率の測定）と `FREEAGENT_PROBE_NET=1 smoke_stdio.py`（モデル生存）。
       # apply_proactive は既定表示のみ（設定を書き換えない）ので副作用なし。
       - name: Proactive config check (no writes)
         run: python scripts/apply_proactive.py --check
