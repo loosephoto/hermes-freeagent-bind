@@ -1690,6 +1690,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_HARNESS_WARN` | 1 | `0` で Hermes 以外のときの警告を止める（判定結果は `structuredContent.harness` に残る） |
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |
 | `FREEAGENT_SELECT_STRATEGY` | `quality` | 自動選抜の**並べ方**（`quality` / `catalog` / `least_busy`）。プロバイダ巡回の多様性は全 strategy 共通。`least_busy` は提供元の実行中本数が少ない順 |
+| `FREEAGENT_RANK_LATENCY` / `FREEAGENT_RANK_LATENCY_FULL_S` | 0 / 20.0 | **既定 off**（0 で従来どおり）。0〜1 の重みを入れると、平均所要が `FULL_S` 秒に達したモデルの品質点からその重みぶんを引く（比例・頭打ちあり）。**実測では改善しなかった**（off 24/24・5.38 秒/件 対 on 22/24・6.75 秒/件・n=24）ので既定 off のままを推奨（SPEC §6.25） |
 | `FREEAGENT_ROUTING` | `off` | `auto` で**タスク分類カスケード**（light / long / reason の層で並べ方を変える）。off は従来と同一 |
 | `FREEAGENT_ROUTING_TIER` | 空 | 測定用に層を強制（`light` / `long` / `reason`）。`measure_quality.py` と組み合わせて A/B する |
 | `FREEAGENT_ROUTING_LONG_CHARS` | 6000 | この文字数以上の入力を `long` 層とみなす（200〜200000） |

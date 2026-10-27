@@ -94,9 +94,23 @@ class TestRanking(unittest.TestCase):
 
 class TestObservationRecordsTheClass(unittest.TestCase):
     def setUp(self):
+        # **テストごとに状態ディレクトリを分ける**（v0.25.0 以降 `note_observation` はロックの内側で
+        # ディスクの最新を読んで足すので、モジュール共有のディレクトリだと前の実行の行が積み上がる）。
+        self._orig_state = os.environ.get("FREEAGENT_STATE_DIR")
+        self._tmp = tempfile.mkdtemp(prefix="fa-nooutput-case-")
+        os.environ["FREEAGENT_STATE_DIR"] = self._tmp
+        self.addCleanup(lambda: __import__("shutil").rmtree(self._tmp, ignore_errors=True))
+        self.addCleanup(self._restore_state)
         S._STATS.clear()
         S._STATS.update({"models": {}, "updated_at": 0.0})
         S._STATS_LOADED = False
+        S._STATS_MTIME = None
+
+    def _restore_state(self):
+        if self._orig_state is None:
+            os.environ.pop("FREEAGENT_STATE_DIR", None)
+        else:
+            os.environ["FREEAGENT_STATE_DIR"] = self._orig_state
 
     def test_no_output_lands_in_its_own_bucket(self):
         S.observe_call({"ref": "nous/x", "error": "空応答（nous/x）。max_tokens=400 を使い切った"},

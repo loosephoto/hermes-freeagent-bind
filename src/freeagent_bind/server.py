@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.26.0"
+SERVER_VERSION = "0.27.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -827,7 +827,14 @@ def _ensure_stats_loaded() -> None:
     with _STATS_LOCK:
         if _STATS_LOADED and (mtime is None or mtime == _STATS_MTIME):
             return
-        _STATS["models"] = _stats_read(path)
+        # **丸ごと置き換えない**。ディスクを土台にし、メモリ側の行は `updated_at` が新しいときだけ
+        # 採用する（読むだけで学んだ行を消さない・テストが直接入れた行も消えない）。
+        merged = _stats_read(path)
+        for ref, row in _STATS["models"].items():
+            cur = merged.get(ref)
+            if cur is None or as_float(row.get("updated_at"), 0.0) >= as_float(cur.get("updated_at"), 0.0):
+                merged[ref] = row
+        _STATS["models"] = merged
         _STATS_LOADED = True
         _STATS_MTIME = mtime
 
@@ -1060,11 +1067,39 @@ def _rank_latency_key(ref: str) -> float:
     return latency if latency is not None else math.inf
 
 
+# 遅延ペナルティ（**既定 off**・v0.27.0）。`FREEAGENT_RANK_LATENCY` に 0〜1 の重みを入れたときだけ
+# 品質点から引く。品質統計（§2.2）は「正しく答えたか」しか見ていないので、**同じ正答率なら速い方**を
+# 選びたい場面（`map` のように件数が多い呼び出し）では順位が遅いモデルに固定され得る。
+# **既定を静かに変えない**ため、重み 0 では `_rank_score` の値を 1 ミリも変えない（`_latency_penalty`
+# が厳密に 0.0 を返す）＝オフの並びは v0.26.0 と同一。
+RANK_LATENCY_W = max(0.0, min(1.0, _env_float("FREEAGENT_RANK_LATENCY", 0.0)))
+RANK_LATENCY_FULL_S = max(1.0, _env_float("FREEAGENT_RANK_LATENCY_FULL_S", 20.0))
+
+
+def _latency_penalty(ref: str) -> float:
+    """平均所要が `RANK_LATENCY_FULL_S` 秒に達したとき、品質点から `RANK_LATENCY_W` を引く。
+
+    比例（頭打ちあり）にするのは、**極端に遅いモデル 1 体が順位を総取りしない**ため
+    （20 秒を超えても引く量は増えない）。観測が無いモデルは 0（探索を妨げない）。
+    """
+    if RANK_LATENCY_W <= 0.0:
+        return 0.0
+    latency_ms = model_mean_latency(ref)
+    if latency_ms is None:
+        return 0.0
+    share = min(1.0, (float(latency_ms) / 1000.0) / RANK_LATENCY_FULL_S)
+    return RANK_LATENCY_W * share
+
+
 def rank_models(refs: list[str]) -> list[str]:
-    """品質順。観測が少ないモデルへ探索ボーナスを与え、新しい Free モデルが試されない問題を防ぐ。"""
+    """品質順。観測が少ないモデルへ探索ボーナスを与え、新しい Free モデルが試されない問題を防ぐ。
+
+    `FREEAGENT_RANK_LATENCY` が 0（既定）なら **v0.26.0 と同じ並び**（同点は平均所要の速い順）。
+    """
     if not RANK_ENABLED:
         return list(refs)
-    return sorted(refs, key=lambda r: (-_rank_score(r), _rank_latency_key(r), r))
+    return sorted(refs, key=lambda r: (-(_rank_score(r) - _latency_penalty(r)),
+                                       _rank_latency_key(r), r))
 
 
 def diverse_order(refs: list[str]) -> list[str]:
