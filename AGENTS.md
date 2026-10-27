@@ -510,7 +510,9 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     （行に `coalesced`、要約に `coalesced_calls`、本文に 1 行）。
 
 68. **`MAX_WORKERS` は呼び出し単位でありプロセス全体のスレッド上限ではない**。提供元ごとの
-    `PROVIDER_GATE` はプロセス内で共有されるが、複数の `run_parallel` はそれぞれプールを作る。
+    `PROVIDER_GATE` はプロセス内で共有され、既定の `run_parallel` はそれぞれプールを作る。任意の
+    公平スケジューラは LLM の重複候補のない呼び出しだけを共有し、重複候補や対象外経路は従来プールへ
+    退避するため、こちらも厳密なプロセス全体の上限ではない。合流待ち上限を保ち、事前に畳まない。
     `scripts/measure_parallel_load.py` はオフラインの模擬 I/O で重なりと期限後の残留を測る。
     計測器の負荷を含み、実 API・提供元ゲート・プロセス全体の RSS を測るものではない。
 

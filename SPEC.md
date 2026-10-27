@@ -275,6 +275,25 @@
 
 並列処理の重なりは `python scripts/measure_parallel_load.py --calls 8 --jobs 8 --workers 8 --delay 0.5 --budget 0.1` で測れる。実際の `run_parallel` を使うが worker は模擬 I/O であり、提供元ゲートや API は使わない。JSON の `active_workers_at_return` は回収打ち切り後も実行中の数、`active_workers_after_drain` は終了待ち後の数。`python_peak_bytes` は `tracemalloc` の Python 管理メモリで、プロセス全体の RSS ではない。計測器の負荷も含むため実運用の性能とは区別する。
 
+### 4.5.1 任意の公平スケジューラ
+
+`FREEAGENT_FAIR_SCHEDULER=1` の場合、`ask_many`、`ask_map`、`tool_map` の重複候補のない LLM ジョブは `fair_scheduler.FairScheduler` に投入する。最初の指定先の提供元ごとにレーンを分けて要求ごとに順番回しし、要求内の `MAX_WORKERS` を維持する。各レーンのワーカー上限は `FREEAGENT_FAIR_WORKERS`（既定 `MAX_WORKERS`）で、必要に応じて生成する。全レーン合計の未開始ジョブの上限は `FREEAGENT_FAIR_MAX_PENDING`（既定 1024）。別の提供元へのフォールバックは元レーン内で実行するため、枠待ちを完全には分離できない。上限超過は要求全体を `{error, dropped: true, overloaded: true}` として返す。
+
+未修飾のモデル名や未知の接頭辞はカタログ解決を前倒しせず、要求全体を従来方式に退避する（未知名ごとにスレッドが増えない）。同一要求内の合流待機者が共有ワーカーを埋めることを避けるため、map は生成後プロンプト、ask_map は `(ref, prompt)`、ask_many は ref に重複がある場合、要求全体を従来の呼び出し単位プールに通す。これにより合流待ち上限切れ時の再取得も従来どおり。**共有ワーカー数はプロセス全体のスレッド上限ではない**。対象外の処理や重複を含む呼び出しには適用されず、提供元ゲートも従来どおり別途適用される。
+
+期限切れ・回収側例外では未開始の共有ジョブを取り除く。既に始まった処理は停止せず終了までワーカー枠を保持する。共有スケジューラは実行時に遅延作成し、既定では無効。`freeagent_map` 自体には `call_budget()` が渡されないため、その予算制限は自動追加されない。
+
+**限定的な実プロバイダー試験（開発環境、2026-10-28）**: `FREEAGENT_MAX_WORKERS=1`、`FREEAGENT_FAIR_WORKERS=1`、provider gate=1、ABBA 順で公平オフ／オン各2ラウンド。各 provider 比較で、3件バッチの上流処理中に別要求として短い1件を投入した。**公平オフ／オンの各アーム8件、1 provider比較あたり計16件（Nous と OpenRouter の2比較で計32件）**の推論リクエストが全件 HTTP 200。各アームの8出力はすべて期待値に一致し、429なし。
+
+| 提供元 / モデル | 公平 | 短問中央値 | 3件バッチ中央値 |
+|---|---|---:|---:|
+| Nous / `nous/poolside/laguna-s-2.1:free` | オフ | 7.200秒 | 12.644秒 |
+| 同上 | オン | 5.546秒 | 11.406秒 |
+| OpenRouter / `openrouter/cohere/north-mini-code:free` | オフ | 1.708秒 | 4.034秒 |
+| 同上 | オン | 1.468秒 | 4.287秒 |
+
+各セル n=2。Nous の短問・バッチには小さな改善、OpenRouter は短問に小差がある一方でバッチは公平オンが少し遅い。モデル・提供元・時点に依存する小標本なので、プロバイダー一般の性能向上や p95 の証拠にはならない。以前の Nous 8ラウンド統合表は gate=2 と gate=1 の結果を混在させていたため撤回し、別条件を合算しない。公平スケジューラは既定オフの実験的 opt-in とし、この測定だけで既定値や品質選抜を変えない。
+
 ### 4.6 進捗通知（`notifications/progress`・v0.19.0）
 
 並列の回収 1 件ごとに `notifications/progress` を 1 件送る。**送るのは、クライアントが要求に

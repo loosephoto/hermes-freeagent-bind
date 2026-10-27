@@ -85,7 +85,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.20.1"
+SERVER_VERSION = "0.21.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -3302,8 +3302,80 @@ def call_budget() -> "Deadline | None":
     return Deadline(CALL_BUDGET_S) if CALL_BUDGET_S > 0 else None
 
 
+# ---------------------------------------------------------------- §4.1 任意の公平な共有スケジューラ
+FAIR_ENABLED = as_flag(os.environ.get("FREEAGENT_FAIR_SCHEDULER", "0"))
+FAIR_WORKERS = max(1, min(32, _env_int("FREEAGENT_FAIR_WORKERS", MAX_WORKERS)))
+FAIR_MAX_PENDING = max(1, min(10000, _env_int("FREEAGENT_FAIR_MAX_PENDING", 1024)))
+_FAIR_SCHEDULER = None
+_FAIR_SCHEDULER_LOCK = threading.Lock()
+
+
+def _get_fair_scheduler():
+    global _FAIR_SCHEDULER
+    with _FAIR_SCHEDULER_LOCK:
+        if _FAIR_SCHEDULER is None:
+            from .fair_scheduler import FairScheduler
+            _FAIR_SCHEDULER = FairScheduler(FAIR_WORKERS, FAIR_MAX_PENDING)
+        return _FAIR_SCHEDULER
+
+
+def _fair_eligible(jobs, keys, providers):
+    if not FAIR_ENABLED or keys is None or len(keys) != len(jobs):
+        return False
+    # Unknown/unqualified refs require catalogue lookup; retain legacy execution
+    # rather than constructing unbounded arbitrary provider lanes.
+    if providers is not None and (len(providers) != len(jobs) or not all(providers)):
+        return False
+    try:
+        return len(set(keys)) == len(keys)
+    except TypeError:
+        return False
+
+
+def _run_fair(jobs, worker, workers, deadline, providers):
+    from .fair_scheduler import QueueFullError
+
+    def guarded(job):
+        if deadline is not None and deadline.expired:
+            return _dropped_result(deadline, "未実行")
+        return worker(job)
+
+    scheduler = _get_fair_scheduler()
+    try:
+        batch = scheduler.submit_batch(guarded, jobs, workers, providers)
+    except QueueFullError:
+        return [{"error": "共有実行キューの上限に達したため実行しませんでした",
+                 "dropped": True, "overloaded": True} for _ in jobs]
+    out: list = [None] * len(jobs)
+    futures = {future: i for i, future in enumerate(batch.futures)}
+    done = 0
+    timed_out = False
+    completed = False
+    try:
+        for future in as_completed(futures, timeout=None if deadline is None else deadline.remaining()):
+            i = futures[future]
+            try:
+                out[i] = future.result()
+            except Exception as exc:
+                out[i] = {"error": f"{type(exc).__name__}: {exc}"}
+            done += 1
+            progress_emit(done, len(jobs), progress_label(jobs[i]))
+        completed = True
+    except FuturesTimeout:
+        timed_out = True
+    finally:
+        if not completed:
+            scheduler.cancel_batch(batch)
+    if timed_out:
+        for i, value in enumerate(out):
+            if value is None:
+                out[i] = _dropped_result(deadline, "回収を打ち切り")
+        progress_emit(done, len(jobs), "予算切れで打ち切りました")
+    return out
+
+
 def run_parallel(jobs: list, worker, max_workers: int | None = None,
-                 deadline: "Deadline | None" = None) -> list:
+                 deadline: "Deadline | None" = None, *, fair_keys=None, fair_providers=None) -> list:
     """jobs を並列に処理して**入力順**で返す。並列化が効くのは I/O 待ち（API 待ち）である点に注意。
 
     `deadline` を渡すと、**残り時間で回収を打ち切る**（未回収の位置は `dropped: true` の dict で埋める）。
@@ -3321,6 +3393,8 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None,
     _coalescer = _call_coalescer()
     if _coalescer is not None:
         worker = _coalescer_worker(worker, _coalescer)
+    if _fair_eligible(jobs, fair_keys, fair_providers):
+        return _run_fair(jobs, worker, workers, deadline, fair_providers)
     if workers == 1:
         for i, job in enumerate(jobs):
             if deadline is not None and deadline.expired:
@@ -3377,7 +3451,8 @@ def ask_many(refs: list[str], prompt: str, *, system: str = "", max_tokens: int 
         list(refs),
         lambda ref: call_model(ref, prompt, system=system, max_tokens=max_tokens,
                                temperature=temperature, kind=kind, claims=claims),
-        max_workers=min(len(refs), MAX_WORKERS), deadline=call_budget())
+        max_workers=min(len(refs), MAX_WORKERS), deadline=call_budget(), fair_keys=refs,
+        fair_providers=[split_ref(ref)[0] for ref in refs])
 
 
 def ask_map(pairs: list[tuple[str, str]], *, system: str = "", max_tokens: int = 800,
@@ -3387,7 +3462,9 @@ def ask_map(pairs: list[tuple[str, str]], *, system: str = "", max_tokens: int =
         list(pairs),
         lambda pair: call_model(pair[0], pair[1], system=system, max_tokens=max_tokens,
                                 temperature=temperature, kind=kind),
-        max_workers=min(len(pairs), MAX_WORKERS), deadline=call_budget())
+        max_workers=min(len(pairs), MAX_WORKERS), deadline=call_budget(),
+        fair_keys=[(ref, prompt) for ref, prompt in pairs],
+        fair_providers=[split_ref(ref)[0] for ref, _ in pairs])
 
 
 # ================================================================ §5 知識バックエンド
@@ -5382,7 +5459,8 @@ def tool_map(args: dict) -> dict:
     # 進捗のラベルに使うので **(要素, プロンプト) の組**で流す（プロンプト全体をラベルにしない）
     pairs = list(zip(items, prompts))
     results = run_parallel(pairs, lambda pair: call_model(model, pair[1], max_tokens=max_tokens, kind="map"),
-                           max_workers=MAX_WORKERS)
+                           max_workers=MAX_WORKERS, fair_keys=prompts,
+                           fair_providers=[split_ref(model)[0]] * len(pairs))
     rows = []
     for item, res in zip(items, results):
         row = {"item": truncate(item, 200),
@@ -7821,25 +7899,30 @@ def serve() -> None:
         except Exception:
             pass
     pool = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2)
-    for raw in iter_stdin_lines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            msg = json.loads(raw)
-        except Exception:
-            respond(None, error={"code": -32700, "message": "parse error"})
-            continue
-        _debug("in", msg)
-        if isinstance(msg, list):
-            if not msg:
+    try:
+        for raw in iter_stdin_lines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                respond(None, error={"code": -32700, "message": "parse error"})
+                continue
+            _debug("in", msg)
+            if isinstance(msg, list):
+                if not msg:
+                    respond(None, error={"code": -32600, "message": "invalid request"})
+                with bound_progress(_stdio_progress_maker):
+                    _dispatch_batch(msg)
+            elif isinstance(msg, dict):
+                _dispatch_message(msg, pool)
+            else:
                 respond(None, error={"code": -32600, "message": "invalid request"})
-            with bound_progress(_stdio_progress_maker):
-                _dispatch_batch(msg)
-        elif isinstance(msg, dict):
-            _dispatch_message(msg, pool)
-        else:
-            respond(None, error={"code": -32600, "message": "invalid request"})
+    finally:
+        # Drain already-dispatched calls before interpreter exit starts closing
+        # the optional scheduler or the stdlib ThreadPoolExecutor registry.
+        pool.shutdown(wait=True)
 
 
 # ================================================================ §10 HTTP (StreamableHTTP)
