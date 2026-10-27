@@ -304,6 +304,32 @@ HF はモデル ID の末尾に `:提供元` を付けて経路を固定でき�
 - 合流を待つ側には上限があります（`FREEAGENT_COALESCE_WAIT`）。超えたら**待たずに自分で取りに行く**ので、
   固まることはありません。`FREEAGENT_COALESCE=0` で丸ごと止められます。
 
+### 🪜 タスクの重さでモデルを選び分ける（タスク分類カスケード・任意）
+
+**既定は off**です。有効にすると、呼び出しの形から層を決めて並べ方を変えます（`FREEAGENT_ROUTING=auto`）。
+
+| 層 | いつ選ばれるか | 並べ方 |
+|---|---|---|
+| `light` | `map` / `ask` で `max_tokens` が小さい（既定 400 以下）短い入力 | 実績のある**速い**モデルから |
+| `long` | 入力が長い（既定 6,000 文字以上） | 途中で**打ち切られにくい**モデルから |
+| `reason` | それ以外（panel / consult / grounded / think の検証） | 品質順（従来と同じ） |
+
+- **分類のために余分なモデル呼び出しはしません**（呼ぶと枠と待ち時間を使うだけなので、入力の形で決めます）。
+- 迷ったら `reason`（品質順）に倒します＝層を分けたことで品質が落ちる事故を避ける設計です。
+- 選んだ層は結果の `selection.cascade_tier` に出ます（`off` のときも `"off"`）。
+- A/B を取るときは層を強制できます: `FREEAGENT_ROUTING_TIER=light` など（未知の値は無視）。
+
+**実測（探索的・n=2・各条件 2 反復・実モデル 7 体・Free 枠）**: `map`（3 要素の抽出・`max_tokens` 200）で
+
+| | 選ばれたモデル | 壁時計（中央値） | 抽出の一致 |
+|---|---|---|---|
+| off | `laguna-s-2.1` | 17.0 秒 | 6/6 |
+| `auto`（light 層） | `solar-mini4`（暖機 0.8 秒の最速） | **10.8 秒（−37%）** | 6/6 |
+
+`panel`（reason 層）は**選抜が off と同一**（`solar-mini4` + `laguna-s`）で、壁 3.8 → 3.5 秒・正答 2/2 のまま
+＝層を分けても品質側の挙動は変わらない。**n=2 の小標本なので方向づけの結果**として扱い、
+既定は off のまま（`auto` にするかは各自の在庫と用途で決める）。
+
 ### 🔗 回答を 1 つに統合する（`freeagent_panel` の `refine`）
 
 `refine: true` を付けると、参加したモデルの回答を**別のモデルが 1 つに統合**します（MoA の集約層）。
@@ -1637,6 +1663,11 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_HARNESS_WARN` | 1 | `0` で Hermes 以外のときの警告を止める（判定結果は `structuredContent.harness` に残る） |
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |
 | `FREEAGENT_SELECT_STRATEGY` | `quality` | 自動選抜の**並べ方**（`quality` / `catalog` / `least_busy`）。プロバイダ巡回の多様性は全 strategy 共通。`least_busy` は提供元の実行中本数が少ない順 |
+| `FREEAGENT_ROUTING` | `off` | `auto` で**タスク分類カスケード**（light / long / reason の層で並べ方を変える）。off は従来と同一 |
+| `FREEAGENT_ROUTING_TIER` | 空 | 測定用に層を強制（`light` / `long` / `reason`）。`measure_quality.py` と組み合わせて A/B する |
+| `FREEAGENT_ROUTING_LONG_CHARS` | 6000 | この文字数以上の入力を `long` 層とみなす（200〜200000） |
+| `FREEAGENT_ROUTING_LIGHT_MAX_TOKENS` | 400 | `map` / `ask` でこの `max_tokens` 以下なら `light` 層（16〜4000） |
+| `FREEAGENT_ROUTING_LIGHT_MIN_QUALITY` | 0.5 | `light` 層で先頭に置く最低品質（これを割ったモデルは速くても後ろ） |
 | `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama,zai,mistral,modelscope,cerebras,sambanova,novita,siliconflow,longcat,opencode` | 一覧に出すプロバイダと優先順。**末尾の 6 社は v0.12.0 の追加分**（オプション）。確認変数が無い間は通信しない |
 | `FREEAGENT_AUTH_TTL` | 900 | 認証失敗を覚えて自動選抜から外す時間（秒） |
 | `FREEAGENT_PROBE_TIMEOUT` | 25.0 | 生存確認 1 件の読み取りタイムアウト（秒） |

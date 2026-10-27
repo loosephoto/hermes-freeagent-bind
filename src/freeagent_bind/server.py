@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.22.0"
+SERVER_VERSION = "0.23.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -1019,12 +1019,146 @@ def selection_strategy() -> str:
     return want if want in SELECT_STRATEGIES else "quality"
 
 
+# ---------------------------------------------------------------- §3.7 タスク分類カスケード
+#
+# 「どの層のモデルに当てるか」を**呼び出しの形から決定的に**決める（分類のための余分な LLM 呼び出しを
+# しない。1 回分類すると、その分だけ枠・クォータ・待ち時間を使う）。
+#   * light  … 抽出・分類・要約（`map` / `ask` かつ max_tokens が小さい短い入力）→ **平均所要時間の速い順**
+#   * long   … 長い入力を渡す呼び出し → **打ち切り（trunc）の率が低い順**（長文では切れた回答が使い物にならない）
+#   * reason … それ以外（panel / consult / grounded / think の検証など）→ **品質順**（v0.21.0 までと同じ）
+#
+# **既定は off**（`FREEAGENT_ROUTING=auto` で有効）。off のときは並びを 1 ミリも変えない
+# （`tests/test_routing.py` が「off は従来と同一の並び」を固定する）。
+# 測定用に層を**強制**できる（`FREEAGENT_ROUTING_TIER=light|long|reason`。
+# `scripts/measure_quality.py --select-strategy quality` と組み合わせて A/B を取る）。
+ROUTING_ENV = "FREEAGENT_ROUTING"
+ROUTING_TIER_ENV = "FREEAGENT_ROUTING_TIER"
+ROUTING_TIERS = ("light", "long", "reason")
+ROUTING_LONG_CHARS = max(200, min(200000, _env_int("FREEAGENT_ROUTING_LONG_CHARS", 6000)))
+ROUTING_LIGHT_MAX_TOKENS = max(16, min(4000, _env_int("FREEAGENT_ROUTING_LIGHT_MAX_TOKENS", 400)))
+ROUTING_LIGHT_MIN_QUALITY = max(0.0, min(1.0, _env_float("FREEAGENT_ROUTING_LIGHT_MIN_QUALITY", 0.5)))
+# 層はスレッドローカルに置く（**選抜は呼び出し側スレッドで走る**。`run_parallel` のワーカーではない）。
+_ROUTING_LOCAL = threading.local()
+
+
+def routing_enabled() -> bool:
+    """`FREEAGENT_ROUTING` が auto のときだけ層分けする（既定 off）。"""
+    return (os.environ.get(ROUTING_ENV) or "off").strip().lower() in ("auto", "on", "tier", "1", "true")
+
+
+def forced_tier() -> str:
+    """測定用の強制層。未指定・未知は空文字。"""
+    want = (os.environ.get(ROUTING_TIER_ENV) or "").strip().lower()
+    return want if want in ROUTING_TIERS else ""
+
+
+def route_tier(kind: str, text_chars: int, max_tokens: int) -> str:
+    """呼び出しの形から層を決める（決定的）。off なら `"off"`。
+
+    `kind` はツール名（`freeagent_map` など）。長さは**渡す文字列の合計**、`max_tokens` は指定値
+    （未指定は 0）。**迷ったら reason**（品質順）に倒す — 層を分けたことで品質が落ちる事故を避ける。
+    """
+    forced = forced_tier()
+    if forced:
+        return forced
+    if not routing_enabled():
+        return "off"
+    if text_chars >= ROUTING_LONG_CHARS:
+        return "long"
+    name = as_str(kind).lower()
+    # **`freeagent_ask` は対象外**: あれは `default_model()` を 1 回呼ぶだけで選抜を通らない（実測）。
+    # 層は「選抜される呼び出し」にだけ意味がある（map / panel / grounded / fanout / agent）。
+    if name == "freeagent_map" and 0 < max_tokens <= ROUTING_LIGHT_MAX_TOKENS \
+            and text_chars < ROUTING_LONG_CHARS // 2:
+        return "light"
+    return "reason"
+
+
+# 長さの判定に使う引数（**ツールごとに名前が違う**ので、代表的な本文キーだけを数える）。
+ROUTING_TEXT_KEYS = ("prompt", "question", "thought", "text", "query", "draft", "main_reply",
+                     "items", "prompts", "plan", "evidence")
+
+
+def _routing_text_chars(args: dict) -> int:
+    """渡す本文の合計文字数（文字列と文字列の配列だけを数える）。型が違う値は数えない。"""
+    total = 0
+    for key in ROUTING_TEXT_KEYS:
+        value = args.get(key)
+        if isinstance(value, str):
+            total += len(value)
+        elif isinstance(value, list):
+            total += sum(len(item) for item in value if isinstance(item, str))
+    return total
+
+
+def _routing_scope(tier: str) -> str:
+    """現在のスレッドに層を置き、直前の値を返す（呼び出し側が戻せるように）。"""
+    previous = getattr(_ROUTING_LOCAL, "tier", "")
+    _ROUTING_LOCAL.tier = tier
+    return previous
+
+
+def current_tier() -> str:
+    """いまのスレッドの層（未設定は空文字）。"""
+    return getattr(_ROUTING_LOCAL, "tier", "")
+
+
+def model_mean_latency(ref: str) -> float | None:
+    """平均所要時間（ミリ秒）。観測が無ければ None（**推測で埋めない**）。"""
+    _ensure_stats_loaded()
+    kinds = (_STATS["models"].get(ref) or {}).get("kinds") or {}
+    total_n = total_ms = 0.0
+    for row in kinds.values():
+        if not isinstance(row, dict):
+            continue
+        n = as_float(row.get("n"), 0.0)
+        ms = as_float(row.get("lat_ms"), 0.0)
+        if n > 0 and ms > 0:
+            total_n += n
+            total_ms += ms
+    return round(total_ms / total_n, 1) if total_n and total_ms else None
+
+
+def model_trunc_rate(ref: str) -> float | None:
+    """打ち切りの率（trunc / n）。観測が無ければ None。"""
+    _ensure_stats_loaded()
+    kinds = (_STATS["models"].get(ref) or {}).get("kinds") or {}
+    n = trunc = 0.0
+    for row in kinds.values():
+        if not isinstance(row, dict):
+            continue
+        n += as_float(row.get("n"), 0.0)
+        trunc += as_float(row.get("trunc"), 0.0)
+    return round(trunc / n, 4) if n else None
+
+
+def _tier_order(refs: list[str], tier: str) -> list[str]:
+    """層ごとの並び。**品質順（`rank_models`）を土台**にし、層の指標で前後させる。"""
+    quality_index = {ref: i for i, ref in enumerate(rank_models(refs))}
+    if tier == "light":
+        def light_key(ref: str):
+            quality = model_quality(ref)
+            observed = model_observations(ref) > 0
+            latency = model_mean_latency(ref)
+            # 0 = 品質の下限を満たす観測済み（速い順）/ 1 = 未観測 / 2 = 品質不足か観測なしの遅い側
+            lane = 0 if (observed and quality >= ROUTING_LIGHT_MIN_QUALITY and latency is not None) else (1 if not observed else 2)
+            return (lane, latency if latency is not None else 0.0, quality_index[ref])
+        return sorted(refs, key=light_key)
+    if tier == "long":
+        def long_key(ref: str):
+            rate = model_trunc_rate(ref)
+            # 打ち切りの少ない順。観測が無いモデルは「分からない」ので品質順の位置に置く（0.5 扱い）。
+            return (rate if rate is not None else 0.5, quality_index[ref])
+        return sorted(refs, key=long_key)
+    return list(refs)
+
+
 def _order_for_selection(refs: list[str]) -> list[str]:
     """自動選抜の並び順を strategy ごとに決める（`diverse_order` は呼び出し側で共通）。"""
     strategy = selection_strategy()
     if strategy == "catalog":
-        return list(refs)
-    if strategy == "least_busy":
+        base = list(refs)
+    elif strategy == "least_busy":
         per = (PROVIDER_GATE.report(list(PROVIDER_ORDER)).get("per_provider") or {})
         quality_index = {ref: i for i, ref in enumerate(rank_models(refs))}
         def busy_key(ref: str):
@@ -1032,8 +1166,12 @@ def _order_for_selection(refs: list[str]) -> list[str]:
             in_flight = (per.get(provider) or {}).get("in_flight") or 0
             # 空きが同じなら品質順（決定的。乱数を使わない）
             return (in_flight, quality_index.get(ref, len(refs)), ref)
-        return sorted(refs, key=busy_key)
-    return rank_models(refs)
+        base = sorted(refs, key=busy_key)
+    else:
+        base = rank_models(refs)
+    # §3.7 タスク分類カスケード。**層が選ばれていない（off）ときは 1 ミリも並べ替えない**。
+    tier = forced_tier() or current_tier()
+    return _tier_order(base, tier) if tier in ROUTING_TIERS else base
 
 
 def select_models(size: int, requested: list[str] | None = None, *,
@@ -1111,6 +1249,8 @@ def select_models(size: int, requested: list[str] | None = None, *,
         "available": len(available),
         "ranking": RANK_ENABLED,
         "selection_strategy": selection_strategy(),
+        # §3.7 の層（off のときは "off"）。選んだ根拠を隠さない（規約 8）。
+        "cascade_tier": forced_tier() or current_tier() or "off",
         "status": {r: model_status(r) for r in chosen},
         "notes": notes,
     }
@@ -7932,11 +8072,17 @@ def handle_tool_call(params: dict) -> dict:
         data["next_action"] = error_advice(data)
         return {"content": [{"type": "text", "text": f"未知のツール: {name}（無効化されている可能性）"}],
                 "structuredContent": data, "isError": True}
+    # §3.7 の層は**呼び出し側スレッド**に置く（選抜は handler の中の同じスレッドで走る。
+    # `run_parallel` のワーカーへは層を渡さない＝層は「誰を選ぶか」だけに効き、実行の分岐は作らない）。
+    previous_tier = _routing_scope(route_tier(as_str(name), _routing_text_chars(args),
+                                              as_int(args.get("max_tokens"), 0, 0, 1000000)))
     try:
         with progress_for(params), bound_coalescer():
             data = handler(args)
     except Exception as exc:  # ツールは絶対に例外を漏らさない
         data = {"error": f"internal error: {type(exc).__name__}: {exc}"}
+    finally:
+        _routing_scope(previous_tier)
     if not isinstance(data, dict):
         data = {"error": f"internal error: handler returned {type(data).__name__}"}
     is_error = bool(data.get("error"))

@@ -230,6 +230,32 @@
 **サーバーが実際に選ぶモデル**のまま A/B できる（未指定は従来どおり一覧の先頭から）。
 回帰は `tests/test_selection_strategies.py`（7 件・同点で揺れないことと多様性の維持を含む）。
 
+#### 4.3.2 タスク分類カスケード（v0.23.0・§3.7）
+
+「どの層のモデルに当てるか」を**呼び出しの形から決定的に**決める。**分類のための追加 LLM 呼び出しはしない**
+（1 回分類すると、その分だけ枠・クォータ・待ち時間を使う）。
+
+| 層 | 条件（`route_tier`） | 並べ方（`_tier_order`） |
+|---|---|---|
+| `light` | `freeagent_map` / `freeagent_ask` かつ `0 < max_tokens <= FREEAGENT_ROUTING_LIGHT_MAX_TOKENS`（既定 400）かつ本文が `ROUTING_LONG_CHARS/2` 未満 | 品質の下限（既定 0.5）を満たす**観測済み**を平均所要時間の速い順 → 未観測 → 品質不足/遅い |
+| `long` | 本文の合計が `FREEAGENT_ROUTING_LONG_CHARS`（既定 6000）以上 | **打ち切り率（trunc / n）の低い順**（観測が無いモデルは 0.5 として品質順の位置） |
+| `reason` | それ以外（`panel` / `consult` / `grounded` / `think` の検証など） | 品質順（`quality` strategy と同じ＝従来の挙動） |
+
+- **既定は off**（`FREEAGENT_ROUTING=auto` で有効）。off では並びを**1 ミリも変えない**
+  （`tests/test_routing.py` の `test_off_is_identical_to_baseline` が固定）。
+- 層は**呼び出し側スレッドのスレッドローカル**に置く（`_routing_scope`）。選抜は `handler` の中の同じ
+  スレッドで走るので層が見える。`run_parallel` のワーカーへは渡さない＝層は「誰を選ぶか」だけに効き、
+  実行の分岐は作らない。`handle_tool_call` は例外時も `finally` で層を戻す。
+- 測定用に層を強制できる（`FREEAGENT_ROUTING_TIER=light|long|reason`。未知の値は無視）。
+  `scripts/measure_quality.py --select-strategy quality` と組み合わせて A/B を取る。
+- 選んだ層は `select_models` の info の `cascade_tier` に載る（`off` のときも `"off"` を返す＝隠さない）。
+- **層が効くのは選抜を通るツールだけ**（`map` / `panel` / `grounded` / `fanout` / `agent`）。
+  `freeagent_ask` は `default_model()` を 1 回呼ぶだけで `select_models` を通らない（実測）ので、
+  `route_tier` の対象から外す（第 1 版の A/B がこれで空振りした）。
+- 実測（探索的・n=2・各条件 2 反復・実モデル 7 体）: `map`（3 要素・`max_tokens` 200）で
+  off = `laguna-s-2.1`・壁 17.0 秒・抽出一致 6/6 / `auto`(light) = `solar-mini4`・壁 **10.8 秒（−37%）**・6/6。
+  `panel`（reason）は選抜が off と同一で壁 3.8 → 3.5 秒・正答 2/2。**小標本なので方向づけ**として扱い、既定は off。
+
 ### 4.4 一覧の取得（§3.3・並列・締め切り・プロセス間キャッシュ）
 
 `fetch_provider_models` / `all_models` / `provider_status` は選抜の入口で、**サブLLM のツール
