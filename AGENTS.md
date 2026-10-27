@@ -498,6 +498,17 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     ので、**送り手は transport が張り、`run_parallel` は受け取った送り手に書くだけ**にする
     （`run_parallel` に transport の分岐を持ち込まない）。**進捗の送信失敗で本体の結果を壊さない**。
 
+67. **重複合流は「1 回のツール呼び出しの中の完全一致」だけにする**（v0.20.0・SPEC §4.7）。
+    キーは `(kind, ref, prompt, system, max_tokens, temperature, allow_fallback, free_only)` で、
+    **モデルが違えば畳まない**（`ask_many` の「同じ問いを N 体へ」は多様性が目的なので壊さない）。
+    **プロセスをまたぐ答えキャッシュにはしない**——`scripts/measure_quality.py --repeat` が同一応答を
+    引くと、ばらつきの測定が壊れる（測定器は `S.call_model` を直接呼ぶ＝`handle_tool_call` を通らない）。
+    **合流器はワーカーへ明示的に渡す**（`run_parallel` が `_coalescer_worker` で包む）。合流器は
+    呼び出し側スレッドのスレッドローカルにあり、ワーカーは別スレッドなので、**包まないと並列経路では
+    1 件も畳まれない**（実測。進捗通知は回収ループが呼び出し側スレッドで回るので包み不要＝非対称）。
+    **待つ側には上限**を置き、超えたら自分で取りに行く（規約 53 と同じ型）。**畳んだことは隠さない**
+    （行に `coalesced`、要約に `coalesced_calls`、本文に 1 行）。
+
 ## ライセンス
 
 MIT。データは各提供元の条件に従い、回答には出典を表示すること。

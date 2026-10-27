@@ -300,6 +300,38 @@
   `{"progressToken": "probe-token-1", "progress": 1.0, "total": 2.0}` → `2.0/2.0` を送り、
   トークン無しの同じ呼び出しでは **0 件**だった。
 
+### 4.7 同一実行内の重複合流（`_CallCoalescer`・v0.20.0）
+
+1 回のツール呼び出しの中で **完全に同じ呼び出し**（キーは `(kind, ref, prompt, system, max_tokens,
+temperature, allow_fallback, free_only)`）を 1 本だけ上流へ流し、結果を全員に配る。知識側の
+`_KB_INFLIGHT`（同じ問いの同時実行を 1 回の上流取得に畳む）と**同じ型**。
+
+| 層 | 実装 | 役割 |
+|---|---|---|
+| 束ねる範囲 | `handle_tool_call` が `bound_coalescer()` を張る | **ツール呼び出し 1 回ぶん**。プロセスをまたがない |
+| キー | 公開の入口 `call_model` が作り、`_call_model_uncached` へ渡す | **モデルが違えば畳まない**（`ask_many` の「同じ問いを N 体へ」の多様性を壊さない） |
+| 配り | `_CallCoalescer.run`（先頭が上流、以降は `threading.Event` で待って deepcopy を配る） | 待つ側に `coalesced: true` を付ける（規約 8: 隠さない） |
+
+- **ワーカーへは明示的に渡す**（`run_parallel` が `_coalescer_worker` で包む）。合流器は
+  **呼び出し側スレッド**のスレッドローカルにあり、ワーカーは**別スレッド**なので、包まないと
+  **並列経路では 1 件も畳まれない**（実測: 包む前は `items: ["alpha","alpha"]` が 2 回上流へ流れた）。
+  進捗通知（§4.6）は「回収ループが呼び出し側スレッドで回る」ので包み不要で、**ここが非対称**な点。
+- `run_parallel` は先頭のジョブから順にワーカーへ渡すので、**待つ側が走り出している時点で同じキーの
+  先頭は既に走っている**（待ち合いが循環しない）。安全網として `FREEAGENT_COALESCE_WAIT`
+  （既定 = `FREEAGENT_CALL_BUDGET`）を超えたら**待たずに自分で取りに行く**（規約 53 と同じ型。
+  上流 1 本と引き換えに固まらない）。
+- 先頭が例外を投げたら、待つ側には同じ失敗を配り、例外は先頭にだけ伝える（上流は 1 回のまま）。
+- 配る値は **deepcopy**（片方の書き換えが他方へ漏れない）。
+- 見せ方: 行に `coalesced: true`、`freeagent_map` / `freeagent_fanout` の要約に `coalesced_calls`、
+  `handle_tool_call` の本文に「上流へは 1 回だけ流しました」。
+- **測定器は畳まれない**: `scripts/measure_quality.py` は `S.call_model` を直接呼び
+  （`handle_tool_call` を通らない）ので、`--repeat` のばらつき測定は従来どおり。これは設計上の決定で、
+  プロセスをまたぐ答えキャッシュにすると測定が壊れる。
+- `FREEAGENT_COALESCE=0` で無効。回帰は `tests/test_coalesce.py`（14 件）。
+- 実測（stdio・実モデル・この環境）: `["alpha","alpha"]` → `coalesced_calls: 1`・壁 **1.3 秒** /
+  `["alpha","beta"]` → `coalesced_calls: 0`・壁 **4.4 秒** /
+  `["alpha","alpha","alpha","beta"]` → `coalesced_calls: 2`・行は 4 件（全件に回答）。
+
 ## 5. 呼び出し（§4）
 
 - 外部 HTTP は **接続タイムアウトと読み取りタイムアウトを分けて設定**する（既定 10 秒 / 180 秒）。`_urlopen` は §3 の共有 `_OPENER` を使う。これは `http.client` の接続クラスに `_ShortConnectMixin` を混ぜ、`HTTPHandler` / `HTTPSHandler` を差し替えたもので、**接続（TCP と TLS ハンドシェイク）の間だけ** `CONNECT_TIMEOUT` を適用し、接続直後に socket を `READ_TIMEOUT` へ切り替える。`build_opener` はサブクラスを既定ハンドラの置換と見なすので、リダイレクト（`HTTPRedirectHandler`）・プロキシ（`ProxyHandler`）・`HTTPError` の既定挙動は保たれる。環境障害（接続不可・timeout）は同じプロバイダ系列の fallback を打ち切り、全候補へ同じ不通を繰り返さない。

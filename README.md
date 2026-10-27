@@ -280,6 +280,28 @@ HF はモデル ID の末尾に `:提供元` を付けて経路を固定でき�
 こちらの同時数を下げても 0 にはなりません。枠は「自分で撒いた 429」を減らす一次防護であって、
 提供元の在庫が尽きている場合（例: `This model is no longer free`）は 404 として別に返ります。
 
+### ♻️ 同じ呼び出しは 1 回だけ流す（重複合流）
+
+`freeagent_map` や `freeagent_fanout` へ**同じ要素・同じプロンプト**を 2 つ以上渡すと、その分だけ
+同じモデルを何度も呼んでいました。いまは **1 回のツール呼び出しの中の完全な重複**を 1 本に畳みます。
+
+| 渡したもの | 上流の呼び出し | 結果（この環境・実モデル） |
+|---|---|---|
+| `items: ["alpha", "alpha"]` | **1 回** | 行は 2 件返る（壁 **1.3 秒**） |
+| `items: ["alpha", "beta"]` | 2 回 | 畳まない（壁 **4.4 秒**） |
+| `items: ["alpha", "alpha", "alpha", "beta"]` | 2 回 | 行は 4 件（`coalesced_calls: 2`） |
+
+- **畳むのは完全一致だけ**です。`(モデル, プロンプト, system, max_tokens, temperature, kind)` の
+  どれか 1 つでも違えば畳みません。**モデルが違えば畳まない**のが要点で、「同じ問いを N 体へ投げる」
+  `panel` / `consult` の多様性は壊れません。
+- 畳んだことは**隠しません**。行に `coalesced: true`、要約に `coalesced_calls: N`、本文に
+  「※ 同じ呼び出しが N 件あり、上流へは 1 回だけ流しました（同じ結果を配っています）」が出ます。
+- **1 回のツール呼び出しの中だけ**で畳みます（プロセスをまたぐ答えキャッシュではありません）。
+  `scripts/measure_quality.py --repeat` のばらつき測定は畳まれません（測定器は `S.call_model` を
+  直接呼ぶため）。
+- 合流を待つ側には上限があります（`FREEAGENT_COALESCE_WAIT`）。超えたら**待たずに自分で取りに行く**ので、
+  固まることはありません。`FREEAGENT_COALESCE=0` で丸ごと止められます。
+
 ### 🔗 回答を 1 つに統合する（`freeagent_panel` の `refine`）
 
 `refine: true` を付けると、参加したモデルの回答を**別のモデルが 1 つに統合**します（MoA の集約層）。
@@ -1564,6 +1586,8 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_MAX_WORKERS` | 8 | 推論の並列度＝同時に走らせる本数（1〜32）。**429 の抑止は提供元の枠が担う**（下の 3 行） |
 | `FREEAGENT_CALL_BUDGET` | 240 | **ツール 1 回の並列実行の壁時計予算**（秒・0 で無制限）。MCP クライアントの待ち（実測 300 秒）より短くしておく——300 秒で切られると**取れていた結果も失われる**。打ち切った分は `dropped: true` の脱落として返り、まだ走っていない呼び出しは取り消す |
 | `FREEAGENT_PROGRESS` | 1 | **進捗通知（`notifications/progress`）を送るか**（0 で無効）。クライアントが要求に `_meta.progressToken` を付けたときだけ送ります（仕様どおり。付けてこなければ 1 件も送りません）。送り先は transport ごと——stdio は stdout の 1 行、HTTP はセッションの SSE 待ち行列 |
+| `FREEAGENT_COALESCE` | 1 | **同一実行内の重複合流**（0 で無効）。1 回のツール呼び出しの中で `(モデル, プロンプト, system, max_tokens, temperature, kind)` が**完全に一致**した呼び出しは 1 本だけ上流へ流し、結果を配ります（行は全件返り、配った側に `coalesced: true` が付きます） |
+| `FREEAGENT_COALESCE_WAIT` | 240（= `FREEAGENT_CALL_BUDGET`） | 合流を待つ上限（秒）。超えたら**待たずに自分で取りに行きます**（固まらない側を選ぶ） |
 | `FREEAGENT_MAX_SUB_MODELS` | 8 | `size` の上限（1 呼び出しで参加させるモデル数・1〜32） |
 | `FREEAGENT_MAX_MODELS_PER_CALL` | 16 | `models` 配列・`models: ["all"]` の展開上限（1〜40） |
 | `FREEAGENT_PROVIDER_LIMIT` | 4 | 提供元ごとの同時実行枠の既定（実測済みの `nous` は 6） |

@@ -85,7 +85,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.19.0"
+SERVER_VERSION = "0.20.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -2897,6 +2897,28 @@ def call_model(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800
                temperature: float | None = None, kind: str = "ask",
                allow_fallback: bool = True, free_only: bool = True,
                timeout: float | None = None, claims: "_ModelClaims | None" = None) -> dict:
+    """1 つのサブLLM呼び出し（**同じツール呼び出しの中の完全な重複を 1 回に畳む**）。
+
+    畳むのは `bound_coalescer()` が張られているとき＝`handle_tool_call` の中だけ。実際の呼び出しは
+    `_call_model_uncached`。キーは `(kind, ref, prompt, system, max_tokens, temperature,
+    allow_fallback, free_only)` の完全一致で、**モデルが違えば畳まない**（多様性を壊さない）。
+    """
+    coalescer = _call_coalescer()
+    if coalescer is None:
+        return _call_model_uncached(ref, prompt, system=system, max_tokens=max_tokens,
+                                    temperature=temperature, kind=kind,
+                                    allow_fallback=allow_fallback, free_only=free_only,
+                                    timeout=timeout, claims=claims)
+    key = (kind, ref, prompt, system, max_tokens, temperature, allow_fallback, free_only)
+    return coalescer.run(key, lambda: _call_model_uncached(
+        ref, prompt, system=system, max_tokens=max_tokens, temperature=temperature, kind=kind,
+        allow_fallback=allow_fallback, free_only=free_only, timeout=timeout, claims=claims))
+
+
+def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens: int = 800,
+                         temperature: float | None = None, kind: str = "ask",
+                         allow_fallback: bool = True, free_only: bool = True,
+                         timeout: float | None = None, claims: "_ModelClaims | None" = None) -> dict:
     """1 つのサブLLM呼び出し。**例外を外へ漏らさず**、失敗も dict で返す。
 
     `claims` を渡すと、フォールバック先に**同じ呼び出しの他の枠が使っている／除外されたモデル**を
@@ -3159,6 +3181,98 @@ def progress_label(job) -> str:
     return text.strip().replace("\n", " ")[:40]
 
 
+# ---------------------------------------------------------------- 同一実行内の重複合流（重複排除）
+# 知識側の `_KB_INFLIGHT`（同じ問いの同時実行を 1 回の上流取得に畳む）と**同じ型**を推論側へ写したもの。
+# 畳むのは **1 回のツール呼び出しの中の、完全に同じ呼び出し**だけ。プロセスをまたぐキャッシュには
+# しない——`scripts/measure_quality.py --repeat` が同一応答を引くと、**ばらつきの測定が壊れる**ため
+# （測る道具は `S.call_model` を直接呼ぶので、そもそもここを通らない）。
+# **モデルが違えば畳まない**: `ask_many` の「同じ問いを N 体へ」は多様性が目的なので、キーに `ref` を
+# 含めて壊さない（実測の考え方は `tests/test_coalesce.py`）。
+COALESCE_ENABLED = as_flag(os.environ.get("FREEAGENT_COALESCE", "1"))
+COALESCE_WAIT_S = max(0.0, _env_float("FREEAGENT_COALESCE_WAIT", CALL_BUDGET_S))
+_COALESCE_LOCAL = threading.local()
+
+
+def _call_coalescer():
+    """このスレッドの合流器（ツール呼び出しの外では None＝畳まない）。"""
+    return getattr(_COALESCE_LOCAL, "coalescer", None)
+
+
+@contextlib.contextmanager
+def bound_coalescer():
+    """ツール呼び出し 1 回ぶんの合流器を張る（入れ子は元に戻す）。"""
+    prev = getattr(_COALESCE_LOCAL, "coalescer", None)
+    _COALESCE_LOCAL.coalescer = _CallCoalescer(COALESCE_WAIT_S) if COALESCE_ENABLED else None
+    try:
+        yield
+    finally:
+        _COALESCE_LOCAL.coalescer = prev
+
+
+def _coalescer_worker(worker, coalescer):
+    """ワーカーを包んで、合流器を**そのスレッド**にも見せる。
+
+    合流器は `bound_coalescer()` を張ったスレッド（= ツール呼び出しを実行しているスレッド）の
+    スレッドローカルにある。`run_parallel` はワーカーを**別スレッド**で走らせるので、包まないと
+    ワーカーから `_call_coalescer()` が見えず、**並列経路では重複が 1 件も畳まれない**
+    （進捗通知は「回収ループが呼び出し側スレッドで回る」ので包み不要——ここが非対称な点）。
+    """
+
+    def run(job):
+        prev = getattr(_COALESCE_LOCAL, "coalescer", None)
+        _COALESCE_LOCAL.coalescer = coalescer
+        try:
+            return worker(job)
+        finally:
+            _COALESCE_LOCAL.coalescer = prev
+
+    return run
+
+
+class _CallCoalescer:
+    """同じキーの呼び出しを 1 本だけ上流へ流し、結果を全員に配る。
+
+    待つ側には**上限**を置く（規約 53 と同じ型）。超えたら自分で取りに行く＝上流 1 本を無駄にする
+    代わりに固まらない。`run_parallel` は先頭のジョブから順にワーカーへ渡すので、待つ側が走り出して
+    いる時点で同じキーの先頭は**既に走っている**（だから待ち合いが循環しない）。
+    """
+
+    def __init__(self, wait_max: float = 0.0):
+        self._lock = threading.Lock()
+        self._slots: dict = {}
+        self._wait_max = max(0.0, float(wait_max))
+        self.saved = 0          # 上流を呼ばずに済んだ件数
+
+    def run(self, key, thunk):
+        with self._lock:
+            slot = self._slots.get(key)
+            first = slot is None
+            if first:
+                slot = {"event": threading.Event(), "value": None, "error": None}
+                self._slots[key] = slot
+        if first:
+            try:
+                value = thunk()
+            except BaseException as exc:        # 先頭が落ちたら、待っている側にはエラーを配る
+                slot["error"] = {"error": f"{type(exc).__name__}: {exc}"}
+                raise
+            else:
+                slot["value"] = value           # `finally` より先に置く（待つ側が読む前に）
+                return value
+            finally:
+                slot["event"].set()
+        if slot["event"].wait(self._wait_max or None):
+            if slot["error"] is not None:
+                return dict(slot["error"], coalesced=True)
+            value = copy.deepcopy(slot["value"])
+            if isinstance(value, dict):
+                value["coalesced"] = True       # 上流を呼んでいないことを**隠さない**（規約 8）
+            with self._lock:
+                self.saved += 1
+            return value
+        return thunk()                          # 待ち切れなかったので自分で取りに行く
+
+
 class Deadline:
     """並列実行の壁時計予算。`run_parallel` が**残り時間で回収を打ち切る**ために使う。
 
@@ -3202,6 +3316,11 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None,
         return [_dropped_result(deadline, "未実行") for _ in jobs]
     out: list = [None] * len(jobs)
     workers = max(1, min(max_workers or MAX_WORKERS, len(jobs)))
+    # 合流器は**呼び出し側スレッド**に張られている（ツール呼び出し 1 回ぶん）。ワーカーは別スレッド
+    # なので、ここで包んで同じ合流器を渡す（渡さないと並列経路で重複が畳まれない）。
+    _coalescer = _call_coalescer()
+    if _coalescer is not None:
+        worker = _coalescer_worker(worker, _coalescer)
     if workers == 1:
         for i, job in enumerate(jobs):
             if deadline is not None and deadline.expired:
@@ -4985,6 +5104,8 @@ def tool_fanout(args: dict) -> dict:
     rows = []
     for (ref, prompt), res in zip(pairs, results):
         row = {"model": ref, "prompt": truncate(prompt, 200)}
+        if res.get("coalesced"):
+            row["coalesced"] = True      # 同一実行内の重複を畳んだ（上流は 1 回だけ）
         if res.get("error"):
             row["error"] = res["error"]
         else:
@@ -4994,9 +5115,10 @@ def tool_fanout(args: dict) -> dict:
             row["truncated"] = res.get("truncated")
         rows.append(row)
     ok = sum(1 for r in rows if not r.get("error"))
+    coalesced_calls = sum(1 for r in rows if r.get("coalesced"))
     sequential = round(sum(as_float(r.get("latency_s"), 0.0) for r in results), 3)
     return {
-        "calls": len(rows), "ok": ok, "failed": len(rows) - ok,
+        "calls": len(rows), "ok": ok, "failed": len(rows) - ok, "coalesced_calls": coalesced_calls,
         "wall_s": wall, "sequential_estimate_s": sequential,
         "speedup": round(sequential / wall, 2) if wall > 0 else None,
         "results": rows, "selection": info, "concurrency": PROVIDER_GATE.report(refs),
@@ -5263,12 +5385,16 @@ def tool_map(args: dict) -> dict:
                            max_workers=MAX_WORKERS)
     rows = []
     for item, res in zip(items, results):
-        rows.append({"item": truncate(item, 200),
-                     "output": truncate(res.get("text") or "", 1500) if not res.get("error") else "",
-                     "error": res.get("error") or ""})
+        row = {"item": truncate(item, 200),
+               "output": truncate(res.get("text") or "", 1500) if not res.get("error") else "",
+               "error": res.get("error") or ""}
+        if res.get("coalesced"):
+            row["coalesced"] = True      # 同一実行内の重複を畳んだ（上流は 1 回だけ）
+        rows.append(row)
     ok = sum(1 for r in rows if not r["error"])
+    coalesced_calls = sum(1 for r in rows if r.get("coalesced"))
     data = {"model": model, "count": len(rows), "ok": ok, "failed": len(rows) - ok, "results": rows,
-            "items_dropped": items_dropped, "selection": selection}
+            "items_dropped": items_dropped, "coalesced_calls": coalesced_calls, "selection": selection}
     if as_flag(args.get("reduce")):
         joined = "\n".join(f"- {r['output']}" for r in rows if r["output"])
         if joined.strip():
@@ -7578,7 +7704,7 @@ def handle_tool_call(params: dict) -> dict:
         return {"content": [{"type": "text", "text": f"未知のツール: {name}（無効化されている可能性）"}],
                 "structuredContent": data, "isError": True}
     try:
-        with progress_for(params):
+        with progress_for(params), bound_coalescer():
             data = handler(args)
     except Exception as exc:  # ツールは絶対に例外を漏らさない
         data = {"error": f"internal error: {type(exc).__name__}: {exc}"}
@@ -7599,6 +7725,11 @@ def handle_tool_call(params: dict) -> dict:
         text = "表示の生成に失敗しました。structuredContent.error を確認してください。"
     if is_error:
         text = "⚠️ 実行は失敗しました。structuredContent.error を確認してください。\n" + text
+    coalesced = as_int(data.get("coalesced_calls"), 0, 0, 1000000) if not is_error else 0
+    if coalesced:
+        # 結果は全件返っているが、**上流へは 1 回しか流していない**（規約 8: 隠さない）。
+        text = text + (f"\n※ 同じ呼び出しが {coalesced} 件あり、上流へは 1 回だけ流しました"
+                       "（同じ結果を配っています）")
     try:
         text = harness_first_call(data) + text   # §8.6（最初の結果だけ）
     except Exception:
