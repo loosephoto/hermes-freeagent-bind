@@ -1641,7 +1641,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_FAIR_SCHEDULER` | 0 | `1` で LLM の並列呼び出しを要求単位で順番回しする共有スケジューラを試用。既定では従来方式。**厳密なプロセス全体の上限ではない**（上記） |
 | `FREEAGENT_FAIR_WORKERS` | `FREEAGENT_MAX_WORKERS` | 指定先の提供元ごとの共有ワーカー数（1〜32）。複数提供元では合算される |
 | `FREEAGENT_FAIR_MAX_PENDING` | 1024 | 共有スケジューラの未開始ジョブ数の上限（1〜10000）。上限を超える要求は実行せずエラーを返す |
-| `FREEAGENT_CALL_BUDGET` | 240 | **ツール 1 回の並列実行の壁時計予算**（秒・0 で無制限）。MCP クライアントの待ち（実測 300 秒）より短くしておく——300 秒で切られると**取れていた結果も失われる**。打ち切った分は `dropped: true` の脱落として返り、まだ走っていない呼び出しは取り消す |
+| `FREEAGENT_CALL_BUDGET` | 240 | **ツール呼び出し 1 回の壁時計予算**（秒・0 で無制限）。並列実行だけでなく、同じ呼び出しの中の後段（`panel` の `refine`・`map` の `reduce`・深い討論の 2 ラウンド目）も**残り時間を共有**します（v0.23.1）。MCP クライアントの待ち（実測 300 秒）より短くしておく——300 秒で切られると**取れていた結果も失われる**。打ち切った分は `dropped: true` の脱落として返り、まだ走っていない呼び出しは取り消す |
 | `FREEAGENT_PROGRESS` | 1 | **進捗通知（`notifications/progress`）を送るか**（0 で無効）。クライアントが要求に `_meta.progressToken` を付けたときだけ送ります（仕様どおり。付けてこなければ 1 件も送りません）。送り先は transport ごと——stdio は stdout の 1 行、HTTP はセッションの SSE 待ち行列 |
 | `FREEAGENT_COALESCE` | 1 | **同一実行内の重複合流**（0 で無効）。1 回のツール呼び出しの中で `(モデル, プロンプト, system, max_tokens, temperature, kind)` が**完全に一致**した呼び出しは 1 本だけ上流へ流し、結果を配ります（行は全件返り、配った側に `coalesced: true` が付きます） |
 | `FREEAGENT_COALESCE_WAIT` | 240（= `FREEAGENT_CALL_BUDGET`） | 合流を待つ上限（秒）。超えたら**待たずに自分で取りに行きます**（固まらない側を選ぶ） |

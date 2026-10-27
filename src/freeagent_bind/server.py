@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.23.0"
+SERVER_VERSION = "0.23.1"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -2396,8 +2396,22 @@ def free_model_refs(free_only: bool = True, chat_only: bool = False) -> list[str
 
 
 def default_model(free_only: bool = True) -> str:
+    """既定モデル。**品質統計・クールダウン・認証失敗を通した並び**の先頭を返す。
+
+    以前は `free_model_refs(chat_only=True)` の先頭（＝カタログ順の先頭）をそのまま返していた。
+    そのため `freeagent_ask`（モデル省略時）は、冷却中・観測上ボロボロ・認証で落ちている
+    モデルでもカタログの先頭なら選び続けた（実測: スコア 0.1 かつクールダウン中のモデルが
+    `select_models(1)` の 0.9 のモデルより先に返った）。`select_models` を通すと
+    `diverse_order` / 品質順 / 冷却の後回し / 認証失敗の除外が同じ規則で効く。
+    """
     if DEFAULT_MODEL:
         return DEFAULT_MODEL
+    try:
+        chosen, _info = select_models(1, free_only=free_only)
+    except Exception:                 # 選抜の失敗で呼び出し経路を止めない（規約 1）
+        chosen = []
+    if chosen:
+        return chosen[0]
     refs = free_model_refs(free_only=free_only, chat_only=True)
     return refs[0] if refs else ""
 
@@ -2427,6 +2441,9 @@ def resolve_ref(ref: str, free_only: bool = True) -> tuple[str, str]:
 
 _FALLBACK_STATUS = {402, 400, 401, 403, 404, 410, 429, 500, 502, 503, 504}
 _MAX_ATTEMPTS = 4
+# **モデルの責任で落ちた**ステータス（統計に残す）。429（提供元の一時制限）・枠待ち・クォータは
+# 提供元側の都合なので、モデルの成績としては記録しない（規約 21 の精神）。
+_MODEL_FAULT_STATUS = {400, 401, 402, 403, 404, 410, 500, 502, 503, 504}
 
 
 # 空応答の再試行（実測: max_tokens=220 で 3 体中 2 体が空。思考トークンで予算を使い切るモデルがある）。
@@ -2943,17 +2960,22 @@ def _call_once(provider: str, model: str, prompt: str, system: str,
 
 
 def _candidates(ref: str, free_only: bool = True) -> list[str]:
-    """指定先が冷却中でも、冷却外かつ認証可能な Free 代替モデルを並べる。"""
+    """指定先が冷却中でも、冷却外かつ認証可能な Free 代替モデルを並べる。
+
+    予備の並びは**選抜と同じ規則**（`diverse_order(_order_for_selection(...))`）にする。
+    以前はカタログ順だったため、実績のあるモデルより「まだ観測の無いカタログ前半のモデル」を
+    先に試し、外れるたびに 1 回ぶんの失敗待ちを払っていた（実測: スコア 0.95 の実績モデルが
+    0.2 の未検証モデルの後ろに並んだ）。
+    """
     cooling = cooling_refs()
     out = [ref] if ref and ref not in cooling else []
     if len(out) >= _MAX_ATTEMPTS:
         return out[:_MAX_ATTEMPTS]
     blocked = {name for name in PROVIDER_ORDER if provider_auth_blocked(name)}
-    for other in free_model_refs(free_only=free_only, chat_only=True):
-        if other == ref or other in cooling or other in out:
-            continue
-        if other.split("/", 1)[0] in blocked:
-            continue
+    pool = [other for other in free_model_refs(free_only=free_only, chat_only=True)
+            if other != ref and other not in cooling and other not in out
+            and other.split("/", 1)[0] not in blocked]
+    for other in diverse_order(_order_for_selection(pool)):
         out.append(other)
         if len(out) >= _MAX_ATTEMPTS:
             break
@@ -3098,6 +3120,20 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
     # 全部埋まっているときに「候補の数 × GATE_WAIT_S」待ってしまう（規約 27 を推論側にも適用）。
     wait_left = GATE_WAIT_S
     gate_wait = 0.0
+
+    def note_failure(cand: str, message: str) -> None:
+        """**フォールバックで落ちた候補**を統計へ残す（成功した候補だけ記録してはいけない）。
+
+        成功時だけ `observe_call` を呼ぶと、毎回 5xx / 404 で落ちるモデルは観測 0 件のまま
+        ＝`_rank_score` の探索ボーナス（`0.25·sd`）が最大で残り、**毎回いちばん最初に選ばれて
+        1 回ぶんの失敗待ちを発生させ続ける**（実測: `nous/meituan/longcat-2.0:free` が
+        `unobserved` のまま第 1 候補に居座り、毎回 `laguna-s-2.1` へフォールバックした）。
+        環境障害（`is_env_failure`）はモデルの成績ではないので `observe_call` が no-op にする。
+        """
+        if not message:
+            return
+        observe_call({"ref": cand, "error": message}, kind, "")
+
     for idx, cand in enumerate(attempts):
         if claims is not None and cand != ref and not claims.take(cand):
             avoided.append(cand)   # 他の枠が使用中／除外済み。独立性を守るため取らない
@@ -3149,6 +3185,9 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
                 if _is_auth_error(exc.status, exc.body):
                     note_provider_auth(c_provider, exc.status, exc.body or last_error)
                 _debug("auth_error", {"ref": cand, "status": exc.status})
+            # 落ちた候補を成績に残す（429 は提供元の一時制限なので除く）。
+            if exc.status in _MODEL_FAULT_STATUS:
+                note_failure(cand, last_error)
             if exc.status not in _FALLBACK_STATUS:
                 break
             continue
@@ -3156,6 +3195,7 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
             last_error = f"{type(exc).__name__}: {exc}"
             if is_env_failure(last_error):
                 break  # 環境障害では別モデルも同じ経路で失敗するため再試行を打ち切る
+            note_failure(cand, last_error)   # 環境障害ではない（JSON 壊れ等）＝モデル側の失敗
             continue
 
         text = result["text"]
@@ -3181,7 +3221,9 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
                 skipped.append(cand)
                 continue
 
-        out = {"ref": cand, "served_by": cand, "model": c_model, "provider": c_provider,
+        # `ref` は**呼び出し側が要求したモデル**、`served_by` が実際に答えたモデル。
+        # `ref` を cand で上書きすると `tool_ask` の「要求 → 代替へ回った」の表示が消える（実測）。
+        out = {"ref": ref, "served_by": cand, "model": c_model, "provider": c_provider,
                "text": text, "latency_s": result["latency_s"],
                "truncated": result["truncated"], "tokens": result["tokens"],
                "cot_leak": _cot_leak(text), "kind": kind,
@@ -3189,7 +3231,8 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
                "fallback": cand != ref, "skipped_cooling": skipped or None}
         PROVIDER_GATE.note_success(c_provider)   # 枠が縮んでいたら 1 本ずつ戻す
         clear_provider_auth(c_provider)   # 通ったら「認証で駄目」の記憶を消す
-        observe_call(out, kind, text)
+        # 統計・トレースは**答えたモデル**に付ける（要求元に付けると、代替で答えた事実が消える）。
+        observe_call(dict(out, ref=cand), kind, text)
         return out
 
     fail = {"error": last_error or "すべての候補で失敗しました", "ref": ref, "kind": kind,
@@ -3438,9 +3481,46 @@ class Deadline:
         return f"Deadline(total={self.total:.1f}s, remaining={self.remaining():.1f}s)"
 
 
+_BUDGET_LOCAL = threading.local()
+
+
+@contextlib.contextmanager
+def budget_scope(seconds: float | None = None):
+    """**ツール呼び出し 1 回ぶん**の予算をこのスレッドに張る（入れ子は元に戻す）。
+
+    以前は `call_budget()` が呼ばれるたびに新しい `Deadline` を作っていたため、
+    (a) `tool_map` / `tool_agent` は予算を渡しておらず打ち切りが効かない、
+    (b) `consult(debate_depth=deep)` はラウンドごとに満額（240 秒 × 2）を作る、
+    (c) `panel(refine)` / `map(reduce)` の後段は残り時間を見ない、
+    という 3 つの穴があった（実測: `CALL_BUDGET_S=0.1` で `tool_fanout` は 0.11 秒で打ち切るのに
+    `tool_map` は 0.50 秒完走、`consult(deep)` は 0.15 秒予算で 0.24 秒走った）。
+    1 回の呼び出しに 1 つの `Deadline` を共有すれば、MCP クライアントの 300 秒より手前で必ず返る。
+    """
+    previous = getattr(_BUDGET_LOCAL, "deadline", None)
+    limit = CALL_BUDGET_S if seconds is None else seconds
+    _BUDGET_LOCAL.deadline = Deadline(limit) if limit > 0 else None
+    try:
+        yield _BUDGET_LOCAL.deadline
+    finally:
+        _BUDGET_LOCAL.deadline = previous
+
+
 def call_budget() -> "Deadline | None":
-    """ツール 1 回ぶんの予算を作る（`FREEAGENT_CALL_BUDGET` が 0 なら None＝無制限）。"""
+    """このツール呼び出しの予算（`FREEAGENT_CALL_BUDGET` が 0 なら None＝無制限）。
+
+    呼び出し側スレッドに `budget_scope()` が張られていれば**その残り**を共有する（後段の
+    refine / reduce / 討論の 2 ラウンド目が満額を新しく作らない）。
+    """
+    shared = getattr(_BUDGET_LOCAL, "deadline", None)
+    if shared is not None:
+        return shared
     return Deadline(CALL_BUDGET_S) if CALL_BUDGET_S > 0 else None
+
+
+def budget_expired() -> bool:
+    """このツール呼び出しの予算を使い切ったか（後段を始めてよいかの判定）。"""
+    shared = getattr(_BUDGET_LOCAL, "deadline", None)
+    return bool(shared is not None and shared.expired)
 
 
 # ---------------------------------------------------------------- §4.1 任意の公平な共有スケジューラ
@@ -3574,7 +3654,8 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None,
 
 def _dropped_result(deadline: "Deadline | None", why: str) -> dict:
     """予算切れの位置を埋める dict（`dropped` を機械可読に立てる）。"""
-    total = f"{deadline.total:.0f} 秒" if deadline is not None else "予算"
+    # `:.0f` は 1 秒未満の予算を「0 秒」と表示する（実測: 0.25 秒 → 「予算（0 秒）」）。`:.3g` で刻む。
+    total = f"{deadline.total:.3g} 秒" if deadline is not None else "予算"
     return {"error": f"並列実行の予算（{total}）で{why}になりました（この結果は脱落です）",
             "dropped": True, "timed_out": True}
 
@@ -5375,6 +5456,10 @@ def _refine_answers(question: str, answers: list[dict], refs: list[str], args: d
     good = [a for a in answers if not a.get("error")]
     if not good:
         return {"model": None, "calls": 0, "error": "統合できる回答がありません（全員脱落）"}
+    if budget_expired():
+        # 予算を使い切った後の統合は 300 秒のクライアント待ちに当たるだけ（本体の結果は返す）。
+        return {"model": None, "calls": 0,
+                "error": "呼び出しの予算を使い切ったため統合を実行しませんでした（パネルの回答は有効です）"}
     requested = as_str(args.get("refine_model"))
     if requested:
         model, why = requested, "refine_model の指定"
@@ -5607,8 +5692,10 @@ def tool_map(args: dict) -> dict:
     prompts = [f"{instruction}\n\n---\n{truncate(item, 4000)}" for item in items]
     # 進捗のラベルに使うので **(要素, プロンプト) の組**で流す（プロンプト全体をラベルにしない）
     pairs = list(zip(items, prompts))
+    # **予算を渡す**（渡さないと 240 秒の打ち切りが効かず、遅い要素 1 件で 300 秒の
+    # クライアント待ちに当たって**取れていた結果まで失われる**。実測: 0.1 秒予算でも完走した）。
     results = run_parallel(pairs, lambda pair: call_model(model, pair[1], max_tokens=max_tokens, kind="map"),
-                           max_workers=MAX_WORKERS, fair_keys=prompts,
+                           max_workers=MAX_WORKERS, deadline=call_budget(), fair_keys=prompts,
                            fair_providers=[split_ref(model)[0]] * len(pairs))
     rows = []
     for item, res in zip(items, results):
@@ -5622,7 +5709,11 @@ def tool_map(args: dict) -> dict:
     coalesced_calls = sum(1 for r in rows if r.get("coalesced"))
     data = {"model": model, "count": len(rows), "ok": ok, "failed": len(rows) - ok, "results": rows,
             "items_dropped": items_dropped, "coalesced_calls": coalesced_calls, "selection": selection}
-    if as_flag(args.get("reduce")):
+    if as_flag(args.get("reduce")) and budget_expired():
+        # 後段の統合は 1 回ぶんの推論を足す。予算切れで始めると 300 秒の待ちに当たるだけ。
+        data["reduce_error"] = ("呼び出しの予算を使い切ったため reduce を実行しませんでした"
+                                "（各要素の出力は results に残しています）")
+    elif as_flag(args.get("reduce")):
         joined = "\n".join(f"- {r['output']}" for r in rows if r["output"])
         if joined.strip():
             reduce_prompt = (f"次の {len(rows)} 件の出力を統合してください。"
@@ -5959,7 +6050,10 @@ def tool_agent(args: dict) -> dict:
                     "injected_citations": sorted(injected),
                 "cited": [], "cited_ok": False}
 
-    results = run_parallel(refs, run_one, max_workers=min(len(refs), MAX_WORKERS))
+    # サブエージェントは 1 体あたり最大 4 ステップ（各ステップが推論 1 回）走るので、
+    # 予算を渡さないと `max_steps` の掛け算で 300 秒を超える（`tool_map` と同じ穴）。
+    results = run_parallel(refs, run_one, max_workers=min(len(refs), MAX_WORKERS),
+                           deadline=call_budget())
     good = [r for r in results if not r.get("error")]
     citations, seen = [], set()
     for row in good:
@@ -6257,7 +6351,17 @@ def _think_verify_block(args: dict, question: str, steps: list, step: dict,
         "agreement": agreement_of([r.get("verdict") or "" for r in answered if r.get("verdict")]),
         "note": "検証は独立モデルによる反証探索です。合意は正しさの保証ではありません。",
     }
-    return verification, (used + [r["model"] for r in rows])[:12], None
+    # `used` には**要求したモデルだけでなく実際に答えたモデル（`served_by`）**も入れる。
+    # 要求名だけだと、`longcat` が `laguna-s-2.1` へフォールバックした直後に、同じ呼び出しの
+    # 「代替案の提案者」が再び `laguna-s-2.1` に決まり、検証者と提案者が同一モデルになる
+    # （実測。規約 26 の「検証者とも別のモデル」が破れる）。
+    served: list[str] = []
+    for row in rows:
+        for name in (row.get("model"), row.get("served_by")):
+            if isinstance(name, str) and name and name not in served:
+                served.append(name)
+    return verification, (used + served)[:12], None
+
 
 def tool_think(args: dict) -> dict:
     """メインの思考ステップを台帳に積み、任意で独立モデルに反証させる。
@@ -7555,11 +7659,15 @@ def _render_agent(data: dict) -> str:
              f" / 根拠を引用した回答 {data.get('answers_with_citations')} 体"
              f" / 合意度 {data.get('agreement')}"]
     for row in (data.get("agents") or []):
+        # 予算切れの行は `run_parallel` が入れる `{error, dropped}` で **`model` を持たない**
+        # （実測: v0.23.1 で予算を渡した直後に `KeyError: 'model'` で表示だけが壊れ、
+        # 取れていた agents まで消えた）。行の欠けで全体を落とさない。
+        name = row.get("model") or "（未実行）"
         if row.get("error"):
-            lines.append(f"  • {row['model']}: ✗ {truncate(row['error'], 120)}")
+            lines.append(f"  • {name}: ✗ {truncate(row['error'], 120)}")
             continue
         mark = "✅" if row.get("cited_ok") else "⚠️ 引用なし"
-        lines.append(f"  • {row['model']}（{row.get('steps')}ステップ, {mark}）: "
+        lines.append(f"  • {name}（{row.get('steps')}ステップ, {mark}）: "
                      f"{truncate(row.get('answer') or '', 220)}")
         if row.get("unsupported_citations"):
             nums = ", ".join(f"[{n}]" for n in row["unsupported_citations"])
@@ -8077,7 +8185,9 @@ def handle_tool_call(params: dict) -> dict:
     previous_tier = _routing_scope(route_tier(as_str(name), _routing_text_chars(args),
                                               as_int(args.get("max_tokens"), 0, 0, 1000000)))
     try:
-        with progress_for(params), bound_coalescer():
+        # `budget_scope()` は**この呼び出し 1 回ぶん**の `Deadline` を張る（入れ子の
+        # `run_parallel` / refine / reduce / 討論 2 ラウンド目が満額を新しく作らない）。
+        with progress_for(params), bound_coalescer(), budget_scope():
             data = handler(args)
     except Exception as exc:  # ツールは絶対に例外を漏らさない
         data = {"error": f"internal error: {type(exc).__name__}: {exc}"}
@@ -8091,14 +8201,20 @@ def handle_tool_call(params: dict) -> dict:
             data.setdefault("next_action", error_advice(data))
         except Exception:
             data["next_action"] = {"kind": "error", "advice": "structuredContent.error を確認してください"}
+    render_failed = False
     try:
         text = render(name, data)
     except Exception as exc:
-        data = {"error": f"internal render error: {type(exc).__name__}: {exc}",
-                "next_action": {"kind": "error", "advice": "structuredContent.error を確認してください"}}
+        # **表示の失敗で構造化された結果を捨てない**（実測: 描画の KeyError で、取れていた
+        # agents ごと `{error}` に潰れた）。`isError` は立てたまま、本文だけ差し替える。
+        data["render_error"] = f"{type(exc).__name__}: {exc}"
         is_error = True
-        text = "表示の生成に失敗しました。structuredContent.error を確認してください。"
-    if is_error:
+        render_failed = True
+        text = (f"⚠️ 表示の生成に失敗しました（{type(exc).__name__}: {exc}）。"
+                "結果は structuredContent に入っています。\n"
+                + truncate(json.dumps(data, ensure_ascii=False), 2000))
+    if is_error and not render_failed:
+        # `error` を持たない失敗（描画だけ）に「error を確認してください」と書かない。
         text = "⚠️ 実行は失敗しました。structuredContent.error を確認してください。\n" + text
     coalesced = as_int(data.get("coalesced_calls"), 0, 0, 1000000) if not is_error else 0
     if coalesced:

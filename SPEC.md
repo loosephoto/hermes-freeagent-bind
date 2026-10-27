@@ -249,9 +249,11 @@
 - 測定用に層を強制できる（`FREEAGENT_ROUTING_TIER=light|long|reason`。未知の値は無視）。
   `scripts/measure_quality.py --select-strategy quality` と組み合わせて A/B を取る。
 - 選んだ層は `select_models` の info の `cascade_tier` に載る（`off` のときも `"off"` を返す＝隠さない）。
-- **層が効くのは選抜を通るツールだけ**（`map` / `panel` / `grounded` / `fanout` / `agent`）。
-  `freeagent_ask` は `default_model()` を 1 回呼ぶだけで `select_models` を通らない（実測）ので、
-  `route_tier` の対象から外す（第 1 版の A/B がこれで空振りした）。
+- **層が効くのは選抜を通るツールだけ**（`map` / `panel` / `grounded` / `fanout` / `agent` / `ask`）。
+  v0.23.0 では `freeagent_ask` が `default_model()` を 1 回呼ぶだけで `select_models` を通らず、
+  層の対象外だった（第 1 版の A/B がこれで空振りした）。**v0.23.1 で `default_model()` を
+  `select_models(1)` に変えた**（カタログ順の先頭が冷却中・低品質でも選ばれていた不都合の修正）ため、
+  `ask` も選抜を通る＝層（`long` など）が効く。**既定は off のままなので、off の並びは変わらない**。
 - 実測（探索的・n=2・各条件 2 反復・実モデル 7 体）: `map`（3 要素・`max_tokens` 200）で
   off = `laguna-s-2.1`・壁 17.0 秒・抽出一致 6/6 / `auto`(light) = `solar-mini4`・壁 **10.8 秒（−37%）**・6/6。
   `panel`（reason）は選抜が off と同一で壁 3.8 → 3.5 秒・正答 2/2。**小標本なので方向づけ**として扱い、既定は off。
@@ -294,8 +296,13 @@
 
 - 既定は `FREEAGENT_CALL_BUDGET`=240 秒（0 で無制限）。**MCP クライアントの待ちは実測 300 秒**で、
   300 秒で切られると取れていた結果も失われる。その手前で切って**脱落として見せる**。
-- 予算は `ask_many` / `ask_map` が作る（ツール 1 回ぶん）。`panel` の refine は別呼び出しなので
-  それぞれに付く（合計は 2×予算まで）。
+- 予算は **`handle_tool_call` が 1 回ぶんだけ作る**（`budget_scope()` ＝ スレッドローカル）。
+  `ask_many` / `ask_map` / `tool_map` / `tool_agent` はその `Deadline` の**残り**を受け取り、
+  `panel` の refine・`map` の reduce・`consult(debate_depth="deep")` の 2 ラウンド目も
+  **同じ予算**を見る（以前はラウンドごとに満額を作って 2×予算まで走れた・v0.23.1 で修正）。
+  予算を使い切った後段は**始めずに理由を返す**（`refined.error` / `reduce_error`）。
+  ツールを直接呼ぶ経路（テスト・スクリプト）では `budget_scope()` が無いので `call_budget()` が
+  その都度 1 つ作る（従来どおり）。
 - 実測（`tests/test_parallel_budget.py`）: 1.0 秒の worker を 0.1 秒の予算で打ち切ると **0.5 秒以内**に
   返る／並列度 1・予算 0.05 秒では走り出した 1 件以外は**実行されない**（取り消しが効いている）。
 
@@ -307,7 +314,7 @@
 
 未修飾のモデル名や未知の接頭辞はカタログ解決を前倒しせず、要求全体を従来方式に退避する（未知名ごとにスレッドが増えない）。同一要求内の合流待機者が共有ワーカーを埋めることを避けるため、map は生成後プロンプト、ask_map は `(ref, prompt)`、ask_many は ref に重複がある場合、要求全体を従来の呼び出し単位プールに通す。これにより合流待ち上限切れ時の再取得も従来どおり。**共有ワーカー数はプロセス全体のスレッド上限ではない**。対象外の処理や重複を含む呼び出しには適用されず、提供元ゲートも従来どおり別途適用される。
 
-期限切れ・回収側例外では未開始の共有ジョブを取り除く。既に始まった処理は停止せず終了までワーカー枠を保持する。共有スケジューラは実行時に遅延作成し、既定では無効。`freeagent_map` 自体には `call_budget()` が渡されないため、その予算制限は自動追加されない。
+期限切れ・回収側例外では未開始の共有ジョブを取り除く。既に始まった処理は停止せず終了までワーカー枠を保持する。共有スケジューラは実行時に遅延作成し、既定では無効。`freeagent_map` も v0.23.1 から `call_budget()` を受け取る（予算の打ち切りは公平スケジューラのオン／オフに依らず効く）。
 
 **限定的な実プロバイダー試験（開発環境、2026-10-28）**: `FREEAGENT_MAX_WORKERS=1`、`FREEAGENT_FAIR_WORKERS=1`、provider gate=1、ABBA 順で公平オフ／オン各2ラウンド。各 provider 比較で、3件バッチの上流処理中に別要求として短い1件を投入した。**公平オフ／オンの各アーム8件、1 provider比較あたり計16件（Nous と OpenRouter の2比較で計32件）**の推論リクエストが全件 HTTP 200。各アームの8出力はすべて期待値に一致し、429なし。
 
@@ -1247,6 +1254,31 @@ v0.18.3 を対象に 5 軸（ドキュメント / 説明文 / 状態機械 / 境
 map 70 件で `items_dropped=6`／`freeagent_models` は `models` と `free_models` を常に両方返す／
 README のレート間隔 14 種が実装のリテラルと一致／常駐 HTTP は `serverInfo` と tools JSON の内容が
 HEAD と一致／作業ツリーはクリーン・`state_dir()` は `FREEAGENT_STATE_DIR` を尊重（監査で本番ストアを汚さない）。
+
+### 6.21 不都合の監査（2026-10-28・v0.23.1）
+
+既存のゲート（`check_integrity` / `unittest` / `smoke_stdio` / `smoke_http` / `check_offline` /
+`doc_drift_check` / `moji_scan`）はすべて緑のまま、**コード精読と実機プローブで 6 件の不都合**が出た。
+各項目は `tests/test_audit_v0231.py` で回帰を固定している。
+
+| # | 不都合（実測） | 原因 | 修正 |
+|---|---|---|---|
+| 1 | `CALL_BUDGET_S=0.1` で `tool_fanout` は 0.11 秒で打ち切るのに **`tool_map` は 0.50 秒完走**した | `tool_map` / `tool_agent` の `run_parallel` に `deadline` を渡していない | `deadline=call_budget()` を渡す（0.11 秒 / 2 体で 0.10 秒に） |
+| 2 | `consult(debate_depth="deep")` が **ラウンドごとに満額**を作り、240 秒 × 2 まで走れた | `call_budget()` が呼ばれるたび `Deadline` を新造 | `handle_tool_call` が `budget_scope()` を 1 回張り、`call_budget()` はその残りを共有。`panel` の refine・`map` の reduce は予算切れなら**始めずに理由を返す**（実測: 0.15 秒予算で deep 討論が 0.20 秒・2 ラウンド目は `dropped`） |
+| 3 | スコア 0.1・クールダウン中のモデルが、0.9 のモデルより**先に返った**（`freeagent_ask` の既定） | `default_model()` が `free_model_refs()[0]`（カタログ順）をそのまま返していた | `select_models(1)` を通す（品質順・冷却の後回し・認証失敗の除外・`diverse_order`） |
+| 4 | フォールバックの並びで、スコア 0.95 の実績モデルが **0.2 の未検証モデルの後ろ**に並んだ | `_candidates()` がカタログ順 | `diverse_order(_order_for_selection(...))` を通す |
+| 5 | 毎回 5xx で落ちるモデルが **`unobserved` のまま第 1 候補に居座り**、毎回 1 回ぶんの失敗待ちを払った（実測: `nous/meituan/longcat-2.0:free` → `laguna-s-2.1` へのフォールバックが繰り返し起きた） | 成功した候補だけ `observe_call` していた（失敗した候補は統計に入らない＝探索ボーナス最大のまま） | 落ちた候補も記録（`_MODEL_FAULT_STATUS` の 4xx/5xx と環境障害でない例外のみ。**429・枠待ち・クォータは記録しない**＝提供元の都合）。返り値は `ref`＝要求モデル・`served_by`＝答えたモデルに分離（以前は `ref` まで上書きされ、`ask` の「要求 → 代替」表示が消えた） |
+| 6 | 検証者（`think(verify=true)`）が A→B へフォールバックした直後、**代替案の提案者も B** になった（規約 26 違反） | `used` に要求モデル名しか入れていなかった | `used` に `served_by` も入れる |
+
+**修正の途中で見つかった副次の不都合**（#1 の修正で初めて到達した経路）: `tool_agent` が予算で
+打ち切ると `run_parallel` は `{error, dropped}`（`model` キー無し）を返すが、`_render_agent` が
+`row["model"]` を直引きしていたため **KeyError → 表示だけが壊れ、取れていた `agents` まで
+`{error}` に潰れた**。→ 描画を行の欠けに耐えるようにし、さらに `handle_tool_call` は
+**描画が失敗しても `structuredContent` を捨てない**ようにした（本文だけ差し替え、`render_error` を足し、
+`isError` は立てたまま。`error` が無いので「error を確認してください」の前置きは付けない）。
+
+**この修正で意図的に変わる挙動**: `freeagent_ask` も選抜を通るため、`FREEAGENT_ROUTING=auto` のときは
+層（`long` など）が `ask` にも効く（既定 off なので並びは従来どおり）。§4.3.2 に追記した。
 
 ## 7. ツールの規約（§6–§8）
 

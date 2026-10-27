@@ -542,10 +542,42 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     層は**呼び出し側スレッドのスレッドローカル**（`_routing_scope`）に置く。`run_parallel` のワーカーは
     別スレッドなので渡さない — 層は「誰を選ぶか」だけに効かせ、実行の分岐を作らない（合流器と進捗の
     非対称と同じ型）。`handle_tool_call` は `finally` で必ず戻す。層は `selection.cascade_tier` に出す。
-    **層が効くのは選抜を通るツールだけ**（`map` / `panel` / `grounded` / `fanout` / `agent`）。
-    `freeagent_ask` は `default_model()` を 1 回呼ぶだけで `select_models` を通らない（実測）ので
-    対象外にした — 知らずに `ask` で A/B を取ると、層が一度も効かないまま「効果なし」と誤読する
-    （実測: 第 1 版の A/B が 40 呼び出しを空振りした）。
+    **層が効くのは選抜を通るツールだけ**（`map` / `panel` / `grounded` / `fanout` / `agent` / `ask`）。
+    v0.23.0 では `freeagent_ask` が `default_model()` を 1 回呼ぶだけで `select_models` を通らず、
+    対象外だった（知らずに `ask` で A/B を取ると、層が一度も効かないまま「効果なし」と誤読する。
+    実測: 第 1 版の A/B が 40 呼び出しを空振りした）。**v0.23.1 で `default_model()` を
+    `select_models(1)` に変えた**ので `ask` も選抜を通る（既定 off なので off の並びは変わらない）。
+
+72. **予算は「ツール呼び出し 1 回に 1 つ」で、後段も残り時間を見る**（v0.23.1・SPEC §4.5 / §6.21）。
+    `handle_tool_call` が `budget_scope()` を 1 回張り、`call_budget()` はその**残り**を返す。
+    `run_parallel` を呼ぶ補助（`tool_map` / `tool_agent` / `ask_many` / `ask_map`）は必ず
+    `deadline=call_budget()` を渡す（渡し忘れると 300 秒のクライアント待ちに当たり、
+    取れていた結果まで失われる。実測: 0.1 秒予算で `tool_map` が 0.50 秒完走した）。
+    `panel` の refine・`map` の reduce・討論の 2 ラウンド目は `budget_expired()` で**始める前に**止め、
+    理由を `refined.error` / `reduce_error` / `dropped` に残す（黙って飛ばさない）。
+
+73. **既定モデルとフォールバックの並びも選抜の規則を通す**（v0.23.1）。`default_model()` は
+    `select_models(1)`、`_candidates()` は `diverse_order(_order_for_selection(...))`。カタログ順の
+    先頭をそのまま使うと、**冷却中・観測上ボロボロ・認証で落ちているモデルが最初に選ばれる**
+    （実測: スコア 0.1・クールダウン中のモデルが 0.9 のモデルより先に返り、0.95 の実績モデルが
+    0.2 の未検証モデルの後ろに並んだ）。副作用として `freeagent_ask` も選抜を通る＝
+    `FREEAGENT_ROUTING=auto` では `ask` にも層が効く（既定 off なので並びは従来どおり）。
+
+74. **落ちた候補も成績に記録し、`ref` と `served_by` を混ぜない**（v0.23.1）。フォールバックで
+    失敗した候補を `observe_call` しないと、毎回 5xx で落ちるモデルが観測 0 件＝探索ボーナス最大の
+    まま**第 1 候補に居座り、毎回 1 回ぶんの失敗待ちを払う**（実測: `longcat-2.0` が `unobserved` の
+    まま選ばれ続け、毎回 `laguna-s-2.1` へ落ちた）。記録するのは `_MODEL_FAULT_STATUS`（400/401/402/
+    403/404/410/500/502/503/504）と環境障害でない例外だけ。**429・提供元の枠待ち・クォータは
+    記録しない**（提供元側の都合でモデルの成績ではない）。返り値は `ref`＝要求モデル・
+    `served_by`＝実際に答えたモデル（`ref` を上書きすると `ask` の「要求 → 代替」表示が消える）。
+    `think(verify=true)` が `used` に積むのも**両方**（要求名だけだと、検証者がフォールバックした
+    モデルが続く代替案の提案者に選ばれ、規約 26 が破れる）。
+
+75. **表示の失敗で `structuredContent` を捨てない**（v0.23.1）。`render` が例外を投げたら本文だけ
+    差し替え、`data["render_error"]` を足して**結果は返す**（実測: `_render_agent` の `KeyError` で、
+    取れていた `agents` まで `{error}` に潰れた）。`isError` は立てたまま（失敗は失敗として見せる）が、
+    `error` を持たないので「`structuredContent.error` を確認してください」の前置きは付けない。
+    描画関数は**行のキー欠けに耐える**（予算切れの行は `{error, dropped}` で `model` を持たない）。
 
 ## ライセンス
 
