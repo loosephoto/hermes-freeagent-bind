@@ -488,6 +488,16 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     **どのテストかをスタックで名指しできる**（付けないと「無言で止まる」だけが残る）。
     `config` の値は**「無い（`None` / キー無し / 空）」と「不正」を混ぜない**（不正は `ValueError`）。
 
+66. **進捗はクライアントが `_meta.progressToken` を出したときだけ送る**（v0.19.0・SPEC §4.6）。
+    トークンの無い要求へ `notifications/progress` を送るのは仕様違反で、クライアントは捨てるだけでは
+    済まず**別の要求の進捗として解釈しうる**。実測（Hermes 側）: `agent/tool_progress_relay.py` の
+    `bound_tool_progress` が呼び出しごとに reporter を張り、`tools/mcp_tool_handlers.py` の
+    `_call_tool_racing_stdio_death` が**それを渡したときだけ** SDK に `progress_callback` を渡す
+    （＝SDK が `_meta.progressToken` を載せる）。「対応していないクライアントにも送っておけば効く」は
+    成り立たない。送り先は transport ごとに違う（stdio = stdout の 1 行 / HTTP = セッションの SSE 待ち行列）
+    ので、**送り手は transport が張り、`run_parallel` は受け取った送り手に書くだけ**にする
+    （`run_parallel` に transport の分岐を持ち込まない）。**進捗の送信失敗で本体の結果を壊さない**。
+
 ## ライセンス
 
 MIT。データは各提供元の条件に従い、回答には出典を表示すること。

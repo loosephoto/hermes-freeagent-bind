@@ -560,6 +560,26 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 
 実装と回帰テストの詳細は [SPEC.md](SPEC.md) の「5. 呼び出し」にあります。
 
+### ⏳ 長い呼び出しの進捗が見える（`notifications/progress`）
+
+`fanout` / `panel` / `consult` / `map` / `agent` / `models(probe=true)` のように**複数を並列に走らせる呼び出し**は、
+1 件回収するごとに **`notifications/progress`** を 1 件送ります（`progress` に回収済みの件数、`total` に本数、
+`message` に短いラベル）。予算切れで打ち切ったときは `message: 予算切れで打ち切りました` を 1 件足すので、
+**途中で黙って止まったようには見えません**。
+
+- **送るのは、クライアントが要求に `_meta.progressToken` を付けたときだけ**です（MCP 仕様: トークンの無い
+  要求に進捗を送ってはならない）。Hermes はツール呼び出しごとに `progress_callback` を渡すので、対応して
+  いるクライアントでは自動的に送られます。付けてこないクライアントには**1 件も送りません**（実測）。
+- 送り先は transport で違います。stdio は stdout に 1 行（`WRITE_LOCK` の内側）、HTTP はセッションの
+  SSE 待ち行列（`GET` の `text/event-stream`）です。
+- 進捗は**表示のためだけ**で、結果はこれまでどおり応答本文と `structuredContent` に入ります。
+  `FREEAGENT_PROGRESS=0` で止められます。
+- **クライアントの待ち時間は延びません**。MCP の進捗によるタイムアウト延長（`resetTimeoutOnProgress`）は
+  各 SDK で**既定 false** で、延長の本筋は Tasks の領域です。ここは「長い処理が生きていることを見せる」
+  ための保険として入れています（打ち切りは `FREEAGENT_CALL_BUDGET` が従来どおり担います）。
+
+実装と回帰テストは [SPEC.md](SPEC.md) の「4.6 進捗通知」と `tests/test_progress.py` にあります。
+
 ### 🚫 失敗の後に同じ呼び出しを繰り返さない
 
 失敗応答の `structuredContent.next_action` に、状況（`kind`）・助言（`advice`）・代替手段が入ります。
@@ -1543,6 +1563,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_DEFAULT_MODEL` | 空（自動選抜） | 既定モデル（`provider/model`） |
 | `FREEAGENT_MAX_WORKERS` | 8 | 推論の並列度＝同時に走らせる本数（1〜32）。**429 の抑止は提供元の枠が担う**（下の 3 行） |
 | `FREEAGENT_CALL_BUDGET` | 240 | **ツール 1 回の並列実行の壁時計予算**（秒・0 で無制限）。MCP クライアントの待ち（実測 300 秒）より短くしておく——300 秒で切られると**取れていた結果も失われる**。打ち切った分は `dropped: true` の脱落として返り、まだ走っていない呼び出しは取り消す |
+| `FREEAGENT_PROGRESS` | 1 | **進捗通知（`notifications/progress`）を送るか**（0 で無効）。クライアントが要求に `_meta.progressToken` を付けたときだけ送ります（仕様どおり。付けてこなければ 1 件も送りません）。送り先は transport ごと——stdio は stdout の 1 行、HTTP はセッションの SSE 待ち行列 |
 | `FREEAGENT_MAX_SUB_MODELS` | 8 | `size` の上限（1 呼び出しで参加させるモデル数・1〜32） |
 | `FREEAGENT_MAX_MODELS_PER_CALL` | 16 | `models` 配列・`models: ["all"]` の展開上限（1〜40） |
 | `FREEAGENT_PROVIDER_LIMIT` | 4 | 提供元ごとの同時実行枠の既定（実測済みの `nous` は 6） |

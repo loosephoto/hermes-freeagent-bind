@@ -85,7 +85,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.18.4"
+SERVER_VERSION = "0.19.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -3060,6 +3060,105 @@ class _ModelClaims:
             return True
 
 
+# ---------------------------------------------------------------- 進捗通知（notifications/progress）
+# MCP の `notifications/progress` は **クライアントが `_meta.progressToken` を付けた要求にだけ**送る
+# （仕様: トークンの無い要求に送ってはならない）。Hermes はツール呼び出しごとに `progress_callback` を
+# 渡し、SDK が `_meta.progressToken` を載せてくる（実測: `agent/tool_progress_relay.py` の
+# `bound_tool_progress` と `tools/mcp_tool_handlers.py` の `_call_tool_racing_stdio_death`）。
+# **送り先は transport で違う**（stdio は stdout に 1 行、HTTP はセッションの SSE 待ち行列）ので、
+# transport が**作り手**をスレッドローカルに置き、`handle_tool_call` が要求から読んだトークンで
+# **送り手**を組み立てる。`run_parallel` が回収のたびに 1 件送る（回収ループは呼び出し側スレッドで
+# 回るので、送り手はここから見える）。
+PROGRESS_ENABLED = as_flag(os.environ.get("FREEAGENT_PROGRESS", "1"))
+_PROGRESS_LOCAL = threading.local()
+
+
+def _progress_token_of(params) -> "str | int | None":
+    """`tools/call` の params から `_meta.progressToken` を読む（str / int だけ。bool は除く）。"""
+    if not isinstance(params, dict):
+        return None
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return None
+    token = meta.get("progressToken")
+    if isinstance(token, bool) or not isinstance(token, (str, int)):
+        return None
+    return token
+
+
+class _ProgressSink:
+    """1 回のツール呼び出しぶんの進捗。`emit` は `run_parallel` の回収ループから呼ばれる。"""
+
+    def __init__(self, token, sender):
+        self.token = token
+        self._send = sender
+        self._lock = threading.Lock()
+        self.sent = 0
+
+    def emit(self, progress, total=None, message=None) -> None:
+        note = {"jsonrpc": "2.0", "method": "notifications/progress",
+                "params": {"progressToken": self.token, "progress": float(progress)}}
+        if total is not None:
+            note["params"]["total"] = float(total)
+        if message:
+            note["params"]["message"] = str(message)[:120]
+        with self._lock:               # 1 行 / 1 フレームを割らない
+            self._send(note)
+            self.sent += 1
+
+
+@contextlib.contextmanager
+def bound_progress(maker):
+    """このスレッドの「送り手の作り」を差し替える（transport が要求 1 件ぶんだけ張る）。"""
+    prev = getattr(_PROGRESS_LOCAL, "maker", None)
+    _PROGRESS_LOCAL.maker = maker
+    try:
+        yield
+    finally:
+        _PROGRESS_LOCAL.maker = prev
+
+
+@contextlib.contextmanager
+def progress_for(params):
+    """`tools/call` の params に応じて送り手を張る（トークンが無ければ**何もしない**）。"""
+    prev = getattr(_PROGRESS_LOCAL, "sink", None)
+    maker = getattr(_PROGRESS_LOCAL, "maker", None)
+    token = _progress_token_of(params) if PROGRESS_ENABLED else None
+    sink = None
+    if maker is not None and token is not None:
+        try:
+            sink = _ProgressSink(token, maker(token))
+        except Exception as exc:            # 送り先の用意に失敗しても本体は動かす
+            _debug("progress_error", f"{type(exc).__name__}: {exc}")
+    try:
+        _PROGRESS_LOCAL.sink = sink         # 前の要求のぶんを引き継がない
+        yield sink
+    finally:
+        _PROGRESS_LOCAL.sink = prev
+
+
+def progress_emit(progress, total=None, message=None) -> None:
+    """送り手があれば 1 件送る（無ければ何もしない＝仕様どおり）。進捗で本体を壊さない。"""
+    sink = getattr(_PROGRESS_LOCAL, "sink", None)
+    if sink is None:
+        return
+    try:
+        sink.emit(progress, total, message)
+    except Exception as exc:
+        _debug("progress_error", f"{type(exc).__name__}: {exc}")
+
+
+def progress_label(job) -> str:
+    """進捗の 1 行に添える短いラベル（モデル名・ソース名など）。長い本文は切る。"""
+    if isinstance(job, str):
+        text = job
+    elif isinstance(job, (tuple, list)) and job and isinstance(job[0], str):
+        text = job[0]
+    else:
+        return ""
+    return text.strip().replace("\n", " ")[:40]
+
+
 class Deadline:
     """並列実行の壁時計予算。`run_parallel` が**残り時間で回収を打ち切る**ために使う。
 
@@ -3112,10 +3211,12 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None,
                 out[i] = worker(job)
             except Exception as exc:  # worker 側の例外もここで吸収する
                 out[i] = {"error": f"{type(exc).__name__}: {exc}"}
+            progress_emit(i + 1, len(jobs), progress_label(job))
         return out
     pool = ThreadPoolExecutor(max_workers=workers)
     futures = {pool.submit(worker, job): i for i, job in enumerate(jobs)}
     timed_out = False
+    done = 0
     try:
         for fut in as_completed(futures, timeout=None if deadline is None else deadline.remaining()):
             i = futures[fut]
@@ -3123,6 +3224,8 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None,
                 out[i] = fut.result()
             except Exception as exc:
                 out[i] = {"error": f"{type(exc).__name__}: {exc}"}
+            done += 1
+            progress_emit(done, len(jobs), progress_label(jobs[i]))
     except FuturesTimeout:
         timed_out = True
     finally:
@@ -3131,6 +3234,7 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None,
         for i, value in enumerate(out):
             if value is None:
                 out[i] = _dropped_result(deadline, "回収を打ち切り")
+        progress_emit(done, len(jobs), "予算切れで打ち切りました")
     return out
 
 
@@ -5153,7 +5257,9 @@ def tool_map(args: dict) -> dict:
         return _no_models()
     max_tokens = as_int(args.get("max_tokens"), 500, 16, 4000)
     prompts = [f"{instruction}\n\n---\n{truncate(item, 4000)}" for item in items]
-    results = run_parallel(prompts, lambda p: call_model(model, p, max_tokens=max_tokens, kind="map"),
+    # 進捗のラベルに使うので **(要素, プロンプト) の組**で流す（プロンプト全体をラベルにしない）
+    pairs = list(zip(items, prompts))
+    results = run_parallel(pairs, lambda pair: call_model(model, pair[1], max_tokens=max_tokens, kind="map"),
                            max_workers=MAX_WORKERS)
     rows = []
     for item, res in zip(items, results):
@@ -7472,7 +7578,8 @@ def handle_tool_call(params: dict) -> dict:
         return {"content": [{"type": "text", "text": f"未知のツール: {name}（無効化されている可能性）"}],
                 "structuredContent": data, "isError": True}
     try:
-        data = handler(args)
+        with progress_for(params):
+            data = handler(args)
     except Exception as exc:  # ツールは絶対に例外を漏らさない
         data = {"error": f"internal error: {type(exc).__name__}: {exc}"}
     if not isinstance(data, dict):
@@ -7539,6 +7646,16 @@ def _emit(replies: list) -> None:
         write_line(json.dumps(replies, ensure_ascii=False))
 
 
+def _stdio_progress_maker(token=None):
+    """stdio の送り手: `notifications/progress` を stdout へ 1 行（UTF-8・規約 14）。"""
+
+    def sender(note):
+        with WRITE_LOCK:
+            write_line(json.dumps(note, ensure_ascii=False))
+
+    return sender
+
+
 def _dispatch_batch(items: list) -> None:
     """JSON-RPC batch を 1 行の response array として返す。通知には応答しない。"""
     replies = []
@@ -7553,7 +7670,11 @@ def _dispatch_message(msg: dict, pool: ThreadPoolExecutor) -> None:
     msg_id = msg.get("id")
     if method == "tools/call" and msg_id is not None:
         params = msg.get("params") or {}
-        pool.submit(lambda i=msg_id, p=params: respond(i, handle_tool_call(p)))
+        def _run_call(i=msg_id, p=params):
+            with bound_progress(_stdio_progress_maker):
+                respond(i, handle_tool_call(p))
+
+        pool.submit(_run_call)
         return
     for reply in _replies_for(msg):
         _debug("out", reply)
@@ -7582,7 +7703,8 @@ def serve() -> None:
         if isinstance(msg, list):
             if not msg:
                 respond(None, error={"code": -32600, "message": "invalid request"})
-            _dispatch_batch(msg)
+            with bound_progress(_stdio_progress_maker):
+                _dispatch_batch(msg)
         elif isinstance(msg, dict):
             _dispatch_message(msg, pool)
         else:
@@ -7724,6 +7846,18 @@ def _http_queue_notification(session, note) -> None:
         session["cv"].notify_all()
 
 
+def _http_progress_maker(session):
+    """HTTP の送り手: セッションの SSE 待ち行列へ入れる（GET が無ければ溜める）。"""
+
+    def maker(token=None):
+        def sender(note):
+            _http_queue_notification(session, note)
+
+        return sender
+
+    return maker
+
+
 def _http_process(msg, session, marker=None):
     """POST の本文 1 件を処理する。(本文に載せる応答, 202 を返すべきか) を返す。
 
@@ -7732,12 +7866,13 @@ def _http_process(msg, session, marker=None):
     """
     items = msg if isinstance(msg, list) else [msg]
     replies = []
-    for item in items:
-        for reply in _replies_for(item, marker):
-            if isinstance(reply, dict) and "id" in reply:
-                replies.append(reply)
-            else:
-                _http_queue_notification(session, reply)
+    with bound_progress(_http_progress_maker(session)):
+        for item in items:
+            for reply in _replies_for(item, marker):
+                if isinstance(reply, dict) and "id" in reply:
+                    replies.append(reply)
+                else:
+                    _http_queue_notification(session, reply)
     if not replies:
         return None, True
     if isinstance(msg, list):

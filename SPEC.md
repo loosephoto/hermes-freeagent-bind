@@ -273,6 +273,33 @@
 - 実測（`tests/test_parallel_budget.py`）: 1.0 秒の worker を 0.1 秒の予算で打ち切ると **0.5 秒以内**に
   返る／並列度 1・予算 0.05 秒では走り出した 1 件以外は**実行されない**（取り消しが効いている）。
 
+### 4.6 進捗通知（`notifications/progress`・v0.19.0）
+
+並列の回収 1 件ごとに `notifications/progress` を 1 件送る。**送るのは、クライアントが要求に
+`_meta.progressToken` を付けたときだけ**（MCP 仕様: トークンの無い要求に送ってはならない）。実装は 3 層:
+
+| 層 | 実装 | 役割 |
+|---|---|---|
+| 送り手の用意 | `bound_progress(maker)` が**スレッドローカル**に作り手を置く | transport が要求 1 件ぶんだけ張る（stdio = `_stdio_progress_maker`、HTTP = `_http_progress_maker(session)`） |
+| 送り手の組み立て | `handle_tool_call` が `progress_for(params)` でトークンを読み `_ProgressSink` を張る | **トークンが無ければ `None` を張る**（前の要求のぶんを引き継がない＝同じスレッドが次の要求を拾うため） |
+| 送出 | `run_parallel` が回収のたびに `progress_emit(done, len(jobs), label)` | 回収ループは**呼び出し側スレッド**で回るのでスレッドローカルが見える（worker 側ではない） |
+
+- 逐次経路（`workers == 1`）でも同じ位置で送る。予算切れのときは最後に
+  `message: 予算切れで打ち切りました` を 1 件足す（`progress` は回収済み件数のまま＝**総数を偽らない**）。
+- トークンは **`str` / `int` だけ**を受ける（`bool` は除く）。それ以外は「未指定」として扱う。
+- ラベルは `progress_label(job)`（文字列ならそのまま、組なら先頭要素、40 文字で切って改行を潰す）。
+  `tool_map` は `(要素, プロンプト)` の組を流すので、**プロンプト全体がラベルにならない**。
+- 送信の失敗は握りつぶして `_debug("progress_error", …)` に残す（**進捗で本体の結果を壊さない**）。
+- `FREEAGENT_PROGRESS=0` で無効（既定 1）。
+- **クライアントの待ちは延びない**。`resetTimeoutOnProgress` は各 SDK で既定 false（MCP TS SDK の
+  PR #849 は未マージ）なので、延長は Tasks の領域。これは生存を見せるための保険であり、
+  打ち切りは従来どおり `FREEAGENT_CALL_BUDGET` が担う（§4.5）。
+- 回帰は `tests/test_progress.py`（15 件: トークンの型・逐次/並列・打ち切り・送信失敗・
+  stdio の 1 行・HTTP の待ち行列・**トークンが無ければ 1 件も出ないこと**）。
+- 実測（stdio・実モデル 2 本）: `freeagent_map` がトークン付きで
+  `{"progressToken": "probe-token-1", "progress": 1.0, "total": 2.0}` → `2.0/2.0` を送り、
+  トークン無しの同じ呼び出しでは **0 件**だった。
+
 ## 5. 呼び出し（§4）
 
 - 外部 HTTP は **接続タイムアウトと読み取りタイムアウトを分けて設定**する（既定 10 秒 / 180 秒）。`_urlopen` は §3 の共有 `_OPENER` を使う。これは `http.client` の接続クラスに `_ShortConnectMixin` を混ぜ、`HTTPHandler` / `HTTPSHandler` を差し替えたもので、**接続（TCP と TLS ハンドシェイク）の間だけ** `CONNECT_TIMEOUT` を適用し、接続直後に socket を `READ_TIMEOUT` へ切り替える。`build_opener` はサブクラスを既定ハンドラの置換と見なすので、リダイレクト（`HTTPRedirectHandler`）・プロキシ（`ProxyHandler`）・`HTTPError` の既定挙動は保たれる。環境障害（接続不可・timeout）は同じプロバイダ系列の fallback を打ち切り、全候補へ同じ不通を繰り返さない。
@@ -1345,6 +1372,8 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   （batch 経路に揃えた。従来の単一経路は id `null` の応答を書いていた）。
 - 通知はセッションの待ち行列へ入れ、`GET` の SSE で流す。`GET` を張らないクライアントには届かないが、
   警告は最初のツール結果にも載るので実害はない。
+- **進捗（`notifications/progress`）も同じ待ち行列へ回す**（§4.6）。ただし送るのは要求が
+  `_meta.progressToken` を付けたときだけ。stdio 側は `write_line` で 1 行を書く（`WRITE_LOCK` の内側）。
 - **二重起動は失敗させる**: `ThreadingHTTPServer` の `allow_reuse_address` を `False` にする
   （Windows の `SO_REUSEADDR` は同一ポートへの二重バインドを許し、状態が 2 つに割れたまま気づけない）。
 - **ハーネス目印はヘッダでも受ける**（`x-freeagent-harness`。HTTP では子プロセスの env が渡らないため）。
