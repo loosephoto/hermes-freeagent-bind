@@ -516,6 +516,24 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     `scripts/measure_parallel_load.py` はオフラインの模擬 I/O で重なりと期限後の残留を測る。
     計測器の負荷を含み、実 API・提供元ゲート・プロセス全体の RSS を測るものではない。
 
+69. **変化の遅い知識は `description` ではなく Resources に置く**（v0.22.0・SPEC §8.5 / §11）。
+    `tools/list` は起動時に丸ごと渡るので、長い説明を足すほど毎回の入力を食う。使い分け・在庫・
+    鍵の入れ方・返り値の形は `resource://freeagent/*` に置き、`description` には【資源】の 1 文だけを
+    置く。Hermes は `capabilities.resources` を見て `list_resources` / `read_resource` を自動生成する
+    （実測: `tools/mcp_tool_registration.py`。宣言しないと 4 ツールは生えない）。**`read` で
+    ネットワークを出さない** — 目録と本文は登録簿（`KB_BACKENDS` / `PROVIDER_ORDER`）と環境変数だけで
+    組み立てる。読むたびに一覧要求を出すと上流の枠を使う（規約 54 と同じ理由）。目録は実装から
+    生成し、**ソース数・プロバイダ数を文章に書き写さない**（規約 5 と同じ型の陳腐化）。未知 URI は
+    `-32002` で返し、空文字で成功にしない。
+
+70. **同じ引用を 2 か所に返さない**（v0.22.0・SPEC §7）。`knowledge_lookup` の `results[source]` は
+    `items` と状態だけを持ち、引用は**トップレベルの `citations` に 1 回だけ**置く（統合側は
+    `metadata_only` / `aliases` も付くので、ソースごとの引用は部分集合だった。実測: limit=3 で
+    構造化 30,589c → 22,722c・26% 減、`citation_count` は不変）。**黙って減らさない**: `citations_in_results:
+    false` を返し、`content` にも「citations に統合済み」の 1 行を出す。汎用の JSON プルーナ
+    （null・`url`・`created_at` の除去）を後付けしない — 既に手で削ってあるので実測の削減は
+    4〜37% にとどまり、規約 48（キーをモードで変えない）を壊すだけだった。
+
 ## ライセンス
 
 MIT。データは各提供元の条件に従い、回答には出典を表示すること。

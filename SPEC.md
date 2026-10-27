@@ -1225,6 +1225,11 @@ HEAD と一致／作業ツリーはクリーン・`state_dir()` は `FREEAGENT_S
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。
+- **引用はトップレベルの `citations` に 1 回だけ置く**（v0.22.0）。`knowledge_lookup` の `results[source]` は
+  `items` と状態（`error` / `timed_out` / `fallback` / `attribution`）だけを持ち、引用を重ねて持たない。
+  統合側は `metadata_only` / `aliases` も付くので、ソースごとの引用は**厳密な部分集合**だった
+  （実測: limit=3 の lookup で構造化 30,589c → 22,722c・26% 減、`citation_count` は不変）。
+  `structuredContent.citations_in_results: false` で明示し、`content` にも 1 行出す（黙って減らさない）。
 - **例外を外へ漏らさない**。失敗は `structuredContent.error`。`handle_tool_call` が最後の砦として
   `Exception` を捕まえ、`internal error:` に変換する。render / error_advice も個別に保護し、表示や助言の失敗で JSON-RPC 応答が消えないようにする。
 - `description` は**モデルが読む唯一の窓口**なので、先頭に【使う条件】【使わない条件】【競合より優先】
@@ -1379,6 +1384,10 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   （ソース確認済み）ので、Hermes での自発利用は `description` と memory / `SOUL.md` の判断規則で作る。
 - `capabilities.logging` を宣言する（`notifications/message` を送るなら MUST。MCP 2025-11-25 Logging）。
   `logging/setLevel` は `{}` を返し、不正なレベルは `-32602`。設定レベルが warning より上なら警告通知を送らない。
+- `capabilities.resources`（`subscribe: false` / `listChanged: false`）を宣言し、`resources/list` と
+  `resources/read` を**§9 のメソッド表**に載せる（stdio と HTTP が同じ表を通る）。読めない URI は
+  `-32002`（resource not found）。Hermes は capabilities を見て `list_resources` / `read_resource` を
+  自動生成する（実測: `tools/mcp_tool_registration.py`）。
 
 ### 8.1 ハーネス判別（§8.6）
 
@@ -1451,6 +1460,24 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
 - **目印（ハーネス判別）の点検も HTTP に対応する**: `scripts/apply_proactive.py --check` は
   `x-freeagent-harness` ヘッダを env と同じ目印として読み、HTTP なら不足時にヘッダを足すコマンドを出す
   （ヘッダを読まないと常駐運用の実機で「未設定」と誤警告した）。
+
+### 8.5 MCP Resources（§11）
+
+ツール定義は起動時に丸ごと渡るため、変化の遅い長い知識を `description` に置くと毎回の入力を食う。
+そこで**呼ばれたときだけ読まれる**別チャネルに逃がす（v0.22.0）。
+
+| URI | 生成元 | 内容 |
+|---|---|---|
+| `resource://freeagent/api-rules` | 定数（`CALL_BUDGET_S` / `KB_DEADLINE` / `MAX_WORKERS` / `MAX_PROMPTS_PER_CALL` / `MAX_MAP_ITEMS`） | ツールの使い分け・失敗時の `next_action`・待ち時間と上限 |
+| `resource://freeagent/sources` | `KB_BACKENDS` / `DEFAULT_SOURCES` | ソース在庫と既定/明示の別 |
+| `resource://freeagent/providers` | `PROVIDER_ORDER` / `PROVIDER_SPECS` / `_provider_missing_settings` | プロバイダと「足りないもの」（**値は返さない**） |
+| `resource://freeagent/result-shape` | 固定文 | `content` / `structuredContent` の契約と引用の位置 |
+
+- **`read` はネットワークを出さない**（登録簿と環境変数だけで組み立てる）。読むたびに一覧要求を出すと
+  上流の枠を使う（規約 54 の「早期返却で一覧を出さない」と同じ理由）。テストは
+  `_kb_new_json` / `provider_http` / `_catalog_prefetch` を爆発するスタブに差し替えて固定する。
+- 目録・本文は**実装の登録簿から生成**する（ソース数・プロバイダ数を文章に書き写さない）。
+- 未知 URI・未知スキーム・空 URI は `-32002`。生成に失敗した場合も例外を外へ出さず、本文に理由を書く。
 
 ## 9. 拡張の手順（新しいツールを足すとき）
 

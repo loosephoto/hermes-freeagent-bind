@@ -30,6 +30,7 @@ import すると無応答になる環境があるため、起動経路は増や�
   §8.5 失敗時の「次の一手」（structuredContent.next_action）
   §8.6 ハーネス判別（Hermes 以外で起動されたときの警告）   §9 JSON-RPC / stdio
   §10 HTTP (StreamableHTTP) トランスポート（1 プロセスを複数クライアントで共有）
+  §11 MCP Resources（使い分け・在庫・鍵・返り値の形を呼ばれたときだけ読ませる）
 
 設計方針（旧 hermes-memex の実測で裏づけられた規約を継承）
   * 実行時依存ゼロ（標準ライブラリのみ）・stdio の JSON-RPC 2.0 を自前実装
@@ -85,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.21.0"
+SERVER_VERSION = "0.22.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -4156,8 +4157,16 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
         citations.extend(res.get("citations") or [])
     citations = _kb_merge_citations(citations)
     late = [src for src, res in by_source.items() if isinstance(res, dict) and res.get("timed_out")]
+    # **同じ引用を 2 回返さない**（v0.22.0）。ソースごとの `citations` は全ソース統合の `citations` の
+    # 部分集合で、統合側には `metadata_only` / `aliases` も付く（実測: limit=3 の lookup で構造化
+    # 30,589c → 22,722c・26% 減、情報の欠落なし）。`results[source]` は items と状態だけを持つ。
+    public_results = {src: ({k: v for k, v in res.items() if k != "citations"}
+                            if isinstance(res, dict) else res)
+                      for src, res in by_source.items()}
     out = {"query": query, "sources": picked, "unknown_sources": unknown,
-           "results": by_source, "citations": citations, "citation_count": len(citations),
+           "results": public_results, "citations": citations, "citation_count": len(citations),
+           # 引用を `results` の中で二重に持たないことを**明示する**（黙って減らさない・規約 8）。
+           "citations_in_results": False,
            "errors": errors, "llm_used": False, "timings": timings,
            "deadline_s": KB_DEADLINE if deadline is None else deadline}
     if late:
@@ -6719,6 +6728,8 @@ TOOLS: list[dict] = [
             "DataCite は自然語の各語を AND 検索、datacite_kind=dataset で研究データ。"
             "fallback=true のときだけ自然語 arXiv検索の失敗/遅延を DataCite で代替する（取得元を明示）。"
             "【使わない条件】単一の事実だけなら web_search が速い。"
+            "【資源】ソースの在庫・使い分け・返り値の形は MCP Resources（list_resources / read_resource、"
+            "resource://freeagent/sources など）で読める。"
         ),
         "inputSchema": {
             "type": "object",
@@ -7186,6 +7197,8 @@ def _render_lookup(data: dict) -> str:
     if late:
         head += f" / 締め切り {data.get('deadline_s')} 秒に間に合わず {len(late)} 件"
     lines = [head]
+    if data.get("citations_in_results") is False:
+        lines.append("ℹ️ 引用は citations に統合済み（results の各ソース内には重複して置きません）")
     # **指定したのに使えなかったソース名を隠さない**（typo を黙って捨てない）。
     unknown = data.get("unknown_sources") or []
     if unknown:
@@ -7665,7 +7678,10 @@ def harness_on_initialize(params, marker=None) -> dict:
     return {
         "protocolVersion": negotiate_protocol(offered),
         # logging: サーバーが notifications/message を送るなら宣言が MUST（MCP 2025-11-25 Logging）。
-        "capabilities": {"tools": {"listChanged": False}, "logging": {}},
+        # resources: 変化の遅い知識（使い分け・在庫・鍵の入れ方・返り値の形）を呼ばれたときだけ読ませる（§11）。
+        "capabilities": {"tools": {"listChanged": False},
+                         "resources": {"subscribe": False, "listChanged": False},
+                         "logging": {}},
         "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         "instructions": harness_instructions(info),
     }
@@ -7725,6 +7741,141 @@ def _harness_reset() -> None:
     with _HARNESS_LOCK:
         _HARNESS.clear()
         _HARNESS.update({"info": None, "announced": False, "notified": False, "log_level": "info"})
+
+
+# ================================================================ §11 MCP Resources（知識のオンデマンド公開）
+#
+# `tools/list` は起動時に丸ごとモデルへ渡るので、変化の遅い長い知識を description に置くと毎回の文脈を食う。
+# Resources は**呼ばれたときだけ**読まれる別チャネルなので、使い分け・在庫・鍵の入れ方・返り値の形を
+# ここへ逃がす（v0.22.0）。Hermes は `capabilities.resources` を見て `list_resources` / `read_resource` を
+# 自動で生やす（実測: hermes-agent の `tools/mcp_tool_registration.py` は capabilities で分岐する）。
+# **read はネットワークを出さない**（登録簿と環境変数だけで組み立てる）。読むたびにプロバイダへ一覧を
+# 要求すると、モデルが 1 回読むだけで上流の枠を使う（規約 54 の「早期返却で一覧を出さない」と同じ理由）。
+
+RESOURCE_SCHEME = "resource://freeagent/"
+RESOURCE_MIME = "text/markdown"
+
+
+def _md_table(headers: list[str], rows: list[list[str]]) -> str:
+    """Markdown の表。Resources の本文を組み立てるためだけに使う（content には使わない）。"""
+    out = ["| " + " | ".join(headers) + " |",
+           "|" + "|".join("---" for _ in headers) + "|"]
+    for row in rows:
+        out.append("| " + " | ".join(str(cell) for cell in row) + " |")
+    return "\n".join(out)
+
+
+def _resource_api_rules() -> str:
+    """どのツールを選ぶか（列挙は実装のツール名から書く）と、待ち時間の契約。"""
+    return "\n".join([
+        "# hermes-freeagent-bind の使い分け",
+        "",
+        "## どのツールを選ぶか",
+        "",
+        _md_table(["場面", "ツール"], [
+            ["出典が要る事実確認（LLM を呼ばない＝幻覚が入らない）", "`freeagent_lookup`"],
+            ["根拠を読ませた上で答えさせたい", "`freeagent_grounded`"],
+            ["同じ問いを複数モデルに当てて多様性が要る", "`freeagent_panel` / `freeagent_fanout`"],
+            ["大量の要素へ同じ指示を並列適用", "`freeagent_map`"],
+            ["設計・デバッグなど 2 段以上の推論", "`freeagent_think` → 必要なら `freeagent_consult`"],
+            ["在庫・Free 判定・生存確認", "`freeagent_models`"],
+            ["決められた手順で自分に調べさせる", "`freeagent_agent`"],
+        ]),
+        "",
+        "## 失敗したとき",
+        "",
+        "- 失敗応答には `structuredContent.next_action`（`kind` / `advice` / `fallback_tools` / `check` / `reenable`）が付く。",
+        "  同じ呼び出しを繰り返さず、そこの次の一手に従う。",
+        "",
+        "## 待ち時間と上限",
+        "",
+        f"- 1 回の呼び出しの予算は既定 {CALL_BUDGET_S:g} 秒（`FREEAGENT_CALL_BUDGET`。0 で無制限）。",
+        f"- 知識取得の締め切りは既定 {KB_DEADLINE:g} 秒（`FREEAGENT_KB_DEADLINE`）。間に合わなかったソースは",
+        "  `timed_out` として返り、裏の取得は続いて次回はキャッシュから返る。",
+        f"- 同時実行は既定 {MAX_WORKERS} 本（`FREEAGENT_MAX_WORKERS`）。`fanout` のプロンプト上限は {MAX_PROMPTS_PER_CALL} 件、",
+        f"  `map` の要素上限は {MAX_MAP_ITEMS} 件。上限で切った件数は `<label>_dropped` に残る（黙って捨てない）。",
+    ])
+
+
+def _resource_sources() -> str:
+    """知識ソースの在庫。既定/明示の別は `DEFAULT_SOURCES` から引く（手で並べない・規約 5）。"""
+    defaults = [name for name in DEFAULT_SOURCES if name in KB_BACKENDS]
+    rows = [[name, "既定" if name in defaults else "明示指定のみ"] for name in KB_BACKENDS]
+    return "\n".join([
+        f"# 知識ソース（{len(KB_BACKENDS)} 種）",
+        "",
+        f"既定で引くのは {len(defaults)} 種: " + ", ".join(defaults),
+        "",
+        "明示指定は `freeagent_lookup` / `freeagent_grounded` の `sources` に名前を並べる",
+        "（`sources` の説明に使う条件がある）。",
+        "",
+        _md_table(["source", "既定/明示"], rows),
+    ])
+
+
+def _resource_providers() -> str:
+    """推論プロバイダと「何を入れれば ready か」。**鍵の値は出さない**（名前だけ）。"""
+    rows = []
+    for name in PROVIDER_ORDER:
+        spec = PROVIDER_SPECS.get(name) or {}
+        missing = _provider_missing_settings(spec)
+        rows.append([name, "ready" if provider_ready(name) else "未設定",
+                     as_str(spec.get("key_env")) or "-",
+                     ", ".join(missing) if missing else "-",
+                     as_str(spec.get("free_kind")) or "-"])
+    return "\n".join([
+        f"# 推論プロバイダ（{len(PROVIDER_ORDER)} 社）",
+        "",
+        "`未設定` は鍵または確認フラグが足りない状態（**値はここに出さない**）。",
+        "キーの置き場所は stdio なら MCP の `env`、常駐 HTTP なら `%LOCALAPPDATA%\\hermes\\.env`。",
+        "",
+        _md_table(["provider", "状態", "key_env", "足りないもの", "free_kind"], rows),
+    ])
+
+
+def _resource_result_shape() -> str:
+    """`content` / `structuredContent` の契約と、引用をどこから読むか。"""
+    return "\n".join([
+        "# 返り値の形（契約）",
+        "",
+        "- `content`: 人間向けの日本語テキスト（表・箇条書き）。LLM 向けの指示は書かない。",
+        "- `structuredContent`: LLM 向けの純粋な JSON。失敗も `error` としてここに入る。",
+        "- 失敗時は `structuredContent.next_action` に次の一手が入る。",
+        "- `freeagent_lookup` の引用は**トップレベルの `citations`** に統合済み。",
+        "  `results[source]` の中に同じ引用は重ねない（`citations_in_results` が false なら統合済み）。",
+        "- 引用 1 件は `source` / `title` / `url` / `summary`（+ `year` / `doi` / `summary_kind` / `metadata_only`）。",
+        "- 本文根拠が無いものは `metadata_only: true` で、根拠として数えない。",
+    ])
+
+
+# 資源の目録。**並びは固定**（辞書の挿入順）で、名前は URI の末尾と一致させる。
+_RESOURCE_BUILDERS = {
+    "api-rules": ("ツールの使い分けと待ち時間の契約", _resource_api_rules),
+    "sources": ("知識ソースの一覧（既定/明示）", _resource_sources),
+    "providers": ("推論プロバイダと必要な設定（値は出さない）", _resource_providers),
+    "result-shape": ("content / structuredContent の契約と引用の位置", _resource_result_shape),
+}
+
+
+def resource_list() -> list[dict]:
+    """`resources/list` の応答（MCP の Resource 形）。"""
+    return [{"uri": RESOURCE_SCHEME + name, "name": name, "title": title,
+             "description": title, "mimeType": RESOURCE_MIME}
+            for name, (title, _builder) in _RESOURCE_BUILDERS.items()]
+
+
+def resource_read(uri) -> str | None:
+    """`resources/read` の本文。未知の URI は None（呼び出し側が -32002 を返す）。"""
+    text = as_str(uri)
+    if not text.startswith(RESOURCE_SCHEME):
+        return None
+    builder = _RESOURCE_BUILDERS.get(text[len(RESOURCE_SCHEME):])
+    if builder is None:
+        return None
+    try:
+        return builder[1]()
+    except Exception as exc:   # 例外は外へ漏らさない（規約 1）。読めなかったことを本文で示す。
+        return f"# 生成に失敗しました\n\n{type(exc).__name__}: {exc}\n"
 
 
 # ================================================================ §9 JSON-RPC / stdio
@@ -7842,6 +7993,18 @@ def _replies_for(msg, marker=None) -> list:
         return [{"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}]
     if method == "tools/call":
         return [{"jsonrpc": "2.0", "id": msg_id, "result": handle_tool_call(params)}]
+    # §11 Resources。**表は 1 か所**（stdio と HTTP が同じ表を通る。規約 38）。
+    if method == "resources/list":
+        return [{"jsonrpc": "2.0", "id": msg_id, "result": {"resources": resource_list()}}]
+    if method == "resources/read":
+        uri = params.get("uri") if isinstance(params, dict) else None
+        text = resource_read(uri) if uri else None
+        if text is None:
+            # MCP の Resource not found は -32002（未知の URI を空文字で成功にしない）。
+            return [{"jsonrpc": "2.0", "id": msg_id,
+                     "error": {"code": -32002, "message": f"resource not found: {uri}"}}]
+        return [{"jsonrpc": "2.0", "id": msg_id,
+                 "result": {"contents": [{"uri": uri, "mimeType": RESOURCE_MIME, "text": text}]}}]
     if method == "ping":
         return [{"jsonrpc": "2.0", "id": msg_id, "result": {}}]
     return [{"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"method not found: {method}"}}]
