@@ -163,8 +163,9 @@ hermes config set mcp_servers.freeagent-bind.headers.x-freeagent-harness hermes
 - トランスポートは `--transport` / `FREEAGENT_TRANSPORT`（既定 `stdio`）。残りは `FREEAGENT_HTTP_*`（[環境変数](#-環境変数)）。
 - HTTP の起動は待受まで実測 463ms（同じ環境の import 単体は 101ms）。**stdio の起動時間は変わりません**
   （`http.server` は HTTP のときだけ読み込みます）。
-- 共有されるのは**レート制限と統計**です。推論の同時実行数の上限（`FREEAGENT_MAX_WORKERS`）は
-  プロセス全体で 1 つになるので、クライアントを増やしても並列度は増えません。
+- 共有されるのは**提供元ごとの同時実行枠・レート制限・統計**です。`FREEAGENT_MAX_WORKERS` は
+  並列処理の**呼び出しごとの上限**で、プロセス全体のスレッド数上限ではありません。複数要求では
+  スレッド数が増えますが、推論先への同時送信は共有された提供元ごとの枠が制御します。
 - HTTP では `FREEAGENT_HARNESS` の env が渡らないので、目印は**ヘッダ**で付けます（上の `headers`）。
   付け忘れると「ハーネスを判別できません」のログが出ます（動作は変わりません）。
 
@@ -1507,8 +1508,8 @@ freeagent_think(thought="…", thought_number=1, total_thoughts=3, card="t_a7558
 > 上流への同時実行数 ≒ プロセス数 × Σ（提供元ごとの枠）= プロセス数 ×（`nous` 6 ＋ 他は 4 …）
 
 **提供元が違えば枠は別々に数えます**（別ホストなので上流の制限も別）。同じ提供元へ集中する分だけが
-枠で直列化されます。`FREEAGENT_MAX_WORKERS`（既定 8）は**スレッドの本数**で、上流への同時数は
-提供元の枠が決めます。
+枠で直列化されます。`FREEAGENT_MAX_WORKERS`（既定 8）は**並列処理 1 回のワーカー上限**で、
+同時に複数回呼べばスレッドは合算されます。上流への同時数は提供元の枠が決めます。
 
 並列ワーカーを回すなら [5. 複数クライアントで 1 プロセスを共有する（HTTP モード・任意）](#5-複数クライアントで-1-プロセスを共有するhttp-モード任意) に切り替えてください。
 実測では、常駐 HTTP に切り替えた後は**ワーカーを回しても `freeagent_bind` のプロセスは 1 つも増えませんでした**
@@ -1583,7 +1584,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 |---|---|---|
 | `FREEAGENT_STATE_DIR` | `%LOCALAPPDATA%\hermes-freeagent-bind` | 蓄積ストア（統計・クールダウン・相談セッション）。**一時領域に置かない** |
 | `FREEAGENT_DEFAULT_MODEL` | 空（自動選抜） | 既定モデル（`provider/model`） |
-| `FREEAGENT_MAX_WORKERS` | 8 | 推論の並列度＝同時に走らせる本数（1〜32）。**429 の抑止は提供元の枠が担う**（下の 3 行） |
+| `FREEAGENT_MAX_WORKERS` | 8 | 並列処理 1 回のワーカー上限（1〜32）。プロセス全体の上限ではない。**429 の抑止は提供元の枠が担う**（下の 3 行） |
 | `FREEAGENT_CALL_BUDGET` | 240 | **ツール 1 回の並列実行の壁時計予算**（秒・0 で無制限）。MCP クライアントの待ち（実測 300 秒）より短くしておく——300 秒で切られると**取れていた結果も失われる**。打ち切った分は `dropped: true` の脱落として返り、まだ走っていない呼び出しは取り消す |
 | `FREEAGENT_PROGRESS` | 1 | **進捗通知（`notifications/progress`）を送るか**（0 で無効）。クライアントが要求に `_meta.progressToken` を付けたときだけ送ります（仕様どおり。付けてこなければ 1 件も送りません）。送り先は transport ごと——stdio は stdout の 1 行、HTTP はセッションの SSE 待ち行列 |
 | `FREEAGENT_COALESCE` | 1 | **同一実行内の重複合流**（0 で無効）。1 回のツール呼び出しの中で `(モデル, プロンプト, system, max_tokens, temperature, kind)` が**完全に一致**した呼び出しは 1 本だけ上流へ流し、結果を配ります（行は全件返り、配った側に `coalesced: true` が付きます） |
@@ -1762,6 +1763,7 @@ python scripts/gen_cases.py
 python scripts/measure_quality.py --cases builtin --strategies single
 python scripts/measure_adoption.py
 python scripts/measure_kb.py --report
+python scripts/measure_parallel_load.py --calls 8 --jobs 8 --workers 8 --delay 0.5 --budget 0.1
 python scripts/apply_proactive.py
 python scripts/apply_proactive.py --check
 ```
@@ -1775,6 +1777,9 @@ env -u PYTHONPATH PYTHONPATH=src python scripts/probe_providers.py
 env -u PYTHONPATH PYTHONPATH=src python scripts/warmup_models.py --page 25
 ```
 
+- `measure_parallel_load.py` は実際の `run_parallel` を模擬 I/O で動かすオフライン計測です。
+  返却時に動いている worker 数・最大同時数・Python 管理メモリのピークを JSON で返します。
+  計測自体の負荷を含み、実 API や提供元のゲート、実運用の性能を再現するものではありません。
 - `smoke_stdio.py` は接続・一覧・エラー経路の確認です。`FREEAGENT_PROBE_NET=1` でもモデル一覧取得までで、
   **終了コード 0 でも Free 候補が 0 の場合があります。モデルの実回答の保証ではありません。**
 - `probe_providers.py` は推論を試しますがフォールバック可能です。要求モデルと実際に答えたモデルを確認してください。

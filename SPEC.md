@@ -273,6 +273,8 @@
 - 実測（`tests/test_parallel_budget.py`）: 1.0 秒の worker を 0.1 秒の予算で打ち切ると **0.5 秒以内**に
   返る／並列度 1・予算 0.05 秒では走り出した 1 件以外は**実行されない**（取り消しが効いている）。
 
+並列処理の重なりは `python scripts/measure_parallel_load.py --calls 8 --jobs 8 --workers 8 --delay 0.5 --budget 0.1` で測れる。実際の `run_parallel` を使うが worker は模擬 I/O であり、提供元ゲートや API は使わない。JSON の `active_workers_at_return` は回収打ち切り後も実行中の数、`active_workers_after_drain` は終了待ち後の数。`python_peak_bytes` は `tracemalloc` の Python 管理メモリで、プロセス全体の RSS ではない。計測器の負荷も含むため実運用の性能とは区別する。
+
 ### 4.6 進捗通知（`notifications/progress`・v0.19.0）
 
 並列の回収 1 件ごとに `notifications/progress` を 1 件送る。**送るのは、クライアントが要求に
@@ -1383,7 +1385,8 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
 **既定は stdio。** `--transport http` / `FREEAGENT_TRANSPORT=http` のときだけ HTTP で待ち受ける。目的は
 「**1 プロセスを複数クライアントが共有する**」こと。stdio を N 本立てると、プロセス内に持つホスト予算
 （`_KB_RATE_NEXT`）・`_KB_CACHE` / `_KB_INFLIGHT`・`_MODELS_CACHE`（600 秒。**一覧だけは `model_catalog.json` に落ちるので、プロセスを入れ替えても温かい**・§4.4）・`_COOLDOWN`・`model_stats`・
-`MAX_WORKERS` が N 分割される（規約 28 が警告する「同一 IP の連打」）。
+提供元ごとのゲートが N 分割される（規約 28 が警告する「同一 IP の連打」）。`MAX_WORKERS` は
+並列処理の呼び出しごとの上限であり、HTTP の単一プロセス全体のスレッド上限ではない。
 
 仕様の範囲は、Hermes の `mcp.client.streamable_http` が実際に要求する経路に絞る（実測で確定）:
 

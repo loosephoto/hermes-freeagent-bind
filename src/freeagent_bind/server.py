@@ -85,7 +85,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.20.0"
+SERVER_VERSION = "0.20.1"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -7849,7 +7849,7 @@ def serve() -> None:
 #   * `_KB_CACHE` / `_KB_INFLIGHT` … 同じ問いはキャッシュに当たり、**同時実行は 1 回の上流取得に畳まれる**
 #   * `_KB_RATE_NEXT` … ホスト単位のアクセス間隔（規約 28 が警告する「複数 MCP による同一 IP の連打」を防ぐ）
 #   * `_MODELS_CACHE`（600 秒）・`_COOLDOWN`・`model_stats`・`_ModelClaims`
-#   * `MAX_WORKERS` … Free モデルへの同時実行数の上限がプロセス全体で 1 つになる
+#   * `PROVIDER_GATE` … 推論先ごとの同時送信枠は共有。MAX_WORKERS は呼び出し単位の制限
 # stdio を N 本立てるとこれらが N 分割され、レート制限も統計も守られない（どちらもプロセス内ロック）。
 #
 # 実装は**標準ライブラリのみ**（依存ゼロは維持）。仕様の範囲は、Hermes の MCP クライアント
