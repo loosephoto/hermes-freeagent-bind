@@ -607,6 +607,26 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     **通知なので応答しない**（`_replies_for` が `[]` を返す）。SSE には `X-Accel-Buffering: no` を
     付ける（仕様の SHOULD。プロキシがバッファすると進捗がまとめて遅れて届く）。
 
+80. **状態ファイルの read-modify-write はプロセス間で直列化する**（v0.25.0・SPEC §6.23）。
+    `_MODELS_LOCK` / `_COOLDOWN_LOCK` / `_QUOTA_LOCK` は `threading` なので、同じ
+    `FREEAGENT_STATE_DIR` を 2 プロセスが共有すると **後勝ちで片方の記録が消える**。
+    `_file_lock(path)`（`msvcrt.locking` / `fcntl.flock`）の内側で**ディスクの最新を読み**、
+    差分を足してから書く。実測: `model_stats` は 2 プロセス × 50 件で **100 → 50 件**（旧）、
+    クォータは `rpd=10` に 12 要求で **4 件しか数えられず上限が効かない**（旧）。
+    **新しい状態ファイルを作るときも同じ型にする**（読むだけの経路は mtime で再読込）。
+
+81. **読み側も mtime で取り込む**（v0.25.0）。`_STATS_MTIME` / `_COOLDOWN_MTIME` / `_QUOTA_MTIME`
+    を覚え、**ファイルが変わっていれば読み直す**（「起動時に 1 回だけ」だと、常駐 HTTP が学習した
+    「Free 終了（404）」を stdio が永久に知らない）。ガードは `mtime is None or mtime == 記録値`
+    のとき早期 return。**`mtime is None`（ファイルが無い）で読み直すと、テストが `_STATS["models"]`
+    に直接入れた値を消す**ので、`_STATS_LOADED` を立てただけの既存テストを壊さない形にしている。
+
+82. **クールダウンの保存は「ディスクと併合」**（v0.25.0）。丸ごと上書きすると、同時に走る他プロセスの
+    期限が消える。併合は **`until` が新しい方**を採る。副作用として、テストがメモリの `until` だけを
+    過去にしてもディスクの未来の期限が併合で戻る（`_cooldown_save()` しても同じ）。**期限切れを
+    試すときは `mock.patch.object(S, "now_ts", lambda: 未来)` で時間を進める**
+    （`tests/test_orchestration_v11.py` の `test_ladder_restarts_after_expiry` がその型）。
+
 ## ライセンス
 
 MIT。データは各提供元の条件に従い、回答には出典を表示すること。

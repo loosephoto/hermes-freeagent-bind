@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.24.0"
+SERVER_VERSION = "0.25.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -523,6 +523,7 @@ def _file_lock(path: str, timeout: float = 10.0):
 
 _COOLDOWN: dict[str, dict] = {}
 _COOLDOWN_LOADED = False
+_COOLDOWN_MTIME: float | None = None
 _COOLDOWN_LOCK = threading.Lock()
 _COOLDOWN_DEFAULT_S = 60.0
 _COOLDOWN_MAX_S = 900.0
@@ -543,13 +544,19 @@ def _cooldown_prune(entries: dict, now: float) -> dict:
 
 
 def _ensure_cooldown_loaded() -> None:
-    global _COOLDOWN_LOADED
-    if _COOLDOWN_LOADED or not COOLDOWN_ENABLED:
+    global _COOLDOWN_LOADED, _COOLDOWN_MTIME
+    if not COOLDOWN_ENABLED:
+        return
+    path = cooldowns_path()
+    mtime = _file_mtime(path)
+    # **別プロセスが書いたクールダウンも見る**（v0.25.0）。1 回だけ読む実装だと、stdio と常駐 HTTP が
+    # 同じディレクトリを共有しているとき、片方が学習した「Free 終了（404）」を知らないまま叩き続ける。
+    if _COOLDOWN_LOADED and (mtime is None or mtime == _COOLDOWN_MTIME):
         return
     with _COOLDOWN_LOCK:
-        if _COOLDOWN_LOADED:
+        if _COOLDOWN_LOADED and (mtime is None or mtime == _COOLDOWN_MTIME):
             return
-        data = _load_json(cooldowns_path(), {})
+        data = _load_json(path, {})
         saved = data.get("cooldowns") if isinstance(data, dict) else None
         now = now_ts()
         if isinstance(saved, dict):
@@ -559,15 +566,32 @@ def _ensure_cooldown_loaded() -> None:
                 if not cur or as_float(entry.get("until"), 0.0) > as_float(cur.get("until"), 0.0):
                     _COOLDOWN[ref] = entry
         _COOLDOWN_LOADED = True
+        _COOLDOWN_MTIME = mtime
 
 
 def _cooldown_save() -> bool:
+    """ディスクの内容と**併合してから**書く（他プロセスの期限を消さない）。"""
     if not COOLDOWN_ENABLED:
         return False
-    with _COOLDOWN_LOCK:
-        payload = {"version": 1, "saved_at": now_ts(),
-                   "cooldowns": _cooldown_prune(_COOLDOWN, now_ts())}
-    return _atomic_write(cooldowns_path(), json.dumps(payload, ensure_ascii=False))
+    now = now_ts()
+    path = cooldowns_path()
+    with _file_lock(path):
+        with _COOLDOWN_LOCK:
+            merged = _cooldown_prune(copy.deepcopy(_COOLDOWN), now)
+        disk = _load_json(path, {})
+        saved = disk.get("cooldowns") if isinstance(disk, dict) else None
+        if isinstance(saved, dict):
+            for ref, entry in _cooldown_prune(saved, now).items():
+                cur = merged.get(ref)
+                if not cur or as_float(entry.get("until"), 0.0) > as_float(cur.get("until"), 0.0):
+                    merged[ref] = entry
+        merged = _cooldown_prune(merged, now)
+        ok = _atomic_write(path, json.dumps({"version": 1, "saved_at": now, "cooldowns": merged},
+                                            ensure_ascii=False))
+        with _COOLDOWN_LOCK:
+            _COOLDOWN.clear()
+            _COOLDOWN.update(merged)
+        return ok
 
 
 def _parse_retry_after(value: str | None, now: float | None = None) -> float:
@@ -778,30 +802,75 @@ def _stats_prune(models: dict, now: float) -> dict:
 
 
 _STATS_WRITE_LOCK = threading.Lock()
+# 最後に読んだファイルの更新時刻（**別プロセスの記録を取り込む**ため・v0.25.0）。
+_STATS_MTIME: float | None = None
+
+
+def _stats_read(path: str) -> dict:
+    """`model_stats.json` を読む（壊れていれば空）。**ロックの内側で呼ぶ**。"""
+    data = _load_json(path, {})
+    models = data.get("models") if isinstance(data, dict) else None
+    return models if isinstance(models, dict) else {}
 
 
 def _ensure_stats_loaded() -> None:
-    global _STATS_LOADED
-    if _STATS_LOADED or not STATS_ENABLED:
+    global _STATS_LOADED, _STATS_MTIME
+    if not STATS_ENABLED:
+        return
+    path = stats_path()
+    mtime = _file_mtime(path)
+    # 読み込み済みでも、**ファイルが別プロセスに更新されていたら読み直す**。
+    # 「起動時に 1 回だけ」だと、常駐 HTTP と stdio が同じディレクトリを共有する構成で
+    # 片方の学習が永久に見えない（`_STATS_MTIME` は自分が読んだ時刻だけを覚える）。
+    if _STATS_LOADED and (mtime is None or mtime == _STATS_MTIME):
         return
     with _STATS_LOCK:
-        if _STATS_LOADED:
+        if _STATS_LOADED and (mtime is None or mtime == _STATS_MTIME):
             return
-        data = _load_json(stats_path(), {})
-        models = data.get("models") if isinstance(data, dict) else None
-        _STATS["models"] = models if isinstance(models, dict) else {}
+        _STATS["models"] = _stats_read(path)
         _STATS_LOADED = True
+        _STATS_MTIME = mtime
+
+
+def _stats_apply(models: dict, ref: str, kind: str, *, now: float, error: str = "",
+                 leak: bool = False, trunc: bool = False, empty: bool = False,
+                 lat_ms: float = 0.0) -> dict:
+    """1 件の観測を `models` に足す（読み直した**最新の写し**に対して行う）。"""
+    entry = models.setdefault(ref, {"kinds": {}, "updated_at": now})
+    if not isinstance(entry.get("kinds"), dict):
+        entry["kinds"] = {}
+    _decay_model(entry, now)
+    row = entry["kinds"].setdefault(kind, _empty_kind())
+    row["n"] = as_float(row.get("n"), 0.0) + 1.0
+    if error:
+        cls = classify_error(error)
+        err = row.setdefault("err", {})
+        err[cls] = as_float(err.get(cls), 0.0) + 1.0
+    else:
+        if leak:
+            row["leak"] = as_float(row.get("leak"), 0.0) + 1.0
+        elif trunc:
+            row["trunc"] = as_float(row.get("trunc"), 0.0) + 1.0
+        elif empty:
+            row["empty"] = as_float(row.get("empty"), 0.0) + 1.0
+        else:
+            row["ok"] = as_float(row.get("ok"), 0.0) + 1.0
+    if lat_ms:
+        row["lat_ms"] = as_float(row.get("lat_ms"), 0.0) + lat_ms
+    return models
 
 
 def _stats_save() -> bool:
+    """いまのメモリ上の統計を書く（`note_observation` は差分を足す経路を使う）。"""
     if not STATS_ENABLED:
         return False
     now = now_ts()
-    with _STATS_WRITE_LOCK:
+    path = stats_path()
+    with _STATS_WRITE_LOCK, _file_lock(path):
         with _STATS_LOCK:
-            _STATS["models"] = _stats_prune(_STATS["models"], now)
-            payload = {"version": 1, "models": copy.deepcopy(_STATS["models"])}
-        return _atomic_write(stats_path(), json.dumps(payload, ensure_ascii=False))
+            models = _stats_prune(copy.deepcopy(_STATS["models"]), now)
+        payload = {"version": 1, "models": models}
+        return _atomic_write(path, json.dumps(payload, ensure_ascii=False))
 
 
 def classify_error(err: str) -> str:
@@ -861,33 +930,25 @@ def is_env_failure(err: str) -> bool:
 def note_observation(ref: str, kind: str, *, error: str = "", leak: bool = False,
                      trunc: bool = False, empty: bool = False, lat_ms: float = 0.0) -> None:
     """1 回の呼び出し結果を記録する（ok は「エラーが無く、空でもなく、切断もされていない」）。"""
+    global _STATS_LOADED, _STATS_MTIME
     if not STATS_ENABLED:
         return
-    _ensure_stats_loaded()
     now = now_ts()
-    with _STATS_LOCK:
-        entry = _STATS["models"].setdefault(ref, {"kinds": {}, "updated_at": now})
-        _decay_model(entry, now)
-        row = entry["kinds"].setdefault(kind, _empty_kind())
-        row["n"] = as_float(row.get("n"), 0.0) + 1.0
-        if error:
-            cls = classify_error(error)
-            err = row.setdefault("err", {})
-            err[cls] = as_float(err.get(cls), 0.0) + 1.0
-        else:
-            if leak:
-                row["leak"] = as_float(row.get("leak"), 0.0) + 1.0
-            elif trunc:
-                row["trunc"] = as_float(row.get("trunc"), 0.0) + 1.0
-            elif empty:
-                row["empty"] = as_float(row.get("empty"), 0.0) + 1.0
-            else:
-                row["ok"] = as_float(row.get("ok"), 0.0) + 1.0
-        if lat_ms:
-            row["lat_ms"] = as_float(row.get("lat_ms"), 0.0) + lat_ms
-
-
-    _stats_save()
+    path = stats_path()
+    # **プロセス間で read-modify-write を直列化する**（v0.25.0）。メモリ上の写しに足して
+    # 丸ごと上書きすると、同じ `FREEAGENT_STATE_DIR` を共有する 2 つのプロセス
+    # （常駐 HTTP と stdio）で **後勝ちの欠落**が出る（実測: 2 プロセス × 50 件 = 期待 100 件に対し
+    # 旧実装は **50 件**。ほぼ片方の記録が丸ごと消える）。ロックの内側でディスクの最新を読み、
+    # そこへ 1 件だけ足す。
+    with _file_lock(path):
+        models = _stats_apply(_stats_read(path), ref, kind, now=now, error=error,
+                              leak=leak, trunc=trunc, empty=empty, lat_ms=lat_ms)
+        models = _stats_prune(models, now)
+        _atomic_write(path, json.dumps({"version": 1, "models": models}, ensure_ascii=False))
+        with _STATS_LOCK:
+            _STATS["models"] = models
+            _STATS_LOADED = True
+            _STATS_MTIME = _file_mtime(path)
 
 
 def _kind_quality(row: dict) -> tuple[float, float]:
@@ -2761,6 +2822,7 @@ _QUOTA_LIMITS = _parse_quota_limits(os.environ.get("FREEAGENT_QUOTA_LIMITS", "")
 QUOTA_ENABLED = _env_on("FREEAGENT_QUOTA", True) and bool(_QUOTA_LIMITS)
 _QUOTA: dict[str, dict] = {}
 _QUOTA_LOADED = False
+_QUOTA_MTIME: float | None = None
 _QUOTA_LOCK = threading.Lock()
 _QUOTA_MINUTE_S = 60.0
 
@@ -2784,28 +2846,48 @@ def _quota_row(provider: str, now: float) -> dict:
     return row
 
 
+def _quota_read(path: str) -> dict:
+    """`quota.json` の `providers` を読む（**ロックの内側で呼ぶ**）。"""
+    data = _load_json(path, {})
+    rows = data.get("providers") if isinstance(data, dict) else None
+    if not isinstance(rows, dict):
+        return {}
+    return {name: row for name, row in rows.items() if isinstance(row, dict)}
+
+
 def _ensure_quota_loaded() -> None:
-    global _QUOTA_LOADED
-    if _QUOTA_LOADED or not QUOTA_ENABLED:
+    global _QUOTA_LOADED, _QUOTA_MTIME
+    if not QUOTA_ENABLED:
+        return
+    path = quota_path()
+    mtime = _file_mtime(path)
+    # **別プロセスの使用量も見る**（v0.25.0）。1 回だけ読むと、常駐 HTTP と stdio が同じ上限を
+    # 別々に数えて **合算で上限を超える**（プロセス数だけ枠を食い潰す）。
+    if _QUOTA_LOADED and (mtime is None or mtime == _QUOTA_MTIME):
         return
     with _QUOTA_LOCK:
-        if _QUOTA_LOADED:
+        if _QUOTA_LOADED and (mtime is None or mtime == _QUOTA_MTIME):
             return
-        data = _load_json(quota_path(), {})
-        rows = data.get("providers") if isinstance(data, dict) else None
-        if isinstance(rows, dict):
-            for name, row in rows.items():
-                if isinstance(row, dict):
-                    _QUOTA[name] = row
+        _QUOTA.update(_quota_read(path))
         _QUOTA_LOADED = True
+        _QUOTA_MTIME = mtime
+
+
+def _quota_write(rows: dict) -> bool:
+    """ロックの内側から呼ぶ（`providers` 全体を書く）。"""
+    ok = _atomic_write(quota_path(), json.dumps({"version": 1, "providers": rows}, ensure_ascii=False))
+    global _QUOTA_MTIME
+    _QUOTA_MTIME = _file_mtime(quota_path())
+    return ok
 
 
 def _quota_save() -> bool:
     if not QUOTA_ENABLED:
         return False
-    with _QUOTA_LOCK:
-        payload = {"version": 1, "providers": copy.deepcopy(_QUOTA)}
-    return _atomic_write(quota_path(), json.dumps(payload, ensure_ascii=False))
+    with _file_lock(quota_path()):
+        with _QUOTA_LOCK:
+            payload = copy.deepcopy(_QUOTA)
+        return _quota_write(payload)
 
 
 def _quota_used(row: dict) -> dict[str, int]:
@@ -2843,19 +2925,23 @@ def quota_reserve(provider: str) -> str | None:
     limits = _QUOTA_LIMITS.get(provider) if QUOTA_ENABLED else None
     if not limits:
         return None
-    _ensure_quota_loaded()
-    reserved = False
-    with _QUOTA_LOCK:
-        row = _quota_row(provider, now_ts())
-        used = _quota_used(row)
-        reason = _quota_reason(provider, used, limits)
-        if reason:
-            return reason
-        row["min_req"] = used["rpm"] + 1
-        row["day_req"] = used["rpd"] + 1
-        reserved = True
-    if reserved:
-        _quota_save()
+    # **プロセス間でも check-then-act を 1 つのクリティカルセクションにする**（v0.25.0）。
+    # ロックの内側でディスクの最新を取り込み、判定と加算を同じ写しに対して行う。
+    # プロセス内の `threading.Lock` だけでは、常駐 HTTP と stdio が同じ上限を別々に数える。
+    path = quota_path()
+    with _file_lock(path):
+        with _QUOTA_LOCK:
+            _QUOTA.clear()
+            _QUOTA.update(_quota_read(path))
+            row = _quota_row(provider, now_ts())
+            used = _quota_used(row)
+            reason = _quota_reason(provider, used, limits)
+            if reason:
+                return reason
+            row["min_req"] = used["rpm"] + 1
+            row["day_req"] = used["rpd"] + 1
+            payload = copy.deepcopy(_QUOTA)
+        _quota_write(payload)
     return None
 
 
@@ -2863,12 +2949,16 @@ def quota_add_tokens(provider: str, tokens: int = 0) -> None:
     """消費したトークンを足す（リクエスト数は `quota_reserve` で確保済み）。"""
     if tokens <= 0 or not QUOTA_ENABLED or not _QUOTA_LIMITS.get(provider):
         return
-    _ensure_quota_loaded()
-    with _QUOTA_LOCK:
-        row = _quota_row(provider, now_ts())
-        row["min_tok"] = int(row.get("min_tok") or 0) + int(tokens)
-        row["day_tok"] = int(row.get("day_tok") or 0) + int(tokens)
-    _quota_save()
+    path = quota_path()
+    with _file_lock(path):
+        with _QUOTA_LOCK:
+            _QUOTA.clear()
+            _QUOTA.update(_quota_read(path))
+            row = _quota_row(provider, now_ts())
+            row["min_tok"] = int(row.get("min_tok") or 0) + int(tokens)
+            row["day_tok"] = int(row.get("day_tok") or 0) + int(tokens)
+            payload = copy.deepcopy(_QUOTA)
+        _quota_write(payload)
 
 
 def quota_record(provider: str, tokens: int = 0) -> None:
@@ -2895,7 +2985,9 @@ def quota_report(providers: list[str] | None = None) -> dict | None:
             limits = _QUOTA_LIMITS.get(name) or {}
             out[name] = {unit: {"used": used[unit], "limit": limits[unit]}
                          for unit in _QUOTA_UNITS if limits.get(unit)}
-    return {"providers": out, "scope": "このプロセスの記録（提供元単位・UTC 日境界）"}
+    # v0.25.0: 同じ `FREEAGENT_STATE_DIR` を共有する限り**プロセスをまたいで合算**される
+    # （以前はプロセスごとに別々に数えていたので、2 プロセスで上限の 2 倍まで通った）。
+    return {"providers": out, "scope": "状態ディレクトリを共有するプロセスの合算（提供元単位・UTC 日境界）"}
 
 
 def quota_reset() -> None:

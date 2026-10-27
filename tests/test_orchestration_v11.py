@@ -184,9 +184,12 @@ class TestCooldownLadder(_StateIsolated):
         S.note_rate_limited("p/m")
         S.note_rate_limited("p/m")
         self.assertEqual(S._COOLDOWN["p/m"]["strikes"], 2)
-        with S._COOLDOWN_LOCK:                       # 冷えきった状態を作る
-            S._COOLDOWN["p/m"]["until"] = time.time() - 1
-        S.note_rate_limited("p/m")
+        # **時間を進めて冷えきった状態を作る**（v0.25.0）。保存は「ディスクの内容と併合」するので、
+        # メモリの `until` だけを過去にすると、ディスクに残る未来の期限が併合で戻ってくる。
+        # 実時間が経った状態を `now_ts` で作る（2 回目の段は 180 秒なので 400 秒進める）。
+        later = time.time() + 400
+        with mock.patch.object(S, "now_ts", lambda: later):
+            S.note_rate_limited("p/m")
         self.assertEqual(S._COOLDOWN["p/m"]["strikes"], 1)
 
 
