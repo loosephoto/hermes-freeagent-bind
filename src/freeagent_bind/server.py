@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.23.1"
+SERVER_VERSION = "0.24.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -380,6 +380,15 @@ def truncate(text: str, limit: int) -> str:
 # 壊れたファイルは無視して空から始める（例外をツールへ漏らさない）。
 # トレースと品質統計には**本文を残さない**（外部 API へ送った内容をディスクに置かない方針）。
 
+_SWEEP_LAST: dict[str, float] = {}
+_SWEEP_LOCK = threading.Lock()
+# 掃除の間隔（秒）。`note_observation` はサブLLM 呼び出し 1 回ごとに `_stats_save` を通るので、
+# 毎回 `os.listdir` すると**並列 8 本の完了ごとにディレクトリ全走査**が直列ロックの内側で走る
+# （実測: 50 モデルの状態で 16 回の保存に 32.3ms）。残骸は 60 秒より古いものだけを消すので、
+# 走査自体を 60 秒に 1 回に間引いても取りこぼさない。
+_SWEEP_INTERVAL_S = 60.0
+
+
 def _sweep_stale_tmp(path: str, *, min_age_s: float = 60.0) -> int:
     """同じ対象の**書きかけファイル**（`<name>.<pid>.<tid>.tmp`）を掃除する。
 
@@ -387,8 +396,15 @@ def _sweep_stale_tmp(path: str, *, min_age_s: float = 60.0) -> int:
     状態ディレクトリに**永久に残る**。再起動のたびに増えるので、原子置換の副作用として掃除する。
     並行して書いている別スレッドの一時ファイルを壊さないよう、**古いものだけ**を対象にする
     （単一ファイルへの書き込みは `threading.Lock` の内側なので、60 秒前の残骸は必ず放棄済み）。
+    走査は**同じディレクトリにつき `_SWEEP_INTERVAL_S` に 1 回**（毎回 listdir しない）。
     """
     directory = os.path.dirname(path) or "."
+    with _SWEEP_LOCK:
+        last = _SWEEP_LAST.get(directory)
+        now = time.monotonic()
+        if last is not None and now - last < _SWEEP_INTERVAL_S:
+            return 0
+        _SWEEP_LAST[directory] = now
     base = os.path.basename(path)
     removed = 0
     try:
@@ -971,11 +987,23 @@ def _rank_score(ref: str) -> float:
     return a / total + _RANK_EXPLORE * math.sqrt(max(0.0, var))
 
 
+def _rank_latency_key(ref: str) -> float:
+    """同点のときの第 2 キー（平均所要ミリ秒）。**観測が無いモデルは後ろ**（`math.inf`）。
+
+    品質の事後平均が完全に一致する 2 体（例: どちらも 1 勝 0 敗）は、これまで ID の
+    アルファベット順で決まっていた。応答が 2 秒のモデルと 25 秒のモデルが同点なら、
+    速い方を先に置く方が利用者の待ち時間は短い（品質の順位は**1 ミリも変えない**＝
+    同点の内側だけを並べ替える。実測: 判断は `_rank_score` の値そのまま）。
+    """
+    latency = model_mean_latency(ref)
+    return latency if latency is not None else math.inf
+
+
 def rank_models(refs: list[str]) -> list[str]:
     """品質順。観測が少ないモデルへ探索ボーナスを与え、新しい Free モデルが試されない問題を防ぐ。"""
     if not RANK_ENABLED:
         return list(refs)
-    return sorted(refs, key=lambda r: (-_rank_score(r), r))
+    return sorted(refs, key=lambda r: (-_rank_score(r), _rank_latency_key(r), r))
 
 
 def diverse_order(refs: list[str]) -> list[str]:
@@ -3477,6 +3505,10 @@ class Deadline:
     def expired(self) -> bool:
         return self.remaining() <= 0.0
 
+    def cancel(self) -> None:
+        """打ち切る（回収は即座に終わり、未開始のジョブは投入されない）。"""
+        self._until = time.monotonic()
+
     def __repr__(self) -> str:
         return f"Deadline(total={self.total:.1f}s, remaining={self.remaining():.1f}s)"
 
@@ -3521,6 +3553,55 @@ def budget_expired() -> bool:
     """このツール呼び出しの予算を使い切ったか（後段を始めてよいかの判定）。"""
     shared = getattr(_BUDGET_LOCAL, "deadline", None)
     return bool(shared is not None and shared.expired)
+
+
+# ---------------------------------------------------------------- §4.0 要求単位のキャンセル
+# MCP の `notifications/cancelled`（`requestId`）を受けたら、**その要求の予算を打ち切る**。
+# スレッドは殺せないので「回収をやめる」だけだが、未開始のジョブは投入されず（`run_parallel` の
+# 冒頭判定）、上流の枠とクォータを無駄に使わない。クライアントが 300 秒で切った後も裏で走り続ける
+# 呼び出しを減らすのが目的（v0.24.0）。
+_REQ_LOCAL = threading.local()
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE_BUDGETS: dict[str, "Deadline"] = {}
+
+
+def _active_key(msg_id) -> str:
+    return f"{type(msg_id).__name__}:{msg_id}"
+
+
+def _register_active(msg_id, deadline) -> None:
+    if deadline is None or msg_id is None:
+        return
+    with _ACTIVE_LOCK:
+        _ACTIVE_BUDGETS[_active_key(msg_id)] = deadline
+
+
+def _unregister_active(msg_id) -> None:
+    if msg_id is None:
+        return
+    with _ACTIVE_LOCK:
+        _ACTIVE_BUDGETS.pop(_active_key(msg_id), None)
+
+
+def cancel_request(msg_id) -> bool:
+    """`requestId` の要求を打ち切る（対応する要求が無ければ False）。"""
+    with _ACTIVE_LOCK:
+        deadline = _ACTIVE_BUDGETS.pop(_active_key(msg_id), None)
+    if deadline is None:
+        return False
+    deadline.cancel()
+    return True
+
+
+@contextlib.contextmanager
+def request_scope(msg_id):
+    """transport が「いま処理している要求の id」を張る（キャンセルの手がかり）。"""
+    previous = getattr(_REQ_LOCAL, "id", None)
+    _REQ_LOCAL.id = msg_id
+    try:
+        yield
+    finally:
+        _REQ_LOCAL.id = previous
 
 
 # ---------------------------------------------------------------- §4.1 任意の公平な共有スケジューラ
@@ -3888,7 +3969,14 @@ def kb_http(url: str, *, accept: str = "application/json", extra_headers: dict |
 
 def kb_json(url: str, *, extra_headers: dict | None = None,
             payload: dict | None = None) -> tuple[dict | None, str]:
-    """JSON を取る。`payload` を渡すと POST（Content-Type: application/json）。"""
+    """JSON を取る。`payload` を渡すと POST（Content-Type: application/json）。
+
+    **持続接続の使えるホスト（`_KA_TRUSTED_HOSTS`）は §5.2.1 の経路へ委譲する**（v0.24.0）。
+    `urllib` は応答ごとに接続を閉じるので、同じホストへ続けて引くソースは毎回 TCP + TLS を
+    張り直していた（実測: crossref 2 連続 722ms → 261ms / wikipedia 2 連続 978ms → 831ms）。
+    """
+    if payload is None and not extra_headers and _ka_usable_here(url):
+        return kb_json_keepalive(url)
     if payload is None:
         status, body = kb_http(url, extra_headers=extra_headers)
     else:
@@ -4064,6 +4152,24 @@ def _ka_allowed(url: str) -> bool:
     return not _ka_proxied(host)
 
 
+# 持続接続へ委譲してよいホスト。この経路は**リダイレクトを追わない**（追うと在庫へ返せない接続が
+# 生まれる）ので、301 を返さないと分かっているホストだけを許可する（下は実測した 5 ホスト）。
+# 追加するときは「間隔を守るソースか」も一緒に見る（arXiv は 3 秒直列なので入れない）。
+_KA_TRUSTED_HOSTS = ("wikidata.org", "wikipedia.org", "www.crossref.org", "api.crossref.org",
+                     "api.openalex.org", "hn.algolia.com")
+
+
+def _ka_usable_here(url: str) -> bool:
+    """`kb_json` から持続接続経路へ委譲してよいか（プール有効・非プロキシ・許可ホスト）。"""
+    if not _ka_allowed(url):
+        return False
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == name or host.endswith("." + name) for name in _KA_TRUSTED_HOSTS)
+
+
 def _ka_new_conn(parts, budget: float) -> http.client.HTTPConnection:
     """新しい接続を作る（`timeout` は**接続と読み取りの両方**に掛ける）。"""
     port = parts.port or (443 if parts.scheme == "https" else 80)
@@ -4175,7 +4281,9 @@ def kb_json_keepalive(url: str, *, timeout: float | None = None) -> tuple[dict |
     target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
     headers = {"User-Agent": KB_USER_AGENT, "Accept": "application/json"}
     error = "応答がありませんでした"
-    for attempt in range(2):
+    # 429 の再試行回数は `kb_http` と同じにする（持続接続経路に委譲したソースが
+    # 「1 回で遮断」に変わらないため。実測: crossref の 429 は再試行で直る）。
+    for attempt in range(_KB_HTTP_429_RETRIES + 2):
         remaining = end - time.monotonic()
         if remaining <= 0.2:
             error = "締め切りの残りが足りません"
@@ -4212,7 +4320,7 @@ def kb_json_keepalive(url: str, *, timeout: float | None = None) -> tuple[dict |
         else:
             _ka_close(conn)
         status = int(resp.status)
-        if status == 429 and attempt == 0:
+        if status == 429 and attempt < _KB_HTTP_429_RETRIES + 1:
             # `kb_http` と同じ扱い: 429 は**再試行**で直る（遮断しない）。
             wait_s = min(_parse_retry_after(retry_after, None), _KB_HTTP_429_MAX_WAIT_S)
             if wait_s > 0 and time.monotonic() + wait_s < end:
@@ -8184,11 +8292,17 @@ def handle_tool_call(params: dict) -> dict:
     # `run_parallel` のワーカーへは層を渡さない＝層は「誰を選ぶか」だけに効き、実行の分岐は作らない）。
     previous_tier = _routing_scope(route_tier(as_str(name), _routing_text_chars(args),
                                               as_int(args.get("max_tokens"), 0, 0, 1000000)))
+    request_id = getattr(_REQ_LOCAL, "id", None)
     try:
         # `budget_scope()` は**この呼び出し 1 回ぶん**の `Deadline` を張る（入れ子の
         # `run_parallel` / refine / reduce / 討論 2 ラウンド目が満額を新しく作らない）。
-        with progress_for(params), bound_coalescer(), budget_scope():
-            data = handler(args)
+        # 要求 ID に紐づけておくと、`notifications/cancelled` で**未開始のジョブを投入させない**。
+        with progress_for(params), bound_coalescer(), budget_scope() as deadline:
+            _register_active(request_id, deadline)
+            try:
+                data = handler(args)
+            finally:
+                _unregister_active(request_id)
     except Exception as exc:  # ツールは絶対に例外を漏らさない
         data = {"error": f"internal error: {type(exc).__name__}: {exc}"}
     finally:
@@ -8241,6 +8355,10 @@ def _replies_for(msg, marker=None) -> list:
         return [{"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}]
     method, msg_id = msg["method"], msg.get("id")
     params = msg.get("params") or {}
+    if method in ("notifications/cancelled", "notifications/cancel", "cancelled"):
+        # **キャンセルは応答しない**（通知）。該当要求の予算を打ち切り、未開始のジョブを投入させない。
+        cancel_request(params.get("requestId") if isinstance(params, dict) else None)
+        return []
     if method in ("notifications/initialized", "initialized"):
         note = harness_log_notification()   # §8.6（other のときだけ・1 回）
         return [note] if note else []
@@ -8305,7 +8423,8 @@ def _dispatch_message(msg: dict, pool: ThreadPoolExecutor) -> None:
     if method == "tools/call" and msg_id is not None:
         params = msg.get("params") or {}
         def _run_call(i=msg_id, p=params):
-            with bound_progress(_stdio_progress_maker):
+            # 要求 ID を張る（この呼び出しが `notifications/cancelled` の対象になる）。
+            with request_scope(i), bound_progress(_stdio_progress_maker):
                 respond(i, handle_tool_call(p))
 
         pool.submit(_run_call)
@@ -8507,7 +8626,10 @@ def _http_process(msg, session, marker=None):
     replies = []
     with bound_progress(_http_progress_maker(session)):
         for item in items:
-            for reply in _replies_for(item, marker):
+            rid = item.get("id") if isinstance(item, dict) else None
+            with request_scope(rid):
+                found = _replies_for(item, marker)
+            for reply in found:
                 if isinstance(reply, dict) and "id" in reply:
                     replies.append(reply)
                 else:
@@ -8709,6 +8831,9 @@ def _http_make_handler(config: dict):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
+            # MCP Streamable HTTP（2025-06-18 / 2026-07-28）が SHOULD とする指定。リバースプロキシ
+            # （nginx 等）が SSE をバッファすると、進捗通知が**まとめて遅れて**届く。
+            self.send_header("X-Accel-Buffering", "no")
             self.send_header("Connection", "close")
             self.end_headers()
             try:

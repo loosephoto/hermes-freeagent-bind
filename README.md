@@ -1686,7 +1686,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_USER_AGENT` | `hermes-freeagent-bind/0.1 (+…/hermes-freeagent-bind)` | 知識 API に名乗る UA（連絡先入りが望ましい。crates.io は識別可能な UA が必須） |
 | `FREEAGENT_CONNECT_TIMEOUT` / `FREEAGENT_READ_TIMEOUT` | 10.0 / 180.0 | 外部 HTTP の (connect, read) タイムアウト（秒） |
 | `FREEAGENT_KB_TTL` / `FREEAGENT_KB_TIMEOUT` | 1800.0 / 20.0 | 知識取得のキャッシュ TTL・読み取りタイムアウト（秒） |
-| `FREEAGENT_KB_KEEPALIVE` / `FREEAGENT_KB_POOL_MAX` / `FREEAGENT_KB_POOL_IDLE` | 1 / 2 / 120.0 | wikidata の api.php で**接続を使い回す**（§5.2.1）。`FREEAGENT_KB_KEEPALIVE=0` または `FREEAGENT_KB_POOL_MAX=0` で無効化（共用経路へ委譲）。プールは origin ごとに最大 `POOL_MAX` 本・空きは `POOL_IDLE` 秒で捨てる（プロキシ環境では常に無効） |
+| `FREEAGENT_KB_KEEPALIVE` / `FREEAGENT_KB_POOL_MAX` / `FREEAGENT_KB_POOL_IDLE` | 1 / 2 / 120.0 | **接続を使い回す**（§5.2.1）。v0.24.0 から対象は wikidata だけでなく **Wikipedia / Crossref / OpenAlex / Hacker News** も含みます（許可ホストは `_KA_TRUSTED_HOSTS`。リダイレクトを追わない経路なので 301 を返さないホストだけ）。`FREEAGENT_KB_KEEPALIVE=0` または `FREEAGENT_KB_POOL_MAX=0` で無効化（共用経路へ委譲）。プールは origin ごとに最大 `POOL_MAX` 本・空きは `POOL_IDLE` 秒で捨てる（プロキシ環境では常に無効） |
 | `FREEAGENT_KB_429_RETRIES` / `FREEAGENT_KB_429_MAX_WAIT` | 2 / 2.0 | 429 の再試行回数と `Retry-After` を尊重して待つ上限（秒）。crossref の 429 は共有プールのTransientな拒否で、**再試行で必ず通る**（実測） |
 | `FREEAGENT_KB_RATE_WAIT_MAX` / `FREEAGENT_KB_RATE_WAIT_MARGIN` | 8.0（= `KB_DEADLINE`）/ 1.0 | ホスト予算の待ちを許す上限（秒）と、応答時間が残るよう確保する余白。待ちが上限を超えるときは待たずに 429 を返す |
 | `FREEAGENT_CATALOG_DEADLINE` | 10.0 | モデル一覧を**並列に投げて打ち切る**までの締め切り（秒・1 以上）。間に合わなかったプロバイダは前回の成功値で埋める（SPEC §4.4） |

@@ -386,6 +386,22 @@ temperature, allow_fallback, free_only)`）を 1 本だけ上流へ流し、結�
   `["alpha","beta"]` → `coalesced_calls: 0`・壁 **4.4 秒** /
   `["alpha","alpha","alpha","beta"]` → `coalesced_calls: 2`・行は 4 件（全件に回答）。
 
+### 4.8 要求単位のキャンセル（`notifications/cancelled`・v0.24.0）
+
+MCP の `notifications/cancelled`（`params.requestId`）を受けたら、**その要求の `Deadline` を過去に
+する**（`Deadline.cancel()`）。スレッドは殺せないので「回収をやめる」だけだが、`run_parallel` の
+冒頭判定（`deadline.expired` → 投入しない）により**未開始のジョブは上流へ流れない**（枠・クォータを
+使わない）。既に走っている呼び出しは完了まで枠を保持する（§4.5 と同じ性質）。
+
+- transport が `request_scope(msg_id)` を張り（stdio は `_dispatch_message` のプール側スレッド、
+  HTTP は `_http_process` の各 item）、`handle_tool_call` が `budget_scope()` の `Deadline` を
+  「要求 ID → 予算」に登録／解除する（`_register_active` / `_unregister_active`）。
+- キャンセルは**通知なので応答しない**（`_replies_for` が `[]` を返す）。未知の `requestId` は無視。
+- 効果の測り方: 予算を登録 → `notifications/cancelled` → `run_parallel([...], deadline=予算)` が
+  **1 件も実行せず** `dropped: true` で埋めること（`tests/test_perf_v0240.py`）。
+- SSE 応答には `X-Accel-Buffering: no` を付ける（仕様の SHOULD。リバースプロキシがバッファすると
+  進捗通知がまとめて遅れて届く）。
+
 ## 5. 呼び出し（§4）
 
 - 外部 HTTP は **接続タイムアウトと読み取りタイムアウトを分けて設定**する（既定 10 秒 / 180 秒）。`_urlopen` は §3 の共有 `_OPENER` を使う。これは `http.client` の接続クラスに `_ShortConnectMixin` を混ぜ、`HTTPHandler` / `HTTPSHandler` を差し替えたもので、**接続（TCP と TLS ハンドシェイク）の間だけ** `CONNECT_TIMEOUT` を適用し、接続直後に socket を `READ_TIMEOUT` へ切り替える。`build_opener` はサブクラスを既定ハンドラの置換と見なすので、リダイレクト（`HTTPRedirectHandler`）・プロキシ（`ProxyHandler`）・`HTTPError` の既定挙動は保たれる。環境障害（接続不可・timeout）は同じプロバイダ系列の fallback を打ち切り、全候補へ同じ不通を繰り返さない。
@@ -598,6 +614,16 @@ v0.11.0 は GitHub の実装（`freellmapi` の設計文書・MoA・FrugalGPT・
   遮断するのは 2 回目も失敗したときだけ＝`kb_http` と同じ扱い）。429 は在庫の接続で再試行し遮断しない。
 - 在庫は origin ごとに `FREEAGENT_KB_POOL_MAX` 本（既定 2）まで、空きは `FREEAGENT_KB_POOL_IDLE`
   秒（既定 120）で捨てる。**貸出中は在庫から外す**ので、同時実行が待たされることはない。
+- **v0.24.0 で対象ホストを広げた**（`_KA_TRUSTED_HOSTS`）。`kb_json` は「プール有効・非プロキシ・
+  許可ホスト・GET・`extra_headers` なし」のときだけこの経路へ委譲する。許可は
+  `wikidata.org` / `wikipedia.org` / `api.crossref.org` / `api.openalex.org` / `hn.algolia.com` の
+  5 ホストで、**リダイレクトを追わない経路なので 301 を返さないホストに限る**（arXiv は
+  http→https の 301 と 3 秒直列を持つので入れない・`export.arxiv.org` は `kb_http` のまま）。
+  429 の再試行回数も `kb_http` と同じ（`_KB_HTTP_429_RETRIES + 1`）に揃えた（持続接続経路に
+  委譲したソースが「1 回で遮断」に変わらないため）。
+  実測（本機・n=6 each・ABBA 交互・同じ問い `Transformer`）: `knowledge_lookup`（既定 6 ソース）の
+  中央値 **2,908ms（off）→ 1,979ms（on）＝ −929ms（−32%）**。crossref 単体は 2 連続 722 → 244ms。
+  上流の分散が大きい（同じ設定でも 1.9〜4.2 秒）ので、この数字は**方向づけ**として扱う。
 - 在庫へ返す条件は「**本文を読み切った**」こと（`will_close` は返さない）。共用経路の読み取りは
   テスト用の「同じ内容が 2 回続いたら終端」という推測を持つが、この推測で止まると**未読を残した
   接続を在庫へ返す**ことになり次のリクエストが壊れる。§5.2.1 の読み取りは `read1` が空を返すか
@@ -1279,6 +1305,28 @@ HEAD と一致／作業ツリーはクリーン・`state_dir()` は `FREEAGENT_S
 
 **この修正で意図的に変わる挙動**: `freeagent_ask` も選抜を通るため、`FREEAGENT_ROUTING=auto` のときは
 層（`long` など）が `ask` にも効く（既定 off なので並びは従来どおり）。§4.3.2 に追記した。
+
+### 6.22 高速化とプロトコル追従（2026-10-28・v0.24.0）
+
+v0.23.1 の不都合修正のあと、**実測したボトルネックだけ**に手を入れた。既定の選抜順・出力の形は
+変えない（変えたのは「同点の内側」だけ）。
+
+| 変更 | 実測 | 備考 |
+|---|---|---|
+| 持続接続の対象を 5 ホストへ拡大（§6.1.1） | `knowledge_lookup`（既定 6 ソース）の中央値 **2,908ms → 1,979ms（−32%）**（n=6 each・ABBA 交互）／crossref 単体 2 連続 722 → 244ms | 上流の分散が大きい（1.9〜4.2 秒）。方向づけとして扱う |
+| Wikidata のラベルキャッシュ | 同じ問いの繰り返し **1,663ms → 1,300ms（−363ms）**／キャッシュ全ヒット時は 351ms | 別の問いが続くと QID が変わるので中央値の改善は小さい（n=4 で +12ms）。**同じ QID の再登場**（`P31`/`P17`）に効く |
+| 同点タイブレークに平均所要 | 品質スコアが一致するときだけ速い方が先（スコアが違えば順位不変） | `test_perf_v0240.py` が「品質差は動かない」ことを固定 |
+| arXiv の CJK 早期拒否 | 日本語クエリ **0.1ms**（従来は 3 秒の直列枠 + 0 件） | 「該当なし」ではなく理由を返す（英語の語が要る旨） |
+| `_sweep_stale_tmp` の間引き | 1 回 0.31ms → **0.002ms**（同じディレクトリは 60 秒に 1 回だけ走査） | 200 ファイルのディレクトリで実測 |
+| `notifications/cancelled`（§4.0） | 予算を過去にして未開始ジョブを投入させない（`run_parallel` は `dropped` で埋める） | キャンセルは通知なので応答しない |
+| SSE の `X-Accel-Buffering: no` | ヘッダ 1 行 | MCP Streamable HTTP の SHOULD（プロキシのバッファで進捗が遅れる） |
+
+**採らなかった案**: (a) `panel(refine)` / `map(reduce)` の**同時実行**（後段は前段の出力に依存する）、
+(b) Wikidata の claims と labels を 1 リクエストに統合（`wbgetentities` の `labels` は**検索した項目
+自身**のラベルで、参照先 QID のラベルは返らない）、(c) 選抜の既定にレイテンシ項を入れる
+（品質 A/B の前提が変わる。同点タイブレークに留めた）、(d) `grounded` への英語検索語引数の追加
+（`tools/list` の schema が変わり、README/SPEC の文字数と probe の期待値を同時に動かす必要がある。
+arXiv 側の早期拒否で「無駄な往復」は消えるため、v0.24.0 では見送り）。
 
 ## 7. ツールの規約（§6–§8）
 

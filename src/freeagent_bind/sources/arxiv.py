@@ -10,9 +10,22 @@ import xml.etree.ElementTree as ET
 from .. import server as S
 from . import register  # noqa: E402  パッケージ初期化中に登録する
 
+# CJK（かな・漢字・ハングル）だけの問い。arXiv の索引は英語なので 0 件になる（実測）。
+_CJK_ONLY_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+
+
 def kb_arxiv(query: str, limit: int = 5) -> dict:
-    """プレプリント検索（Atom XML）。検索語は `all:` に寄せる（フィールド指定はそのまま活かす）。"""
+    """プレプリント検索（Atom XML）。検索語は `all:` に寄せる（フィールド指定はそのまま活かす）。
+
+    **CJK だけの問いは HTTP を出さずに断る**（v0.24.0）。arXiv は日本語クエリで 0 件（実測）なのに、
+    呼ぶと `_arxiv_throttle` の 3 秒直列枠を占有し、`grounded` / `lookup` の締め切り（8 秒）を
+    その分だけ食う。英語の語が 1 つも無いときは**理由を返す**（「該当なし」と混同させない）。
+    """
     limit = S.as_int(limit, 5, 1, 20)
+    if _CJK_ONLY_RE.search(query or "") and not re.search(r"[A-Za-z]", query or ""):
+        return {"source": "arxiv", "items": [], "citations": [],
+                "error": "arXiv は英語の語で引く必要があります（この問いには英字がありません）。"
+                         "日本語で調べるなら wikipedia / wikidata / qiita を sources に指定してください"}
     field_q = query if re.search(r"\b(all|ti|au|abs|cat):", query) else f"all:{query}"
 
     def produce() -> dict:
