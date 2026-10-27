@@ -748,6 +748,8 @@ len(json.dumps({"tools": TOOLS}, ensure_ascii=False, separators=(",", ":")))
 **v0.14.2 から v0.18.4 まで 17,666 のまま**です（この間の変更は `description` に触れていません）。
 v0.22.0 は `freeagent_lookup` の説明に Resources への案内を 1 文足しただけなので
 **+105 文字の 17,771**（ツール数は 11 のまま。増えた知識は `resource://freeagent/*` 側に置いた）。
+v0.23.1〜v0.25.0 はツール定義に触れていない（17,771 のまま）。v0.26.0 は `freeagent_grounded` に
+`search_query`（検索語。省略時は question）を足したので **+215 文字の 17,986**。
 
 v0.14.2 は**上限での切り捨ての残りを塞いだ**回。`map` の `items` は `items[:64]` と**黙って捨てて**
 いました（v0.14.1 で `fanout` の `prompts` を直したのと同じ穴）。実行しなかった件数を
@@ -1115,6 +1117,27 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 
 > Hacker News の story は**リンク投稿**なので本文が無く、根拠になりません。
 > 議論の中身は**コメント**に書いてあります（`freeagent_grounded` は comment も検索します）。
+
+### 🔎 質問は日本語のまま、検索語だけ英語にする（`search_query`）
+
+`freeagent_grounded` は**質問文**と**検索語**を分けられます（v0.26.0）。arXiv / Crossref / IA は
+英語の語で引く前提なので、日本語の質問をそのまま検索語にすると根拠が薄くなります。
+
+```json
+{"question": "大規模言語モデルのスケーリング則は何ですか",
+ "search_query": "large language model scaling laws",
+ "sources": ["arxiv", "crossref", "openalex"]}
+```
+
+実測（この環境・`sources` は上の 3 つ・`limit=3`）:
+
+| 検索語 | 結果 |
+|---|---|
+| 質問文のまま（日本語） | arxiv は「英語の語で引く必要があります」で 0 件。crossref は**無関係な中国語の LLM 論文 6 件** |
+| `search_query`（英語） | **7 件**。先頭は "Scaling Laws for Downstream Task Performance of Large Language Models" など狙いどおり |
+
+省略すると従来どおり `question` をそのまま検索語にします（`search_query` は結果にも入るので、
+どちらで引いたかは返り値から分かります。本文には質問文と違うときだけ「検索語: …」を出します）。
 
 ### 📗 既定の6ソース
 

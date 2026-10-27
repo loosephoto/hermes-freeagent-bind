@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.25.0"
+SERVER_VERSION = "0.26.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -5814,7 +5814,11 @@ def tool_grounded(args: dict) -> dict:
     if not question:
         return {"error": "question は必須です"}
     sources = as_str_list(args.get("sources")) or None
-    kb = knowledge_lookup(question, sources, limit=as_int(args.get("limit"), 3, 1, 10),
+    # **検索語と質問文を分けられる**（v0.26.0）。arXiv / Crossref / Internet Archive は英語の語で
+    # 引く必要があり、日本語の質問をそのまま投げると 0 件（arXiv は CJK を早期拒否）になる。
+    # `search_query` を省略したときは従来どおり question をそのまま検索語にする。
+    search_query = as_str(args.get("search_query")) or question
+    kb = knowledge_lookup(search_query, sources, limit=as_int(args.get("limit"), 3, 1, 10),
                           lang=as_str(args.get("lang"), ""),
                           kind=as_str(args.get("github_kind"), "repo"),
                           datacite_kind=as_str(args.get("datacite_kind"), "all"), fallback=args.get("fallback") is True,
@@ -5855,7 +5859,8 @@ def tool_grounded(args: dict) -> dict:
                         "truncated": res.get("truncated"), "cot_leak": res.get("cot_leak")})
     good = [a for a in answers if not a.get("error")]
     return {
-        "question": question, "citations": citations, "citation_count": len(citations),
+        "question": question, "search_query": search_query,
+        "citations": citations, "citation_count": len(citations),
         "sources_used": kb.get("sources"), "source_errors": kb.get("errors"),
         "injected_citations": window["numbers"], "not_injected_citations": window["omitted"],
         "evidence_citation_count": len(window["numbers"]),
@@ -7204,6 +7209,12 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "question": {"type": "string"},
+                "search_query": {"type": "string",
+                                 "description": "根拠を引くときの**検索語**。日本語の質問のまま arXiv / "
+                                                "Crossref / openalex / ia を引くと 0 件になりやすいので、"
+                                                "英語の語（例: \"large language model scaling\"）を"
+                                                "ここに置くと質問文はそのままモデルへ渡る。"
+                                                "省略すると question をそのまま検索語にする"},
                 "sources": {"type": "array", "items": {"type": "string"},
                             "description": "既定6種（wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件）/ crossref / openalex / github）。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**question は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。**未認証は 60 回/時**、FREEAGENT_QIITA_TOKEN で 1,000 回/時）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。**crossref は抄録が無い書誌が多い**（grounded では抄録の有る論文に絞る） / **hn は議論のコメントが本文根拠になる**（故事的リンク投稿は本文が無い）。医学・生物学は対象外"},
                 "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
@@ -7686,6 +7697,10 @@ def _render_grounded(data: dict) -> str:
     if unknown:
         lines.append(f"⚠ 未知のソースを無視しました: {', '.join(unknown)}"
                      "（名前は sources の説明を参照）")
+    # 質問文と検索語が違うときは**どちらで引いたか**を出す（0 件の切り分けができる）。
+    searched, asked = as_str(data.get("search_query")), as_str(data.get("question"))
+    if searched and asked and searched != asked:
+        lines.append(f"検索語: {truncate(searched, 120)}")
     for row in (data.get("answers") or []):
         if row.get("error"):
             lines.append(f"  • {row['model']}: ✗ {truncate(row['error'], 120)}")

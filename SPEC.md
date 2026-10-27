@@ -1355,6 +1355,26 @@ arXiv 側の早期拒否で「無駄な往復」は消えるため、v0.24.0 で
 合算されない（`FREEAGENT_STATS_PATH` などの上書きも同様）。`_file_lock` は取れなくても止めない
 （best-effort・timeout 10 秒）ので、ロックが取れない異常時は従来どおり後勝ちになり得る。
 
+### 6.24 `grounded` の検索語分離（`search_query`・v0.26.0）
+
+`freeagent_grounded` は `question` が**検索語とモデルへのプロンプトを兼ねていた**。arXiv は CJK を
+早期拒否し（§6.22）、Crossref は日本語の語を部分一致で拾って**無関係な中国語論文**を返すため、
+日本語で質問すると根拠が薄いまま回答させていた。
+
+- 引数 `search_query`（任意）を追加。**省略時は従来どおり `question` を検索語にする**（後方互換）。
+- **質問文はモデルへそのまま**渡す（検索語に置き換えない）。根拠ブロックだけが検索語で引かれる。
+- 返り値に `search_query`（実際に使った語）を**常に**含める（規約 48: モードでキーを変えない）。
+  本文（`content`）には**質問文と違うときだけ**「検索語: …」を 1 行出す（0 件の切り分け用）。
+- **`freeagent_lookup` には足さない**。lookup の `query` は検索語そのもので、モデルへ渡す文が無い
+  （日本語で引きたいなら英語の語を `query` に入れればよい）。schema を太らせない判断。
+- 実測（本機・`sources=[arxiv, crossref, openalex]`・`limit=3`・`need_evidence=True`）:
+  質問文のまま＝**arxiv 0 件（CJK 拒否）＋ crossref 6 件（中国語の LLM 論文）**、
+  `search_query="large language model scaling laws"`＝**7 件**（先頭は
+  "Scaling Laws for Downstream Task Performance of Large Language Models"）。
+- `tools/list` の JSON は 17,771 → **17,986 文字（+215）**（計測方法は README の式と同じ）。
+- 回帰: `tests/test_grounded_search_v0260.py`（9 件。検索語の置換・質問文の保持・
+  空白時のフォールバック・`need_evidence` の維持・schema・描画）。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。

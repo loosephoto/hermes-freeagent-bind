@@ -627,6 +627,14 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     試すときは `mock.patch.object(S, "now_ts", lambda: 未来)` で時間を進める**
     （`tests/test_orchestration_v11.py` の `test_ladder_restarts_after_expiry` がその型）。
 
+83. **検索語と質問文を分けるのは `grounded` だけ**（v0.26.0・SPEC §6.24）。`question` が検索語と
+    プロンプトを兼ねていたため、日本語の質問では arXiv が 0 件・crossref が無関係な中国語論文を返していた
+    （実測: 6 件 → 英語の `search_query` で 7 件）。`search_query` を足し、**省略時は question**
+    （後方互換）・**質問文はモデルへそのまま**・返り値に実際の検索語を常に含める。
+    `freeagent_lookup` には足さない（`query` が検索語そのもので、モデルへ渡す文が無い）。
+    **schema を触ったら README の文字数を測り直す**（17,771 → 17,986。計測式は README の
+    `len(json.dumps({"tools": TOOLS}, ensure_ascii=False, separators=(",", ":")))`）。
+
 ## ライセンス
 
 MIT。データは各提供元の条件に従い、回答には出典を表示すること。
