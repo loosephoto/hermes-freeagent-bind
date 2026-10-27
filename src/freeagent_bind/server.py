@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.27.0"
+SERVER_VERSION = "0.28.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -5686,6 +5686,36 @@ _REFINE_PROMPT = (
 )
 
 
+# 統合役の選び方（v0.28.0）: **品質がほぼ同じ帯の中だけ**、平均所要の速い順に並べ替える。
+# 実測（panel+refine・3 体・本機）: 壁 11.9 / 8.1 秒のうち **refine 単発が 4.4〜5.1 秒**（35〜63%）。
+# refine は前段の出力に依存するので**並列化できない**。代わりに「誰に統合させるか」を速さで選ぶ。
+# 品質の足切りは `REFINE_BAND`（既定 0.05）で、帯の外のモデルは決して選ばない（品質を犠牲にしない）。
+# 観測が無いモデルは `_rank_latency_key` が inf なので、**学習前は従来と同じ**（品質順の先頭）。
+REFINE_BAND = max(0.0, min(0.5, _env_float("FREEAGENT_REFINE_BAND", 0.05)))
+
+
+def _pick_refiner(candidates: list[str], fallback: str = "品質順の先頭") -> tuple[str, str]:
+    """統合役を選ぶ。品質の帯（`REFINE_BAND`）の中で**平均所要が速い**モデルを優先する。
+
+    帯に該当が無い（学習前・帯の外しか居ない）ときは `fallback` の文面で品質順の先頭を返す
+    （**表示の後方互換**＝既存の `refined.reason` の文言を保つ）。
+    """
+    ranked = rank_models(candidates)
+    if not ranked:
+        return "", ""
+    if REFINE_BAND <= 0.0:
+        return ranked[0], fallback
+    best = _rank_score(ranked[0])
+    band = [ref for ref in ranked if best - _rank_score(ref) <= REFINE_BAND]
+    observed = [ref for ref in band if model_mean_latency(ref) is not None]
+    if len(band) > 1 and observed:
+        fastest = min(observed, key=lambda ref: float(model_mean_latency(ref) or 0.0))
+        if fastest != ranked[0]:
+            return fastest, (f"品質の帯（差 {REFINE_BAND} 以内）で最も速い"
+                             f"（{float(model_mean_latency(fastest) or 0.0):.0f}ms）")
+    return ranked[0], fallback
+
+
 def _refine_answers(question: str, answers: list[dict], refs: list[str], args: dict) -> dict:
     """参加者の回答を 1 つの答えに統合する（MoA の集約層）。失敗も dict で返す（規約 1）。"""
     good = [a for a in answers if not a.get("error")]
@@ -5703,9 +5733,9 @@ def _refine_answers(question: str, answers: list[dict], refs: list[str], args: d
         # 合意度が上がるだけで新しい情報が入らない。全員参加しているときだけ最上位が兼務する。
         pool = [r for r in free_model_refs(free_only=True, chat_only=True) if r not in refs]
         if pool:
-            model, why = rank_models(pool)[0], "参加していないモデルの最上位"
+            model, why = _pick_refiner(pool, fallback="参加していないモデルの最上位")
         else:
-            model, why = rank_models(refs)[0], "全員参加のため最上位が兼務"
+            model, why = _pick_refiner(refs, fallback="全員参加のため最上位が兼務")
     candidates = "\n".join(
         f"[{i + 1}] {a['model']}: {truncate(a.get('answer') or a.get('conclusion') or '', 900)}"
         for i, a in enumerate(good))
