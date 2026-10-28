@@ -59,7 +59,7 @@
 | やりたいこと | できること | 注意点 |
 |---|---|---|
 | 設計案の見落としを探す | 同じ問いを複数のモデルに聞き、一致点・対立点を返す | 同じ誤りに賛成することもあります。多数決は正しさの保証ではありません |
-| 出典を探す | 論文・百科・構造化データ・GitHub から URL と説明を取得する | 検索結果の関連性・情報の正確さは別途確認が必要です |
+| 出典を探す | 25 の検索先（論文・百科・パッケージ・脆弱性・標準・議論・アーカイブ）から URL と説明を取得する | 検索結果の関連性・情報の正確さは別途確認が必要です。既定は6ソースで、追加は[明示指定](#-知識バックエンド) |
 | 出典を読ませて回答させる | 取得した説明やアブストラクトをサブ LLM に渡す | 論文の全文を読む機能ではありません。引用番号の検査も内容の正しさは判定しません |
 | 多数の文章を分類・要約する | 同じ指示を各要素へ並列適用し、必要なら統合する | `map` は 1 回最大 64 件。超過分は処理されず、先頭 64 件だけになるため、100 件なら分割してください。失敗した要素も確認してください |
 | 長い検討の続きを忘れない | 計画・仮説・改訂・分岐を思考ノートへ記録する | ノートは期限つきです。AI の知能が増えるわけではありません |
@@ -672,6 +672,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | 登録すれば必ず自動的に使う | ツール選択はメイン LLM と設定に依存します |
 | Internet Archive で日本語を検索できる | IA のメタデータ検索は日本語（CJK）クエリを拒否します（実測 10/10 が `QUERY_NOT_READY`）。英語の語で指定してください |
 | Qiita を未認証で連続検索できる | 未認証は 60 回/時です。同じ問いはキャッシュで即返りますが、別の問いは 1 分待ちます（`FREEAGENT_QIITA_TOKEN` で 1,000 回/時・3.6 秒間隔） |
+| OpenReview で日本語のまま引ける | 索引は英語です（実測 0 件）。日本語（CJK だけ）の問いは HTTP を出さずに理由を返します。またこの提供元は一部の経路で自動アクセスのチャレンジ（403）を返すため、時間を置いても取れないときは arxiv / openalex を使ってください |
 | HTTP にすれば大量並列をさばける | 共有できるのはキャッシュ・レート制限・統計・**提供元ごとの枠**です。枠はプロセス内のカウンタなので、クライアントを増やすと上流への合計はその分増えます（1 プロセスに寄せるほど枠が効きます） |
 | HTTP なら安全に外へ出せる | 既定は 127.0.0.1 のみ・トークンなしです。`--host 0.0.0.0` にするときは必ず `--token` を付けてください。TLS は提供しません |
 | HTTP で複数マシンから共有できる | 単一ホスト前提です（ループバック）。複数マシン間の調整はしません |
@@ -1007,10 +1008,14 @@ API キーに加えて、契約プランやデータの扱いを確認したこ�
 | `FREEAGENT_LIBRARIESIO_KEY` | librariesio | **このソースを使う場合は必須**。[Libraries.io](https://libraries.io/account)の無料アカウントで取得する API キー。未設定なら librariesio は HTTP を出さず、登録先を案内します（60 req/分） |
 | `FREEAGENT_QIITA_TOKEN` | qiita | **任意**（キーが無くても 60 回/時で動きます）。[個人用アクセストークン](https://qiita.com/settings/tokens/new)を設定すると 1,000 回/時に上がり、アクセス間隔が 60 秒 → 3.6 秒になります |
 
-wikipedia / wikidata / arxiv / doaj / npm / crates / openaire / zenodo / ror /
-osv / ietf / inspirehep / oeis / hfhub / hn / swh / ia / qiita はキー不要・匿名で使えます。
-**cinii と librariesio だけは例外**で、利用者自身の appid / API キーが必要です
-（利用目的に当たるかの判断は利用者。SPEC §6.7 / §6.10）。
+キーなしで動くのは **23 ソース**です（25 ソースのうち、下の 2 つを除いた全部）:
+`wikipedia` / `wikidata` / `arxiv` / `crossref` / `openalex` / `github` / `datacite` / `openaire` /
+`zenodo` / `ror` / `doaj` / `npm` / `crates` / `osv` / `ietf` / `inspirehep` / `oeis` / `hfhub` /
+`hn` / `swh` / `ia` / `qiita` / `openreview`。
+このうち `openalex` と `github` は、キーを入れると枠と安定性が上がります（無くても動きます）。
+
+**必須なのは `cinii` と `librariesio` の 2 つだけ**です。利用者自身の appid / API キーが要り、
+未設定なら HTTP を出さずに登録先を案内します（利用目的に当たるかの判断は利用者。SPEC §6.7 / §6.10）。
 
 ### 📤 キーの渡し方
 
@@ -1101,20 +1106,35 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 **検索先は25ソースです。何も指定しなければ既定の6ソースだけを使います。**
 `sources` を指定すると、指定したソースだけを検索します（既定の6ソースに追加されるのではありません）。
 
-- **論文を探す**：arxiv / crossref / openalex。日本語文献の書誌なら cinii。会議の採択・撤回まで見たいなら openreview。
-- **パッケージを探す**：npm / crates / librariesio。脆弱性なら osv。
-- **標準・専門情報を調べる**：ietf（RFC）、inspirehep（素粒子物理）、oeis（整数列）、hfhub（MLモデル）。
-- **研究データや機関を探す**：datacite / zenodo / ror。
-- **開発者の議論・アーカイブを探す**：hn / swh。
-- **当時の一次資料（マニュアル・書籍・ソフト）を探す**：ia（Internet Archive）。**query は英語の語で**指定します。
+**まず「何を探したいか」で選んでください**（25 ソースすべてが、どれかの行に入っています）。
 
-本文ではなく書誌情報だけの結果もあります。**取得した説明や抄録を読む機能であり、原典の全文を取得する機能ではありません。**
+| 探したいもの | ソース |
+|---|---|
+| 百科事典・用語・構造化データ | `wikipedia` / `wikidata` |
+| 論文（プレプリント・書誌・OA） | `arxiv` / `crossref` / `openalex` / `doaj` / `inspirehep` / `datacite` / `openaire` |
+| 会議論文の採択・撤回まで | `openreview` |
+| 日本語文献の書誌 | `cinii`（appid 必須） |
+| パッケージ・ライブラリ | `npm` / `crates` / `librariesio`（キー必須） |
+| 既知の脆弱性 | `osv` |
+| 標準文書・整数列・ML モデル | `ietf` / `oeis` / `hfhub` |
+| コード・リポジトリ | `github` / `swh` |
+| 研究データ・研究機関 | `zenodo` / `ror` |
+| 開発者の議論・技術記事 | `hn` / `qiita` |
+| 当時の一次資料（マニュアル・書籍・ソフト） | `ia` |
 
-### 場面によって取り方が違います（根拠の充填率）
+先に知っておくと迷わない 3 点:
 
-**書誌を広く集めたい場面**（`freeagent_lookup`）と、**本文の根拠が要る場面**（`freeagent_grounded`）は
-別の取り方をします。根拠の要る場面では同じクエリでも**引用の中身が変わります**
-（根拠が要る場面だけ引用の中身が変わるのが自然な設計です）。
+- **英語の語で指定するソース**: `arxiv` / `openreview` / `ia`。日本語のままでは 0 件なので、サーバーは HTTP を出さずに理由を返します（`crossref` などは日本語でも引けますが、無関係な結果が混じります）。
+- **利用者自身のキー・登録が要るソース**: `cinii`（appid） / `librariesio`（API キー）。未設定なら登録先を案内して HTTP を出しません。
+- **summary が抄録ではなく目録・属性の整形になるソース**: `ror` / `swh` / `ia` / `hfhub` / `zenodo`。`cinii` は抄録を返さないので常に `metadata_only` で、`freeagent_grounded` の本文根拠には入りません。
+
+**取得するのは説明・抄録・目録までで、原典の全文を取得する機能ではありません。**
+
+### 場面によって取り方が違います（変わるのは 2 ソース・根拠の充填率）
+
+**書誌を広く集めたい場面**（`freeagent_lookup`）と、**本文の根拠が要る場面**（`freeagent_grounded`）では、
+**2 つのソースだけ引き方が変わります**（Crossref と Hacker News）。根拠の要る場面では同じクエリでも
+**引用の中身が変わり**、書誌だけの結果は注入されません。
 
 | 場面 | crossref | Hacker News |
 |---|---|---|
@@ -1124,10 +1144,14 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 > Hacker News の story は**リンク投稿**なので本文が無く、根拠になりません。
 > 議論の中身は**コメント**に書いてあります（`freeagent_grounded` は comment も検索します）。
 
+**残りの 23 ソースは `lookup` と `grounded` で同じ引き方をします。** 違いは、本文根拠の無い引用
+（`metadata_only`）を `grounded` がプロンプトに注入しないことだけです。
+
 ### 🔎 質問は日本語のまま、検索語だけ英語にする（`search_query`）
 
-`freeagent_grounded` は**質問文**と**検索語**を分けられます（v0.26.0）。arXiv / Crossref / IA は
-英語の語で引く前提なので、日本語の質問をそのまま検索語にすると根拠が薄くなります。
+`freeagent_grounded` は**質問文**と**検索語**を分けられます（v0.26.0）。arXiv / OpenReview / IA は
+**英語の語でしか引けない**ので、日本語の質問をそのまま検索語にすると根拠が薄くなります
+（Crossref は日本語でも引けますが、無関係な論文が混じります）。
 
 ```json
 {"question": "大規模言語モデルのスケーリング則は何ですか",
@@ -1162,30 +1186,29 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 
 | ソース名 | 取得するもの | 注意点 |
 |---|---|---|
-| `datacite`（明示指定） | DOIメタデータ・抄録、研究データ | `datacite_kind`: `all` / `arxiv` / `dataset`。各語を引用したAND検索＋関連度順 |
-| `openaire`（明示指定） | Graph V3の論文書誌・抄録・掲載先 | 匿名API。60.1秒間隔で制御。抄録欠落あり、OpenAIREのクレジットを表示 |
-| `zenodo`（明示指定） | 研究データ・ソフトウェア・論文等の公開メタデータ | 説明・注記を取得。全文/ファイルは取得しない。メタデータCC0とファイル条件を分離 |
-| `ror`（明示指定） | 研究機関の候補・種別・国・都市・設立年 | v2の構造化情報。論文検索ではなく機関情報の補完。機関を自動同定しない |
-| `doaj`（明示指定） | オープンアクセス誌の記事メタデータ・抄録 | 記事メタデータはCC0。OA記事限定。OpenAlexが不安定なときの科学系検索の受け皿 |
-| `npm`（明示指定） | npm パッケージの検索結果（名前・説明・版・リンク） | 説明は登録者の自己申告で、品質・安全性の審査結果ではありません |
-| `crates`（明示指定） | crates.io のクレート検索結果（名前・説明・版・DL数） | 同上。Rust パッケージ。GitHub の検索枠を消費しません |
-| `cinii`（明示指定・**appid 必須**） | CiNii Research の日本語文献の書誌（タイトル・著者・資料名・巻号頁・発行年・DOI/NAID/NCID/ISBN・種別） | **利用者自身の appid** を `FREEAGENT_CINII_APPID` に設定したときだけ動きます（未設定なら登録先を案内して HTTP を出しません）。**抄録は返らない**ので本文根拠には使わず、書誌のみです |
-| `osv`（明示指定） | パッケージの既知脆弱性（OSV スキーマ。ID・概要・別名 CVE・深刻度・影響パッケージ） | キー不要・公称レート無し。パッケージ名は PyPI / npm / crates.io / Go / Maven / RubyGems / NuGet / Packagist / Hex / Pub の順に照合し、Maven は `groupId:artifactId` の形が必要。`CVE-` / `GHSA-` / `PYSEC-` 等のIDなら直引き |
-| `ietf`（明示指定） | RFC / Internet-Draft の書誌と抄録（RFC 番号・標準レベル・ページ数・版） | キー不要。`RFC 9110` / `rfc9110` / `9110` は name 直引き、`draft-...` は名前部分一致、それ以外は**タイトルの 1 語部分一致**（複数語は最長語で引いて全語一致を優先）。全文検索ではありません。文書は英語 |
-| `inspirehep`（明示指定） | 素粒子物理の文献（表題・抄録・DOI・arXiv ID・被引用数） | データは CC0。DOI があれば DOI を出典 URL にします |
-| `oeis`（明示指定） | 整数列（A 番号・名前・先頭項・キーワード） | CC BY-SA 4.0 で**出典表示が必須**。数列そのものでも語でも引けます |
-| `hfhub`（明示指定） | Hugging Face Hub のモデル（ID・タスク・ライブラリ・DL 数・likes・ライセンスタグ） | モデルごとにライセンス・品質が異なります。summary は `structured_record` |
-| `hn`（明示指定） | Hacker News の投稿（表題・本文・点数・コメント数・投稿者） | Algolia HN Search 経由。**帰属表示が必須**（"Search by Algolia"）。リンク投稿は本文が無く `metadata_only`。引用 URL は HN の投稿で、記事 URL は `extra.article_url` に残します |
-| `swh`（明示指定） | Software Heritage のリポジトリ（origin）の URL・取得方式 | 公開コードの長期アーカイブ。**コード本文は取得しません**。summary は `structured_record`。API 利用規約はポイントアクセス可・大量抽出不可 |
-| `librariesio`（明示指定・**キー必須**） | 19+ のパッケージ登録簿を横断した検索（名前・説明・版・DL数・ライセンス） | **利用者自身の無料 API キー**を `FREEAGENT_LIBRARIESIO_KEY` に設定したときだけ動きます（未設定なら登録先を案内して HTTP を出しません）。説明は登録者の自己申告 |
-| `ia`（明示指定） | Internet Archive のアイテム（歴史的な計算機マニュアル・書籍・ソフト等のタイトル・作成者・年・メディア種別・DL数） | **query は英語の語で指定**します。日本語（CJK）クエリは IA 側が拒否するため、HTTP を出さずにエラーを返します（実測 10/10）。`title:(語 AND 語)` に組み直して引きます。summary は**目録・アップロード者の注記**で抄録ではありません。本文は取得しません |
-| `qiita`（明示指定） | Qiita の技術記事（タイトル・本文の抜粋・タグ・Likes・Stock・コメント数・投稿者・更新日時） | キー不要。検索構文（`tag:Python` / `user:foo` / `created:>2026-01-01` / `stocks:>50`）が使えます。**未認証は 60 回/時**なので、同じ問いはキャッシュで即返りますが**別の問いは 1 分待ち**ます。`FREEAGENT_QIITA_TOKEN` を設定すると 1,000 回/時・間隔 3.6 秒。記事の著作権は投稿者に帰属します |
-| `openreview`（明示指定） | OpenReview の会議論文（タイトル・抄録・著者・会議名・査読状態・forum URL） | **query は英語の語で**指定します（日本語クエリは 0 件なので HTTP を出しません）。`venue` に採択（Poster / Spotlight / Oral）・Workshop・**Withdrawn**・**Desk Rejected**・未査読の Submission が出るので、撤回済みを根拠に使う前に確認できます（`kind`: `published` / `withdrawn` / `desk_rejected` / `rejected` / `under_review`）。レート制限の公表値が無いため **1 req/s に自制**（`FREEAGENT_OPENREVIEW_INTERVAL`）。`/notes/search` 以外の一覧経路は自動アクセスのチャレンジ（403）を返します |
+| `datacite` | DOIメタデータ・抄録、研究データ | `datacite_kind`: `all` / `arxiv` / `dataset`。各語を引用したAND検索＋関連度順 |
+| `openaire` | Graph V3の論文書誌・抄録・掲載先 | 匿名API。60.1秒間隔で制御。抄録欠落あり、OpenAIREのクレジットを表示 |
+| `zenodo` | 研究データ・ソフトウェア・論文等の公開メタデータ | 説明・注記を取得。全文/ファイルは取得しない。メタデータCC0とファイル条件を分離 |
+| `ror` | 研究機関の候補・種別・国・都市・設立年 | v2の構造化情報。論文検索ではなく機関情報の補完。機関を自動同定しない |
+| `doaj` | オープンアクセス誌の記事メタデータ・抄録 | 記事メタデータはCC0。OA記事限定。OpenAlexが不安定なときの科学系検索の受け皿 |
+| `npm` | npm パッケージの検索結果（名前・説明・版・リンク） | 説明は登録者の自己申告で、品質・安全性の審査結果ではありません |
+| `crates` | crates.io のクレート検索結果（名前・説明・版・DL数） | 同上。Rust パッケージ。GitHub の検索枠を消費しません |
+| `cinii`（**appid 必須**） | CiNii Research の日本語文献の書誌（タイトル・著者・資料名・巻号頁・発行年・DOI/NAID/NCID/ISBN・種別） | **利用者自身の appid** を `FREEAGENT_CINII_APPID` に設定したときだけ動きます（未設定なら登録先を案内して HTTP を出しません）。**抄録は返らない**ので本文根拠には使わず、書誌のみです |
+| `osv` | パッケージの既知脆弱性（OSV スキーマ。ID・概要・別名 CVE・深刻度・影響パッケージ） | キー不要・公称レート無し。パッケージ名は PyPI / npm / crates.io / Go / Maven / RubyGems / NuGet / Packagist / Hex / Pub の順に照合し、Maven は `groupId:artifactId` の形が必要。`CVE-` / `GHSA-` / `PYSEC-` 等のIDなら直引き |
+| `ietf` | RFC / Internet-Draft の書誌と抄録（RFC 番号・標準レベル・ページ数・版） | キー不要。`RFC 9110` / `rfc9110` / `9110` は name 直引き、`draft-...` は名前部分一致、それ以外は**タイトルの 1 語部分一致**（複数語は最長語で引いて全語一致を優先）。全文検索ではありません。文書は英語 |
+| `inspirehep` | 素粒子物理の文献（表題・抄録・DOI・arXiv ID・被引用数） | データは CC0。DOI があれば DOI を出典 URL にします |
+| `oeis` | 整数列（A 番号・名前・先頭項・キーワード） | CC BY-SA 4.0 で**出典表示が必須**。数列そのものでも語でも引けます |
+| `hfhub` | Hugging Face Hub のモデル（ID・タスク・ライブラリ・DL 数・likes・ライセンスタグ） | モデルごとにライセンス・品質が異なります。summary は `structured_record` |
+| `hn` | Hacker News の投稿（表題・本文・点数・コメント数・投稿者） | Algolia HN Search 経由。**帰属表示が必須**（"Search by Algolia"）。リンク投稿は本文が無く `metadata_only`。引用 URL は HN の投稿で、記事 URL は `extra.article_url` に残します |
+| `swh` | Software Heritage のリポジトリ（origin）の URL・取得方式 | 公開コードの長期アーカイブ。**コード本文は取得しません**。summary は `structured_record`。API 利用規約はポイントアクセス可・大量抽出不可 |
+| `librariesio`（**キー必須**） | 19+ のパッケージ登録簿を横断した検索（名前・説明・版・DL数・ライセンス） | **利用者自身の無料 API キー**を `FREEAGENT_LIBRARIESIO_KEY` に設定したときだけ動きます（未設定なら登録先を案内して HTTP を出しません）。説明は登録者の自己申告 |
+| `ia` | Internet Archive のアイテム（歴史的な計算機マニュアル・書籍・ソフト等のタイトル・作成者・年・メディア種別・DL数） | **query は英語の語で指定**します。日本語（CJK）クエリは IA 側が拒否するため、HTTP を出さずにエラーを返します（実測 10/10）。`title:(語 AND 語)` に組み直して引きます。summary は**目録・アップロード者の注記**で抄録ではありません。本文は取得しません |
+| `qiita` | Qiita の技術記事（タイトル・本文の抜粋・タグ・Likes・Stock・コメント数・投稿者・更新日時） | キー不要。検索構文（`tag:Python` / `user:foo` / `created:>2026-01-01` / `stocks:>50`）が使えます。**未認証は 60 回/時**なので、同じ問いはキャッシュで即返りますが**別の問いは 1 分待ち**ます。`FREEAGENT_QIITA_TOKEN` を設定すると 1,000 回/時・間隔 3.6 秒。記事の著作権は投稿者に帰属します |
+| `openreview` | OpenReview の会議論文（タイトル・抄録・著者・会議名・**査読状態**・forum URL） | **query は英語の語で**指定します（日本語クエリは 0 件なので HTTP を出しません）。会議名に `Poster` / `Spotlight` / `Oral` / `Workshop` / **`Withdrawn`** / **`Desk Rejected`** が出るので、撤回済みを根拠に使う前に確認できます（機械可読な `kind` の値は下の折りたたみ）。レート制限の公表値が無いため **1 req/s に自制**（`FREEAGENT_OPENREVIEW_INTERVAL`） |
 
-`sources` を省略すると**従来の6ソースのみ**、指定すると指定したソースだけを検索します。
-追加19ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
-`limit` は**各ソースの上限**です。全体の結果は重複除去などで減るので、合計件数を保証する値ではありません。
-本文という場合も、取得できた説明・導入部・アブストラクトを指します。原典の全文とは限りません。
+**追加19ソースを毎回自動送信することはありません**（指定したときだけ引きます）。未知の名前は報告し、
+同じ名前の重複指定は1回にまとめます。`limit` は**各ソースの上限**で、全体の結果は重複除去などで
+減るため、合計件数を保証する値ではありません。
 
 ### 💡 目的別の頼み方
 
@@ -1251,6 +1274,10 @@ Zenodo は非軍事用途に限ります。各ソースの帰属表示と利用�
 {"query":"json schema validator","sources":["librariesio"],"limit":2}
 // 当時の一次資料（Internet Archive。**query は英語の語で**）
 {"query":"FORTRAN manual","sources":["ia"],"limit":2}
+// 会議論文（OpenReview。**query は英語の語で**。venue に採択・撤回が出る）
+{"query":"mixture of experts","sources":["openreview"],"limit":2}
+// 日本語の技術記事（Qiita。検索構文が使える）
+{"query":"tag:Python created:>2026-01-01","sources":["qiita"],"limit":2}
 // 自然語arXiv検索の失敗・遅延時にのみ、DataCiteの追加利用を明示許可
 {"query":"language model hallucination","sources":["arxiv"],"fallback":true,"limit":2}
 ```
@@ -1271,6 +1298,13 @@ Zenodoの`summary_kind=metadata_description`は説明・注記の抜粋で、フ
 未対応の`@`表記が残ればその値を返しません。script/style等の非本文とHTMLコメントは除外し、除外だけの結果には本文番号を付けません。
 RORの`summary_kind=structured_metadata`は、種別・国・都市・状態・設立年の実属性を整形したものです。
 論文の抄録を作る処理ではなく、`established`を出版年にしないため`year`は空です。候補の順位を本人同定・機関同定の確定と解釈しません。
+
+OpenReview の引用には `kind` が付きます（`venueid` の末尾から決める機械可読な査読状態）:
+`published`（採択・掲載）/ `withdrawn`（撤回）/ `desk_rejected`（デスクリジェクト）/
+`rejected`（査読で不採択）/ `under_review`（未査読の投稿）/ `unknown`。
+**撤回・不採択の論文を「査読を通った根拠」として数えない**ために、`kind` と会議名の両方を残します。
+`/notes/search` 以外の一覧経路（`/notes?content.venueid=…`）は自動アクセスのチャレンジで 403 を返すため、
+その場合は「チャレンジ」として明示エラーにし、5xx のような再試行はしません（実測 2026-10-28）。
 
 本文が無い結果は、既存・追加ソースを問わず `metadata_only=true`。書誌探索には表示しますが、groundedの本文根拠には注入しません。
 agentでも本文根拠の引用番号を振らず、書誌は`bibliography`に分離します。
@@ -1327,6 +1361,7 @@ npm 0.34秒（`json schema validator`・説明2件）、crates.io 0.78秒（`asy
 ietf 0.63秒（`RFC 9110`）/ inspirehep 0.86秒 / oeis 1.29秒 / hfhub 0.28秒。
 第7段階の実stdio検証（2026-10-05、各2件）: hn 0.47〜0.5秒（`rust ownership`）/ swh 1.2秒（`kubernetes`）。
 第8段階の実stdio検証（2026-10-13、各2件）: ia 0.8秒（`FORTRAN manual`・根拠2件）。
+第10段階の実stdio検証（2026-10-28、3件）: openreview 0.28〜0.3秒（`mixture of experts`・抄録3件。暖機後は 0.21 秒）。
 librariesio はキー未設定なら検査・計測せずに外します。脱落したソースは取得が裏で続き、
 同じ問いの次回はキャッシュから返ります。
 **代替APIにも速度のムラがあります。一時点の成功は24時間の安定性の保証ではありません**。
@@ -1334,7 +1369,7 @@ librariesio はキー未設定なら検査・計測せずに外します。脱�
 | 症状 | 理由・対処 |
 |---|---|
 | 追加ソースが検索されない | `sources`に明示指定してください。既定6ソースは変えていません |
-| 「ローカルのアクセス間隔制御」 | 同じホストの予算待ちです。DataCiteは0.61秒、OpenAIREは60.1秒、Zenodoは2.01秒、RORは6.1秒、DOAJは0.51秒、npmは1秒、crates.ioは1.01秒、librariesioは1秒間隔。第6段階は osv 0.5秒（エンドポイント単位）、ietf / inspirehep / oeis / hfhub は1秒。第7段階は hn 0.4秒、swh 1秒。第8段階は ia 1秒（`archive.org/advancedsearch` を metadata API と別の予算に分けています）。待機せずエラーを返すため表示された秒数後に再試行 |
+| 「ローカルのアクセス間隔制御」 | 同じホストの予算待ちです。DataCiteは0.61秒、OpenAIREは60.1秒、Zenodoは2.01秒、RORは6.1秒、DOAJは0.51秒、npmは1秒、crates.ioは1.01秒、librariesioは1秒間隔。第6段階は osv 0.5秒（エンドポイント単位）、ietf / inspirehep / oeis / hfhub は1秒。第7段階は hn 0.4秒、swh 1秒。第8段階は ia 1秒（`archive.org/advancedsearch` を metadata API と別の予算に分けています）。第10段階は openreview 1秒（エンドポイント単位）。**qiita は未認証 60秒 / トークンあり 3.6秒**（公称 60 回/時・1,000 回/時）。待機せずエラーを返すため表示された秒数後に再試行 |
 | OpenAIREを別プロセスでも使う | 間隔制御はプロセス内のみ。同一IPの別MCP/CLIを含め提供元の枠を共有するため、並行実行を避ける。今回のOpenAIRE認証枠の拡張は未実装 |
 | 書誌はあるがgroundedの根拠がない | 抄録無しの追加ソースは本文を生成で補いません。別ソースを明示指定 |
 | arXivの代替が起動しない | `fallback=true`、自然語検索、締切内、障害/遅延という条件を確認 |
@@ -1355,6 +1390,9 @@ python scripts/probe_knowledge_stdio.py --sources swh --query kubernetes
 python scripts/probe_knowledge_stdio.py --sources librariesio --query "json schema"
 python scripts/probe_knowledge_stdio.py --sources ia --query "FORTRAN manual"
 python scripts/probe_knowledge_stdio.py --sources oeis --query Fibonacci
+python scripts/probe_knowledge_stdio.py --sources hfhub --query llama
+python scripts/probe_knowledge_stdio.py --sources openreview --query "mixture of experts"
+python scripts/probe_knowledge_stdio.py --sources qiita --query "tag:Python"
 python scripts/measure_kb.py --sources zenodo ror
 python scripts/measure_kb.py --sources doaj npm crates
 python scripts/measure_kb.py --sources datacite openaire
@@ -1392,10 +1430,8 @@ python scripts/measure_relevance.py --report
 [Software Heritage API](https://www.softwareheritage.org/legal/api-terms-of-use/)（ポイントアクセス可・大量抽出不可） /
 [Libraries.io](https://libraries.io/terms)（**利用者自身の無料APIキーが必要**・60 req/min。§6.10） /
 [Internet Archive](https://archive.org/developers/bots.html)（読み取りはキー不要。`robots.txt` の Disallow は `/control/` と `/report/` のみ。AI エージェントを含む自動アクセスに説明的 User-Agent と間隔・429 の尊重を IA が明示。**日本語クエリは不可**。§6.11） /
-[Qiita](https://qiita.com/terms)（記事の著作権は投稿者に帰属。未認証は 60 回/時、`FREEAGENT_QIITA_TOKEN` で 1,000 回/時）。
-[OpenReview](https://openreview.net/legal/terms)（API は data upload / search / download のための公式インターフェース。
-Works の著作権は著者に残るので、引用はタイトル・抄録・著者・forum URL までとし、PDF は取得しません。
-レート制限の公表値が無いため 1 req/s に自制します）。
+[Qiita](https://qiita.com/terms)（記事の著作権は投稿者に帰属。未認証は 60 回/時、`FREEAGENT_QIITA_TOKEN` で 1,000 回/時） /
+[OpenReview](https://openreview.net/legal/terms)（API は data upload / search / download のための公式インターフェース。Works の著作権は著者に残るので、引用はタイトル・抄録・著者・forum URL までとし、PDF は取得しません。レート制限の公表値が無いため 1 req/s に自制。§6.27）。
 
 リンク先全文・パッケージ本体の利用条件はメタデータの条件とは別です。
 
