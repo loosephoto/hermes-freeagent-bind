@@ -95,6 +95,9 @@ SOURCE_QUERIES = {
     "inspirehep": ["higgs boson", "dark matter", "neutrino", "supersymmetry", "black hole", "QCD"],
     "oeis": ["Fibonacci", "prime", "Catalan", "factorial", "partition", "1,2,3,5,7,11"],
     "hfhub": ["llama", "bert", "whisper", "diffusion", "mistral", "embedding"],
+    # openreview は会議論文なので、英語の研究語を回す（日本語は 0 件・HTTP を出さない）。
+    "openreview": ["retrieval augmented generation", "mixture of experts", "diffusion model",
+                   "graph neural network", "reinforcement learning", "vision transformer"],
 }
 
 def measure_round(index: int | None = None, sources: list[str] | None = None,

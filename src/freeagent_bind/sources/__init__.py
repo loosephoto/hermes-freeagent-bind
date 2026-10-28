@@ -50,5 +50,6 @@ from . import swh  # noqa: E402,F401
 from . import librariesio  # noqa: E402,F401
 from . import ia  # noqa: E402,F401
 from . import qiita  # noqa: E402,F401
+from . import openreview  # noqa: E402,F401
 
 NAMES = tuple(REGISTRY)

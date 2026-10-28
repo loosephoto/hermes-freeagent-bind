@@ -139,6 +139,11 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
         if cite["source"] == "qiita" and (not cite.get("identifier")
                                           or cite.get("summary_kind") != "discussion"):
             raise ValueError("Qiita citation must carry an item id and a discussion summary")
+        if cite["source"] == "openreview" and (not cite.get("identifier")
+                                               or cite.get("kind") not in
+                                               ("published", "withdrawn", "desk_rejected",
+                                                "rejected", "under_review", "unknown")):
+            raise ValueError("OpenReview citation must carry a forum id and a review-state kind")
         if cite["source"] == "cinii" and not cite.get("metadata_only"):
             raise ValueError("CiNii は書誌のみ（抄録を返さない）ので metadata_only であること")
         S._kb_http_url(cite["url"])

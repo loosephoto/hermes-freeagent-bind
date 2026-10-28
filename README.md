@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 11 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社）、検索は **24 ソース（既定 6 ＋ 明示指定 18）** に対応します。
+- 11 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社）、検索は **25 ソース（既定 6 ＋ 明示指定 19）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 **対象分野は科学（物理・数学・計算機）とプログラミングです。医学・生物学は対象外です。**
@@ -735,7 +735,13 @@ v0.9.5 は**提供元別の同時実行ゲート**と**モデル数の上限の�
 #### 新しい版の内訳（v0.11.0〜v0.14.2・新しい順）
 
 上の表の列は v0.9.5 までです（v0.11.0 以降の文字数: v0.12.0 = 17,198 / v0.13.0 = 17,495 /
-v0.14.0 = 17,495 / v0.14.1 = 17,555 / v0.14.2 = 17,666）。以下は新しい順の内訳です。
+v0.14.0 = 17,495 / v0.14.1 = 17,555 / v0.14.2 = 17,666 / v0.22.0 = 17,771 / v0.26.0 = 17,986 /
+**v0.29.0 = 18,199**）。以下は新しい順の内訳です。
+
+**v0.29.0（OpenReview 追加）**: `sources` の説明（`lookup` と `grounded` の 2 か所）に
+`openreview` の使う条件（英語の語・日本語は 0 件・`venue` に撤回が出る）を足したため
+**+213 文字（+1.2%）** の 18,199 になりました（ツール数は 11 のまま。既定 6 ソースは不変）。
+文字数の列の値はすべて同じ式で測り直した値です。
 
 **計測方法（表と内訳の数字はこの 1 つの式で再現できます）**:
 
@@ -1092,10 +1098,10 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 
 ## 📚 知識バックエンド
 
-**検索先は24ソースです。何も指定しなければ既定の6ソースだけを使います。**
+**検索先は25ソースです。何も指定しなければ既定の6ソースだけを使います。**
 `sources` を指定すると、指定したソースだけを検索します（既定の6ソースに追加されるのではありません）。
 
-- **論文を探す**：arxiv / crossref / openalex。日本語文献の書誌なら cinii。
+- **論文を探す**：arxiv / crossref / openalex。日本語文献の書誌なら cinii。会議の採択・撤回まで見たいなら openreview。
 - **パッケージを探す**：npm / crates / librariesio。脆弱性なら osv。
 - **標準・専門情報を調べる**：ietf（RFC）、inspirehep（素粒子物理）、oeis（整数列）、hfhub（MLモデル）。
 - **研究データや機関を探す**：datacite / zenodo / ror。
@@ -1150,7 +1156,7 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `openalex` | 論文のメタデータ・被引用数・アブストラクト | 匿名検索の制限あり。API キーを推奨 |
 | `github` | リポジトリ / Issue / コードの検索結果。コード検索は一致箇所の**断片**（`snippet`）も返す | コード検索はトークン必須（10 req/分）。**ライセンス情報を含まない**ので取り込み前に確認 |
 
-### 📘 明示指定で使う18ソース
+### 📘 明示指定で使う19ソース
 
 通常の検索には自動で追加されません。表の名前を会話で指定してください。
 
@@ -1174,9 +1180,10 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `librariesio`（明示指定・**キー必須**） | 19+ のパッケージ登録簿を横断した検索（名前・説明・版・DL数・ライセンス） | **利用者自身の無料 API キー**を `FREEAGENT_LIBRARIESIO_KEY` に設定したときだけ動きます（未設定なら登録先を案内して HTTP を出しません）。説明は登録者の自己申告 |
 | `ia`（明示指定） | Internet Archive のアイテム（歴史的な計算機マニュアル・書籍・ソフト等のタイトル・作成者・年・メディア種別・DL数） | **query は英語の語で指定**します。日本語（CJK）クエリは IA 側が拒否するため、HTTP を出さずにエラーを返します（実測 10/10）。`title:(語 AND 語)` に組み直して引きます。summary は**目録・アップロード者の注記**で抄録ではありません。本文は取得しません |
 | `qiita`（明示指定） | Qiita の技術記事（タイトル・本文の抜粋・タグ・Likes・Stock・コメント数・投稿者・更新日時） | キー不要。検索構文（`tag:Python` / `user:foo` / `created:>2026-01-01` / `stocks:>50`）が使えます。**未認証は 60 回/時**なので、同じ問いはキャッシュで即返りますが**別の問いは 1 分待ち**ます。`FREEAGENT_QIITA_TOKEN` を設定すると 1,000 回/時・間隔 3.6 秒。記事の著作権は投稿者に帰属します |
+| `openreview`（明示指定） | OpenReview の会議論文（タイトル・抄録・著者・会議名・査読状態・forum URL） | **query は英語の語で**指定します（日本語クエリは 0 件なので HTTP を出しません）。`venue` に採択（Poster / Spotlight / Oral）・Workshop・**Withdrawn**・**Desk Rejected**・未査読の Submission が出るので、撤回済みを根拠に使う前に確認できます（`kind`: `published` / `withdrawn` / `desk_rejected` / `rejected` / `under_review`）。レート制限の公表値が無いため **1 req/s に自制**（`FREEAGENT_OPENREVIEW_INTERVAL`）。`/notes/search` 以外の一覧経路は自動アクセスのチャレンジ（403）を返します |
 
 `sources` を省略すると**従来の6ソースのみ**、指定すると指定したソースだけを検索します。
-追加18ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
+追加19ソースを毎回自動送信することはありません。未知の名前は報告し、同じ名前の重複指定は1回にまとめます。
 `limit` は**各ソースの上限**です。全体の結果は重複除去などで減るので、合計件数を保証する値ではありません。
 本文という場合も、取得できた説明・導入部・アブストラクトを指します。原典の全文とは限りません。
 
@@ -1197,6 +1204,7 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | 標準文書を調べる | 「IETF で RFC 9110 の概要を調べて」 | `ietf` |
 | 物理・数学・ML を調べる | 「INSPIRE-HEP でヒッグス粒子の論文を」「OEIS で Fibonacci 数列を」「HF Hub で Llama を探して」 | `inspirehep`, `oeis`, `hfhub` |
 | 開発者の議論を探す | 「Hacker News で Rust の所有権についての議論を探して」 | `hn` |
+| 会議論文と採択状況を調べる | 「OpenReview で mixture of experts の論文と採択状況を調べて」 | `openreview` |
 | アーカイブの存在を調べる | 「Software Heritage に cargo のリポジトリがあるか調べて」 | `swh` |
 | 当時の一次資料を探す | 「Internet Archive で FORTRAN のマニュアルを探して」 | `ia`（**英語の語で**） |
 | 日本語の技術記事を探す | 「Qiita で Python の非同期処理の記事を探して」 | `qiita` |
@@ -1385,6 +1393,9 @@ python scripts/measure_relevance.py --report
 [Libraries.io](https://libraries.io/terms)（**利用者自身の無料APIキーが必要**・60 req/min。§6.10） /
 [Internet Archive](https://archive.org/developers/bots.html)（読み取りはキー不要。`robots.txt` の Disallow は `/control/` と `/report/` のみ。AI エージェントを含む自動アクセスに説明的 User-Agent と間隔・429 の尊重を IA が明示。**日本語クエリは不可**。§6.11） /
 [Qiita](https://qiita.com/terms)（記事の著作権は投稿者に帰属。未認証は 60 回/時、`FREEAGENT_QIITA_TOKEN` で 1,000 回/時）。
+[OpenReview](https://openreview.net/legal/terms)（API は data upload / search / download のための公式インターフェース。
+Works の著作権は著者に残るので、引用はタイトル・抄録・著者・forum URL までとし、PDF は取得しません。
+レート制限の公表値が無いため 1 req/s に自制します）。
 
 リンク先全文・パッケージ本体の利用条件はメタデータの条件とは別です。
 
@@ -1787,6 +1798,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_MAILTO` | 空 | Crossref / OpenAlex / DataCite の polite pool 用メールアドレス（キーではない） |
 | `FREEAGENT_LIBRARIESIO_KEY` | 空 | Libraries.io の検索。利用者自身の API キーが必須 |
 | `FREEAGENT_QIITA_TOKEN` | 空 | Qiita の検索枠を 60 回/時 → 1,000 回/時に上げる（任意） |
+| `FREEAGENT_OPENREVIEW_INTERVAL` | 1.0 | OpenReview の最小呼び出し間隔（秒）。公表レートが無いので既定 1 req/s に自制する |
 
 **接続先の上書き（通常は触らない）**
 

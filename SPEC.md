@@ -12,7 +12,7 @@
 ## 1. 構成（モジュラーモノリス）
 
 本体は `src/freeagent_bind/server.py`（§0〜§4・§5 の横断部・§6〜§10）。**データの一覧は 2 つの
-パッケージに出している**: 知識ソース 24 種は `sources/<name>.py`（1 ソース 1 ファイル）、
+パッケージに出している**: 知識ソース 25 種は `sources/<name>.py`（1 ソース 1 ファイル）、
 プロバイダ 18 社は `providers/<name>.py`（1 社 1 ファイル）。`sources/__init__.py` のレジストリが
 `SOURCES` / `KB_BACKENDS` を import 順に 1 回だけ組み立て、`providers/__init__.py` が
 `PROVIDER_SPECS` と `PROVIDER_ORDER` の既定順を作る（既定順の手書き列挙は持たない）。区画の追加は「行を足す」ではなく
@@ -34,7 +34,7 @@
 | §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳） |
 | §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
-| §5 | 知識バックエンド24種（**実装は `sources/<name>.py`**。ここには横断検索・締め切り・引用統合・ホスト予算だけを残す）＝既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須） / §5.21 Internet Archive（明示指定のみ） / §5.22 Qiita（明示指定のみ）） |
+| §5 | 知識バックエンド25種（**実装は `sources/<name>.py`**。ここには横断検索・締め切り・引用統合・ホスト予算だけを残す）＝既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須） / §5.21 Internet Archive（明示指定のみ） / §5.22 Qiita（明示指定のみ） / §5.23 OpenReview（明示指定のみ）） |
 | §6 | ツール実装（11本、§6.11 本文の注入番号・引用認定） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
@@ -604,7 +604,7 @@ v0.11.0 は GitHub の実装（`freellmapi` の設計文書・MoA・FrugalGPT・
   1 本の接続で通すと **3.096 秒**（**-0.636 秒・17%**。TLS ハンドシェイクが 163〜183ms/回なので
   2 回ぶん ≈ 0.35 秒は確実に消える。実測 2026-10-21・この環境）。
 - **共用経路（`kb_http`）には入れない**。`kb_http` はリダイレクト追従・プロキシ env・読み取り途中の
-  打ち切りを持つ 24 ソース共通の道で、接続の使い回しを混ぜると影響範囲が一気に広がる。§5.2.1 は
+  打ち切りを持つ 25 ソース共通の道で、接続の使い回しを混ぜると影響範囲が一気に広がる。§5.2.1 は
   **接続の再利用だけ**を担う専用の道（`kb_json_keepalive`）にする:
   * リダイレクトは追わない（wikidata の api.php は 200 を返す。実測）
   * プロキシが設定された環境では `kb_json` へ委譲する（`ProxyHandler` の挙動を変えない）
@@ -635,7 +635,7 @@ v0.11.0 は GitHub の実装（`freellmapi` の設計文書・MoA・FrugalGPT・
   `FREEAGENT_STATE_DIR/kb_latency.jsonl`・最大 20,000 行・超えたら古い行から tmp + `os.replace` で捨てる）へ追記。
   記録は `ts` / `hour`（日本時間）/ `source` / `elapsed_s` / `ok` / `items` / `error`（160 字）/ `mailto` /
   `openalex_key` / `cinii_appid` / `env_failure` に加え `datacite_kind` / `summaries`（本文がある件数）を記録し、**タイトル・本文は残さない**。
-  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応24ソースを測る（cinii / librariesio はキー未設定なら外す・§6.7 / §6.10）。論文キーワードだと空振りするソース（ror / npm / crates / librariesio / osv / ietf / hn / swh / ia / qiita / inspirehep / oeis / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
+  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応25ソースを測る（cinii / librariesio はキー未設定なら外す・§6.7 / §6.10）。論文キーワードだと空振りするソース（ror / npm / crates / librariesio / osv / ietf / hn / swh / ia / qiita / openreview / inspirehep / oeis / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
 - 全ソースが接続系の失敗なら `env_failure=true`（こちらのネットワーク障害）とし、`--report` の集計から外す。
 - `--schedule N` は Windows のタスク（`pythonw`＝窓を出さない）を 1 時間おきに登録し、残り回数を
   `kb_latency.jsonl.schedule.json` で数えて、最後の 1 回でタスクを自分で消す（`/ED` `/ET` は HOURLY との
@@ -1430,6 +1430,52 @@ key     = (-(品質点 - penalty), 平均所要ms（観測なしは inf）, ref)
   （「品質の帯（差 0.05 以内）で最も速い（3003ms）」など）。
 - 回帰: `tests/test_refine_pick_v0280.py`（8 件。帯 0・帯内最速・帯外は選ばない・未観測は従来同一・
   空の候補・`_refine_answers` がこの選抜を通ること）。
+
+### 6.27 第10段階 OpenReview（§5.23・明示指定のみ・v0.29.0）
+
+**会議論文の「採択・撤回」まで取れる唯一のソース**として足した。arXiv（プレプリント）・OpenAlex・
+Crossref（DOI）は、ICLR / NeurIPS などの会議論文に DOI が無いことが多く、**撤回・Desk Reject の情報も
+持たない**。実測（2026-10-28・本機）:
+
+- `https://api2.openreview.net/notes/search?term=…&limit=…&source=forum` は **5/5 が 200**、
+  0.21〜1.78 秒（暖機後 0.21 秒）。**`KB_DEADLINE` 8 秒に対して余裕がある**。
+- 引用に要る項目の**充填率 10/10**（title / authors / venue / forum / pdate、abstract 200 字超 10/10、
+  pdf 9/10）。v2 の `content` は `{value: …}` で包まれる（v1 の素の値も受ける）。
+- **一覧経路 `/notes?content.venueid=…` は 403 `ChallengeRequiredError`**（自動アクセスのチャレンジ）。
+  `/notes/search` は影響を受けない（第三者も同じ報告）が、将来同じ扱いになる可能性があるので
+  403 は「チャレンジ」として明示エラーにする（503 のリトライには載せない）。
+- 空 `term` は 400 `ValidationError`、未知語・記号のみ・**日本語は 0 件**（索引は英語）。
+  日本語（CJK だけ）の問いは **HTTP を出さずに理由を返す**（arXiv と同じ型。1 req/s の枠を空振りで食わない）。
+- **レート制限の公表値が無い**（openreview/openreview#459 が未解決）。npm と同じく**公表が無いので自制**し、
+  既定 1 req/s（`FREEAGENT_OPENREVIEW_INTERVAL`）。予算キーはエンドポイント単位
+  （`api2.openreview.net/notes-search`）。
+- robots.txt は `Disallow: /*?*email=` のみ（検索は許可）。ToS は API を
+  「data upload, search, and download のプログラム的インターフェース」と定義し、Works の権利は著者に残る。
+  引用は**タイトル・抄録・forum URL・著者・会議名**までで、PDF は取得しない。
+- **重複**: `diffusion model` の上位 20 件を Crossref 上位 100 件と照合して**重複 0/20**
+  （会議論文は DOI を持たず Crossref に載らない）。arXiv との重複率は**未測定**（arXiv API が 429）。
+- `kind`（`published` / `withdrawn` / `desk_rejected` / `rejected` / `under_review` / `unknown`）は
+  `venueid` の末尾から決め、venue の文字列（"… Withdrawn Submission" 等）でも補う。
+  **撤回論文を「査読を通った根拠」と誤読させない**ための情報なので、引用に残す。
+
+**同じ回で実測して落とした候補**（再確認なしに登録しない）:
+
+| 候補 | 実測 | 判定 |
+|---|---|---|
+| Stack Exchange 2.3 | 200 / 0.58 秒 / 本文あり | 保留（AUP が生成 AI 用途の自動取得に**事前の書面許諾**を要求。技術的障壁は無い） |
+| Semantic Scholar | **429**（再現） | 保留（キー運用のみ。利用条件の文書が無い） |
+| DBLP | **202** / Anubis のボット判定 HTML / robots `Disallow: /search` | 却下 |
+| Lobsters | robots が `User-agent: *` → **`Disallow: /`** | 却下（規約 29） |
+| Papers with Code | 200 だが **HTML**（API 終了） | 却下 |
+| dev.to | 200 / 0.87 秒 / 本文ありだが `tag=` 絞り込みのみ | 却下（キーワード検索でない・Qiita と重複） |
+| Artifact Hub / RubyGems / Packagist / NuGet | 200 / 0.37・0.39・0.41・0.98 秒 | 却下（librariesio と重複・schema コスト） |
+| MetaCPAN | 200 / 0.40 秒 / 0 件（Elasticsearch DSL 前提） | 却下 |
+| figshare / OSF Preprints | 200 / 1.07・1.65 秒 | 却下（Zenodo・OpenAlex と重複、領域混在） |
+| Codeberg | 200 / **5.22 秒** | 却下（GitHub と重複・遅い） |
+| endoflife.date | 200 / 0.40 秒 / 486 件だが ID 一覧 | 却下（キーワード検索 API 無し） |
+
+回帰: `tests/test_knowledge_stage10.py`（18 件。`{value: …}` の剥がし・forum URL・`kind` の判定・
+CJK は HTTP を出さない・403/400/配列でない応答の文言・`limit` のクランプ）。
 
 ## 7. ツールの規約（§6–§8）
 

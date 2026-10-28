@@ -656,6 +656,13 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     見ている**ので、選抜を差し替えるときは `fallback` 引数で旧文言を温存する。
     **end-to-end の壁時計 A/B は n=3 では判定できない**（panel の壁が 6.3〜31 秒に散る）ので、
     「panel が速くなった」とは書かず、機構の実測までを根拠にする。
+86. **会議論文のソースは「査読状態」を機械可読で返す**（v0.29.0・SPEC §6.27）。OpenReview の
+    `venue`（`ICLR 2025 Poster` / `… Withdrawn Submission` / `… Desk Rejected Submission`）は
+    人が読む文字列なので、`venueid` の末尾から `kind`（`published` / `withdrawn` / `desk_rejected` /
+    `rejected` / `under_review`）を決めて引用に残す。**撤回済みの論文を「査読を通った根拠」として
+    数えさせない**ための情報で、`venue` の文字列一致だけに頼ると会議ごとの表記揺れで落ちる。
+    同じ型で、レート制限の公表が無い提供元は**自制の間隔**（既定 1 req/s）を置き、
+    自動アクセスのチャレンジ（403 `ChallengeRequired`）は 5xx の再試行に載せず明示エラーにする。
 
 ## ライセンス
 

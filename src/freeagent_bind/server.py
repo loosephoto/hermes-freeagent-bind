@@ -7,7 +7,7 @@ Internet Archive / Qiita）で
 対象外**（第6段階で採った生命・医学系ソースは 2026-10-05 に方針変更で削除。§5.19 に記録）。
 
 **モジュラーモノリス**として書く。本体はこの 1 ファイル（§0〜§4・§5 の横断部・§6〜§10）で、
-知識ソース 24 種だけを `sources/<name>.py`（1 ソース 1 ファイル）に置く。配布物は今も
+知識ソース 25 種だけを `sources/<name>.py`（1 ソース 1 ファイル）に置く。配布物は今も
 **stdio スクリプト 1 本**で完結する（`python server.py` / `runpy.run_path(server.py)` の直接実行は、
 冒頭の互換シムがパッケージ版を import して `main()` を呼ぶ。実測: stdio 起動後にネイティブ拡張を
 import すると無応答になる環境があるため、起動経路は増やさない）。肥大化は前提なので、増築は
@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.28.1"
+SERVER_VERSION = "0.29.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -4210,7 +4210,7 @@ def _cite(source: str, title: str, url: str, **extra) -> dict:
 # 「読み切れば在庫に返せる」ことが条件になる（下の `_ka_read_body`）。
 #
 # 共用経路（`kb_http`）に混ぜない理由: `kb_http` はリダイレクト追従・プロキシ env・読み取り途中の
-# 打ち切りを持つ 24 ソース共通の道で、接続の使い回しを入れると影響範囲が一気に広がる。
+# 打ち切りを持つ 25 ソース共通の道で、接続の使い回しを入れると影響範囲が一気に広がる。
 # ここは**接続の再利用だけ**を担い、
 #   * リダイレクトは追わない（wikidata の api.php は 200 を返す。実測）
 #   * プロキシが設定された環境では `kb_json` へ委譲する（`ProxyHandler` の挙動を変えない）
@@ -5245,7 +5245,7 @@ AGENT_SYSTEM = (
     "あなたは調査補佐です。次のいずれか**1つだけ**を JSON で出力してください。\n"
     '  ツールを使う: {"tool": "lookup", "query": "<検索語>", "sources": ["arxiv","crossref",...]}\n'
     '  使える source: wikipedia, wikidata, arxiv, crossref, openalex, github, datacite, openaire, zenodo, ror, doaj, npm, crates, cinii\n'
-    '  追加（明示指定のみ）: osv, ietf, inspirehep, oeis, hfhub, hn, swh, librariesio, ia, qiita\n'
+    '  追加（明示指定のみ）: osv, ietf, inspirehep, oeis, hfhub, hn, swh, librariesio, ia, qiita, openreview\n'
     '  追加sourceは明示指定のみ。datacite_kind: all / arxiv / dataset。fallback: trueでarXivのDataCite代替を許可。\n'
     '  回答する:     {"answer": "<回答。使った根拠の番号 [n] を本文に書く>"}\n'
     "ツール結果は [1] [2] … の番号つきで返ります。回答では使った根拠の番号を本文に書き、"
@@ -7250,7 +7250,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "query": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6ソース: wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件） / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。検索構文 tag:Python user:foo created:>2026-01-01。**未認証は 60 回/時**で別の問いは 1 分待ち、FREEAGENT_QIITA_TOKEN を設定すると 1,000 回/時）。対象は科学とプログラミングまでで医学・生物学は含まない"},
+                            "description": "既定6ソース: wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件） / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。検索構文 tag:Python user:foo created:>2026-01-01。**未認証は 60 回/時**で別の問いは 1 分待ち、FREEAGENT_QIITA_TOKEN を設定すると 1,000 回/時）／openreview（OpenReview の会議論文。**query は英語の語**で指定する。日本語クエリは 0 件。venue に採択・スポットライト・撤回・Desk Reject が出るので、撤回済みを根拠に使う前に確認できる）。対象は科学とプログラミングまでで医学・生物学は含まない"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
                 "lang": {"type": "string", "description": "Wikipedia / Wikidata の言語。**wikipedia は省略時に問いから自動**（日本語・中国語・韓国語なら ja、それ以外は en。英語の語（Transformer など）は自動で en になるので、通常は指定しない。**wikidata は既定 ja 固定**（実測で ja の方が当たったため。en にすると機械学習の項目が電気機器に化ける）。明示するとその言語で引く"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須・10 req/分）。code はファイルへのポインタと一致箇所の断片を返し、ライセンス情報を含まない（取り込む前に repo 検索で確認する）。repo: owner/name・path:・language:・filename:・in:file の修飾子を付けると精度が上がる"},
@@ -7281,7 +7281,7 @@ TOOLS: list[dict] = [
                                                 "ここに置くと質問文はそのままモデルへ渡る。"
                                                 "省略すると question をそのまま検索語にする"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6種（wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件）/ crossref / openalex / github）。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**question は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。**未認証は 60 回/時**、FREEAGENT_QIITA_TOKEN で 1,000 回/時）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。**crossref は抄録が無い書誌が多い**（grounded では抄録の有る論文に絞る） / **hn は議論のコメントが本文根拠になる**（故事的リンク投稿は本文が無い）。医学・生物学は対象外"},
+                            "description": "既定6種（wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件）/ crossref / openalex / github）。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**question は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。**未認証は 60 回/時**、FREEAGENT_QIITA_TOKEN で 1,000 回/時）／openreview（OpenReview の会議論文。**question は英語の語**で指定する。日本語クエリは 0 件。venue に採択・撤回・Desk Reject が出る）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。**crossref は抄録が無い書誌が多い**（grounded では抄録の有る論文に絞る） / **hn は議論のコメントが本文根拠になる**（故事的リンク投稿は本文が無い）。医学・生物学は対象外"},
                 "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
                 "limit": {"type": "integer"},
