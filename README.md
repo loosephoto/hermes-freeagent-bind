@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 11 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社）、検索は **25 ソース（既定 6 ＋ 明示指定 19）** に対応します。
+- 11 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社）、検索は **27 ソース（既定 6 ＋ 明示指定 21）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 **対象分野は科学（物理・数学・計算機）とプログラミングです。医学・生物学は対象外です。**
@@ -1205,8 +1205,10 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `ia` | Internet Archive のアイテム（歴史的な計算機マニュアル・書籍・ソフト等のタイトル・作成者・年・メディア種別・DL数） | **query は英語の語で指定**します。日本語（CJK）クエリは IA 側が拒否するため、HTTP を出さずにエラーを返します（実測 10/10）。`title:(語 AND 語)` に組み直して引きます。summary は**目録・アップロード者の注記**で抄録ではありません。本文は取得しません |
 | `qiita` | Qiita の技術記事（タイトル・本文の抜粋・タグ・Likes・Stock・コメント数・投稿者・更新日時） | キー不要。検索構文（`tag:Python` / `user:foo` / `created:>2026-01-01` / `stocks:>50`）が使えます。**未認証は 60 回/時**なので、同じ問いはキャッシュで即返りますが**別の問いは 1 分待ち**ます。`FREEAGENT_QIITA_TOKEN` を設定すると 1,000 回/時・間隔 3.6 秒。記事の著作権は投稿者に帰属します |
 | `openreview` | OpenReview の会議論文（タイトル・抄録・著者・会議名・**査読状態**・forum URL） | **query は英語の語で**指定します（日本語クエリは 0 件なので HTTP を出しません）。会議名に `Poster` / `Spotlight` / `Oral` / `Workshop` / **`Withdrawn`** / **`Desk Rejected`** が出るので、撤回済みを根拠に使う前に確認できます（機械可読な `kind` の値は下の折りたたみ）。レート制限の公表値が無いため **1 req/s に自制**（`FREEAGENT_OPENREVIEW_INTERVAL`） |
+| `mdn` | MDN Web Docs の Web 技術ドキュメント（HTML/CSS/JS/Web API 等のタイトル・公式要約・URL） | 公開検索 API（`/api/v1/search`）。**帰属表示が必須**（Mozilla contributors, CC-BY-SA 2.5）。`lang` でロケール指定可（省略時 `en-US`）。内容は Web 技術に特化 |
+| `devdocs` | DevDocs の 779+ docset の索引（Python/JavaScript/React/Django/PostgreSQL 等の API 名・パス・URL） | `doc` で docset slug を指定して index を引く（例: `doc="python~3.14"`）。`doc` 省略時は `query` に一致する docset の一覧を返す。本文は取得しない（`metadata_only`）。各 docset のライセンスに従う |
 
-**追加19ソースを毎回自動送信することはありません**（指定したときだけ引きます）。未知の名前は報告し、
+**追加21ソースを毎回自動送信することはありません**（指定したときだけ引きます）。未知の名前は報告し、
 同じ名前の重複指定は1回にまとめます。`limit` は**各ソースの上限**で、全体の結果は重複除去などで
 減るため、合計件数を保証する値ではありません。
 
