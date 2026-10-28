@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.29.1"
+SERVER_VERSION = "0.29.2"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -672,6 +672,7 @@ def is_cooling(ref: str) -> bool:
 
 _AUTH: dict[str, dict] = {}
 _AUTH_LOADED = False
+_AUTH_MTIME: float | None = None
 _AUTH_LOCK = threading.Lock()
 AUTH_TTL_S = _env_float("FREEAGENT_AUTH_TTL", 900.0)
 
@@ -686,24 +687,62 @@ def _auth_prune(entries: dict, now: float) -> dict:
 
 
 def _ensure_auth_loaded() -> None:
-    global _AUTH_LOADED
+    global _AUTH_LOADED, _AUTH_MTIME
+    path = auth_path()
+    mtime = _file_mtime(path)
     if _AUTH_LOADED:
+        if mtime is None:
+            return
+        if _AUTH_MTIME is not None and abs(mtime - _AUTH_MTIME) < 1e-6:
+            return
+        with _AUTH_LOCK:
+            if _AUTH_MTIME is not None and abs(mtime - _AUTH_MTIME) < 1e-6:
+                return
+            data = _load_json(path, {})
+            saved = data.get("providers") if isinstance(data, dict) else None
+            if isinstance(saved, dict):
+                for p, e in saved.items():
+                    if not isinstance(e, dict):
+                        continue
+                    cur = _AUTH.get(p)
+                    if cur is None or as_float(e.get("until"), 0.0) > as_float(cur.get("until"), 0.0):
+                        _AUTH[p] = e
+            _AUTH_LOADED = True
+            _AUTH_MTIME = mtime
         return
     with _AUTH_LOCK:
         if _AUTH_LOADED:
             return
-        data = _load_json(auth_path(), {})
+        data = _load_json(path, {})
         saved = data.get("providers") if isinstance(data, dict) else None
         if isinstance(saved, dict):
             _AUTH.update(_auth_prune(saved, now_ts()))
         _AUTH_LOADED = True
+        _AUTH_MTIME = mtime if mtime is not None else _AUTH_MTIME
 
 
 def _auth_save() -> bool:
-    with _AUTH_LOCK:
-        payload = {"version": 1, "saved_at": now_ts(),
-                   "providers": _auth_prune(_AUTH, now_ts())}
-    return _atomic_write(auth_path(), json.dumps(payload, ensure_ascii=False))
+    global _AUTH_MTIME
+    path = auth_path()
+    with _file_lock(path):
+        data = _load_json(path, {})
+        saved = data.get("providers") if isinstance(data, dict) else None
+        merged = dict(saved) if isinstance(saved, dict) else {}
+        now = now_ts()
+        with _AUTH_LOCK:
+            for p, e in _AUTH.items():
+                cur = merged.get(p)
+                if cur is None or as_float(e.get("until"), 0.0) >= as_float(cur.get("until"), 0.0):
+                    merged[p] = e
+            merged = _auth_prune(merged, now)
+            payload = {"version": 1, "saved_at": now, "providers": merged}
+            ok = _atomic_write(path, json.dumps(payload, ensure_ascii=False))
+            if ok:
+                _AUTH.clear()
+                _AUTH.update(merged)
+                _AUTH_LOADED = True
+                _AUTH_MTIME = _file_mtime(path)
+        return ok
 
 
 def note_provider_auth(provider: str, status: int, detail: str = "") -> float:
@@ -724,12 +763,27 @@ def note_provider_auth(provider: str, status: int, detail: str = "") -> float:
 
 def clear_provider_auth(provider: str) -> None:
     """呼び出しが通ったら記憶を消す（キーを直したのに古い記憶で避け続けるのを防ぐ）。"""
+    if not provider:
+        return
     _ensure_auth_loaded()
-    with _AUTH_LOCK:
-        if provider not in _AUTH:
-            return
-        _AUTH.pop(provider, None)
-    _auth_save()
+    path = auth_path()
+    with _file_lock(path):
+        with _AUTH_LOCK:
+            _AUTH.pop(provider, None)
+            data = _load_json(path, {})
+            saved = data.get("providers") if isinstance(data, dict) else None
+            merged = dict(saved) if isinstance(saved, dict) else {}
+            merged.pop(provider, None)
+            now = now_ts()
+            merged = _auth_prune(merged, now)
+            payload = {"version": 1, "saved_at": now, "providers": merged}
+            ok = _atomic_write(path, json.dumps(payload, ensure_ascii=False))
+            if ok:
+                _AUTH.clear()
+                _AUTH.update(merged)
+                _AUTH_LOADED = True
+                global _AUTH_MTIME
+                _AUTH_MTIME = _file_mtime(path)
 
 
 def provider_auth_blocked(provider: str) -> dict | None:
@@ -1459,6 +1513,7 @@ def observe_call(result: dict, kind: str, text: str = "") -> None:
 
 _SESSIONS: dict[str, dict] = {}
 _SESSIONS_LOADED = False
+_SESSIONS_MTIME: float | None = None
 _SESSIONS_LOCK = threading.Lock()
 SESSION_TTL_S = _env_float("FREEAGENT_SESSION_TTL", 3600.0)
 SESSION_MAX = _env_int("FREEAGENT_SESSION_MAX", 32)
@@ -1478,25 +1533,65 @@ def _sessions_prune(data: dict, now: float) -> dict:
 
 
 def _ensure_sessions_loaded() -> None:
-    global _SESSIONS_LOADED
-    if _SESSIONS_LOADED or not SESSIONS_ENABLED:
+    global _SESSIONS_LOADED, _SESSIONS_MTIME
+    if not SESSIONS_ENABLED:
+        return
+    path = sessions_path()
+    mtime = _file_mtime(path)
+    if _SESSIONS_LOADED:
+        if mtime is None:
+            return
+        if _SESSIONS_MTIME is not None and abs(mtime - _SESSIONS_MTIME) < 1e-6:
+            return
+        with _SESSIONS_LOCK:
+            if _SESSIONS_MTIME is not None and abs(mtime - _SESSIONS_MTIME) < 1e-6:
+                return
+            data = _load_json(path, {})
+            rows = data.get("sessions") if isinstance(data, dict) else None
+            rows = rows if isinstance(rows, dict) else {}
+            for sid, row in rows.items():
+                if not isinstance(row, dict):
+                    continue
+                cur = _SESSIONS.get(sid)
+                if cur is None or as_float(row.get("updated_at"), 0.0) >= as_float(cur.get("updated_at"), 0.0):
+                    _SESSIONS[sid] = row
+            _SESSIONS_LOADED = True
+            _SESSIONS_MTIME = mtime
         return
     with _SESSIONS_LOCK:
         if _SESSIONS_LOADED:
             return
-        data = _load_json(sessions_path(), {})
+        data = _load_json(path, {})
         rows = data.get("sessions") if isinstance(data, dict) else None
         _SESSIONS.update(_sessions_prune(rows if isinstance(rows, dict) else {}, now_ts()))
         _SESSIONS_LOADED = True
+        _SESSIONS_MTIME = mtime if mtime is not None else _SESSIONS_MTIME
 
 
 def _sessions_save() -> bool:
+    global _SESSIONS_MTIME
     if not SESSIONS_ENABLED:
         return False
-    with _SESSIONS_LOCK:
-        payload = {"version": 1, "saved_at": now_ts(),
-                   "sessions": _sessions_prune(_SESSIONS, now_ts())}
-    return _atomic_write(sessions_path(), json.dumps(payload, ensure_ascii=False))
+    path = sessions_path()
+    with _file_lock(path):
+        data = _load_json(path, {})
+        disk_rows = data.get("sessions") if isinstance(data, dict) else None
+        disk_rows = disk_rows if isinstance(disk_rows, dict) else {}
+        merged = dict(disk_rows)
+        with _SESSIONS_LOCK:
+            for sid, row in _SESSIONS.items():
+                cur = merged.get(sid)
+                if cur is None or (isinstance(row, dict) and as_float(row.get("updated_at"), 0.0) >= as_float((cur or {}).get("updated_at"), 0.0)):
+                    merged[sid] = row
+            merged = _sessions_prune(merged, now_ts())
+            payload = {"version": 1, "saved_at": now_ts(), "sessions": merged}
+            ok = _atomic_write(path, json.dumps(payload, ensure_ascii=False))
+            if ok:
+                _SESSIONS.clear()
+                _SESSIONS.update(merged)
+                _SESSIONS_LOADED = True
+                _SESSIONS_MTIME = _file_mtime(path)
+        return ok
 
 
 def new_session_id() -> str:
@@ -1528,10 +1623,27 @@ def session_put(sid: str, row: dict) -> None:
 
 
 def session_drop(sid: str) -> None:
+    if not sid or not SESSIONS_ENABLED:
+        return
     _ensure_sessions_loaded()
-    with _SESSIONS_LOCK:
-        _SESSIONS.pop(sid, None)
-    _sessions_save()
+    path = sessions_path()
+    with _file_lock(path):
+        with _SESSIONS_LOCK:
+            _SESSIONS.pop(sid, None)
+            data = _load_json(path, {})
+            disk_rows = data.get("sessions") if isinstance(data, dict) else None
+            disk_rows = disk_rows if isinstance(disk_rows, dict) else {}
+            merged = dict(disk_rows)
+            merged.pop(sid, None)
+            merged = _sessions_prune(merged, now_ts())
+            payload = {"version": 1, "saved_at": now_ts(), "sessions": merged}
+            ok = _atomic_write(path, json.dumps(payload, ensure_ascii=False))
+            if ok:
+                _SESSIONS.clear()
+                _SESSIONS.update(merged)
+                _SESSIONS_LOADED = True
+                global _SESSIONS_MTIME
+                _SESSIONS_MTIME = _file_mtime(path)
 
 
 # ---------------------------------------------------------------- §2.6 思考台帳
@@ -5534,7 +5646,7 @@ def tool_models(args: dict) -> dict:
                         "error": truncate(err, 200),
                         "sample": truncate((res.get("text") or "").strip(), 60)}
 
-            probed = run_parallel(shown, check, max_workers=probe_workers)
+            probed = run_parallel(shown, check, max_workers=probe_workers, deadline=call_budget())
             # 消えたもの（404/410）と権限で拒否されたものだけ一覧から外す。**遅い・一時エラーは残す**
             # （残さないと「まだ生きているが遅い」モデルを永久に隠すことになる）。
             dropped = {"gone", "auth"}
@@ -6065,7 +6177,17 @@ def tool_consult(args: dict) -> dict:
                    "answers": round_rows})
 
     debate_summary = None
-    if depth == "deep":
+    do_debate = (depth == "deep") and not budget_expired()
+    if depth == "deep" and not do_debate:
+        dropped_rows = [_dropped_result(call_budget(), "未実行") for _ in refs]
+        debate_rows = [{"model": ref, "error": r.get("error")} for ref, r in zip(refs, dropped_rows)]
+        rounds.append({"round": round_no + 1, "kind": "debate", "answers": debate_rows})
+        dropped = [{"round": r["round"], "kind": r["kind"], "model": a.get("model"),
+                    "error": truncate(a.get("error") or "", 160)}
+                   for r in rounds for a in r["answers"] if a.get("error")]
+        debate_summary = {"dropped": dropped,
+                          "error": "呼び出しの予算を使い切ったため討論を実行しませんでした（初回回答は有効です）"}
+    if do_debate:
         peers = [row for row in round_rows if not row.get("error")]
         rebuttal_prompt = _consult_prompt(question, main_reply, round_no, peers=peers)
         rebuttal = ask_many(refs, rebuttal_prompt, system=DEBATE_SYSTEM,
@@ -6114,7 +6236,7 @@ def tool_consult(args: dict) -> dict:
                 and bool(row.get("unresolved")) for row in debate_rows if not row.get("error")),
         }
 
-    if depth == "deep":
+    if do_debate:
         debate_by_model = {row.get("model"): row for row in debate_rows}
         last = []
         for initial in round_rows:
