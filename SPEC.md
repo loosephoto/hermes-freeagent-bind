@@ -1503,6 +1503,29 @@ CJK は HTTP を出さない・403/400/配列でない応答の文言・`limit` 
 （基準値 2026-11-01: 20 セッションで採用率 10%・必要場面 33%、50 セッションで必要場面 24%）。
 **この変更単体では効果を主張しない**（文面の変更は標本 1 つでは判定できない）。
 
+### 6.29 査読の型と質問の予算（v0.31.1）
+
+外部の OSS（`addyosmani/agent-skills` の 5 軸レビュー、`github/spec-kit` の clarify と質問上限）から
+**型だけ**を写した。ツールは増やさず、`freeagent_consult` の中だけを変える。
+
+- **`mode="review"` + `draft` は査読モード**。専用の `REVIEW_SYSTEM` で 4 行（結論 / 重要度 / 指摘 /
+  確認したい点）を要求し、5 軸（correctness / readability / architecture / security / performance）を
+  一通り見させる。`draft` が無いときは従来の discuss に落ちる（モード名だけで挙動を変えない）。
+- **重要度は固定語彙**（critical / required / optional / nit）。和英の別名は寄せる（重大→critical、
+  軽微→nit、必須→required）。**寄らない綴りは `unknown` として残し、`blocking` に数える**。
+  試作で「語彙外は素通り（blocking=False）」という穴が出たため、保守側に倒す仕様にした。
+  `findings_summary` は参加者ごとの集計で、`reviewed` / `unreviewed`（失敗した参加者）を併記する。
+- **質問は最大 5 件（`QUESTION_CAP`）**。超えた分は捨てずに `deferred_questions` へ移す（規約 8）。
+  質問文の「既定: …」は `open_questions[].default` として分離する（本文は変えない）。
+- **カバレッジ**は直前ラウンドとの差分で決める（`_previous_questions`）。前のラウンドで出て今回出なかった
+  質問を `resolved`、今回出たものを `outstanding`、上限超えを `deferred`。すべて解消すると
+  `status="clear"`。spec-kit の Coverage 表の写しだが、**仕様書ではなく会話の状態**で数える。
+
+実測: `tools/list` は 18,349 → **18,646 文字（+297）**。897 テスト（新規 12 件）・smoke 2 種・
+`check_offline`・`check_integrity`・`apply_proactive --check`・`moji_scan` は緑。
+回帰は `tests/test_consult_review_v0311.py`（12 件。語彙の正規化・語彙外の blocking・失敗行の除外・
+review と discuss の system 切替・draft 無しの退避・上限と deferred・既定値の分離・再開時の解消・本文表示）。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。

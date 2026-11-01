@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.31.0"
+SERVER_VERSION = "0.31.1"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -5348,6 +5348,30 @@ DEBATE_SYSTEM = (
     "応答: <その反論への応答を1〜2文>\n"
     "未解決: <合意できずに残った点。無ければ なし>"
 )
+# 査読（`freeagent_consult(mode="review", draft=...)`）専用の型。**軸と重要度の語彙を固定**しないと、
+# モデルごとに「重大」「blocker」「高い」と揺れて比較できない（外部 OSS の 5 軸レビューと同じ理由）。
+# 重要度を名乗らなかった/語彙外の回答は `unknown` として残し、**blocking 側に倒す**（黙って通さない）。
+REVIEW_SYSTEM = (
+    "あなたは下書きの査読者です。出力は必ず次の4行だけです。\n"
+    "結論: <総評を1〜3文>\n"
+    "重要度: <critical / required / optional / nit のうち最も重いものを1つ>\n"
+    "指摘: <根拠つきの指摘を最大3個。各「[軸] 箇所 — 理由」。軸は correctness / readability / "
+    "architecture / security / performance>\n"
+    "メインに確認したい点: <前提が足りず判断できない点を1つだけ。推奨の既定値を「既定: …」で添える。"
+    "無ければ なし>\n"
+    "前置き・思考過程・挨拶・Markdown の見出しは書かない。"
+)
+REVIEW_AXES = ("correctness", "readability", "architecture", "security", "performance")
+REVIEW_SEVERITIES = ("critical", "required", "optional", "nit")
+_SEVERITY_ALIAS = {
+    "critical": "critical", "クリティカル": "critical", "重大": "critical", "blocker": "critical",
+    "required": "required", "必須": "required", "high": "required",
+    "optional": "optional", "任意": "optional", "推奨": "optional", "medium": "optional",
+    "nit": "nit", "軽微": "nit", "low": "nit", "nitpick": "nit",
+}
+# メインへ返す質問の上限（dsh-superagent の「注意予算」と spec-kit の質問上限の写し）。
+# 上限を超えた分は**捨てずに** `deferred_questions` に移す（規約 8）。
+QUESTION_CAP = 5
 AGENT_SYSTEM_FINAL = (
     "これ以上のツール呼び出しはできません。集めた情報だけを根拠に、最終回答を JSON 1つで出してください。\n"
     '  {"answer": "<回答。使った根拠の番号 [n] を本文に書き、根拠が足りない点は「根拠に無い」と明記>"}\n'
@@ -5411,6 +5435,57 @@ def parse_labeled(text: str) -> dict:
             out["question"] = "" if empty_value in _NO_ANSWER else truncate(value, 400)
             out["labels_found"] += 1
     return out
+
+
+# 査読の解析。`重要度` は語彙に寄せ、寄らない綴りは **unknown** として残す（勝手に丸めない）。
+_LABEL_SEVERITY = re.compile(r"(?:重要度|severity|重大度)\s*[:：]\s*([A-Za-zぁ-んァ-ヶ一-龠]{2,12})", re.I)
+_LABEL_FINDINGS = re.compile(r"(?:指摘|findings?)\s*[:：]\s*(.+)", re.I)
+_LABEL_DEFAULT = re.compile(r"既定\s*[:：]\s*([^。\n]{1,60})")
+
+
+def parse_review(text: str) -> dict:
+    """査読回答から重要度・指摘・軸を取る。取れない項目は空（推測で埋めない）。"""
+    out = {"severity": "", "findings": [], "axes": []}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _LABEL_SEVERITY.search(line)
+        if m and not out["severity"]:
+            out["severity"] = _SEVERITY_ALIAS.get(m.group(1).strip().lower(), "unknown")
+        m = _LABEL_FINDINGS.search(line)
+        if m and len(out["findings"]) < 6:
+            out["findings"].append(truncate(m.group(1).strip().strip("* "), 240))
+    low = (text or "").lower()
+    out["axes"] = [axis for axis in REVIEW_AXES if axis in low]
+    return out
+
+
+def summarize_review(rows: list[dict]) -> dict:
+    """査読の重要度を数える。**語彙外は unknown として blocking に数える**（安全側）。"""
+    counts = {sev: 0 for sev in REVIEW_SEVERITIES}
+    counts["unknown"] = 0
+    reviewed = 0
+    for row in rows:
+        if row.get("error"):
+            continue
+        reviewed += 1
+        sev = as_str(row.get("severity")).strip().lower()
+        if sev in counts:
+            counts[sev] += 1
+        elif sev:
+            counts["unknown"] += 1
+    counts["blocking"] = counts["critical"] + counts["required"] + counts["unknown"] > 0
+    counts["reviewed"] = reviewed
+    counts["unreviewed"] = len(rows) - reviewed
+    return counts
+
+
+def parse_question_default(text: str) -> tuple[str, str]:
+    """質問文から「既定: …」を切り離す（本文は変えない。既定値は別のキーで返す）。"""
+    raw = (text or "").strip()
+    m = _LABEL_DEFAULT.search(raw)
+    return raw, (truncate(m.group(1).strip(), 120) if m else "")
 
 
 # 検証者（THINK_CRITIC_SYSTEM）の出力の解析。**1 行 1 ラベルと決め打たない**（同一行に複数ラベルが
@@ -6120,8 +6195,28 @@ def _consult_prompt(question: str, main_reply: str, round_no: int, peers: list[d
         block = "\n".join(f"- {p['model']}: {truncate(p.get('conclusion') or p.get('text') or '', 400)}"
                           for p in peers)
         parts.append(f"【他の参加者の回答（第{round_no}ラウンド）】\n{block}")
-    parts.append("上の形式（結論/確信度/メインに確認したい点）だけで答えてください。")
+    if mode == "review" and draft:
+        parts.append("上の形式（結論/重要度/指摘/メインに確認したい点）だけで答えてください。"
+                     "5 軸（correctness / readability / architecture / security / performance）を"
+                     "一通り見てから、最も重い重要度を 1 つ名乗ってください。")
+    else:
+        parts.append("上の形式（結論/確信度/メインに確認したい点）だけで答えてください。"
+                     "確認したい点は最も重要な 1 つだけにし、推奨の既定値を「既定: …」で添えてください。")
     return "\n\n".join(parts)
+
+
+def _previous_questions(rounds: list[dict]) -> list[str]:
+    """直前ラウンドで出ていた質問（「解消した」を数えるため）。無ければ空。"""
+    if len(rounds) < 2:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in rounds[-2].get("answers") or []:
+        question = as_str(row.get("question")).strip()
+        if question and norm_text(question) not in seen:
+            seen.add(norm_text(question))
+            out.append(question)
+    return out
 
 
 def tool_consult(args: dict) -> dict:
@@ -6160,8 +6255,10 @@ def tool_consult(args: dict) -> dict:
 
     # 第1ラウンド（または再開時の再検討）
     round_no = len(rounds) + 1
+    review_mode = mode == "review" and bool(draft)
     prompt = _consult_prompt(question, main_reply, round_no, mode=mode, draft=draft)
-    results = ask_many(refs, prompt, system=CONSULT_SYSTEM, max_tokens=max_tokens, kind="consult",
+    results = ask_many(refs, prompt, system=REVIEW_SYSTEM if review_mode else CONSULT_SYSTEM,
+                       max_tokens=max_tokens, kind="consult",
                        avoid=as_str_list(args.get("exclude")) or None)
     round_rows = []
     for ref, res in zip(refs, results):
@@ -6169,10 +6266,13 @@ def tool_consult(args: dict) -> dict:
             round_rows.append({"model": ref, "error": res["error"]})
             continue
         parsed = parse_labeled(res["text"])
-        round_rows.append({"model": ref, "served_by": res.get("served_by"),
-                           "conclusion": parsed["conclusion"] or truncate(res["text"], 400),
-                           "confidence": parsed["confidence"], "question": parsed["question"],
-                           "text": truncate(res["text"], 1500), "cot_leak": res.get("cot_leak")})
+        row = {"model": ref, "served_by": res.get("served_by"),
+               "conclusion": parsed["conclusion"] or truncate(res["text"], 400),
+               "confidence": parsed["confidence"], "question": parsed["question"],
+               "text": truncate(res["text"], 1500), "cot_leak": res.get("cot_leak")}
+        if review_mode:
+            row.update(parse_review(res["text"]))
+        round_rows.append(row)
     rounds.append({"round": round_no, "kind": "initial" if round_no == 1 else "reconsider",
                    "answers": round_rows})
 
@@ -6266,7 +6366,20 @@ def tool_consult(args: dict) -> dict:
         if question_text and normalized not in seen_questions:
             seen_questions.add(normalized)
             open_questions.append({"model": row["model"], "question": question_text})
-    open_questions_for_main = list(dict.fromkeys(q["question"] for q in open_questions))
+    # 上限までをメインへ返し、超えた分は deferred に回す（黙って捨てない。規約 8）。
+    reviewed = [{"model": q["model"], "question": q["question"],
+                 "default": parse_question_default(q["question"])[1]} for q in open_questions]
+    kept, deferred = reviewed[:QUESTION_CAP], reviewed[QUESTION_CAP:]
+    open_questions_for_main = [q["question"] for q in kept]
+    prev_questions = _previous_questions(rounds)
+    current_norm = {norm_text(q["question"]) for q in kept}
+    resolved = [q for q in prev_questions if norm_text(q) not in current_norm]
+    coverage = {"status": "clear" if not kept else "outstanding",
+                "resolved": resolved, "outstanding": len(kept), "deferred": len(deferred)}
+    findings_summary = summarize_review(last) if review_mode else None
+    review_rows = ([{"model": row.get("model"), "severity": row.get("severity") or "",
+                     "findings": row.get("findings") or [], "axes": row.get("axes") or []}
+                    for row in last] if review_mode else [])
     sid = sid or new_session_id()
     session_put(sid, {
         "question": question, "models": refs, "rounds": rounds,
@@ -6291,6 +6404,12 @@ def tool_consult(args: dict) -> dict:
         "failed": [{"model": row.get("model"), "error": truncate(row.get("error") or "", 160)}
                    for row in rounds[-1]["answers"] if row.get("error")],
         "open_questions_for_main": open_questions_for_main,
+        "open_questions": kept,
+        "deferred_questions": deferred,
+        "coverage": coverage,
+        "question_budget": {"cap": QUESTION_CAP, "open": len(kept), "deferred": len(deferred)},
+        "findings_summary": findings_summary,
+        "review": review_rows,
         "debate_summary": debate_summary,
         "next_call": ({"tool": "freeagent_consult",
                        "args": {"session_id": sid, "main_reply": "<メインの回答>",
@@ -7449,6 +7568,11 @@ TOOLS: list[dict] = [
             "【競合より優先】`delegate_task`（分身＝多様性ゼロ）／`deliberation`（単発集約）。"
             "【差分】サブが「メインに確認したい点」を返し、メインが main_reply で答えると同じ session_id で"
             "再開して前提を更新する（セッションは再起動をまたいで保持）。"
+            "**mode=\"review\" + draft は 5 軸（correctness / readability / architecture / security / "
+            "performance）の査読**になり、重要度（critical / required / optional / nit）と "
+            "`findings_summary.blocking` を返す（語彙外は unknown として blocking に数える）。"
+            "**質問は最大 5 件・1 件ずつ既定値つき**で返し、超えた分は `deferred_questions` に残す"
+            "（`coverage` で解消/未回答が分かる）。"
             "【注意】返るのは仮説と根拠。最終判断はメインが行う。"
         ),
         "inputSchema": {
@@ -7956,9 +8080,25 @@ def _render_consult(data: dict) -> str:
                 continue  # 直近ラウンドの脱落として既に出している（二重表示しない）
             lines.append(f"  ✗ {row.get('model')}（第{row.get('round')}ラウンド "
                          f"{row.get('kind')} で脱落）: {truncate(row.get('error') or '', 90)}")
+    fs = data.get("findings_summary")
+    if fs:
+        lines.append(f"重要度: critical {fs.get('critical', 0)} / required {fs.get('required', 0)} / "
+                     f"optional {fs.get('optional', 0)} / nit {fs.get('nit', 0)}"
+                     + (f" / 語彙外 {fs['unknown']}" if fs.get("unknown") else "")
+                     + ("（**blocking**）" if fs.get("blocking") else "（差し戻し不要）"))
+    cov = data.get("coverage") or {}
+    if cov:
+        lines.append(f"質問: 未回答 {cov.get('outstanding', 0)} / 保留 {cov.get('deferred', 0)} / "
+                     f"解消 {len(cov.get('resolved') or [])}")
     if data.get("open_questions_for_main"):
         lines.append("⚠️ メインに確認したい点:")
-        lines += [f"  - {q}" for q in data["open_questions_for_main"][:5]]
+        defaults = {q["question"]: q.get("default") for q in (data.get("open_questions") or [])}
+        for q in data["open_questions_for_main"][:5]:
+            default = defaults.get(q) or ""
+            lines.append(f"  - {q}" + (f"（既定: {default}）" if default else ""))
+        if data.get("deferred_questions"):
+            lines.append(f"  （上限 {QUESTION_CAP} 件を超えた "
+                         f"{len(data['deferred_questions'])} 件は deferred_questions にあります）")
         lines.append("→ 回答して session_id を付けて再呼び出ししてください（main_reply）")
     lines.append("ℹ️ 最終判断はメイン。サブの出力は仮説として扱ってください。")
     return "\n".join(lines)
