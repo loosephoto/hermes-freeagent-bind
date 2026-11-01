@@ -87,7 +87,7 @@ def main() -> int:
 
         listing = send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         tools = ((listing or {}).get("result") or {}).get("tools") or []
-        check(len(tools) == 11, f"tools/list が 11 件ではありません（{len(tools)} 件）")
+        check(len(tools) == 12, f"tools/list が 12 件ではありません（{len(tools)} 件）")
         lookup = next((t for t in tools if t.get("name") == "freeagent_lookup"), {})
         props = (lookup.get("inputSchema") or {}).get("properties") or {}
         check({"datacite_kind", "fallback"}.issubset(props), "追加検索のスキーマがありません")

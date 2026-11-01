@@ -939,7 +939,7 @@ class TestToolRegistry(unittest.TestCase):
         names = [t["name"] for t in S.TOOLS]
         self.assertEqual(len(names), len(set(names)), "ツール名が重複している")
         self.assertEqual(set(names), set(S.HANDLERS), "TOOLS と HANDLERS が一致していない")
-        self.assertEqual(len(names), 11)
+        self.assertEqual(len(names), 12)
 
     def test_descriptions_carry_required_markers(self):
         for tool in S.TOOLS:

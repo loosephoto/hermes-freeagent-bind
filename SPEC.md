@@ -35,7 +35,7 @@
 | §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
 | §5 | 知識バックエンド25種（**実装は `sources/<name>.py`**。ここには横断検索・締め切り・引用統合・ホスト予算だけを残す）＝既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須） / §5.21 Internet Archive（明示指定のみ） / §5.22 Qiita（明示指定のみ） / §5.23 OpenReview（明示指定のみ）） |
-| §6 | ツール実装（11本、§6.11 本文の注入番号・引用認定） |
+| §6 | ツール実装（12本、§6.11 本文の注入番号・引用認定・§6.10 受付と報告） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
 | §8.5 / §8.6 | 失敗時の「次の一手」（`next_action`） / ハーネス判別（Hermes 以外で起動されたときの警告） |
@@ -1554,6 +1554,29 @@ v0.31.0 の文面の効果は 2 標本そろわないと判定できないので
 
 cron 側は `no_agent=true` でこのスクリプトを日次実行する（変化が無ければ何も配られない）。
 `--sessions` で窓を変えられる。
+
+### 6.32 受付と報告（`freeagent_admit`・12 本目・v0.32.0）
+
+dsh-superagent の **Eval（決定論ゲート）と Mandate（認可）**、**Report（実行役の報告）**だけを写した。
+**作業の状態機械は持たない**（Ticket は KANBAN が持ち主）＝ 二重の真実を作らないための線引き。
+
+- **ゲート**（`_admit_gate`）: bot は推測候補まで（未知の bot は不受理）／許可者の名指しは explicit／
+  チケットのあるスレッドへの追記は explicit／それ以外は scope ごとの受付表のセル。**モデルは呼ばない**。
+- **accept_mode** は `off` / `observe`（既定）/ `auto`。`observe` は「受け入れるはずだった」を
+  `would_accept` として記録だけする（最初から自動で受け入れない）。
+- **Mandate** は不変。`policy_version`（ポリシー内容の sha1 先頭 8 桁）・強度・一致したルール・
+  `card`・`assumptions`（既定値で答えた質問）を持つ。**版を内容から決める**ので上げ忘れが起きない。
+- **冪等フェンス**: 同じ `(source, thread, trigger_id)` の再実行は裁定を replay し、ログを増やさない
+  （dsh の「同じ Trigger を 2 回受けても Ticket は 1 つ」）。
+- **報告の検査**（`action=report`）: `ready` は `evidence.commands`（cmd / result）が必須で全件 pass、
+  `blocked` / `failed` / `dropped` は `reason` が必須。足りなければ `next_action` 付きで差し戻す。
+  **報告は状態を書かない**（検査だけ）。
+- ポリシーは `<state>/admit_policy.json`（無ければ既定＝許可リスト空・observe）、ログは
+  `<state>/admission.jsonl`（追記専用・`_file_lock` でプロセス間直列化）。
+
+実測: `tools/list` は 18,646 → **20,350 文字（+1,704）**、ツール **12 本**。新規テスト 26 件。
+実装中に**テストが実バグを 1 つ捕まえた**（`_admit_key` が入力の `trigger_id` と記録の `trigger` を
+取り違え、replay が効かず二重記録になりかけた）。
 
 ## 7. ツールの規約（§6–§8）
 
