@@ -1477,6 +1477,32 @@ Crossref（DOI）は、ICLR / NeurIPS などの会議論文に DOI が無いこ�
 回帰: `tests/test_knowledge_stage10.py`（18 件。`{value: …}` の剥がし・forum URL・`kind` の判定・
 CJK は HTTP を出さない・403/400/配列でない応答の文言・`limit` のクランプ）。
 
+### 6.28 作業規律の注入（外の OSS の写し・v0.31.0）
+
+`obra/superpowers`（MIT）の中核手順（計画の粒度 → 1 項目ごとの検証 → 完了前の実行証明）を、
+**ツールを増やさずに**既存の文面へ写した。写す先は 3 つで、いずれも「モデルが毎ターン読む場所」に置く
+（規約 23。`description` だけでは自発率が 1/2 で頭打ちという実測がある）。
+
+1. `scripts/apply_proactive.py` の `SNIPPET`（SOUL.md へ差し込む判断規則）に 2 文。大きめの作業は
+   plan を「2〜5 分・対象・検証方法」まで書いてから着手し、1 項目ごとに検証を通す／完了を宣言する前に
+   実行したコマンドとその出力で確かめる（確かめていない項目は未検証と明記する）。
+   併せて、出典が要る場面で `web_search` を単独で使わず `freeagent_lookup` / `freeagent_grounded` を
+   先に試す（実測 2026-11-01: 出典が要る 6 セッションで使用 **0 件**）。
+2. `freeagent_think` の `plan` の `description` に「2〜5 分・対象・検証方法まで。検証できない項目は
+   項目として数えない」を追記（計画の粒度を説明で規定する）。
+3. `freeagent_delegate` の `description` に「`task` に最終報告の検証条件を入れる」を追記（委譲は
+   完了の証拠を返さないと使い物にならない）。
+
+**ツール数は 11 のまま**、既定動作は不変。`freeagent_agent` の `AGENT_SYSTEM` は触らない
+（あちらは JSON を返す調査ループで、完了報告の型を持たない）。受付の認可層（決定論ゲート＋
+ポリシー版つきの認可）は別の段階で、この変更には含まれない。
+
+実測: `tools/list` は 18,199 → **18,349 文字（+150）**（式は README と同じ封筒込み）。
+885 テスト・`smoke_stdio` / `smoke_http`・`check_offline`・`check_integrity`・
+`apply_proactive --check` は緑。効果は `measure_adoption.py` を 2 標本で再測して比べる
+（基準値 2026-11-01: 20 セッションで採用率 10%・必要場面 33%、50 セッションで必要場面 24%）。
+**この変更単体では効果を主張しない**（文面の変更は標本 1 つでは判定できない）。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。
