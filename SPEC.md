@@ -1578,6 +1578,23 @@ dsh-superagent の **Eval（決定論ゲート）と Mandate（認可）**、**R
 実装中に**テストが実バグを 1 つ捕まえた**（`_admit_key` が入力の `trigger_id` と記録の `trigger` を
 取り違え、replay が効かず二重記録になりかけた）。
 
+### 6.33 査読の 2 段（仕様適合 → 品質・v0.33.0）
+
+superpowers の `subagent-driven-development` は「仕様適合 → 品質」の順にレビューする。v0.31.1 の査読は
+品質（5 軸）だけで、**計画どおりか**を見る段が無かった。そこで `basis` を足した。
+
+- `freeagent_consult(mode="review", draft=…, basis=…)` は **2 段**: 1 段目が `COMPLIANCE_SYSTEM`
+  （compliant / partial / noncompliant。**品質は書かせない**）、2 段目が従来の 5 軸＋重要度。
+- `basis` が無ければ従来どおり 1 段（既定の挙動は変えない）。
+- `compliance_summary`（compliant / partial / noncompliant / unknown / blocking）を返し、
+  `findings_summary.blocking` は**どちらかの blocking** を取る。noncompliant と判定なし（unknown）は blocking。
+- 再開時は保存済みの適合ラウンドを使い回す（毎ラウンド 2 倍の呼び出しを払わない）。**mode / draft / basis は
+  セッションから復元**する（実測で basis の復元漏れを踏み、再開で片肺になった）。
+- 品質ラウンドの `kind` は「既に品質ラウンドがあるか」で決める（`round_no == 1` だと 2 段のとき
+  最初の品質が reconsider と誤記された）。
+
+実測: `tools/list` 20,350 → **20,520 文字（+170）**。931 テスト（新規 7 件）。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。

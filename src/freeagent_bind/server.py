@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.32.0"
+SERVER_VERSION = "0.33.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -5361,6 +5361,19 @@ REVIEW_SYSTEM = (
     "無ければ なし>\n"
     "前置き・思考過程・挨拶・Markdown の見出しは書かない。"
 )
+# 仕様適合の査読（`basis` を渡したときの第 1 段）。**品質は見ない**のが役割で、
+# 「計画どおりか」と「良いコードか」を混ぜないために段を分ける（superpowers の
+# subagent-driven-development が仕様適合 → 品質の順に見るのと同じ理由）。
+COMPLIANCE_SYSTEM = (
+    "あなたは仕様適合の査読者です。**品質の良し悪しは判定せず**、下書きが【仕様・計画】の要件を"
+    "満たしているかだけを見てください。出力は必ず次の4行だけです。\n"
+    "結論: <満たしている点と足りない点を1〜3文>\n"
+    "判定: <compliant / partial / noncompliant のうち1つ>\n"
+    "指摘: <満たしていない要件を最大3個。各「[要件] 該当箇所 — 何が足りないか」>\n"
+    "メインに確認したい点: <前提が足りず判断できない点を1つだけ。推奨の既定値を「既定: …」で"
+    "添える。無ければ なし>\n"
+    "前置き・思考過程・挨拶・Markdown の見出しは書かない。"
+)
 REVIEW_AXES = ("correctness", "readability", "architecture", "security", "performance")
 REVIEW_SEVERITIES = ("critical", "required", "optional", "nit")
 _SEVERITY_ALIAS = {
@@ -5479,6 +5492,51 @@ def summarize_review(rows: list[dict]) -> dict:
         else:
             counts["unknown"] += 1
     counts["blocking"] = counts["critical"] + counts["required"] + counts["unknown"] > 0
+    counts["reviewed"] = reviewed
+    counts["unreviewed"] = len(rows) - reviewed
+    return counts
+
+
+_LABEL_COMPLIANCE = re.compile(
+    r"(?:判定|適合|compliance)\s*[:：]\s*([A-Za-zぁ-んァ-ヶ一-龠]{2,16})", re.I)
+_COMPLIANCE_ALIAS = {
+    "compliant": "compliant", "適合": "compliant", "ok": "compliant", "満たす": "compliant",
+    "partial": "partial", "一部適合": "partial", "一部": "partial", "部分的": "partial",
+    "noncompliant": "noncompliant", "不適合": "noncompliant", "ng": "noncompliant",
+    "満たさない": "noncompliant",
+}
+
+
+def parse_compliance(text: str) -> dict:
+    """仕様適合の判定を取る。語彙外・名乗りなしは `unknown` として残す（推測で丸めない）。"""
+    out = {"verdict": "", "findings": []}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _LABEL_COMPLIANCE.search(line)
+        if m and not out["verdict"]:
+            out["verdict"] = _COMPLIANCE_ALIAS.get(m.group(1).strip().lower(), "unknown")
+        m = _LABEL_FINDINGS.search(line)
+        if m and len(out["findings"]) < 6:
+            out["findings"].append(truncate(m.group(1).strip().strip("* "), 240))
+    return out
+
+
+def summarize_compliance(rows: list[dict]) -> dict:
+    """適合判定を数える。**noncompliant と unknown（名乗りなし）は blocking**。"""
+    counts = {"compliant": 0, "partial": 0, "noncompliant": 0, "unknown": 0}
+    reviewed = 0
+    for row in rows:
+        if row.get("error"):
+            continue
+        reviewed += 1
+        verdict = as_str(row.get("verdict")).strip().lower()
+        if verdict in counts:
+            counts[verdict] += 1
+        else:
+            counts["unknown"] += 1
+    counts["blocking"] = counts["noncompliant"] + counts["unknown"] > 0
     counts["reviewed"] = reviewed
     counts["unreviewed"] = len(rows) - reviewed
     return counts
@@ -6188,17 +6246,23 @@ def tool_map(args: dict) -> dict:
 
 
 def _consult_prompt(question: str, main_reply: str, round_no: int, peers: list[dict] | None = None,
-                    mode: str = "discuss", draft: str = "") -> str:
+                    mode: str = "discuss", draft: str = "", basis: str = "",
+                    stage: str = "quality") -> str:
     parts = [f"【問い】\n{question}"]
     if mode == "review" and draft:
         parts.append(f"【査読対象の下書き】\n{truncate(draft, 4000)}")
+    if basis:
+        parts.append(f"【仕様・計画（これに適合するかを見る）】\n{truncate(basis, 3000)}")
     if main_reply:
         parts.append(f"【メインからの回答（権威ある前提として扱う）】\n{truncate(main_reply, 3000)}")
     if peers:
         block = "\n".join(f"- {p['model']}: {truncate(p.get('conclusion') or p.get('text') or '', 400)}"
                           for p in peers)
         parts.append(f"【他の参加者の回答（第{round_no}ラウンド）】\n{block}")
-    if mode == "review" and draft:
+    if stage == "compliance":
+        parts.append("上の形式（結論/判定/指摘/メインに確認したい点）だけで答えてください。"
+                     "**品質の良し悪しは書かず**、仕様・計画の各要件を満たすかどうかだけを見てください。")
+    elif mode == "review" and draft:
         parts.append("上の形式（結論/重要度/指摘/メインに確認したい点）だけで答えてください。"
                      "5 軸（correctness / readability / architecture / security / performance）を"
                      "一通り見てから、最も重い重要度を 1 つ名乗ってください。")
@@ -6227,9 +6291,16 @@ def tool_consult(args: dict) -> dict:
     sid = as_str(args.get("session_id"))
     main_reply = as_str(args.get("main_reply"))
     draft = as_str(args.get("draft"))
+    basis = as_str(args.get("basis"))
     mode = as_str(args.get("mode"), "discuss")
     depth = as_str(args.get("debate_depth"), "normal")
     stored = session_get(sid) if sid else None
+    if stored:
+        # 再開では mode / draft / basis を引き継ぐ（渡されなければ保存値）。
+        # 2 段査読は basis が無いと成立しないので、ここを落とすと再開で片肺になる（実測で踏んだ）。
+        mode = as_str(args.get("mode")) or as_str(stored.get("mode"), mode)
+        draft = draft or as_str(stored.get("draft"))
+        basis = basis or as_str(stored.get("basis"))
     question = as_str(args.get("question") or (stored or {}).get("question"))
 
     if stored and not args.get("question"):
@@ -6260,6 +6331,35 @@ def tool_consult(args: dict) -> dict:
 
     # 第1ラウンド（または再開時の再検討）
     round_no = len(rounds) + 1
+    # `basis` を渡したときだけ、先に**仕様適合**の段を 1 回走らせる（2 段目が品質）。
+    # 再開時は保存済みの適合結果を使い回す（毎ラウンド 2 倍の呼び出しを払わない）。
+    compliance_rows: list[dict] = []
+    compliance_summary = None
+    if review_mode and basis:
+        stored_compliance = next((r for r in rounds if r.get("kind") == "compliance"), None)
+        if stored_compliance:
+            compliance_rows = [row for row in (stored_compliance.get("answers") or [])
+                               if isinstance(row, dict) and not row.get("error")]
+        else:
+            cprompt = _consult_prompt(question, main_reply, round_no, mode=mode, draft=draft,
+                                      basis=basis, stage="compliance")
+            cres = ask_many(refs, cprompt, system=COMPLIANCE_SYSTEM, max_tokens=max_tokens,
+                            kind="consult", avoid=as_str_list(args.get("exclude")) or None)
+            crows = []
+            for ref, res in zip(refs, cres):
+                if res.get("error"):
+                    crows.append({"model": ref, "error": res["error"]})
+                    continue
+                row = {"model": ref, "served_by": res.get("served_by"),
+                       "conclusion": truncate(res["text"], 400),
+                       "text": truncate(res["text"], 1500),
+                       "truncated": bool(res.get("truncated"))}
+                row.update(parse_compliance(res["text"]))
+                crows.append(row)
+            rounds.append({"round": round_no, "kind": "compliance", "answers": crows})
+            compliance_rows = [row for row in crows if not row.get("error")]
+            round_no += 1
+        compliance_summary = summarize_compliance(compliance_rows)
     prompt = _consult_prompt(question, main_reply, round_no, mode=mode, draft=draft)
     results = ask_many(refs, prompt, system=REVIEW_SYSTEM if review_mode else CONSULT_SYSTEM,
                        max_tokens=max_tokens, kind="consult",
@@ -6278,7 +6378,9 @@ def tool_consult(args: dict) -> dict:
         if review_mode:
             row.update(parse_review(res["text"]))
         round_rows.append(row)
-    rounds.append({"round": round_no, "kind": "initial" if round_no == 1 else "reconsider",
+    quality_rounds = [r for r in rounds if r.get("kind") in ("initial", "reconsider")]
+    rounds.append({"round": round_no,
+                   "kind": "reconsider" if quality_rounds else "initial",
                    "answers": round_rows})
 
     debate_summary = None
@@ -6385,6 +6487,11 @@ def tool_consult(args: dict) -> dict:
     findings_summary = summarize_review(last) if review_mode else None
     if findings_summary is not None:
         findings_summary["truncated"] = sum(1 for row in last if row.get("truncated"))
+        if compliance_summary:
+            # 仕様に適合していない・判定を名乗らない、は品質の重さに関係なく差し戻し。
+            findings_summary["compliance_blocking"] = compliance_summary["blocking"]
+            findings_summary["blocking"] = (findings_summary["blocking"]
+                                            or compliance_summary["blocking"])
     review_rows = ([{"model": row.get("model"), "severity": row.get("severity") or "",
                      "findings": row.get("findings") or [], "axes": row.get("axes") or [],
                      "truncated": bool(row.get("truncated"))}
@@ -6392,7 +6499,8 @@ def tool_consult(args: dict) -> dict:
     sid = sid or new_session_id()
     session_put(sid, {
         "question": question, "models": refs, "rounds": rounds,
-        "main_replies": replies, "mode": mode, "depth": depth,
+        "main_replies": replies, "mode": mode, "depth": depth, "draft": draft,
+        "basis": basis,
         "stage": "awaiting_main" if open_questions else "complete",
         "created_at": (stored or {}).get("created_at") or now_ts(),
     })
@@ -6419,6 +6527,10 @@ def tool_consult(args: dict) -> dict:
         "question_budget": {"cap": QUESTION_CAP, "open": len(kept), "deferred": len(deferred)},
         "findings_summary": findings_summary,
         "review": review_rows,
+        "stages": (["compliance", "quality"] if compliance_summary else ["quality"])
+                  if review_mode else ["discuss"],
+        "compliance_summary": compliance_summary,
+        "compliance": compliance_rows,
         "debate_summary": debate_summary,
         "next_call": ({"tool": "freeagent_consult",
                        "args": {"session_id": sid, "main_reply": "<メインの回答>",
@@ -7936,7 +8048,9 @@ TOOLS: list[dict] = [
             "performance）の査読**になり、重要度（critical / required / optional / nit）と "
             "`findings_summary.blocking` を返す（語彙外は unknown として blocking に数える）。"
             "**質問は最大 5 件・1 件ずつ既定値つき**で返し、超えた分は `deferred_questions` に残す"
-            "（`coverage` で解消/未回答が分かる）。"
+            "（`coverage` で解消/未回答が分かる）。**`basis`（仕様・計画）を渡すと 2 段になる**: "
+            "1 段目が仕様適合（compliant / partial / noncompliant）、2 段目が品質（5 軸＋重要度）で、 "
+            "`compliance_summary.blocking` と `findings_summary.blocking` のどちらかが立つと差し戻し。"
             "【注意】返るのは仮説と根拠。最終判断はメインが行う。"
         ),
         "inputSchema": {
@@ -8491,6 +8605,11 @@ def _render_consult(data: dict) -> str:
                      f"optional {fs.get('optional', 0)} / nit {fs.get('nit', 0)}"
                      + (f" / 語彙外 {fs['unknown']}" if fs.get("unknown") else "")
                      + ("（**blocking**）" if fs.get("blocking") else "（差し戻し不要）"))
+        cs = data.get("compliance_summary")
+        if cs:
+            lines.append(f"適合: compliant {cs.get('compliant', 0)} / partial {cs.get('partial', 0)} "
+                         f"/ noncompliant {cs.get('noncompliant', 0)} / 判定なし {cs.get('unknown', 0)}"
+                         + ("（**blocking**）" if cs.get("blocking") else "（適合）"))
         if fs.get("truncated"):
             lines.append(f"⚠️ 切り詰められた回答 {fs['truncated']} 件"
                          "（max_tokens を上げるか、draft を短くしてください）")
