@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.31.1"
+SERVER_VERSION = "0.31.2"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -5462,7 +5462,10 @@ def parse_review(text: str) -> dict:
 
 
 def summarize_review(rows: list[dict]) -> dict:
-    """査読の重要度を数える。**語彙外は unknown として blocking に数える**（安全側）。"""
+    """査読の重要度を数える。**語彙外も、名乗らない回答も unknown** として blocking に数える。
+
+    査読モードの system は重要度の表明を要求しているので、無言は「軽い」ではなく「不明」として扱う。
+    """
     counts = {sev: 0 for sev in REVIEW_SEVERITIES}
     counts["unknown"] = 0
     reviewed = 0
@@ -5473,7 +5476,7 @@ def summarize_review(rows: list[dict]) -> dict:
         sev = as_str(row.get("severity")).strip().lower()
         if sev in counts:
             counts[sev] += 1
-        elif sev:
+        else:
             counts["unknown"] += 1
     counts["blocking"] = counts["critical"] + counts["required"] + counts["unknown"] > 0
     counts["reviewed"] = reviewed
@@ -6248,14 +6251,15 @@ def tool_consult(args: dict) -> dict:
         return _no_models()
 
     rounds: list[dict] = list((stored or {}).get("rounds") or [])
-    max_tokens = as_int(args.get("max_tokens"), 600, 16, 4000)
+    # 査読は 4 行（結論/重要度/指摘/確認点）を要求するので既定を上げる（実測: 500 で指摘が切れた）。
+    review_mode = mode == "review" and bool(draft)
+    max_tokens = as_int(args.get("max_tokens"), 800 if review_mode else 600, 16, 4000)
     replies = list((stored or {}).get("main_replies") or [])
     if main_reply:
         replies.append(main_reply)
 
     # 第1ラウンド（または再開時の再検討）
     round_no = len(rounds) + 1
-    review_mode = mode == "review" and bool(draft)
     prompt = _consult_prompt(question, main_reply, round_no, mode=mode, draft=draft)
     results = ask_many(refs, prompt, system=REVIEW_SYSTEM if review_mode else CONSULT_SYSTEM,
                        max_tokens=max_tokens, kind="consult",
@@ -6269,7 +6273,8 @@ def tool_consult(args: dict) -> dict:
         row = {"model": ref, "served_by": res.get("served_by"),
                "conclusion": parsed["conclusion"] or truncate(res["text"], 400),
                "confidence": parsed["confidence"], "question": parsed["question"],
-               "text": truncate(res["text"], 1500), "cot_leak": res.get("cot_leak")}
+               "text": truncate(res["text"], 1500), "cot_leak": res.get("cot_leak"),
+               "truncated": bool(res.get("truncated"))}
         if review_mode:
             row.update(parse_review(res["text"]))
         round_rows.append(row)
@@ -6375,10 +6380,14 @@ def tool_consult(args: dict) -> dict:
     current_norm = {norm_text(q["question"]) for q in kept}
     resolved = [q for q in prev_questions if norm_text(q) not in current_norm]
     coverage = {"status": "clear" if not kept else "outstanding",
-                "resolved": resolved, "outstanding": len(kept), "deferred": len(deferred)}
+                "resolved": resolved, "outstanding": len(kept), "deferred": len(deferred),
+                "note": "resolved は質問文の表層一致で判定します（言い換えは解消と誤判定しえます）"}
     findings_summary = summarize_review(last) if review_mode else None
+    if findings_summary is not None:
+        findings_summary["truncated"] = sum(1 for row in last if row.get("truncated"))
     review_rows = ([{"model": row.get("model"), "severity": row.get("severity") or "",
-                     "findings": row.get("findings") or [], "axes": row.get("axes") or []}
+                     "findings": row.get("findings") or [], "axes": row.get("axes") or [],
+                     "truncated": bool(row.get("truncated"))}
                     for row in last] if review_mode else [])
     sid = sid or new_session_id()
     session_put(sid, {
@@ -8086,6 +8095,9 @@ def _render_consult(data: dict) -> str:
                      f"optional {fs.get('optional', 0)} / nit {fs.get('nit', 0)}"
                      + (f" / 語彙外 {fs['unknown']}" if fs.get("unknown") else "")
                      + ("（**blocking**）" if fs.get("blocking") else "（差し戻し不要）"))
+        if fs.get("truncated"):
+            lines.append(f"⚠️ 切り詰められた回答 {fs['truncated']} 件"
+                         "（max_tokens を上げるか、draft を短くしてください）")
     cov = data.get("coverage") or {}
     if cov:
         lines.append(f"質問: 未回答 {cov.get('outstanding', 0)} / 保留 {cov.get('deferred', 0)} / "

@@ -739,6 +739,12 @@ v0.9.5 は**提供元別の同時実行ゲート**と**モデル数の上限の�
 v0.14.0 = 17,495 / v0.14.1 = 17,555 / v0.14.2 = 17,666 / v0.22.0 = 17,771 / v0.26.0 = 17,986 /
 **v0.29.0 = 18,199 / v0.31.0 = 18,349 / v0.31.1 = 18,646**）。以下は新しい順の内訳です。
 
+**v0.31.2（査読の穴を塞ぐ）**: 実モデルで通して見つかった 3 点を直した。**重要度を名乗らない回答も
+`unknown` として blocking に数える**（v0.31.1 は「名乗らない方が罰せられない」状態だった）、
+**切り詰め（`truncated`）を返して本文に警告を出し、査読の既定 `max_tokens` を 600 → 800**、
+`coverage.note` に「resolved は表層一致」を明記。ツール定義に触れていないので
+**文字数は 18,646 のまま**（実測）。SPEC §6.30。
+
 **v0.31.1（査読の型と質問の予算）**: `freeagent_consult(mode="review", draft=…)` に 5 軸
 （correctness / readability / architecture / security / performance）の査読を入れ、重要度
 （critical / required / optional / nit）を `findings_summary` で返す。**語彙外の重要度は unknown として

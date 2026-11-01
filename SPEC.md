@@ -1526,6 +1526,22 @@ CJK は HTTP を出さない・403/400/配列でない応答の文言・`limit` 
 回帰は `tests/test_consult_review_v0311.py`（12 件。語彙の正規化・語彙外の blocking・失敗行の除外・
 review と discuss の system 切替・draft 無しの退避・上限と deferred・既定値の分離・再開時の解消・本文表示）。
 
+### 6.30 査読の穴を塞ぐ（v0.31.2）
+
+v0.31.1 の査読を実モデルで通して見つかった 3 点を直した。**ツール定義に触れていない**ため
+`tools/list` は 18,646 文字のまま（実測）。
+
+- **重要度を名乗らない回答も `unknown`**（＝blocking）。v0.31.1 は空をどのカウントにも入れていなかったので、
+  「名乗らない方が罰せられない」状態だった（`REVIEW_SYSTEM` は表明を要求しているのに矛盾）。
+  回帰テストは期待値ごと逆に差し替えた。
+- **切り詰めを見せる**。`call_model` の `truncated`（`finish == "length"`）を consult の行と
+  `findings_summary.truncated` に載せ、本文に 1 行警告を出す。査読の既定 `max_tokens` は 600 → **800**
+  （実測: 500 では指摘行が切れて findings 0 件になった）。
+- **`coverage.note`** に「resolved は質問文の表層一致。言い換えは解消と誤判定しうる」を明記（実装は変えない）。
+
+実測: 898 テスト・smoke 2 種・`check_offline`・`moji_scan` は緑。
+この 3 点は「査読が通ったつもりで通る」型なので、**数える側（blocking・truncated）を先に固める**。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。

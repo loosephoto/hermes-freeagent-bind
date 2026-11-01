@@ -36,9 +36,11 @@ class ReviewParseTest(unittest.TestCase):
         self.assertEqual(summary["unknown"], 1)
         self.assertTrue(summary["blocking"], "語彙外は安全側に倒す（黙って通さない）")
 
-    def test_missing_severity_is_not_blocking(self):
+    def test_missing_severity_blocks_because_it_was_requested(self):
+        # 査読の system は重要度の表明を要求している。名乗らない＝「軽い」ではなく「不明」。
         summary = S.summarize_review([{"severity": ""}, {"conclusion": "x"}])
-        self.assertFalse(summary["blocking"])
+        self.assertTrue(summary["blocking"])
+        self.assertEqual(summary["unknown"], 2)
         self.assertEqual(summary["reviewed"], 2)
 
     def test_failed_rows_do_not_count_as_reviewed(self):
@@ -61,6 +63,7 @@ class ConsultReviewTest(unittest.TestCase):
 
         def fake_ask(refs, prompt, **kwargs):
             seen["system"] = kwargs.get("system")
+            seen["max_tokens"] = kwargs.get("max_tokens")
             return _rows(["結論: OK\n重要度: required\n指摘: [correctness] 境界値 — 未処理\n"
                           "メインに確認したい点: なし"] * 2)
 
@@ -68,9 +71,22 @@ class ConsultReviewTest(unittest.TestCase):
              mock.patch.object(S, "ask_many", side_effect=fake_ask):
             got = S.tool_consult({"question": "Q", "mode": "review", "draft": "下書き"})
         self.assertIs(seen["system"], S.REVIEW_SYSTEM)
+        self.assertEqual(seen["max_tokens"], 800, "査読は 4 行を要求するので既定を上げる")
         self.assertEqual(got["findings_summary"]["required"], 2)
         self.assertTrue(got["findings_summary"]["blocking"])
         self.assertEqual(got["review"][0]["severity"], "required")
+
+    def test_truncated_answers_are_visible(self):
+        def fake_ask(refs, prompt, **kwargs):
+            return [{"ref": refs[0], "served_by": refs[0], "truncated": True,
+                     "text": "結論: OK\n重要度: critical"}]
+
+        with mock.patch.object(S, "_select_or_error", return_value=(["nous/a"], {})), \
+             mock.patch.object(S, "ask_many", side_effect=fake_ask):
+            got = S.tool_consult({"question": "Q", "mode": "review", "draft": "下書き"})
+        self.assertEqual(got["findings_summary"]["truncated"], 1)
+        self.assertTrue(got["review"][0]["truncated"])
+        self.assertIn("切り詰められた回答 1 件", S.render("freeagent_consult", got))
 
     def test_discuss_mode_keeps_consult_system_and_no_summary(self):
         seen = {}
@@ -147,6 +163,7 @@ class QuestionBudgetTest(unittest.TestCase):
             second = S.tool_consult({"session_id": first["session_id"], "main_reply": "30 秒です"})
         self.assertEqual(second["coverage"]["status"], "clear")
         self.assertIn("予算は？", second["coverage"]["resolved"])
+        self.assertIn("表層一致", second["coverage"]["note"])
         self.assertEqual(second["open_questions_for_main"], [])
 
     def test_render_shows_severity_and_question_lines(self):
