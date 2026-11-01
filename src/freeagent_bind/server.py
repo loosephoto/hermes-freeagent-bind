@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.33.0"
+SERVER_VERSION = "0.34.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -6708,6 +6708,18 @@ def tool_agent(args: dict) -> dict:
     }
 
 
+# 完了報告の条件。**description の願いではなく依頼文に必ず前置きする**（サブプロセスは
+# description を読まないので、文面だけでは強制できない）。不要なら verify_required=false。
+DELEGATE_VERIFY_PREFIX = (
+    "【完了報告の条件（この依頼では必ず守る）】\n"
+    "- 最終報告に、実行した検証コマンドとその出力（成功/失敗）を必ず含める\n"
+    "- 確かめていない項目は「未検証」と明記する（推測で埋めない）\n"
+    "- 失敗が 1 つでもあれば「完了」と書かない\n"
+    "\n"
+    "【依頼】\n"
+)
+
+
 def tool_delegate(args: dict) -> dict:
     """フルツール付きの Hermes 本体を独立プロセスで起動する（opt-in・重い経路）。"""
     if not ALLOW_AGENT:
@@ -6717,15 +6729,24 @@ def tool_delegate(args: dict) -> dict:
     if not task:
         return {"error": "task は必須です"}
     timeout = as_int(args.get("timeout"), 300, 30, 1800)
+    # 真偽の既定は `dict.get(既定)` に載せない（明示 None で既定が死ぬ。規約 D）。
+    verify_raw = args.get("verify_required")
+    verify_required = True if verify_raw is None else as_flag(verify_raw)
+    effective = (DELEGATE_VERIFY_PREFIX + task) if verify_required else task
     import subprocess
     started = now_ts()
     try:
-        proc = subprocess.run([HERMES_BIN, "chat", "-q", task], capture_output=True,
+        proc = subprocess.run([HERMES_BIN, "chat", "-q", effective], capture_output=True,
                               timeout=timeout, text=True, encoding="utf-8", errors="replace")
-        return {"task": truncate(task, 300), "exit_code": proc.returncode,
+        return {"task": truncate(task, 300), "verification_enforced": verify_required,
+                "task_effective": truncate(effective, 400),
+                "exit_code": proc.returncode,
                 "stdout": truncate(proc.stdout or "", 4000),
                 "stderr": truncate(proc.stderr or "", 1000),
-                "elapsed_s": round(now_ts() - started, 1)}
+                "elapsed_s": round(now_ts() - started, 1),
+                "next_step": "返ってきた報告の証拠を freeagent_admit(action=\"report\", "
+                             "report={kind, evidence:{commands:[{cmd,result}]}}) に渡すと"
+                             "受理/差し戻しを決定論で判定できます"}
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}", "elapsed_s": round(now_ts() - started, 1)}
 
@@ -8184,14 +8205,18 @@ TOOLS: list[dict] = [
             "【使う条件】フルツール付きの Hermes 本体を独立プロセスで走らせる重い委譲（調査から実作業まで）。"
             "【使わない条件】既定では無効（FREEAGENT_ALLOW_AGENT=1 で有効化）。"
             "【差分】起動コストが高い（実測 15〜20 秒/回）が、既存のツールセット・skills・独立セッションを使える。"
-            "task には「最終報告に、実行した検証コマンドとその出力（成功/失敗）を含める。確かめていない項目は"
-            "未検証と書く」を必ず入れる（委譲は完了の証拠を返さないと使い物にならない）。"
+            "**完了報告の条件は依頼文に自動で前置きする**（既定 `verify_required=true`。サブプロセスは"
+            "description を読まないので、呼び出し側が書き足すのを待たない）。返ってきた証拠は"
+            "`freeagent_admit(action=\"report\")` に渡すと受理/差し戻しを決定論で判定できる。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "task": {"type": "string"},
                 "timeout": {"type": "integer", "description": "秒（既定 300）"},
+                "verify_required": {"type": "boolean",
+                                    "description": "完了報告の条件（検証コマンドと出力の明記）を"
+                                                   "依頼文に前置きする（既定 true。false で素の依頼）"},
             },
             "required": ["task"],
         },
@@ -8761,8 +8786,11 @@ def _render_agent(data: dict) -> str:
     return "\n".join(lines)
 def _render_delegate(data: dict) -> str:
     """`freeagent_delegate` の本文（`content` = 人間向け日本語）。"""
-    return (f"exit={data.get('exit_code')}（{data.get('elapsed_s')}s）\n"
-            f"{truncate(data.get('stdout') or '', 2000)}")
+    enforced = data.get("verification_enforced")
+    head = (f"exit={data.get('exit_code')}（{data.get('elapsed_s')}s）"
+            + ("" if enforced is None else
+               ("／報告条件: 強制（検証コマンドと出力の明記）" if enforced else "／報告条件: 未強制")))
+    return f"{head}\n{truncate(data.get('stdout') or '', 2000)}"
 # ツール別の本文レンダラ（`_render_body` から機械的に分離した）。
 # 名前 → 関数の対応表。**分岐表を手で書くのは漏れるので、関数名から生成**する。
 _RENDERERS = {

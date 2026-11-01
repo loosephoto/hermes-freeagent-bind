@@ -1595,6 +1595,20 @@ superpowers の `subagent-driven-development` は「仕様適合 → 品質」�
 
 実測: `tools/list` 20,350 → **20,520 文字（+170）**。931 テスト（新規 7 件）。
 
+### 6.34 委譲の完了報告を強制する（v0.34.0）
+
+v0.31.0 では `delegate` の description に「task に検証条件を入れる」と書いたが、**サブプロセスは
+description を読まない**ので強制力が無かった（文面だけの規律の限界）。
+
+- `verify_required`（既定 **true**）で、依頼文の先頭に完了報告の条件（検証コマンドと出力の明記・
+  未検証の明記・失敗を完了と書かない）を**前置きしてから** `hermes chat -q` に渡す。
+- 実際に渡した文は `task_effective` で返す（黙って書き換えない。規約 8）。
+- `next_step` で「返ってきた証拠を `freeagent_admit(action="report")` に渡す」まで繋ぐ
+  （P2 の決定論の検査と C2 の強制が 1 本の線になる）。
+- 既定の真偽は `args.get(k) is None` で分岐（規約 D。`as_flag(args.get(k, True))` は明示 None で壊れる）。
+
+実測: `tools/list` 20,520 → **20,700 文字（+180）**。938 テスト（新規 7 件）。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。
