@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.34.0"
+SERVER_VERSION = "0.35.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -3189,9 +3189,47 @@ def _gated_call_once(provider: str, model: str, prompt: str, system: str,
     return result, waited
 
 
+# 上流（外部の Free モデル）へ送る直前に秘密を伏せる。**誤爆より見逃しの方が高くつく**ので、
+# 形がはっきりしたもの（既知の接頭辞・JWT・秘密鍵ブロック）だけを対象にする。
+# 伏せた件数は返り値の `redactions` に載せ、呼び出し側が「送る前に消えた」ことを見せる。
+REDACT_SECRETS = as_flag(os.environ.get("FREEAGENT_REDACT_SECRETS", "1"))
+_SECRET_PATTERNS = [
+    (re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"), "[REDACTED:sk]"),
+    (re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"), "[REDACTED:ghp]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "[REDACTED:github_pat]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED:aws]"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "[REDACTED:slack]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), "[REDACTED:google]"),
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{16,}"), "Bearer [REDACTED]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b"),
+     "[REDACTED:jwt]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+     "[REDACTED:private-key]"),
+]
+
+
+def scrub_secrets(text: str, enabled: bool | None = None) -> tuple[str, int]:
+    """秘密を伏せた本文と、伏せた件数を返す。既定は有効（`FREEAGENT_REDACT_SECRETS=0` で無効）。
+
+    上流は外部の無料モデルなので、鍵が混ざったまま送ると取り消しが効かない。
+    """
+    if enabled is None:
+        enabled = REDACT_SECRETS
+    if not enabled or not text:
+        return text, 0
+    total = 0
+    for pattern, replacement in _SECRET_PATTERNS:
+        text, count = pattern.subn(replacement, text)
+        total += count
+    return text, total
+
+
 def _call_once(provider: str, model: str, prompt: str, system: str,
                max_tokens: int, temperature: float | None,
                timeout: float | None = None) -> dict:
+    prompt, prompt_redactions = scrub_secrets(prompt)
+    system, system_redactions = scrub_secrets(system)
+    redactions = prompt_redactions + system_redactions
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -3222,7 +3260,7 @@ def _call_once(provider: str, model: str, prompt: str, system: str,
         finish = ""
     usage = data.get("usage") or {}
     return {"text": text, "latency_s": round(latency, 3), "finish_reason": finish,
-            "truncated": finish == "length",
+            "truncated": finish == "length", "redactions": redactions,
             "tokens": {"prompt": usage.get("prompt_tokens"), "completion": usage.get("completion_tokens")}}
 
 
@@ -3493,6 +3531,7 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
         out = {"ref": ref, "served_by": cand, "model": c_model, "provider": c_provider,
                "text": text, "latency_s": result["latency_s"],
                "truncated": result["truncated"], "tokens": result["tokens"],
+               "redactions": result.get("redactions", 0),
                "cot_leak": _cot_leak(text), "kind": kind,
                "gate_wait_s": round(gate_wait, 3) if gate_wait else None,
                "fallback": cand != ref, "skipped_cooling": skipped or None}
@@ -6353,7 +6392,8 @@ def tool_consult(args: dict) -> dict:
                 row = {"model": ref, "served_by": res.get("served_by"),
                        "conclusion": truncate(res["text"], 400),
                        "text": truncate(res["text"], 1500),
-                       "truncated": bool(res.get("truncated"))}
+                       "truncated": bool(res.get("truncated")),
+                       "redactions": as_int(res.get("redactions"), 0, 0, 999)}
                 row.update(parse_compliance(res["text"]))
                 crows.append(row)
             rounds.append({"round": round_no, "kind": "compliance", "answers": crows})
@@ -6374,7 +6414,8 @@ def tool_consult(args: dict) -> dict:
                "conclusion": parsed["conclusion"] or truncate(res["text"], 400),
                "confidence": parsed["confidence"], "question": parsed["question"],
                "text": truncate(res["text"], 1500), "cot_leak": res.get("cot_leak"),
-               "truncated": bool(res.get("truncated"))}
+               "truncated": bool(res.get("truncated")),
+               "redactions": as_int(res.get("redactions"), 0, 0, 999)}
         if review_mode:
             row.update(parse_review(res["text"]))
         round_rows.append(row)
@@ -6527,6 +6568,7 @@ def tool_consult(args: dict) -> dict:
         "question_budget": {"cap": QUESTION_CAP, "open": len(kept), "deferred": len(deferred)},
         "findings_summary": findings_summary,
         "review": review_rows,
+        "redactions": sum(as_int((row or {}).get("redactions"), 0, 0, 999) for row in last),
         "stages": (["compliance", "quality"] if compliance_summary else ["quality"])
                   if review_mode else ["discuss"],
         "compliance_summary": compliance_summary,
@@ -8072,6 +8114,8 @@ TOOLS: list[dict] = [
             "（`coverage` で解消/未回答が分かる）。**`basis`（仕様・計画）を渡すと 2 段になる**: "
             "1 段目が仕様適合（compliant / partial / noncompliant）、2 段目が品質（5 軸＋重要度）で、 "
             "`compliance_summary.blocking` と `findings_summary.blocking` のどちらかが立つと差し戻し。"
+            "**上流へ送る直前に既知の形の秘密（sk- / ghp_ / AKIA / Bearer / JWT / 秘密鍵）は"
+            "自動で伏せる**（件数は `redactions`）。"
             "【注意】返るのは仮説と根拠。最終判断はメインが行う。"
         ),
         "inputSchema": {
@@ -8624,6 +8668,9 @@ def _render_consult(data: dict) -> str:
                 continue  # 直近ラウンドの脱落として既に出している（二重表示しない）
             lines.append(f"  ✗ {row.get('model')}（第{row.get('round')}ラウンド "
                          f"{row.get('kind')} で脱落）: {truncate(row.get('error') or '', 90)}")
+    if data.get("redactions"):
+        lines.append(f"伏せ字: 上流へ送る前に {data['redactions']} 件の秘密を伏せました"
+                     "（FREEAGENT_REDACT_SECRETS=0 で無効）")
     fs = data.get("findings_summary")
     if fs:
         lines.append(f"重要度: critical {fs.get('critical', 0)} / required {fs.get('required', 0)} / "
