@@ -1707,6 +1707,33 @@ GitHub の harness / skills 系（`obra/superpowers` / `anthropics/skills` / `af
 
 実測: `tools/list` 22,317 → **22,463 文字（+146）**。991 テスト（新規 17 件）。
 
+### 6.40 国立国会図書館デジタルコレクションの API 調査（2026-11-02・保留。実装なし）
+
+「デジタルコレクションに API はあるか」を一次情報と実測で確かめた。**専用の検索 API は無く**、
+メタデータは **NDLサーチ API** 経由で提供される。**登録はしない（保留）**。
+
+| 経路 | 実測（2026-11-02・この環境） |
+|---|---|
+| OpenSearch `…/api/opensearch?any=…&cnt=5&dpid=ndl-dl` | 200 / XML(RSS)。コールド **7.50 秒**・ウォーム **0.05〜0.08 秒** |
+| SRU `…/api/sru?operation=searchRetrieve&query=title%3d%22源氏物語%22` | 200 / XML・**4.83〜10.41 秒**・`numberOfRecords` **34,712** |
+| OAI-PMH `…/api/oaipmh?verb=Identify` | 200 / XML・**0.07 秒**（DC は `set=ndl-dl` / `ndl-dl-online`） |
+| 旧ドメイン `iss.ndl.go.jp/api/opensearch` | **303**（`ndlsearch.ndl.go.jp` へ移転） |
+| `dl.ndl.go.jp/api/search` | **404**（DC 専用の検索 API は無い） |
+| `lab.ndl.go.jp/dl/api…` | 200 だが `text/html`（API ではない） |
+
+- デジタルコレクションへの絞り込みは **`dpid=ndl-dl`**（`R100000039` は**提供機関 ID**で、
+  これを渡すと **0 件・20.46 秒**だった）。
+- **関連性が崩れる**（実測 2 例）: 「源氏物語」→「愛知教育大学研究報告」「愛知県立大学説林」、
+  「吾輩は猫である」→「赤い実」「頭のいい子を育てる…」。§6.13 の ja.wikipedia と同じ型で、
+  **生のキーワード検索を既定ソースにすると無関係な書誌が根拠になる**。
+- コールドが `KB_DEADLINE`（既定 8 秒）を超える（7.50〜20.46 秒）。本文は無く `metadata_only`。
+- 条件（公式・`ndlsearch.ndl.go.jp/help/api`）: **非営利・収益なしは申請不要**／営利は利用申請／
+  継続アクセスは連絡先の届け出を依頼／同時リクエスト数は非公開の制限／**クレジット表示が必須**。
+
+**採らない理由**: ①関連性が実測で崩れる（§6.14 の測定器で改善を確認できていない）②コールドが締め切りを
+超える ③本文が無い。将来入れるなら「**明示指定のみ・`dpid=ndl-dl` 固定・日本語クエリ・
+`measure_relevance.py` で的中率を測ってから**」が条件（規約 28・30・39・40）。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。
