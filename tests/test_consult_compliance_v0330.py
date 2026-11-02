@@ -87,7 +87,8 @@ class TwoStageTest(unittest.TestCase):
 
     def test_resume_reuses_stored_compliance_round(self):
         texts = {id(S.COMPLIANCE_SYSTEM): [COMPLIANT], id(S.REVIEW_SYSTEM): [QUALITY_NIT]}
-        first, calls = self._run(plan=texts, question="Q", mode="review", draft="D", basis="R1")
+        first, calls = self._run(plan=texts, question="Q", mode="review", draft="D", basis="R1",
+                                 main_reply="R2 は来週対応")
         self.assertEqual(len(calls), 2)
 
         # 2 回目（再開）: 適合ラウンドは走らず、品質だけ 1 回

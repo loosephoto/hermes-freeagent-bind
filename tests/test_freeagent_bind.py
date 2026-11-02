@@ -273,9 +273,9 @@ class TestThoughtLedgerStore(unittest.TestCase):
 
     def test_expired_is_gone(self):
         sid = S.thought_merge("", {"n": 1, "text": "t"})["session_id"]
-        with S._THOUGHTS_LOCK:
-            S._THOUGHTS[sid]["updated_at"] = S.now_ts() - S.THOUGHT_TTL_S - 10
-        self.assertIsNone(S.thought_get(sid), "TTL 切れの台帳を復活させてはいけない")
+        future = S.now_ts() + S.THOUGHT_TTL_S + 10
+        with unittest.mock.patch.object(S, "now_ts", return_value=future):
+            self.assertIsNone(S.thought_get(sid), "TTL 切れの台帳を復活させてはいけない")
 
     def test_persisted_and_reloaded(self):
         sid = S.thought_merge("", {"n": 1, "text": "永続"})["session_id"]
@@ -519,8 +519,8 @@ class TestThinkTool(unittest.TestCase):
         """2 回目の検証では 1 回目に使った検証者を選抜から外す（同じモデルに固定しない）。"""
         seen: list[list[str]] = []
 
-        def fake_select(size, requested=None, *, prefer=None, exclude=None, free_only=True):
-            seen.append(list(exclude or []))
+        def fake_select(size, requested=None, *, prefer=None, exclude=None, free_only=True, identity_exclude=None):
+            seen.append(list(exclude or []) + list(identity_exclude or []))
             return [f"p/m{len(seen)}"], {"notes": []}
 
         row = [{"text": "判定: 妥当\n反証: なし\n見落とし: なし\n確信度: 60",
@@ -769,8 +769,8 @@ class TestThinkStructure(unittest.TestCase):
     def test_propose_alternatives_uses_other_models(self):
         seen: list[list[str]] = []
 
-        def fake_select(size, requested=None, *, prefer=None, exclude=None, free_only=True):
-            seen.append(list(exclude or []))
+        def fake_select(size, requested=None, *, prefer=None, exclude=None, free_only=True, identity_exclude=None):
+            seen.append(list(exclude or []) + list(identity_exclude or []))
             return [f"p/m{len(seen)}"], {"notes": []}
 
         answers = iter([

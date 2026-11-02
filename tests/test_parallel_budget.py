@@ -90,7 +90,7 @@ class TestDeadlineDrops(unittest.TestCase):
 
         got = S.run_parallel([0, 1, 2, 3], worker, max_workers=1, deadline=S.Deadline(0.05))
         self.assertLessEqual(len(ran), 1, f"取り消されずに走った: {ran}")
-        self.assertEqual(sum(1 for g in got if g.get("dropped")), 4 - len(ran))
+        self.assertTrue(all(g.get("dropped") for g in got))
 
 
 class TestCallBudget(unittest.TestCase):

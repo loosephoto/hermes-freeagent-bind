@@ -250,6 +250,8 @@ def extract_final_answer(text: str, truncated: bool = False) -> tuple[str | None
     ただし **長い本文や切断された応答からは推測しない**（実測: 途中で切れた推論の末尾の数値を
     拾って「7」「11」のような誤答にしていた。切断は ``no_answer`` として再質問に回すのが正しい）。
     """
+    if truncated:
+        return None, "truncated_no_answer"
     body = (text or "").strip()
     if not body:
         return None, "empty"
@@ -271,9 +273,7 @@ def extract_final_answer(text: str, truncated: bool = False) -> tuple[str | None
     if boxed:
         return boxed[-1].group(1).strip(), "boxed"
 
-    # ここから先は「本文が短い」ときだけ許す推測。長文・切断からは値を拾わない。
-    if truncated:
-        return None, "truncated_no_answer"
+    # ここから先は「本文が短い」ときだけ許す推測。長文からは値を拾わない。
     if len(body) > 200:
         return None, "no_answer_prose"
 
@@ -311,7 +311,7 @@ def grade(text: str, case: dict, tol: float = 1e-6, truncated: bool = False) -> 
 
     規約 8（失敗を黙って落とさない）に従い、``no_answer``（答えが書かれていない）と
     ``wrong``（書いてあるが違う）を区別する。この区別が無いと切り詰めを誤答に変換してしまう。
-    ``truncated`` が真なら、本文に最終回答のラベルが無い限り**推測しない**。
+    ``truncated`` が真なら、ラベルや boxed の有無にかかわらず ``no_answer``。
     """
     answer, how = extract_final_answer(text, truncated=truncated)
     if answer is None:

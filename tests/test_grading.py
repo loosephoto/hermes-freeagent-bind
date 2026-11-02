@@ -79,10 +79,11 @@ class TestExtraction(unittest.TestCase):
         self.assertEqual(graded["verdict"], "no_answer")
         self.assertIsNone(graded["answer"])
 
-    def test_truncated_but_labeled_answer_survives(self):
+    def test_truncated_labeled_answer_is_no_answer(self):
         text = "long reasoning that was cut off\nFinal answer: 1044"
         graded = G.grade(text, {"kind": "numeric", "expect": ["1044"]}, truncated=True)
-        self.assertEqual(graded["verdict"], "correct")
+        self.assertEqual(graded["verdict"], "no_answer")
+        self.assertIsNone(graded["answer"])
 
     def test_long_prose_without_label_is_not_guessed(self):
         # 200 字を超える本文の末尾の数値を答えと見なさない（"7" 誤答の再発防止）

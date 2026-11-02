@@ -94,8 +94,8 @@ MOA_PROMPT = (
 
 # 抽出できなかったときの再質問（1 回だけ）。切り詰めで最終行が落ちた回答を救済する。
 RETRY_PROMPT = (
-    "{question}\n\nYour previous answer could not be scored because it did not end with a final "
-    "answer line. Do not explain. Reply with exactly one line:\nFinal answer: <value>\n\n"
+    "{question}\n\nThe previous response could not be scored; it may be incomplete or missing a "
+    "final answer. Do not explain. Reply with exactly one line:\nFinal answer: <value>\n\n"
     "Previous answer (may be truncated):\n{previous}"
 )
 
@@ -116,6 +116,10 @@ def parse_confidence(text: str) -> float | None:
 
 def load_cases(source: str, per_tier: int, seed: int, limit: int | None) -> list[dict]:
     """ケースを用意する（`builtin` / `gen` / `both`）。生成分は独立検算を通ったものだけ使う。"""
+    if source == "all":
+        source = "both"
+    if source not in ("builtin", "gen", "both"):
+        raise ValueError(f"Unknown case source: {source}")
     cases: list[dict] = []
     if source in ("builtin", "both"):
         cases += [dict(case) for case in BUILTIN_CASES]
@@ -130,10 +134,11 @@ def load_cases(source: str, per_tier: int, seed: int, limit: int | None) -> list
     return cases
 
 
-def _answers_text(pairs: list[tuple[str, dict]]) -> list[tuple[str, str]]:
+def _answers_text(pairs: list[tuple[str, dict]], complete_only: bool = False) -> list[tuple[str, str]]:
     out = []
     for ref, res in pairs:
-        out.append((ref, (res.get("text") or "").strip() if not res.get("error") else ""))
+        usable = not res.get("error") and not (complete_only and res.get("truncated"))
+        out.append((ref, (res.get("text") or "").strip() if usable else ""))
     return out
 
 
@@ -165,13 +170,17 @@ def run_strategy(name: str, refs: list[str], case: dict, max_tokens: int) -> dic
     detail = ""
     text = ""
     attempts: list[str] = []
+    metric_attempts = None
+    results: list[dict] = []
     truncated = False
+    model = served_by = None
 
     if name == "single":
         res = _call(refs[0], case["question"], max_tokens)
         calls = 1
         text = res.get("text") or ""
         truncated = bool(res.get("truncated"))
+        model, served_by = refs[0], res.get("served_by")
         attempts = [text]
         detail = refs[0] + ("" if not res.get("error") else f" ({str(res['error'])[:60]})")
 
@@ -179,7 +188,7 @@ def run_strategy(name: str, refs: list[str], case: dict, max_tokens: int) -> dic
         results = S.ask_many(refs, case["question"], max_tokens=max_tokens, temperature=0.0,
                              kind="eval")
         calls = len(refs)
-        attempts = [t for _, t in _answers_text(list(zip(refs, results))) if t]
+        attempts = [t for _, t in _answers_text(list(zip(refs, results)), complete_only=True) if t]
         text = vote(attempts)
         detail = f"{len(attempts)}/{len(refs)} が回答"
 
@@ -188,6 +197,7 @@ def run_strategy(name: str, refs: list[str], case: dict, max_tokens: int) -> dic
                              kind="eval")
         calls = len(refs)
         attempts = [t for _, t in _answers_text(list(zip(refs, results))) if t]
+        metric_attempts = [t for _, t in _answers_text(list(zip(refs, results)), complete_only=True) if t]
         if attempts:
             candidates = "\n\n".join(f"[{i + 1}] {t[:1200]}" for i, t in enumerate(attempts))
             agg = _call(refs[-1], MOA_PROMPT.format(question=case["question"],
@@ -195,6 +205,7 @@ def run_strategy(name: str, refs: list[str], case: dict, max_tokens: int) -> dic
             calls += 1
             text = agg.get("text") or ""
             truncated = bool(agg.get("truncated"))
+            model, served_by = refs[-1], agg.get("served_by")
         detail = f"{len(attempts)} 票を統合"
 
     elif name == "refine":
@@ -204,8 +215,11 @@ def run_strategy(name: str, refs: list[str], case: dict, max_tokens: int) -> dic
                              "refine": True, "max_tokens": max_tokens})
         refined = data.get("refined") or {}
         calls = int(data.get("calls") or len(refs))
-        attempts = [a.get("text") or "" for a in data.get("answers", []) if not a.get("error")]
+        attempts = [a.get("answer") or "" for a in data.get("answers", [])
+                    if not a.get("error") and not a.get("truncated") and not a.get("text_truncated")]
         text = refined.get("text") or ""
+        truncated = bool(refined.get("truncated") or refined.get("text_truncated"))
+        model, served_by = refined.get("model"), refined.get("served_by")
         detail = f"統合役 {refined.get('model')}"
         if refined.get("error"):
             detail += f" ({str(refined['error'])[:50]})"
@@ -216,9 +230,10 @@ def run_strategy(name: str, refs: list[str], case: dict, max_tokens: int) -> dic
         results = S.ask_many(head, case["question"], max_tokens=max_tokens, temperature=0.0,
                              kind="eval")
         calls = len(head)
-        attempts = [t for _, t in _answers_text(list(zip(head, results))) if t]
+        attempts = [t for _, t in _answers_text(list(zip(head, results)), complete_only=True) if t]
         keys = [G.normalize_value(G.extract_final_answer(t)[0] or "") for t in attempts]
-        agree = len(attempts) == len(head) and bool(keys[0]) and len(set(keys)) == 1
+        agree = (len(attempts) == len(head) and bool(keys[0]) and len(set(keys)) == 1
+                 and not any(r.get("truncated") for r in results))
         if agree:
             text = attempts[0]
             detail = f"{len(head)} 体で一致したので打ち切り"
@@ -227,20 +242,43 @@ def run_strategy(name: str, refs: list[str], case: dict, max_tokens: int) -> dic
             more = S.ask_many(rest, case["question"], max_tokens=max_tokens, temperature=0.0,
                               kind="eval") if rest else []
             calls += len(rest)
-            attempts += [t for _, t in _answers_text(list(zip(rest, more))) if t]
+            results = results + more
+            attempts += [t for _, t in _answers_text(list(zip(rest, more)), complete_only=True) if t]
             text = vote(attempts)
             detail = f"一致せず {len(refs)} 体へ拡大"
 
     else:
         raise SystemExit(f"未知の戦略: {name}")
 
+    if name in ("panel", "cascade"):
+        selected_pair = next(((ref, r) for ref, r in zip(refs, results)
+                              if not r.get("error") and not r.get("truncated")
+                              and (r.get("text") or "").strip() == text and text), None)
+        selected = selected_pair[1] if selected_pair else None
+        if selected_pair:
+            model, served_by = selected_pair[0], selected_pair[1].get("served_by")
+        truncated = bool(selected.get("truncated")) if selected else (
+            not text and any(r.get("truncated") for r in results if not r.get("error")))
+        if truncated and not text:
+            incomplete = next(((ref, r) for ref, r in zip(refs, results)
+                               if not r.get("error") and r.get("truncated")), None)
+            if incomplete:
+                model, res = incomplete
+                served_by, text = res.get("served_by"), res.get("text") or ""
+
     return {"strategy": name, "text": (text or ""), "calls": calls,
             "wall_s": round(time.time() - started, 2), "detail": detail,
-            "attempts": attempts, "truncated": truncated}
+            "attempts": attempts, "truncated": truncated,
+            "metric_attempts": metric_attempts if metric_attempts is not None else attempts,
+            "model": model, "served_by": served_by}
 
 
 def grade_row(row: dict, case: dict, retry_ref: str | None, max_tokens: int) -> dict:
     """採点し、必要なら 1 回だけ再質問する（``no_answer`` を誤答に変換しない）。"""
+    row.update({"original_text": row["text"], "original_model": row.get("model"),
+                "original_served_by": row.get("served_by"),
+                "effective_truncated": bool(row.get("truncated")),
+                "effective_model": row.get("model"), "effective_served_by": row.get("served_by")})
     graded = G.grade(row["text"], case, truncated=bool(row.get("truncated")))
     row.update({"ok": graded["ok"], "answer": graded["answer"], "how": graded["how"],
                 "verdict": graded["verdict"], "retried": False})
@@ -250,17 +288,25 @@ def grade_row(row: dict, case: dict, retry_ref: str | None, max_tokens: int) -> 
                        max(64, min(max_tokens, 256)))
         row["calls"] += 1
         row["retried"] = True
-        row["retry_text"] = (repair.get("text") or "")[:400]
+        row["retry_model"] = retry_ref
+        row["retry_served_by"] = repair.get("served_by")
+        row["retry_text"] = repair.get("text") or ""
+        row["retry_truncated"] = bool(repair.get("truncated"))
+        row["retry_error"] = repair.get("error")
         if not repair.get("error"):
-            second = G.grade(repair.get("text") or "", case)
-            row["text"] = repair.get("text") or row["text"]
+            second = G.grade(repair.get("text") or "", case, truncated=row["retry_truncated"])
+            row["text"] = row["retry_text"]
+            row["effective_truncated"] = row["retry_truncated"]
+            row["effective_model"] = retry_ref
+            row["effective_served_by"] = repair.get("served_by")
             row.update({"ok": second["ok"], "answer": second["answer"], "how": second["how"],
                         "verdict": "correct" if second["ok"] else second["verdict"]})
     row["no_answer"] = row["verdict"] == "no_answer"
-    row["cluster_entropy"] = (G.cluster_entropy(row["attempts"])
-                              if len(row["attempts"]) > 1 else None)
-    row["agreement"] = (G.agreement_rate(row["attempts"])
-                        if len(row["attempts"]) > 1 else None)
+    metric_attempts = row.get("metric_attempts", row["attempts"])
+    row["cluster_entropy"] = (G.cluster_entropy(metric_attempts)
+                              if len(metric_attempts) > 1 else None)
+    row["agreement"] = (G.agreement_rate(metric_attempts)
+                        if len(metric_attempts) > 1 else None)
     return row
 
 
@@ -297,7 +343,7 @@ def summarize(rows: list[dict], strategies: list[str]) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="戦略ごとの推論品質を測る（Free の枠を使う）")
     parser.add_argument("--cases", default="gen",
-                        help="gen（自前生成・既定）/ builtin（従来 10 問）/ both / 数字（両方から N 件）")
+                        help="gen（自前生成・既定）/ builtin（従来 10 問）/ both（all と同じ）/ 数字（両方から N 件）")
     parser.add_argument("--strategies", default="single,panel,moa,refine,cascade",
                         help="カンマ区切り（single / panel / moa / refine / cascade）")
     parser.add_argument("--pool", type=int, default=6, help="参加モデル数の上限（既定 6＝nous の枠）")
@@ -318,33 +364,52 @@ def main(argv: list[str] | None = None) -> int:
                              "指定すると `select_models` を通して**サーバーが実際に選ぶモデル**で測る"
                              "（未指定なら従来どおり一覧の先頭から pool 件）")
     args = parser.parse_args(argv)
+    for option, value in (("--pool", args.pool), ("--per-tier", args.per_tier),
+                          ("--max-tokens", args.max_tokens), ("--repeat", args.repeat)):
+        if value < 1:
+            parser.error(f"{option} must be a positive integer")
+    strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
+    if not strategies:
+        parser.error("--strategies must contain at least one strategy")
+    if len(strategies) != len(set(strategies)):
+        parser.error("--strategies must not contain duplicates")
+    if "refine" in strategies and not 16 <= args.max_tokens <= 4000:
+        parser.error("--max-tokens must be 16..4000 when using refine")
+    unknown = set(strategies) - {"single", "panel", "moa", "refine", "cascade"}
+    if unknown:
+        parser.error("Unknown strategies: " + ", ".join(sorted(unknown)))
+    if args.cases.isascii() and args.cases.isdigit():
+        if int(args.cases) < 1:
+            parser.error("--cases must be a positive number")
+        source, limit = "both", int(args.cases)
+    elif args.cases in ("gen", "builtin", "both", "all"):
+        source, limit = ("both" if args.cases == "all" else args.cases), None
+    else:
+        parser.error("--cases must be gen, builtin, both, all, or a positive number")
+    cases = load_cases(source, args.per_tier, args.seed, limit)
+    if not cases:
+        parser.error("--cases produced no cases")
 
     if args.select_strategy:
         os.environ[S.SELECT_STRATEGY_ENV] = args.select_strategy
-        refs = S.select_models(max(1, args.pool))[0]
-        print(f"選抜 strategy={args.select_strategy} / 参加 {len(refs)} 体: {', '.join(refs)}")
+        refs = S.select_models(args.pool)[0]
+        print(f"選抜 strategy={args.select_strategy} / 参加 {len(refs)} 体: {', '.join(refs)}",
+              file=sys.stderr if args.json else sys.stdout)
     else:
-        refs = S.free_model_refs(free_only=True, chat_only=True)[: max(1, args.pool)]
+        refs = S.free_model_refs(free_only=True, chat_only=True)[:args.pool]
     if not refs:
-        print("推論可能な Free モデルが 0 件です（`hermes proxy start` か各社のキーを確認）")
+        print("推論可能な Free モデルが 0 件です（`hermes proxy start` か各社のキーを確認）", file=sys.stderr)
         return 2
-    strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
-
-    if args.cases.isdigit():
-        source, limit = "both", max(1, int(args.cases))
-    else:
-        source, limit = args.cases, None
-    cases = load_cases(source, args.per_tier, args.seed, limit)
 
     rows: list[dict] = []
     for case in cases:
         question = case["question"] + (CALIBRATION_SUFFIX if args.calibrate else "")
         scorable = dict(case, question=question)
-        for repeat in range(max(1, args.repeat)):
+        for repeat in range(args.repeat):
             for name in strategies:
                 row = run_strategy(name, refs, scorable, args.max_tokens)
                 grade_row(row, scorable, refs[0] if args.retry else None, args.max_tokens)
-                row = {k: v for k, v in row.items() if k != "attempts"}
+                row = {k: v for k, v in row.items() if k not in ("attempts", "metric_attempts")}
                 if args.calibrate:
                     row["confidence"] = parse_confidence(row["text"])
                 row.update({"case": case["id"], "tier": case.get("tier", 0),

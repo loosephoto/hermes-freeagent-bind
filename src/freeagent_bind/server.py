@@ -70,7 +70,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
 
 # `python server.py` / `runpy.run_path(server.py)` で**直接実行される配布形態**を保つ。
@@ -90,7 +90,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.38.2"
+SERVER_VERSION = "0.38.3"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -1367,19 +1367,30 @@ def env_excluded_models() -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+def _model_identity(ref: str) -> str:
+    """Identity for independent opinions, not for catalog pricing or authorization."""
+    provider, model = split_ref(ref)
+    if _is_hf(provider) and ":" in model:
+        return make_ref(provider, model.rsplit(":", 1)[0])
+    return ref
+
+
 def _is_model_excluded(ref: str, excluded: set[str]) -> bool:
-    """完全一致または `:free` 等のサフィックスを除いた基底名で除外判定する."""
+    """Explicit base exclusions retain their existing wildcard semantics."""
     if not excluded or not ref:
         return False
-    return ref in excluded or ref.rsplit(":", 1)[0] in excluded
+    identity = _model_identity(ref)
+    return (ref in excluded or ref.rsplit(":", 1)[0] in excluded
+            or any(_model_identity(item) == identity for item in excluded))
 
 
 def select_models(size: int, requested: list[str] | None = None, *,
                   prefer: list[str] | None = None, exclude: list[str] | None = None,
-                  free_only: bool = True) -> tuple[list[str], dict]:
+                  free_only: bool = True, identity_exclude: list[str] | None = None) -> tuple[list[str], dict]:
     """参加モデルを決める。明示 > prefer > 品質統計 の順に効かせる（選んだ根拠を返す）。"""
     all_exclude = list(dict.fromkeys(as_str_list(exclude) + env_excluded_models()))
     ex_set = set(all_exclude)
+    identity_set = {_model_identity(ref) for ref in as_str_list(identity_exclude)}
     available = free_model_refs(free_only=free_only)
     if not available:
         return [], {"reason": "no_models", "available": 0}
@@ -1392,11 +1403,15 @@ def select_models(size: int, requested: list[str] | None = None, *,
         提供元ごとに無料/有料・生死が違うので、`inclusionAI/…:novita` のように指定して使う。
         在庫一覧は提供元サフィックス無しの ID を返すため、素の突き合わせだと除外されてしまう）。
         """
-        return ref in avail_set or ref.rsplit(":", 1)[0] in avail_set
+        provider, model = split_ref(ref)
+        return ref in avail_set or (_is_hf(provider) and ":" in model
+                                    and make_ref(provider, model.rsplit(":", 1)[0]) in avail_set)
 
     def add(refs: list[str]) -> None:
         for ref in refs:
-            if is_available(ref) and ref not in chosen:
+            if (is_available(ref) and _model_identity(ref) not in {_model_identity(r) for r in chosen}
+                    and _model_identity(ref) not in identity_set
+                    and not _is_model_excluded(ref, ex_set)):
                 chosen.append(ref)
 
     if requested:
@@ -1413,7 +1428,8 @@ def select_models(size: int, requested: list[str] | None = None, *,
         # **非チャットモデルは自動選抜に載せない**（§3.2）。明示指定の在庫確認（is_available）は
         # 在庫の全 Free を使うので、名指しされたモデルはこれまでどおり試す。
         chat_ok = set(free_model_refs(free_only=free_only, chat_only=True))
-        pool = [r for r in available if r not in chosen and r in chat_ok]
+        pool = [r for r in available if r not in chosen and r in chat_ok
+                and _model_identity(r) not in identity_set]
         if ex_set:
             pool = [r for r in pool if not _is_model_excluded(r, ex_set)]
         # クールダウン中を**先に選ばない**（除外ではなく後回し）。選んだ直後に 429 が記録されると
@@ -1430,9 +1446,23 @@ def select_models(size: int, requested: list[str] | None = None, *,
         ready = [r for r in pool if r not in cooling]
         waiting = [r for r in pool if r in cooling]
         need = size - len(chosen)
-        picked = diverse_order(_order_for_selection(ready))[:need]
+        picked = []
+        seen = {_model_identity(ref) for ref in chosen}
+        for candidate in diverse_order(_order_for_selection(ready)):
+            identity = _model_identity(candidate)
+            if identity not in seen:
+                picked.append(candidate)
+                seen.add(identity)
+                if len(picked) >= need:
+                    break
         if len(picked) < need and waiting:
-            picked += diverse_order(_order_for_selection(waiting))[:need - len(picked)]
+            for candidate in diverse_order(_order_for_selection(waiting)):
+                identity = _model_identity(candidate)
+                if identity not in seen:
+                    picked.append(candidate)
+                    seen.add(identity)
+                    if len(picked) >= need:
+                        break
             notes.append(f"空きが足りずクールダウン中から補充: {', '.join(waiting[:3])}")
         chosen.extend(picked)
     if ex_set:
@@ -1723,9 +1753,12 @@ def session_drop(sid: str) -> None:
 
 _THOUGHTS: dict[str, dict] = {}
 _THOUGHTS_LOADED = False
-# ディスクの最終読み込み時刻（**別プロセスの更新を検知する**ために使う）。
+# Compatibility bookkeeping; reads refresh from the locked disk ledger.
 _THOUGHTS_MTIME = 0.0
 _THOUGHTS_LOCK = threading.RLock()
+# Per-process, per-ledger high-water time. Reads never persist expiry; this
+# prevents a local clock rollback from reviving an already-observed expiry.
+_THOUGHTS_CLOCK: dict[str, float] = {}
 THOUGHTS_ENABLED = _env_on("FREEAGENT_THOUGHTS", True)
 # 相談セッション（1 時間）より長めに持つ（思考の連鎖は 1 ターンをまたぐことがある）。
 THOUGHT_TTL_S = _env_float("FREEAGENT_THOUGHT_TTL", 7200.0)
@@ -1748,8 +1781,33 @@ def _thoughts_prune(data: dict, now: float) -> dict:
     return alive
 
 
-def _thoughts_disk_chains(path: str) -> dict:
-    """ディスク上の台帳（chains）を読む。壊れていても空で返す。"""
+def _thoughts_disk_chains(path: str, *, strict: bool = False) -> dict:
+    """Read chains; strict writes must never replace an unreadable ledger."""
+    if strict:
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                data = json.load(stream)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            raise OSError("思考台帳を読めません。上書きしません") from exc
+        rows = data.get("chains") if isinstance(data, dict) else None
+        if not isinstance(rows, dict) or any(
+            not isinstance(row, dict)
+            or not isinstance(row.get("updated_at"), (int, float))
+            or isinstance(row.get("updated_at"), bool)
+            or not math.isfinite(row["updated_at"])
+            or ("verifier_models" in row and
+                (not isinstance(row["verifier_models"], list) or
+                 any(not isinstance(model, str) for model in row["verifier_models"])))
+            or ("verifier_generation" in row and
+                (type(row["verifier_generation"]) is not int or row["verifier_generation"] < 0))
+            or ("steps" in row and (not isinstance(row["steps"], list)
+                                   or any(not isinstance(step, dict) for step in row["steps"])))
+            for row in rows.values()
+        ):
+            raise OSError("思考台帳の形式が不正です。上書きしません")
+        return rows
     data = _load_json(path, {})
     rows = data.get("chains") if isinstance(data, dict) else None
     return rows if isinstance(rows, dict) else {}
@@ -1783,10 +1841,12 @@ def _thoughts_merge_row(base: dict, mine: dict) -> dict:
         if newer.get(key):
             out[key] = newer[key]
     vms = [m for m in (out.get("verifier_models") or []) if isinstance(m, str)]
-    for m in [m for m in (newer.get("verifier_models") or []) if isinstance(m, str)]:
-        if m not in vms:
-            vms.append(m)
-    out["verifier_models"] = vms[:12]
+    newer_vms = list(dict.fromkeys(m for m in (newer.get("verifier_models") or []) if isinstance(m, str)))
+    # Prefer the newer snapshot's order; retain all of its names even if a
+    # single call used more than the ordinary 12-name rotation window.
+    newer_vm_set = set(newer_vms)
+    vms = [m for m in vms if m not in newer_vm_set] + newer_vms
+    out["verifier_models"] = vms[-max(12, len(newer_vms)):]
     out["created_at"] = newer.get("created_at") or older.get("created_at") or now_ts()
     out["updated_at"] = max(as_float(base.get("updated_at"), 0.0),
                              as_float(mine.get("updated_at"), 0.0))
@@ -1796,8 +1856,7 @@ def _thoughts_merge_row(base: dict, mine: dict) -> dict:
 def _thoughts_write_locked(path: str, chains: dict) -> bool:
     """ロックの中で台帳を書き出す（**呼び出し側がロックを持っている**前提）。"""
     global _THOUGHTS_MTIME
-    payload = {"version": 1, "saved_at": now_ts(),
-               "chains": _thoughts_prune(chains, now_ts())}
+    payload = {"version": 1, "saved_at": now_ts(), "chains": chains}
     ok = _atomic_write(path, json.dumps(payload, ensure_ascii=False))
     if ok:
         _THOUGHTS_MTIME = _file_mtime(path) or 0.0
@@ -1805,36 +1864,33 @@ def _thoughts_write_locked(path: str, chains: dict) -> bool:
 
 
 def _ensure_thoughts_loaded() -> None:
-    """台帳をメモリへ読み込む。**別プロセスが更新していたら読み直す**（陳腐化の解消）。
-
-    一度読んだだけでは、別プロセス（MCP 子プロセス = KANBAN ワーカーなど）が足した思考を
-    永久に見えない（実測: ワーカーの 2 手目が常駐プロセスから見えず、親の保存で
-    ファイル上から消えた）。更新時刻が変わっていればディスクから取り直す。
-    """
+    """Refresh from the locked disk ledger, including deletions and read failures."""
     global _THOUGHTS_LOADED, _THOUGHTS_MTIME
     if not THOUGHTS_ENABLED:
         return
     path = thoughts_path()
-    mtime = _file_mtime(path)
+    clock_key = os.path.normcase(os.path.abspath(path))
     with _THOUGHTS_LOCK:
-        if not _THOUGHTS_LOADED:
-            rows = _thoughts_disk_chains(path)
-            _THOUGHTS.update(_thoughts_prune(rows, now_ts()))
+        try:
+            os.stat(path)
+        except FileNotFoundError:
+            # The absent observation linearizes before any concurrent creation.
+            # A writer still takes the lock and re-reads before modifying the file.
+            _THOUGHTS.clear()
             _THOUGHTS_LOADED = True
-            _THOUGHTS_MTIME = mtime if mtime is not None else 0.0
+            _THOUGHTS_MTIME = 0.0
             return
-        if mtime is None:
-            return
-        if abs(mtime - _THOUGHTS_MTIME) < 1e-6:
-            return
-        rows = _thoughts_prune(_thoughts_disk_chains(path), now_ts())
-        for sid, row in rows.items():
-            if not isinstance(row, dict):
-                continue
-            cur = _THOUGHTS.get(sid)
-            if cur is None or as_float(row.get("updated_at"), 0.0) >= as_float((cur or {}).get("updated_at"), 0.0):
-                _THOUGHTS[sid] = row
-        _THOUGHTS_MTIME = mtime
+        with _file_lock(path) as locked:
+            if not locked:
+                raise OSError("思考台帳のロックを取得できませんでした")
+            disk = _thoughts_disk_chains(path, strict=True)
+            effective_now = max(now_ts(), _THOUGHTS_CLOCK.get(clock_key, 0.0))
+            rows = _thoughts_prune(disk, effective_now)
+            _THOUGHTS_CLOCK[clock_key] = effective_now
+            _THOUGHTS.clear()
+            _THOUGHTS.update(rows)
+            _THOUGHTS_LOADED = True
+            _THOUGHTS_MTIME = _file_mtime(path) or 0.0
 
 
 def new_thought_id() -> str:
@@ -1844,18 +1900,41 @@ def new_thought_id() -> str:
 def thought_get(sid: str) -> dict | None:
     if not sid:
         return None
-    _ensure_thoughts_loaded()
-    now = now_ts()
     with _THOUGHTS_LOCK:
+        _ensure_thoughts_loaded()
         row = _THOUGHTS.get(sid)
-        if not row or as_float(row.get("updated_at"), 0.0) <= now - THOUGHT_TTL_S:
-            _THOUGHTS.pop(sid, None)
+        if not row:
             return None
-        return json.loads(json.dumps(row))  # 呼び出し側の書き換えが他へ波及しないよう複製を渡す
+        result = json.loads(json.dumps(row))
+        if THOUGHTS_ENABLED:
+            result["verifier_models"] = result.get("verifier_models") or []
+            result["verifier_generation"] = result.get("verifier_generation", 0)
+        return result
+
+
+def _thought_verifier_update(row: dict, models: list | None, snapshot: list | None,
+                             additions: list | None = None,
+                             snapshot_generation: int | None = None) -> tuple[list, int]:
+    """Apply this call's additions to the locked history, preserving concurrent additions."""
+    current = [m for m in (row.get("verifier_models") or []) if isinstance(m, str)]
+    if snapshot is None:
+        return current, 0
+    before = set(snapshot)
+    candidates = additions if additions is not None else [m for m in (models or []) if m not in before]
+    added = list(dict.fromkeys(m for m in candidates if isinstance(m, str) and m))
+    combined = list(dict.fromkeys([m for m in current if m not in added] + added))
+    # Unknown generations are conservative; equality alone cannot detect ABA.
+    if (snapshot_generation is None or snapshot_generation != row.get("verifier_generation", 0)
+            or current != snapshot):
+        return combined, 0
+    keep = max(12, len(set(added)))
+    return combined[-keep:], max(0, len(combined) - keep)
 
 
 def thought_merge(sid: str, step: dict, *, question: str = "", verifier_models: list | None = None,
-                  assign_number: bool = False, ops: dict | None = None, card: str = "") -> dict:
+                  assign_number: bool = False, ops: dict | None = None, card: str = "",
+                  verifier_snapshot: list | None = None, verifier_additions: list | None = None,
+                  verifier_snapshot_generation: int | None = None, require_existing: bool = False) -> dict:
     """台帳へ 1 ステップを**1 つのロック内で**統合する（読み・採番・書きを分けない）。
 
     読みと書きを分けると、並列に呼ばれた 2 つの思考が同じ番号を採番して**片方が上書きで消える**
@@ -1863,20 +1942,22 @@ def thought_merge(sid: str, step: dict, *, question: str = "", verifier_models: 
     番号をロック内で採番する。`sid` が未知・期限切れなら**古い内容は復活させず**新しい ID を採番する。
     上限（`THOUGHT_MAX_STEPS`）に達していたら**黙って捨てず** `refused` を立てて返す。
 
-    **プロセス間でも同じ**ようにする: ファイルロック（`_file_lock`）を取り、直前のファイル内容と
-    統合してから書く。実測: 4 プロセスが同時に同じ台帳へ書くと、5 試行中 3 回で思考が欠落していた
-    （last-writer-wins）。番号の採番も**ファイル反映後の内容**に対して行うので、
-    別プロセスが同じ番号を採番しても片方が消えない。
+    **プロセス間でも同じ**ようにする: ファイルロック（`_file_lock`）を取り、最新のディスク内容を
+    正本として読み、採番・更新・保存まで直列化する。期限切れや削除済み ID は新規扱いにし、
+    容量や期限の制約で更新行を残せない場合は何も保存せずエラーを返す。
     """
-    _ensure_thoughts_loaded()
+    global _THOUGHTS_LOADED
     with _THOUGHTS_LOCK:
         path = thoughts_path()
+        clock_key = os.path.normcase(os.path.abspath(path))
         if not THOUGHTS_ENABLED:
             # 台帳が無効なら**ロックファイルも作らない**（状態ディレクトリを汚さない）。
             target = sid if sid in _THOUGHTS else new_thought_id()
             row = json.loads(json.dumps(_THOUGHTS.get(target) or {}))
             steps = [s for s in (row.get("steps") or []) if isinstance(s, dict)]
             step = dict(step)
+            if not _thought_subgoal_still_matches(row, steps, step, ops or {}):
+                return {"error": "計画が並行して変更され、subgoal の参照先が変わりました。記録していません。台帳を確認して再試行してください。"}
             if assign_number:
                 step["n"] = max([as_int(s.get("n"), 0, 0, 9999) for s in steps] + [0]) + 1
             number = as_int(step.get("n"), 0, 0, 9999)
@@ -1887,23 +1968,38 @@ def thought_merge(sid: str, step: dict, *, question: str = "", verifier_models: 
             steps = [s for s in steps if as_int(s.get("n"), 0, 0, 9999) != number] + [step]
             steps.sort(key=lambda s: as_int(s.get("n"), 0, 0, 9999))
             _thought_apply_ops(row, steps, step, old, ops or {})
+            history, omitted = _thought_verifier_update(row, verifier_models, verifier_snapshot, verifier_additions,
+                                                         verifier_snapshot_generation)
             row.update({"steps": steps,
                         "card": card or row.get("card") or "",
                         "question": question or row.get("question") or "",
-                        "verifier_models": verifier_models or row.get("verifier_models") or [],
+                        "verifier_models": history,
+                        "verifier_generation": row.get("verifier_generation", 0) + (verifier_snapshot is not None),
                         "created_at": row.get("created_at") or now_ts(),
                         "updated_at": now_ts()})
             _THOUGHTS[target] = row
             return {"session_id": target, "step": step, "steps_recorded": len(steps),
-                    "refused": False, "replaced": replaced}
-        with _file_lock(path):
-            disk = _thoughts_disk_chains(path)
-            known = sid if (sid and (sid in disk or sid in _THOUGHTS)) else ""
-            base = _thoughts_merge_row(disk.get(known) or {}, _THOUGHTS.get(known) or {}) if known else {}
+                    "refused": False, "replaced": replaced, "verifier_omitted": omitted}
+        with _file_lock(path) as locked:
+            if not locked:
+                return {"error": "思考台帳のロックを取得できませんでした。記録していません。"}
+            try:
+                disk = _thoughts_disk_chains(path, strict=True)
+            except OSError as exc:
+                return {"error": str(exc)}
+            effective_now = max(now_ts(), _THOUGHTS_CLOCK.get(clock_key, 0.0))
+            disk_row = disk.get(sid) if sid else None
+            known = sid if (disk_row is not None and
+                            as_float(disk_row.get("updated_at"), 0.0) > effective_now - THOUGHT_TTL_S) else ""
+            if require_existing and not known:
+                return {"error": "読み取り後に思考台帳が削除または期限切れになりました。記録していません。"}
+            base = disk[known] if known else {}
             target = known or new_thought_id()
             row = json.loads(json.dumps(base))
             steps = [s for s in (row.get("steps") or []) if isinstance(s, dict)]
             step = dict(step)
+            if not _thought_subgoal_still_matches(row, steps, step, ops or {}):
+                return {"error": "計画が並行して変更され、subgoal の参照先が変わりました。記録していません。台帳を確認して再試行してください。"}
             if assign_number:
                 step["n"] = max([as_int(s.get("n"), 0, 0, 9999) for s in steps] + [0]) + 1
             number = as_int(step.get("n"), 0, 0, 9999)
@@ -1915,26 +2011,30 @@ def thought_merge(sid: str, step: dict, *, question: str = "", verifier_models: 
             steps.sort(key=lambda s: as_int(s.get("n"), 0, 0, 9999))
             # 他ステップ・台帳メタへの波及（改訂済みの印・仮説の状態・分岐の状態・計画）も**同じロック内**。
             _thought_apply_ops(row, steps, step, old, ops or {})   # §2.7
+            history, omitted = _thought_verifier_update(row, verifier_models, verifier_snapshot, verifier_additions,
+                                                         verifier_snapshot_generation)
             row.update({
                 "steps": steps,
                 # KANBAN のカード ID（任意）。渡された値が優先で、未指定なら既存を保つ（§6.9 の card 引数）。
                 "card": card or row.get("card") or "",
                 "question": question or row.get("question") or "",
-                "verifier_models": verifier_models or row.get("verifier_models") or [],
-                "created_at": row.get("created_at") or now_ts(),
-                "updated_at": now_ts(),
+                "verifier_models": history,
+                "verifier_generation": row.get("verifier_generation", 0) + (verifier_snapshot is not None),
+                "created_at": row.get("created_at") or effective_now,
+                "updated_at": max(as_float(base.get("updated_at"), 0.0), effective_now),
             })
-            # ディスク上の同じ台帳と統合してから書く（別プロセスの内容を消さない）。
-            merged = _thoughts_merge_row(disk.get(target) or {}, row)
-            disk[target] = merged
-            for other_sid, other_row in disk.items():
-                if isinstance(other_row, dict):
-                    _THOUGHTS[other_sid] = other_row
-            _thoughts_write_locked(path, disk)
-            row = merged
-            _THOUGHTS[target] = row
+            disk[target] = row
+            retained = _thoughts_prune(disk, effective_now)
+            if target not in retained:
+                return {"error": "思考台帳の容量または期限により記録できませんでした。"}
+            if not _thoughts_write_locked(path, retained):
+                return {"error": "思考台帳の保存に失敗しました。記録していません。"}
+            _THOUGHTS_CLOCK[clock_key] = effective_now
+            _THOUGHTS.clear()
+            _THOUGHTS.update(retained)
+            _THOUGHTS_LOADED = True
     return {"session_id": target, "step": step, "steps_recorded": len(steps),
-            "refused": False, "replaced": replaced}
+            "refused": False, "replaced": replaced, "verifier_omitted": omitted}
 
 
 def thought_find_by_card(card: str) -> str:
@@ -1947,8 +2047,8 @@ def thought_find_by_card(card: str) -> str:
     card = as_str(card).strip()
     if not card:
         return ""
-    _ensure_thoughts_loaded()
     with _THOUGHTS_LOCK:
+        _ensure_thoughts_loaded()
         hits = [(as_float((row or {}).get("updated_at"), 0.0), sid)
                 for sid, row in _THOUGHTS.items()
                 if isinstance(row, dict) and as_str(row.get("card")).strip() == card]
@@ -1956,26 +2056,36 @@ def thought_find_by_card(card: str) -> str:
 
 
 def thought_drop(sid: str) -> None:
+    global _THOUGHTS_LOADED
     if not sid:
         return
-    _ensure_thoughts_loaded()
     with _THOUGHTS_LOCK:
-        _THOUGHTS.pop(sid, None)
         if not THOUGHTS_ENABLED:
+            _THOUGHTS.pop(sid, None)
             return
         path = thoughts_path()
-        with _file_lock(path):
-            disk = _thoughts_disk_chains(path)
+        clock_key = os.path.normcase(os.path.abspath(path))
+        with _file_lock(path) as locked:
+            if not locked:
+                raise OSError("思考台帳のロックを取得できませんでした")
+            disk = _thoughts_disk_chains(path, strict=True)
             disk.pop(sid, None)
-            _thoughts_write_locked(path, disk)
+            effective_now = max(now_ts(), _THOUGHTS_CLOCK.get(clock_key, 0.0))
+            retained = _thoughts_prune(disk, effective_now)
+            if not _thoughts_write_locked(path, retained):
+                raise OSError("思考台帳の保存に失敗しました")
+            _THOUGHTS_CLOCK[clock_key] = effective_now
+            _THOUGHTS.clear()
+            _THOUGHTS.update(retained)
+            _THOUGHTS_LOADED = True
 
 
 # ---------------------------------------------------------------- §2.7 思考台帳の構造（分解・改訂・分岐・仮説）
 #
 # 台帳を「思考の列」から**構造**へ上げる操作。`thought_merge` が**ロック内**で呼ぶ（読みと書きを
 # 分けると並列呼び出しで印が消える。規約 24b）。引数の検証は §6.10 の `_think_structure` が**先に**
-# 済ませる（検証に失敗した呼び出しでサブ呼び出しの予算を使わないため）。ここでは検証済みの操作を
-# 適用するだけで、対象が見つからなければ黙って何もしない（ステップは削除されないので実際には起きない）。
+# 済ませる（検証に失敗した呼び出しでサブ呼び出しの予算を使わないため）。subgoal は保存時にも
+# 最新の台帳で再検査する。その他の操作はここで検証済みの対象に適用する。
 #
 # - 改訂: 改訂された元ステップに `superseded_by` を付ける（消さない＝履歴は残す）。
 # - 仮説: `kind=hypothesis` のステップが状態（open/supported/refuted/inconclusive）を持つ。
@@ -3042,25 +3152,62 @@ def quota_path() -> str:
 def _quota_row(provider: str, now: float) -> dict:
     """分・日の窓を必要なら進める（分は直近 60 秒、日は UTC の日付境界）。"""
     row = _QUOTA.setdefault(provider, {})
-    day = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).date()
+    day = today.isoformat()
+    if row:
+        prior = row.get("day")
+        try:
+            prior_date = datetime.date.fromisoformat(prior) if isinstance(prior, str) else None
+        except ValueError:
+            prior_date = None
+        if prior_date is None or prior_date.isoformat() != prior or prior_date > today:
+            raise QuotaExhaustedError("クォータの日付が不正です。送信を中止しました")
     if row.get("day") != day:
         row["day"] = day
         row["day_req"] = 0
         row["day_tok"] = 0
-    if now - as_float(row.get("min_start"), 0.0) >= _QUOTA_MINUTE_S:
-        row["min_start"] = now
-        row["min_req"] = 0
-        row["min_tok"] = 0
+    for key in ("day_req", "day_tok"):
+        value = row.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise QuotaExhaustedError("クォータの日次集計が不正です。送信を中止しました")
+    if "minute_events" not in row:
+        start = as_float(row.get("min_start"), 0.0)
+        req = int(row.get("min_req") or 0)
+        tok = int(row.get("min_tok") or 0)
+        # Legacy fixed-window counts have no individual timestamps. Charge them
+        # at the latest possible time, never earlier than the original events.
+        row["minute_events"] = [[start + _QUOTA_MINUTE_S, req, tok]] if req or tok else []
+    raw_events = row["minute_events"]
+    if (not isinstance(raw_events, list) or any(
+        not isinstance(e, list) or len(e) != 3
+        or isinstance(e[0], bool) or not isinstance(e[0], (int, float)) or not math.isfinite(e[0])
+        or any(isinstance(x, bool) or not isinstance(x, int) or x < 0 for x in e[1:])
+        for e in raw_events
+    )):
+        raise QuotaExhaustedError("クォータの分次履歴が不正です。送信を中止しました")
+    if ("min_req" in row and row["min_req"] != sum(e[1] for e in raw_events)
+            or "min_tok" in row and row["min_tok"] != sum(e[2] for e in raw_events)):
+        raise QuotaExhaustedError("クォータの分次集計が履歴と不一致です。旧版との併用を停止してください")
+    events = [e for e in raw_events if e[0] > now - _QUOTA_MINUTE_S]
+    row["minute_events"] = events
+    row["min_req"] = sum(int(e[1]) for e in events)
+    row["min_tok"] = sum(int(e[2]) for e in events)
     return row
 
 
 def _quota_read(path: str) -> dict:
     """`quota.json` の `providers` を読む（**ロックの内側で呼ぶ**）。"""
-    data = _load_json(path, {})
-    rows = data.get("providers") if isinstance(data, dict) else None
-    if not isinstance(rows, dict):
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except FileNotFoundError:
         return {}
-    return {name: row for name, row in rows.items() if isinstance(row, dict)}
+    except (OSError, ValueError) as exc:
+        raise QuotaExhaustedError("クォータ状態を読めません。送信を中止しました") from exc
+    rows = data.get("providers") if isinstance(data, dict) else None
+    if not isinstance(rows, dict) or any(not isinstance(row, dict) for row in rows.values()):
+        raise QuotaExhaustedError("クォータ状態の形式が不正です。送信を中止しました")
+    return rows
 
 
 def _ensure_quota_loaded() -> None:
@@ -3099,8 +3246,17 @@ def _quota_save() -> bool:
 
 
 def _quota_used(row: dict) -> dict[str, int]:
+    reservations = row.get("pending", {})
+    if not isinstance(reservations, dict) or any(
+        not isinstance(v, dict) or isinstance(v.get("tokens"), bool)
+        or not isinstance(v.get("tokens"), int) or v["tokens"] < 0
+        for v in reservations.values()
+    ):
+        raise QuotaExhaustedError("クォータの予約状態が不正です。送信を中止しました")
+    pending = sum(v["tokens"] for v in reservations.values())
     return {"rpm": int(row.get("min_req") or 0), "rpd": int(row.get("day_req") or 0),
-            "tpm": int(row.get("min_tok") or 0), "tpd": int(row.get("day_tok") or 0)}
+            "tpm": int(row.get("min_tok") or 0) + pending,
+            "tpd": int(row.get("day_tok") or 0) + pending}
 
 
 def _quota_reason(provider: str, used: dict[str, int], limits: dict[str, int]) -> str | None:
@@ -3124,11 +3280,16 @@ def quota_block(provider: str) -> str | None:
     return _quota_reason(provider, used, limits)
 
 
-def quota_reserve(provider: str) -> str | None:
+def quota_reserve(provider: str, tokens: int = 0, reservation_id: str = "", *,
+                  output_cap: list[int] | None = None, input_tokens: int = 0) -> str | None:
     """1 リクエスト分を**先に確保**する（check-then-act の穴を塞ぐ）。
 
     上限判定と加算を 1 つのロック内で行う。呼び出し側は「送る直前に確保 → 送る → トークンだけ足す」の
     順にする。確保しないと、並列 N 本が同じ残量を読んで**全員が通る**（実測: 枠 4 本・上限 3 で 4 本通った）。
+
+    Token reservations are shared by processes using this state file. The estimate
+    is not an upper bound on provider usage; upstream limits remain authoritative.
+    Unknown or interrupted usage remains pending until explicitly reconciled.
     """
     limits = _QUOTA_LIMITS.get(provider) if QUOTA_ENABLED else None
     if not limits:
@@ -3137,36 +3298,66 @@ def quota_reserve(provider: str) -> str | None:
     # ロックの内側でディスクの最新を取り込み、判定と加算を同じ写しに対して行う。
     # プロセス内の `threading.Lock` だけでは、常駐 HTTP と stdio が同じ上限を別々に数える。
     path = quota_path()
-    with _file_lock(path):
+    with _file_lock(path) as locked:
+        if not locked:
+            return f"提供元 {provider} のクォータのロックを取得できませんでした"
         with _QUOTA_LOCK:
             _QUOTA.clear()
-            _QUOTA.update(_quota_read(path))
-            row = _quota_row(provider, now_ts())
-            used = _quota_used(row)
+            try:
+                _QUOTA.update(_quota_read(path))
+                row = _quota_row(provider, now_ts())
+                used = _quota_used(row)
+            except QuotaExhaustedError as exc:
+                return str(exc)
             reason = _quota_reason(provider, used, limits)
             if reason:
                 return reason
+            if output_cap is not None:
+                remaining = [limits[u] - used[u] for u in ("tpm", "tpd") if limits.get(u)]
+                if remaining:
+                    allowed = min(remaining) - input_tokens
+                    if allowed < 1:
+                        return f"提供元 {provider} のクォータ残量に入力と出力 1 トークンが収まりません"
+                    output_cap[0] = min(output_cap[0], allowed)
+                    tokens = input_tokens + output_cap[0]
+            for unit in ("tpm", "tpd"):
+                if limits.get(unit) and used[unit] + tokens > limits[unit]:
+                    return f"提供元 {provider} の {unit.upper()} 上限 {limits[unit]} に予約量が収まりません"
+            if tokens and reservation_id:
+                row.setdefault("pending", {})[reservation_id] = {"tokens": tokens, "at": now_ts()}
+            row["minute_events"].append([now_ts(), 1, 0])
             row["min_req"] = used["rpm"] + 1
             row["day_req"] = used["rpd"] + 1
             payload = copy.deepcopy(_QUOTA)
-        _quota_write(payload)
+            if not _quota_write(payload):
+                _QUOTA.clear()
+                _QUOTA.update(_quota_read(path))
+                return f"提供元 {provider} のクォータの保存に失敗しました"
     return None
 
 
-def quota_add_tokens(provider: str, tokens: int = 0) -> None:
+def quota_add_tokens(provider: str, tokens: int = 0, reservation_id: str = "") -> None:
     """消費したトークンを足す（リクエスト数は `quota_reserve` で確保済み）。"""
     if tokens <= 0 or not QUOTA_ENABLED or not _QUOTA_LIMITS.get(provider):
         return
     path = quota_path()
-    with _file_lock(path):
+    with _file_lock(path) as locked:
+        if not locked:
+            raise QuotaExhaustedError(f"提供元 {provider} のクォータ精算ロックを取得できませんでした")
         with _QUOTA_LOCK:
             _QUOTA.clear()
             _QUOTA.update(_quota_read(path))
             row = _quota_row(provider, now_ts())
+            if reservation_id:
+                (row.get("pending") or {}).pop(reservation_id, None)
+            row["minute_events"].append([now_ts(), 0, int(tokens)])
             row["min_tok"] = int(row.get("min_tok") or 0) + int(tokens)
             row["day_tok"] = int(row.get("day_tok") or 0) + int(tokens)
             payload = copy.deepcopy(_QUOTA)
-        _quota_write(payload)
+            if not _quota_write(payload):
+                _QUOTA.clear()
+                _QUOTA.update(_quota_read(path))
+                raise QuotaExhaustedError(f"提供元 {provider} のクォータ精算の保存に失敗しました")
 
 
 def quota_record(provider: str, tokens: int = 0) -> None:
@@ -3189,10 +3380,14 @@ def quota_report(providers: list[str] | None = None) -> dict | None:
     out: dict[str, dict] = {}
     with _QUOTA_LOCK:
         for name in names:
-            used = _quota_used(_quota_row(name, now))
+            row = _quota_row(name, now)
+            used = _quota_used(row)
             limits = _QUOTA_LIMITS.get(name) or {}
             out[name] = {unit: {"used": used[unit], "limit": limits[unit]}
                          for unit in _QUOTA_UNITS if limits.get(unit)}
+            pending = row.get("pending", {})
+            out[name]["pending_reservations"] = len(pending)
+            out[name]["reserved_tokens"] = sum(v["tokens"] for v in pending.values())
     # v0.25.0: 同じ `FREEAGENT_STATE_DIR` を共有する限り**プロセスをまたいで合算**される
     # （以前はプロセスごとに別々に数えていたので、2 プロセスで上限の 2 倍まで通った）。
     return {"providers": out, "scope": "状態ディレクトリを共有するプロセスの合算（提供元単位・UTC 日境界）"}
@@ -3204,14 +3399,29 @@ def quota_reset() -> None:
         _QUOTA.clear()
 
 
+def _quota_report_after_answers(refs: list[str]) -> dict:
+    try:
+        return {"quota": quota_report(refs)}
+    except Exception as exc:
+        return {"quota": None, "quota_report_error": str(exc)}
+
+
 def _result_tokens(result: dict) -> int:
     """使用トークン数（`tokens` は dict / 数値 / 欠落のどれでも来る＝テストのモックで実測した）。"""
     tokens = result.get("tokens") if isinstance(result, dict) else None
     if isinstance(tokens, bool):
         return 0
     if isinstance(tokens, (int, float)):
+        if isinstance(tokens, float) and (not math.isfinite(tokens) or not tokens.is_integer()):
+            return 0
         return int(tokens)
     if not isinstance(tokens, dict):
+        return 0
+    if any(not isinstance(tokens.get(key), (int, float)) or isinstance(tokens.get(key), bool)
+           or tokens[key] < 0
+           or (isinstance(tokens[key], float)
+               and (not math.isfinite(tokens[key]) or not tokens[key].is_integer()))
+           for key in ("prompt", "completion")):
         return 0
     total = 0
     for key in ("prompt", "completion"):
@@ -3239,14 +3449,34 @@ def _gated_call_once(provider: str, model: str, prompt: str, system: str,
             "枠を上げる／別の提供元を有効にする、のいずれかで解消します")
     try:
         # 送る**直前**に 1 回分を確保する（並列 N 本が同じ残量を読んで全員通るのを防ぐ・§3.5）
-        exhausted = quota_reserve(provider)
+        limits = _QUOTA_LIMITS.get(provider, {}) if QUOTA_ENABLED else {}
+        # UTF-8 bytes plus max output is a conservative heuristic, not a
+        # tokenizer-independent upper bound (provider framing can add tokens).
+        input_estimate = len((prompt + system).encode("utf-8"))
+        token_limits = [limits[u] for u in ("tpm", "tpd") if limits.get(u)]
+        cap = [max_tokens]
+        reservation_id = os.urandom(16).hex() if token_limits else ""
+        exhausted = (quota_reserve(provider, reservation_id=reservation_id, output_cap=cap,
+                                   input_tokens=input_estimate) if token_limits else quota_reserve(provider))
         if exhausted:
             raise QuotaExhaustedError(exhausted)
-        result = _call_once(provider, model, prompt, system, max_tokens, temperature,
+        effective_max = cap[0]
+        result = _call_once(provider, model, prompt, system, effective_max, temperature,
                             timeout=timeout)
     finally:
         PROVIDER_GATE.release(provider)
-    quota_add_tokens(provider, _result_tokens(result))
+    if effective_max != max_tokens:
+        result["quota_accounting"] = f"max_tokens_capped: {max_tokens} -> {effective_max}"
+    actual_tokens = _result_tokens(result)
+    try:
+        quota_add_tokens(provider, actual_tokens, reservation_id)
+    except Exception as exc:
+        warning = f"settlement_failed: {exc}"
+        result["quota_accounting"] = "; ".join(filter(None, (result.get("quota_accounting"), warning)))
+        return result, waited
+    if reservation_id and actual_tokens <= 0:
+        result["quota_accounting"] = "; ".join(filter(None, (result.get("quota_accounting"),
+                                                               "usage_unknown_reservation_retained")))
     return result, waited
 
 
@@ -3482,6 +3712,9 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
                 "skipped_cooling": [ref], "rate_limited": bool(ref in cooling)}
 
     last_error = ""
+    last_error_ref = ref
+    last_observed_error = ""
+    quota_warnings: list[str] = []
     skipped: list[str] = []
     avoided: list[str] = []
     # 提供元の枠を待つ予算は **1 回の `call_model` で共有する**。候補ごとに満額待つと、枠が
@@ -3498,17 +3731,21 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
         `unobserved` のまま第 1 候補に居座り、毎回 `laguna-s-2.1` へフォールバックした）。
         環境障害（`is_env_failure`）はモデルの成績ではないので `observe_call` が no-op にする。
         """
+        nonlocal last_observed_error
         if not message:
             return
         observe_call({"ref": cand, "error": message}, kind, "")
+        last_observed_error = message
 
     for idx, cand in enumerate(attempts):
-        if claims is not None and cand != ref and not claims.take(cand):
+        if claims is not None and ((cand == ref and claims.is_excluded(cand))
+                                   or (cand != ref and not claims.take(cand))):
             avoided.append(cand)   # 他の枠が使用中／除外済み。独立性を守るため取らない
             continue
         c_provider, c_model = resolve_ref(cand, free_only=free_only)
         if not c_model:
             continue
+        last_error_ref = cand
         try:
             result, waited = _gated_call_once(c_provider, c_model, prompt, system, max_tokens,
                                               temperature, timeout=timeout, wait_budget=wait_left)
@@ -3566,6 +3803,8 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
             note_failure(cand, last_error)   # 環境障害ではない（JSON 壊れ等）＝モデル側の失敗
             continue
 
+        if result.get("quota_accounting"):
+            quota_warnings.append(result["quota_accounting"])
         text = result["text"]
         if not text.strip():
             # 空応答。**成功として返さない**（メインLLMが「無回答」を回答と誤解する）。思考トークンで
@@ -3578,6 +3817,8 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
                                                          wait_budget=wait_left)
                     wait_left = max(0.0, wait_left - retry_wait)
                     gate_wait += retry_wait
+                    if retry.get("quota_accounting"):
+                        quota_warnings.append(retry["quota_accounting"])
                     if (retry.get("text") or "").strip():
                         result, text = retry, retry["text"]
                 except Exception:
@@ -3585,7 +3826,7 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
             if not text.strip():
                 last_error = (f"空応答（{cand}）。max_tokens={max_tokens} を思考トークンで使い切った"
                               "可能性があります。max_tokens を増やしてください")
-                observe_call({"ref": cand, "error": last_error}, kind, "")
+                note_failure(cand, last_error)
                 skipped.append(cand)
                 continue
 
@@ -3598,6 +3839,8 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
                "cot_leak": _cot_leak(text), "kind": kind,
                "gate_wait_s": round(gate_wait, 3) if gate_wait else None,
                "fallback": cand != ref, "skipped_cooling": skipped or None}
+        if quota_warnings:
+            out["quota_accounting"] = "; ".join(quota_warnings)
         PROVIDER_GATE.note_success(c_provider)   # 枠が縮んでいたら 1 本ずつ戻す
         clear_provider_auth(c_provider)   # 通ったら「認証で駄目」の記憶を消す
         # 統計・トレースは**答えたモデル**に付ける（要求元に付けると、代替で答えた事実が消える）。
@@ -3607,12 +3850,15 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
     fail = {"error": last_error or "すべての候補で失敗しました", "ref": ref, "kind": kind,
             "skipped_cooling": skipped or None,
             "rate_limited": any(r in cooling_refs() for r in attempts)}
+    if quota_warnings:
+        fail["quota_accounting"] = "; ".join(quota_warnings)
     if avoided and not last_error:
         fail["error"] = ("フォールバック先がすべて同じ呼び出しの他の枠で使用中か除外済みでした"
                          "（独立性を守るため同じモデルで枠を埋めていません）")
     if avoided:
         fail["avoided_duplicates"] = len(avoided)
-    observe_call(fail, kind, "")
+    if fail["error"] != last_observed_error:
+        observe_call(dict(fail, ref=last_error_ref), kind, "")
     return fail
 
 
@@ -3623,15 +3869,24 @@ class _ModelClaims:
     モデルはロック内で 1 回だけ確保できる（2 枠が同時に同じ予備モデルへ落ちるのを防ぐ）。
     """
 
-    def __init__(self, refs, avoid=()):
+    def __init__(self, refs, avoid=(), identity_avoid=()):
         self._lock = threading.Lock()
-        self._taken = {r for r in list(refs) + list(avoid or ()) if isinstance(r, str) and r}
+        self._excluded = {r for r in (avoid or ()) if isinstance(r, str) and r}
+        self._identity_excluded = {_model_identity(r) for r in (identity_avoid or ())
+                                   if isinstance(r, str) and r}
+        self._taken = {_model_identity(r) for r in list(refs) + list(self._excluded) + list(identity_avoid or ())
+                       if isinstance(r, str) and r}
+
+    def is_excluded(self, ref: str) -> bool:
+        return (_model_identity(ref) in self._identity_excluded
+                or _is_model_excluded(ref, self._excluded))
 
     def take(self, ref: str) -> bool:
         with self._lock:
-            if ref in self._taken:
+            identity = _model_identity(ref)
+            if identity in self._taken or self.is_excluded(ref):
                 return False
-            self._taken.add(ref)
+            self._taken.add(identity)
             return True
 
 
@@ -3846,6 +4101,8 @@ class Deadline:
     def __init__(self, seconds: float):
         self.total = max(0.0, float(seconds))
         self._until = time.monotonic() + self.total
+        self._cancel_signal = Future()
+        self._cancel_lock = threading.Lock()
 
     def remaining(self) -> float:
         return max(0.0, self._until - time.monotonic())
@@ -3856,7 +4113,10 @@ class Deadline:
 
     def cancel(self) -> None:
         """打ち切る（回収は即座に終わり、未開始のジョブは投入されない）。"""
-        self._until = time.monotonic()
+        with self._cancel_lock:
+            self._until = min(self._until, time.monotonic())
+            if not self._cancel_signal.done():
+                self._cancel_signal.set_result(None)
 
     def __repr__(self) -> str:
         return f"Deadline(total={self.total:.1f}s, remaining={self.remaining():.1f}s)"
@@ -3879,7 +4139,8 @@ def budget_scope(seconds: float | None = None):
     """
     previous = getattr(_BUDGET_LOCAL, "deadline", None)
     limit = CALL_BUDGET_S if seconds is None else seconds
-    _BUDGET_LOCAL.deadline = Deadline(limit) if limit > 0 else None
+    _BUDGET_LOCAL.deadline = (Deadline(limit) if limit > 0 else
+                              Deadline(float("inf")) if getattr(_REQ_LOCAL, "id", None) is not None else None)
     try:
         yield _BUDGET_LOCAL.deadline
     finally:
@@ -3911,46 +4172,58 @@ def budget_expired() -> bool:
 # 呼び出しを減らすのが目的（v0.24.0）。
 _REQ_LOCAL = threading.local()
 _ACTIVE_LOCK = threading.Lock()
-_ACTIVE_BUDGETS: dict[str, "Deadline"] = {}
+_ACTIVE_BUDGETS: dict = {}
 
 
-def _active_key(msg_id) -> str:
-    return f"{type(msg_id).__name__}:{msg_id}"
+def _active_key(msg_id):
+    return (getattr(_REQ_LOCAL, "session", None), f"{type(msg_id).__name__}:{msg_id}")
 
 
 def _register_active(msg_id, deadline) -> None:
     if deadline is None or msg_id is None:
         return
     with _ACTIVE_LOCK:
-        _ACTIVE_BUDGETS[_active_key(msg_id)] = deadline
+        _ACTIVE_BUDGETS.setdefault(_active_key(msg_id), set()).add(deadline)
 
 
-def _unregister_active(msg_id) -> None:
+def _unregister_active(msg_id, deadline=None) -> None:
     if msg_id is None:
         return
     with _ACTIVE_LOCK:
-        _ACTIVE_BUDGETS.pop(_active_key(msg_id), None)
+        key = _active_key(msg_id)
+        active = _ACTIVE_BUDGETS.get(key)
+        if active is not None:
+            if deadline is None:
+                _ACTIVE_BUDGETS.pop(key, None)
+            else:
+                active.discard(deadline)
+                if not active:
+                    _ACTIVE_BUDGETS.pop(key, None)
 
 
 def cancel_request(msg_id) -> bool:
-    """`requestId` の要求を打ち切る（対応する要求が無ければ False）。"""
-    with _ACTIVE_LOCK:
-        deadline = _ACTIVE_BUDGETS.pop(_active_key(msg_id), None)
-    if deadline is None:
+    """Cancel all active occurrences of this ID within the current transport session."""
+    if msg_id is None:
         return False
-    deadline.cancel()
-    return True
+    with _ACTIVE_LOCK:
+        deadlines = _ACTIVE_BUDGETS.pop(_active_key(msg_id), ())
+    for deadline in deadlines:
+        deadline.cancel()
+    return bool(deadlines)
 
 
 @contextlib.contextmanager
-def request_scope(msg_id):
-    """transport が「いま処理している要求の id」を張る（キャンセルの手がかり）。"""
+def request_scope(msg_id, session=None):
+    """Bind a request ID and transport session for cancellation."""
     previous = getattr(_REQ_LOCAL, "id", None)
+    previous_session = getattr(_REQ_LOCAL, "session", None)
     _REQ_LOCAL.id = msg_id
+    _REQ_LOCAL.session = session
     try:
         yield
     finally:
         _REQ_LOCAL.id = previous
+        _REQ_LOCAL.session = previous_session
 
 
 # ---------------------------------------------------------------- §4.1 任意の公平な共有スケジューラ
@@ -3986,43 +4259,88 @@ def _fair_eligible(jobs, keys, providers):
 def _run_fair(jobs, worker, workers, deadline, providers):
     from .fair_scheduler import QueueFullError
 
-    def guarded(job):
-        if deadline is not None and deadline.expired:
-            return _dropped_result(deadline, "未実行")
-        return worker(job)
-
     scheduler = _get_fair_scheduler()
     try:
-        batch = scheduler.submit_batch(guarded, jobs, workers, providers)
+        batch = scheduler.submit_batch(worker, jobs, workers, providers)
     except QueueFullError:
         return [{"error": "共有実行キューの上限に達したため実行しませんでした",
                  "dropped": True, "overloaded": True} for _ in jobs]
     out: list = [None] * len(jobs)
     futures = {future: i for i, future in enumerate(batch.futures)}
+    collected = set()
     done = 0
     timed_out = False
     completed = False
     try:
-        for future in as_completed(futures, timeout=None if deadline is None else deadline.remaining()):
+        signals = list(futures) + ([deadline._cancel_signal] if deadline is not None else [])
+        for future in as_completed(signals, timeout=None if deadline is None or math.isinf(deadline.remaining()) else deadline.remaining()):
+            if deadline is not None and (future is deadline._cancel_signal or deadline.expired):
+                timed_out = True
+                break
             i = futures[future]
-            try:
-                out[i] = future.result()
-            except Exception as exc:
-                out[i] = {"error": f"{type(exc).__name__}: {exc}"}
+            out[i] = _parallel_future_result(future, deadline)
+            collected.add(i)
             done += 1
             progress_emit(done, len(jobs), progress_label(jobs[i]))
-        completed = True
+            if done == len(futures):
+                break
+        completed = not timed_out
     except FuturesTimeout:
         timed_out = True
     finally:
         if not completed:
             scheduler.cancel_batch(batch)
     if timed_out:
+        _collect_completed_parallel(futures, out, collected, deadline)
+        done = len(collected)
         for i, value in enumerate(out):
-            if value is None:
+            if i not in collected:
                 out[i] = _dropped_result(deadline, "回収を打ち切り")
         progress_emit(done, len(jobs), "予算切れで打ち切りました")
     return out
+
+
+_PARALLEL_INFLIGHT = set()
+_PARALLEL_INFLIGHT_LOCK = threading.Condition()
+
+
+def _track_parallel_future(future):
+    with _PARALLEL_INFLIGHT_LOCK:
+        _PARALLEL_INFLIGHT.add(future)
+    def forget(done):
+        with _PARALLEL_INFLIGHT_LOCK:
+            _PARALLEL_INFLIGHT.discard(done)
+            _PARALLEL_INFLIGHT_LOCK.notify_all()
+    future.add_done_callback(forget)
+
+
+def _drain_parallel_futures():
+    with _PARALLEL_INFLIGHT_LOCK:
+        while _PARALLEL_INFLIGHT:
+            _PARALLEL_INFLIGHT_LOCK.wait()
+
+
+def _parallel_future_result(future, deadline):
+    try:
+        result = future.result()
+        return result[1] if deadline is not None else result
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _collect_completed_parallel(futures, out, collected, deadline):
+    # A progress sender can block past the cutoff; use worker completion time,
+    # not the later time when the collector happens to inspect the future.
+    for future, i in futures.items():
+        if i in collected or not future.done() or future.cancelled():
+            continue
+        try:
+            completed_at, result = future.result()
+        except Exception:
+            continue
+        if completed_at <= deadline._until:
+            out[i] = result
+            collected.add(i)
 
 
 def run_parallel(jobs: list, worker, max_workers: int | None = None,
@@ -4049,9 +4367,26 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None,
     _parent_run, _parent_tool = current_run(), current_tool()
     if _parent_run:
         worker = _run_worker(worker, _parent_run, _parent_tool)
+    if deadline is not None:
+        inner_worker = worker
+        def budgeted_worker(job):
+            previous = getattr(_BUDGET_LOCAL, "deadline", None)
+            _BUDGET_LOCAL.deadline = deadline
+            try:
+                if deadline.expired:
+                    result = _dropped_result(deadline, "未実行")
+                else:
+                    try:
+                        result = inner_worker(job)
+                    except Exception as exc:
+                        result = {"error": f"{type(exc).__name__}: {exc}"}
+                return time.monotonic(), result
+            finally:
+                _BUDGET_LOCAL.deadline = previous
+        worker = budgeted_worker
     if _fair_eligible(jobs, fair_keys, fair_providers):
         return _run_fair(jobs, worker, workers, deadline, fair_providers)
-    if workers == 1:
+    if workers == 1 and deadline is None:
         for i, job in enumerate(jobs):
             if deadline is not None and deadline.expired:
                 out[i] = _dropped_result(deadline, "未実行")
@@ -4063,25 +4398,38 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None,
             progress_emit(i + 1, len(jobs), progress_label(job))
         return out
     pool = ThreadPoolExecutor(max_workers=workers)
-    futures = {pool.submit(worker, job): i for i, job in enumerate(jobs)}
+    futures = {}
+    collected = set()
     timed_out = False
     done = 0
+    completed = False
     try:
-        for fut in as_completed(futures, timeout=None if deadline is None else deadline.remaining()):
+        for i, job in enumerate(jobs):
+            future = pool.submit(worker, job)
+            _track_parallel_future(future)
+            futures[future] = i
+        signals = list(futures) + ([deadline._cancel_signal] if deadline is not None else [])
+        for fut in as_completed(signals, timeout=None if deadline is None or math.isinf(deadline.remaining()) else deadline.remaining()):
+            if deadline is not None and (fut is deadline._cancel_signal or deadline.expired):
+                timed_out = True
+                break
             i = futures[fut]
-            try:
-                out[i] = fut.result()
-            except Exception as exc:
-                out[i] = {"error": f"{type(exc).__name__}: {exc}"}
+            out[i] = _parallel_future_result(fut, deadline)
+            collected.add(i)
             done += 1
             progress_emit(done, len(jobs), progress_label(jobs[i]))
+            if done == len(futures):
+                break
+        completed = not timed_out
     except FuturesTimeout:
         timed_out = True
     finally:
-        pool.shutdown(wait=not timed_out, cancel_futures=timed_out)
+        pool.shutdown(wait=completed, cancel_futures=not completed)
     if timed_out:
+        _collect_completed_parallel(futures, out, collected, deadline)
+        done = len(collected)
         for i, value in enumerate(out):
-            if value is None:
+            if i not in collected:
                 out[i] = _dropped_result(deadline, "回収を打ち切り")
         progress_emit(done, len(jobs), "予算切れで打ち切りました")
     return out
@@ -4090,20 +4438,20 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None,
 def _dropped_result(deadline: "Deadline | None", why: str) -> dict:
     """予算切れの位置を埋める dict（`dropped` を機械可読に立てる）。"""
     # `:.0f` は 1 秒未満の予算を「0 秒」と表示する（実測: 0.25 秒 → 「予算（0 秒）」）。`:.3g` で刻む。
-    total = f"{deadline.total:.3g} 秒" if deadline is not None else "予算"
+    total = ("無制限" if math.isinf(deadline.total) else f"{deadline.total:.3g} 秒") if deadline is not None else "予算"
     return {"error": f"並列実行の予算（{total}）で{why}になりました（この結果は脱落です）",
             "dropped": True, "timed_out": True}
 
 
 def ask_many(refs: list[str], prompt: str, *, system: str = "", max_tokens: int = 800,
              temperature: float | None = None, kind: str = "panel",
-             avoid: list[str] | None = None) -> list[dict]:
+             avoid: list[str] | None = None, identity_avoid: list[str] | None = None) -> list[dict]:
     """同じプロンプトを複数モデルへ**同時に**投げる（1 ターン待たずに走るのが並列の利点）。
 
     「独立した複数の意見」を返す経路なので、フォールバックが**他の枠と同じモデル**や `avoid`
-    （除外・同じ手順で既に使ったモデル）に落ちないようにする（`_ModelClaims`）。
+    （利用者の明示除外）や `identity_avoid`（既に使ったモデル）に落ちないようにする（`_ModelClaims`）。
     """
-    claims = _ModelClaims(refs, avoid)
+    claims = _ModelClaims(refs, avoid, identity_avoid)
     return run_parallel(
         list(refs),
         lambda ref: call_model(ref, prompt, system=system, max_tokens=max_tokens,
@@ -5651,7 +5999,7 @@ def summarize_compliance(rows: list[dict]) -> dict:
             counts[verdict] += 1
         else:
             counts["unknown"] += 1
-    counts["blocking"] = counts["noncompliant"] + counts["unknown"] > 0
+    counts["blocking"] = counts["noncompliant"] + counts["unknown"] + len(rows) - reviewed > 0
     counts["reviewed"] = reviewed
     counts["unreviewed"] = len(rows) - reviewed
     return counts
@@ -5962,7 +6310,8 @@ def tool_ask(args: dict) -> dict:
                         kind="ask")
     if result.get("error"):
         return {"error": result["error"], "model": result.get("ref"), "kind": "ask",
-                "rate_limited": result.get("rate_limited")}
+                "rate_limited": result.get("rate_limited"),
+                **({"quota_accounting": result["quota_accounting"]} if result.get("quota_accounting") else {})}
     return {
         "answer": result["text"],
         "model": result["ref"],
@@ -5972,6 +6321,7 @@ def tool_ask(args: dict) -> dict:
         "truncated": result.get("truncated"),
         "cot_leak": result.get("cot_leak"),
         "tokens": result.get("tokens"),
+        **({"quota_accounting": result["quota_accounting"]} if result.get("quota_accounting") else {}),
         "quality": {"status": model_status(result["ref"]), "score": model_quality(result["ref"])},
     }
 
@@ -6009,6 +6359,8 @@ def tool_fanout(args: dict) -> dict:
     rows = []
     for (ref, prompt), res in zip(pairs, results):
         row = {"model": ref, "prompt": truncate(prompt, 200)}
+        if res.get("quota_accounting"):
+            row["quota_accounting"] = res["quota_accounting"]
         if res.get("coalesced"):
             row["coalesced"] = True      # 同一実行内の重複を畳んだ（上流は 1 回だけ）
         if res.get("error"):
@@ -6027,7 +6379,7 @@ def tool_fanout(args: dict) -> dict:
         "wall_s": wall, "sequential_estimate_s": sequential,
         "speedup": round(sequential / wall, 2) if wall > 0 else None,
         "results": rows, "selection": info, "concurrency": PROVIDER_GATE.report(refs),
-        "quota": quota_report(refs),
+        **_quota_report_after_answers(refs),
         "prompts_dropped": prompts_dropped,
         **_rate_limit_report(results),
     }
@@ -6115,6 +6467,8 @@ def _refine_answers(question: str, answers: list[dict], refs: list[str], args: d
                      temperature=0.0, kind="panel_refine")
     out: dict = {"model": model, "calls": 1, "reason": why,
                  "from_panel": model in (set(refs) if requested else used)}
+    if res.get("quota_accounting"):
+        out["quota_accounting"] = res["quota_accounting"]
     if res.get("error"):
         out["error"] = truncate(res["error"], 240)
         return out
@@ -6122,6 +6476,7 @@ def _refine_answers(question: str, answers: list[dict], refs: list[str], args: d
     out.update({
         "served_by": res.get("served_by"),
         "text": truncate(res["text"], 2000),
+        "text_truncated": len(res["text"]) > 2000,
         "conclusion": parsed["conclusion"] or truncate(res["text"], 400),
         "confidence": parsed["confidence"],
         "cot_leak": res.get("cot_leak"),
@@ -6146,7 +6501,8 @@ def tool_panel(args: dict) -> dict:
     answers = []
     for ref, res in zip(refs, results):
         if res.get("error"):
-            answers.append({"model": ref, "error": res["error"]})
+            answers.append({"model": ref, "error": res["error"],
+                            **({"quota_accounting": res["quota_accounting"]} if res.get("quota_accounting") else {})})
             continue
         parsed = parse_labeled(res["text"])
         answers.append({
@@ -6155,7 +6511,9 @@ def tool_panel(args: dict) -> dict:
             "conclusion": parsed["conclusion"] or truncate(res["text"], 400),
             "confidence": parsed["confidence"], "labels_found": parsed["labels_found"],
             "question": parsed["question"], "answer": truncate(res["text"], 1500),
+            "text_truncated": len(res["text"]) > 1500,
             "cot_leak": res.get("cot_leak"), "truncated": res.get("truncated"),
+            **({"quota_accounting": res["quota_accounting"]} if res.get("quota_accounting") else {}),
         })
     good = [a for a in answers if not a.get("error")]
     independent = independent_answers(good)
@@ -6174,7 +6532,7 @@ def tool_panel(args: dict) -> dict:
                            for a in good if a.get("question")],
         "answers": answers,
         "concurrency": PROVIDER_GATE.report(refs),
-        "quota": quota_report(refs),
+        **_quota_report_after_answers(refs),
         **_rate_limit_report(reported),
         "agreement_note": "合意度は解析済みの結論の表層類似度であり、正しさの確率ではありません。",
     }
@@ -6287,13 +6645,15 @@ def tool_grounded(args: dict) -> dict:
     answers = []
     for ref, res in zip(refs, results):
         if res.get("error"):
-            answers.append({"model": ref, "error": res["error"]})
+            answers.append({"model": ref, "error": res["error"],
+                            **({"quota_accounting": res["quota_accounting"]} if res.get("quota_accounting") else {})})
             continue
         cited, unsupported = _cited_numbers(res["text"] or "", len(citations), allowed=window["numbers"])
         answers.append({"model": ref, "served_by": res.get("served_by"),
                         "answer": truncate(res["text"], 2000),
                         "cited": cited, "cited_ok": bool(cited), "unsupported_citations": unsupported,
-                        "truncated": res.get("truncated"), "cot_leak": res.get("cot_leak")})
+                        "truncated": res.get("truncated"), "cot_leak": res.get("cot_leak"),
+                        **({"quota_accounting": res["quota_accounting"]} if res.get("quota_accounting") else {})})
     good = [a for a in answers if not a.get("error")]
     return {
         "question": question, "search_query": search_query,
@@ -6304,7 +6664,7 @@ def tool_grounded(args: dict) -> dict:
         "unsupported_citations": sorted({n for row in good for n in row.get("unsupported_citations", [])}),
         "models": refs, "selection": info, "answers": answers,
         "concurrency": PROVIDER_GATE.report(refs),
-        "quota": quota_report(refs),
+        **_quota_report_after_answers(refs),
         "agreement": agreement_of([a.get("answer") or "" for a in good]),
         "answers_with_citations": sum(1 for a in good if a.get("cited_ok")),
         "answered": len(good), "failed": len(answers) - len(good),
@@ -6344,6 +6704,8 @@ def tool_map(args: dict) -> dict:
         row = {"item": truncate(item, 200),
                "output": truncate(res.get("text") or "", 1500) if not res.get("error") else "",
                "error": res.get("error") or ""}
+        if res.get("quota_accounting"):
+            row["quota_accounting"] = res["quota_accounting"]
         if res.get("coalesced"):
             row["coalesced"] = True      # 同一実行内の重複を畳んだ（上流は 1 回だけ）
         rows.append(row)
@@ -6364,6 +6726,8 @@ def tool_map(args: dict) -> dict:
                              max_tokens=as_int(args.get("reduce_max_tokens"), 900, 16, 4000),
                              kind="map_reduce")
             data["reduced"] = red.get("text") or ""
+            if red.get("quota_accounting"):
+                data["reduce_quota_accounting"] = red["quota_accounting"]
             if red.get("error"):
                 data["reduce_error"] = red["error"]
     return data
@@ -6436,7 +6800,22 @@ def tool_consult(args: dict) -> dict:
         return {"error": "question は必須です（session_id を付けると前回の問いを引き継ぎます）"}
 
     if stored and stored.get("models"):
-        refs = [m for m in stored["models"] if m and not is_cooling(m)][:MAX_MODELS_PER_CALL]
+        # A compliance review retains its original slots, including cooling models.
+        saved_refs = [m for m in stored["models"] if m][:MAX_MODELS_PER_CALL]
+        excluded = set(as_str_list(args.get("exclude")) + env_excluded_models())
+        blocked_refs = [ref for ref in saved_refs if _is_model_excluded(ref, excluded)]
+        if blocked_refs:
+            return {"error": "保存済みセッションに除外対象のモデルがあります。除外設定を確認するか、"
+                             "別のモデルで新しいセッションを開始してください: " + ", ".join(blocked_refs),
+                    "session_id": sid, "excluded_models": blocked_refs}
+        seen_slots = {}
+        for ref in saved_refs:
+            identity = _model_identity(ref)
+            if identity in seen_slots:
+                return {"error": f"Duplicate model identity in saved session: {seen_slots[identity]}, {ref}. Start a new session with distinct models.",
+                        "session_id": sid}
+            seen_slots[identity] = ref
+        refs = saved_refs if mode == "review" and draft and basis else [m for m in saved_refs if not is_cooling(m)]
         info = {"requested": True, "resumed_from": sid, "models": refs}
         if not refs:
             refs, info = _select_or_error(args, default_size=3)
@@ -6458,33 +6837,69 @@ def tool_consult(args: dict) -> dict:
     # `basis` を渡したときだけ、先に**仕様適合**の段を 1 回走らせる（2 段目が品質）。
     # 再開時は保存済みの適合結果を使い回す（毎ラウンド 2 倍の呼び出しを払わない）。
     compliance_rows: list[dict] = []
+    compliance_failures: list[dict] = []
     compliance_summary = None
     if review_mode and basis:
-        stored_compliance = next((r for r in rounds if r.get("kind") == "compliance"), None)
-        if stored_compliance:
-            compliance_rows = [row for row in (stored_compliance.get("answers") or [])
-                               if isinstance(row, dict) and not row.get("error")]
-        else:
+        import hashlib
+        fingerprint = hashlib.sha256(json.dumps([question, draft, basis, main_reply], ensure_ascii=False).encode("utf-8")).hexdigest()
+        stored_compliance = next((r for r in reversed(rounds) if r.get("kind") == "compliance"), None)
+        # Legacy rounds with no fingerprint (or an older fingerprint) are re-reviewed conservatively.
+        if stored_compliance and stored_compliance.get("fingerprint") != fingerprint:
+            stored_compliance = None
+        prior = {row.get("model"): row for row in (stored_compliance or {}).get("answers", [])
+                 if isinstance(row, dict) and not row.get("error")}
+        excluded_now = set(as_str_list(args.get("exclude")) + env_excluded_models())
+        blocked_prior = [as_str(row.get("served_by")) for row in prior.values()
+                         if as_str(row.get("served_by"))
+                         and _is_model_excluded(as_str(row.get("served_by")), excluded_now)]
+        if blocked_prior:
+            return {"error": "保存済み査読の回答モデルが除外対象です。除外設定を確認するか、"
+                             "別のモデルで新しいセッションを開始してください: " + ", ".join(blocked_prior),
+                    "session_id": sid, "excluded_models": blocked_prior}
+        missing = [ref for ref in refs if ref not in prior]
+        crows = [prior[ref] for ref in refs if ref in prior]
+        seen_reviewers = {}
+        for row in crows:
+            reviewer = row.get("served_by") or row["model"]
+            identity = _model_identity(reviewer)
+            if identity in seen_reviewers:
+                return {"error": f"Duplicate reviewer identity in saved session: {seen_reviewers[identity]}, {reviewer}. Start a new session with distinct models.",
+                        "session_id": sid}
+            seen_reviewers[identity] = reviewer
+        cooling_missing = [ref for ref in missing if stored and is_cooling(ref)]
+        crows.extend({"model": ref, "error": "適合査読はクールダウン中のため未実施です"}
+                     for ref in cooling_missing)
+        pending = [ref for ref in missing if ref not in cooling_missing]
+        if pending:
             cprompt = _consult_prompt(question, main_reply, round_no, mode=mode, draft=draft,
                                       basis=basis, stage="compliance")
-            cres = ask_many(refs, cprompt, system=COMPLIANCE_SYSTEM, max_tokens=max_tokens,
-                            kind="consult", avoid=as_str_list(args.get("exclude")) or None)
-            crows = []
-            for ref, res in zip(refs, cres):
+            used_reviewers = [name for row in crows if not row.get("error")
+                              for name in (row.get("model"), row.get("served_by"))
+                              if isinstance(name, str) and name]
+            cres = ask_many(pending, cprompt, system=COMPLIANCE_SYSTEM, max_tokens=max_tokens,
+                            kind="consult", avoid=as_str_list(args.get("exclude")),
+                            identity_avoid=used_reviewers + cooling_missing)
+            for index, ref in enumerate(pending):
+                res = cres[index] if index < len(cres) else {"error": "適合査読の応答がありません"}
                 if res.get("error"):
-                    crows.append({"model": ref, "error": res["error"]})
+                    crows.append({"model": ref, "error": res["error"],
+                                  **({"quota_accounting": res["quota_accounting"]} if res.get("quota_accounting") else {})})
                     continue
                 row = {"model": ref, "served_by": res.get("served_by"),
                        "conclusion": truncate(res["text"], 400),
                        "text": truncate(res["text"], 1500),
                        "truncated": bool(res.get("truncated")),
-                       "redactions": as_int(res.get("redactions"), 0, 0, 999)}
+                       "redactions": as_int(res.get("redactions"), 0, 0, 999),
+                       **({"quota_accounting": res["quota_accounting"]} if res.get("quota_accounting") else {})}
                 row.update(parse_compliance(res["text"]))
                 crows.append(row)
-            rounds.append({"round": round_no, "kind": "compliance", "answers": crows})
-            compliance_rows = [row for row in crows if not row.get("error")]
+        if missing:
+            rounds.append({"round": round_no, "kind": "compliance", "answers": crows,
+                           "fingerprint": fingerprint})
             round_no += 1
-        compliance_summary = summarize_compliance(compliance_rows)
+        compliance_rows = [row for row in crows if not row.get("error")]
+        compliance_failures = [row for row in crows if row.get("error")]
+        compliance_summary = summarize_compliance(crows)
     prompt = _consult_prompt(question, main_reply, round_no, mode=mode, draft=draft)
     results = ask_many(refs, prompt, system=REVIEW_SYSTEM if review_mode else CONSULT_SYSTEM,
                        max_tokens=max_tokens, kind="consult",
@@ -6492,7 +6907,8 @@ def tool_consult(args: dict) -> dict:
     round_rows = []
     for ref, res in zip(refs, results):
         if res.get("error"):
-            round_rows.append({"model": ref, "error": res["error"]})
+            round_rows.append({"model": ref, "error": res["error"],
+                               **({"quota_accounting": res["quota_accounting"]} if res.get("quota_accounting") else {})})
             continue
         parsed = parse_labeled(res["text"])
         row = {"model": ref, "served_by": res.get("served_by"),
@@ -6500,7 +6916,8 @@ def tool_consult(args: dict) -> dict:
                "confidence": parsed["confidence"], "question": parsed["question"],
                "text": truncate(res["text"], 1500), "cot_leak": res.get("cot_leak"),
                "truncated": bool(res.get("truncated")),
-               "redactions": as_int(res.get("redactions"), 0, 0, 999)}
+               "redactions": as_int(res.get("redactions"), 0, 0, 999),
+               **({"quota_accounting": res["quota_accounting"]} if res.get("quota_accounting") else {})}
         if review_mode:
             row.update(parse_review(res["text"]))
         round_rows.append(row)
@@ -6529,7 +6946,8 @@ def tool_consult(args: dict) -> dict:
         debate_rows = []
         for ref, res in zip(refs, rebuttal):
             if res.get("error"):
-                debate_rows.append({"model": ref, "error": res["error"]})
+                debate_rows.append({"model": ref, "error": res["error"],
+                                    **({"quota_accounting": res["quota_accounting"]} if res.get("quota_accounting") else {})})
                 continue
             labels = {}
             for part in (res["text"] or "").splitlines():
@@ -6541,7 +6959,8 @@ def tool_consult(args: dict) -> dict:
                                 "position": truncate(labels.get("立場") or "", 300),
                                 "strongest_objection": truncate(labels.get("最強の反論") or "", 400),
                                 "response": truncate(labels.get("応答") or "", 400),
-                                "unresolved": truncate(labels.get("未解決") or "", 400)})
+                                "unresolved": truncate(labels.get("未解決") or "", 400),
+                                **({"quota_accounting": res["quota_accounting"]} if res.get("quota_accounting") else {})})
         rounds.append({"round": round_no + 1, "kind": "debate", "answers": debate_rows})
         initial = {row["model"]: row.get("conclusion") for row in round_rows if not row.get("error")}
         # ラウンド途中で脱落した参加者を**明示的に残す**（実測: deep 討論の 2 ラウンド目で 1 体が落ち、
@@ -6578,17 +6997,17 @@ def tool_consult(args: dict) -> dict:
                 continue
             debated = debate_by_model.get(initial.get("model"), {})
             if debated.get("error"):
-                last.append({**initial, "error": debated["error"]})
+                last.append(initial)
                 continue
             last.append({
-                "model": initial["model"], "served_by": debated.get("served_by"),
+                **initial, "model": initial["model"], "served_by": debated.get("served_by") or initial.get("served_by"),
                 "conclusion": debated.get("position") or initial.get("conclusion") or "",
                 "confidence": initial.get("confidence"), "question": initial.get("question") or "",
                 "answer": debated.get("text") or initial.get("text") or "",
                 "text": debated.get("text") or initial.get("text") or "",
             })
     else:
-        last = [row for row in rounds[-1]["answers"] if not row.get("error")]
+        last = [row for row in round_rows if not row.get("error")]
     question_rows = last
     last = [row for row in last if not row.get("error")]
     open_questions = []
@@ -6631,6 +7050,9 @@ def tool_consult(args: dict) -> dict:
         "created_at": (stored or {}).get("created_at") or now_ts(),
     })
     conf = [row["confidence"] for row in last if isinstance(row.get("confidence"), int)]
+    quota_accounting = [{"round": r.get("round"), "kind": r.get("kind"), "model": a.get("model"),
+                         "warning": a["quota_accounting"]}
+                        for r in rounds for a in r.get("answers", []) if a.get("quota_accounting")]
     return {
         "session_id": sid,
         "mode": mode,
@@ -6639,13 +7061,14 @@ def tool_consult(args: dict) -> dict:
         "question": truncate(question, 400),
         "models": refs, "selection": info,
         "concurrency": PROVIDER_GATE.report(refs),
-        "quota": quota_report(refs),
+        **_quota_report_after_answers(refs),
+        "quota_accounting": quota_accounting,
         "agreement": agreement_of([row.get("conclusion") or "" for row in last]),
         "agreement_note": "表層合意度。正しさの確率ではありません。",
         "confidence_mean": round(sum(conf) / len(conf), 1) if conf else None,
         "consensus": last,
         "failed": [{"model": row.get("model"), "error": truncate(row.get("error") or "", 160)}
-                   for row in rounds[-1]["answers"] if row.get("error")],
+                   for row in compliance_failures + rounds[-1]["answers"] if row.get("error")],
         "open_questions_for_main": open_questions_for_main,
         "open_questions": kept,
         "deferred_questions": deferred,
@@ -7094,12 +7517,13 @@ def _think_verify_block(args: dict, question: str, steps: list, step: dict,
     refs, info = select_models(as_int(args.get("size"), 2, 1, 4),
                                as_str_list(args.get("models")) or None,
                                prefer=as_str_list(args.get("prefer")) or None,
-                               exclude=(as_str_list(args.get("exclude")) or []) + used)
+                               exclude=as_str_list(args.get("exclude")) or None,
+                               identity_exclude=used)
     if not refs:
         return None, used, _no_models()   # 状態を書かない（環境障害で台帳を汚さない）
     results = ask_many(refs, _think_prompt(question, steps, step, preview), system=THINK_CRITIC_SYSTEM,
                        max_tokens=as_int(args.get("max_tokens"), 400, 16, 2000), kind="think",
-                       avoid=as_str_list(args.get("exclude")) or None)
+                       avoid=as_str_list(args.get("exclude")) or None, identity_avoid=used)
     rows: list[dict] = []
     for ref, res in zip(refs, results):
         if res.get("error"):
@@ -7148,7 +7572,7 @@ def _think_verify_block(args: dict, question: str, steps: list, step: dict,
         for name in (row.get("model"), row.get("served_by")):
             if isinstance(name, str) and name and name not in served:
                 served.append(name)
-    return verification, (used + served)[:12], None
+    return verification, list(dict.fromkeys(used + served)), None
 
 
 def tool_think(args: dict) -> dict:
@@ -7239,7 +7663,10 @@ def tool_think(args: dict) -> dict:
     if st["kind"] == "hypothesis":
         step["hypothesis_status"] = "open"
     used = [m for m in ((stored or {}).get("verifier_models") or []) if isinstance(m, str)]
-    question = as_str(args.get("question")) or (stored or {}).get("question") or ""
+    previous_used = list(used)
+    previous_generation = (stored or {}).get("verifier_generation", 0)
+    explicit_question = as_str(args.get("question"))
+    question = explicit_question or (stored or {}).get("question") or ""
     # 検証者へ渡す台帳には、今回の呼び出しで決まる計画・分岐の決着を先に反映して見せる。
     preview = _think_preview_row(stored or {}, st)
 
@@ -7259,7 +7686,20 @@ def tool_think(args: dict) -> dict:
             alternatives.update({"session_id": sid_in or None})
             return alternatives    # 状態を書かない（規約 21）
         step["alternatives"] = alternatives
-        used = (used + list(alternatives.get("models") or []))[:12]
+        alt_served = [name for row in alternatives.get("answers", []) if isinstance(row, dict)
+                      for name in (row.get("model"), row.get("served_by"))
+                      if isinstance(name, str) and name]
+        used = list(dict.fromkeys(used + list(alternatives.get("models") or []) + alt_served))
+
+    # Merge and rotate against the latest history while holding the ledger lock.
+    selected = verification is not None or alternatives is not None
+    selected_models = []
+    for result in (verification, alternatives):
+        if result is not None:
+            selected_models.extend(result.get("models") or [])
+            selected_models.extend(name for answer in result.get("answers", []) if isinstance(answer, dict)
+                                   for name in (answer.get("model"), answer.get("served_by"))
+                                   if isinstance(name, str) and name)
 
     # 台帳への統合は**ロック内**で行う（番号の採番と、他ステップ・メタへの波及も含む。
     # 並列呼び出しで片方が消えるのを防ぐ）。検証プロンプトに載せた `#n` は採番前の見積りなので、
@@ -7269,12 +7709,23 @@ def tool_think(args: dict) -> dict:
            "resolve_branch": st["resolve_branch"], "branch_status": st["branch_status"],
            "plan": st["plan"], "subgoal_done": st["subgoal_done"],
            "total": total, "total_auto": total_auto}
-    merged = thought_merge(sid_in, step, question=question, verifier_models=used, card=card,
-                           assign_number=not explicit_number, ops=ops)
+    if st["subgoal"]:
+        ops["subgoal_check"] = {"raw": st["subgoal_raw"],
+                                "identity": _thought_subgoal_identity(preview, st["subgoal"])}
+    merged = thought_merge(sid_in, step, question=explicit_question, verifier_models=used if selected else None, card=card,
+                           assign_number=not explicit_number, ops=ops,
+                           verifier_snapshot=previous_used if selected else None,
+                           verifier_additions=selected_models if selected else None,
+                           verifier_snapshot_generation=previous_generation if selected else None,
+                           require_existing=stored is not None)
+    if merged.get("error"):
+        return merged
     if merged.get("refused"):
         return {"error": f"思考数が上限（{THOUGHT_MAX_STEPS}）に達しています。新しい session_id で"
                          "台帳を分けるか、FREEAGENT_THOUGHT_MAX_STEPS を上げてください",
                 "session_id": merged["session_id"], "steps_recorded": merged["steps_recorded"]}
+    if merged.get("verifier_omitted"):
+        notes.append(f"検証者の古い履歴を{merged['verifier_omitted']}件省略しました。古いモデルは次回以降に再選択され得ます。")
     sid = merged["session_id"]
     step = merged["step"] or step
     n = as_int(step.get("n"), n, 1, 9999)
@@ -7398,6 +7849,27 @@ def _think_preview_row(row: dict, st: dict) -> dict:
         meta[st["resolve_branch"]]["status"] = st["branch_status"]
     out["branch_meta"] = meta
     return out
+
+
+def _thought_subgoal_identity(preview: dict, subgoal: int):
+    for key in ("plan", "plan_retired"):
+        for item in preview.get(key) or []:
+            if isinstance(item, dict) and as_int(item.get("id"), 0, 0, 9999) == subgoal:
+                return (subgoal, as_str(item.get("text")), key)
+    return None
+
+
+def _thought_subgoal_still_matches(row: dict, steps: list[dict], step: dict, ops: dict) -> bool:
+    check = ops.get("subgoal_check")
+    if not check:
+        return True
+    problem, current = _think_structure({"plan": ops.get("plan"), "subgoal": check["raw"],
+                                         "subgoal_done": ops.get("subgoal_done")},
+                                        steps, as_int(step.get("n"), 0, 0, 9999), row)
+    if problem:
+        return False
+    identity = _thought_subgoal_identity(_think_preview_row(row, current), current["subgoal"])
+    return identity is not None and identity == check["identity"]
 
 
 def _think_structure(args: dict, steps: list[dict], n: int, row: dict) -> tuple[dict | None, dict]:
@@ -7582,7 +8054,7 @@ def _think_alternatives(args: dict, question: str, steps: list[dict], step: dict
     user_exclude = as_str_list(args.get("exclude")) or []
     refs, info = select_models(as_int(args.get("size"), 2, 1, 4), None,
                                prefer=as_str_list(args.get("prefer")) or None,
-                               exclude=user_exclude + list(exclude))
+                               exclude=user_exclude, identity_exclude=exclude)
     if not refs:
         return _no_models()
     prompt = _think_prompt(question, steps, step, row).rsplit("\n\n", 1)[0] + (
@@ -7593,7 +8065,7 @@ def _think_alternatives(args: dict, question: str, steps: list[dict], step: dict
     # avoid: フォールバックが同じ呼び出しの**検証者**に落ちると「検証者とも別のモデル」が破れる（実測）。
     results = ask_many(refs, prompt, system=THINK_ALT_SYSTEM,
                        max_tokens=as_int(args.get("max_tokens"), 400, 16, 2000), kind="think",
-                       avoid=user_exclude + list(exclude))
+                       avoid=user_exclude, identity_avoid=exclude)
     rows: list[dict] = []
     for ref, res in zip(refs, results):
         if res.get("error"):
@@ -8522,11 +8994,10 @@ def _diag_advice(totals: dict, by_class: dict, ref_fail: dict, fails: list[dict]
         return {"kind": "ok", "check": [],
                 "advice": "窓の中に失敗はありません（全て成功）。この調子なら選抜の設定を触る必要はありません。"}
     share = {k: v / failed for k, v in by_class.items()}
-    top_class, top_n = max(by_class.items(), key=lambda kv: kv[1])
     if share.get("rate_limited", 0.0) >= 0.4:
         return {"kind": "rate_limited", "check": ["FREEAGENT_QUOTA_LIMITS", "FREEAGENT_PROVIDER_ORDER",
                                                   "FREEAGENT_QUOTA"],
-                "advice": f"失敗 {failed} 件のうち {top_n} 件が枠（429・クォータ・クールダウン）です。"
+                "advice": f"失敗 {failed} 件のうち {by_class['rate_limited']} 件が枠（429・クォータ・クールダウン）です。"
                           "FREEAGENT_QUOTA_LIMITS の宣言値が実際の枠より小さいか、1 つの提供元に寄りすぎています"
                           "（宣言が無ければ何も制限していないので、この分類は提供元側の 429 です）。"
                           "size を減らすか、PROVIDER_ORDER で別の提供元を先に並べてください。"}
@@ -8534,12 +9005,12 @@ def _diag_advice(totals: dict, by_class: dict, ref_fail: dict, fails: list[dict]
         ranked_fail = [r for r, _ in sorted(ref_fail.items(), key=lambda kv: (-kv[1], kv[0]))]
         worst = ", ".join(ranked_fail[:3]) or "特定できず"
         return {"kind": "empty_output", "check": ["FREEAGENT_MODEL_EXCLUDE"],
-                "advice": f"失敗 {failed} 件のうち {top_n} 件が空応答です（思考モデルが max_tokens を"
+                "advice": f"失敗 {failed} 件のうち {by_class['no_output']} 件が空応答です（思考モデルが max_tokens を"
                           f"使い切る型）。呼び出しの max_tokens を 256 以上に上げるか、空応答の多いモデルを"
                           f"FREEAGENT_MODEL_EXCLUDE で外してください（上位: {worst}）。"}
     if share.get("timeout", 0.0) >= 0.2:
         return {"kind": "timeout", "check": ["FREEAGENT_CALL_BUDGET", "FREEAGENT_MAX_WORKERS"],
-                "advice": f"失敗 {failed} 件のうち {top_n} 件が時間切れです。size と FREEAGENT_MAX_WORKERS を"
+                "advice": f"失敗 {failed} 件のうち {by_class['timeout']} 件が時間切れです。size と FREEAGENT_MAX_WORKERS を"
                           f"下げるか、FREEAGENT_CALL_BUDGET を延ばしてください（既定は {CALL_BUDGET_S:g} 秒）。"}
     if ref_fail:
         ref, n = max(ref_fail.items(), key=lambda kv: kv[1])
@@ -8907,6 +9378,8 @@ def _render_ask(data: dict) -> str:
         meta.append("切断あり")
     if data.get("cot_leak"):
         meta.append("思考過程の混入")
+    if data.get("quota_accounting"):
+        meta.append(f"クォータ警告: {data['quota_accounting']}")
     out.append("(" + ", ".join(str(m) for m in meta) + ")")
     return "\n".join(out)
 def _render_fanout(data: dict) -> str:
@@ -8916,11 +9389,16 @@ def _render_fanout(data: dict) -> str:
             f"倍率 {data.get('speedup')}）")
     if data.get("slot_waited"):
         head += f" / 提供元の枠待ち {data['slot_waited']} 件（429 を踏まずに順番待ちで吸収）"
+    if data.get("quota_report_error"):
+        head += f"\n⚠️ クォータ報告失敗: {data['quota_report_error']}"
     head += "".join(f"\n{line}" for line in _dropped_lines(data, "prompts", MAX_PROMPTS_PER_CALL))
     body = ""
     for row in (data.get("results") or [])[:12]:
         text = row.get("answer") or row.get("error") or ""
         body += f"\n  • {row['model']}: {truncate(text, 200)}"
+    for index, row in enumerate(data.get("results") or [], 1):
+        if row.get("quota_accounting"):
+            body += f"\n  ⚠️ #{index} クォータ: {row['quota_accounting']}"
     return head + body
 def _render_panel(data: dict) -> str:
     """`freeagent_panel` の本文（`content` = 人間向け日本語）。"""
@@ -8931,6 +9409,8 @@ def _render_panel(data: dict) -> str:
              f" / 合意度 {data.get('agreement')}{conf_note}"]
     if data.get("slot_waited"):
         lines.append(f"ℹ️ 提供元の枠待ち {data['slot_waited']} 件（429 を踏まずに順番待ちで吸収しました）")
+    if data.get("quota_report_error"):
+        lines.append(f"⚠️ クォータ報告失敗: {data['quota_report_error']}")
     for group in (data.get("consensus") or [])[:5]:
         lines.append(f"  • {', '.join(group['models'])}: {truncate(group['excerpt'], 160)}")
     if data.get("open_questions"):
@@ -8938,7 +9418,12 @@ def _render_panel(data: dict) -> str:
         for row in data["open_questions"][:5]:
             lines.append(f"  - {row['model']}: {truncate(row['question'], 160)}")
     refined = data.get("refined")
+    for index, row in enumerate(data.get("answers") or [], 1):
+        if row.get("quota_accounting"):
+            lines.append(f"⚠️ #{index} クォータ: {row['quota_accounting']}")
     if isinstance(refined, dict):
+        if refined.get("quota_accounting"):
+            lines.append(f"⚠️ 統合クォータ: {refined['quota_accounting']}")
         if refined.get("error"):
             lines.append(f"⚠️ 統合に失敗: {truncate(refined['error'], 120)}")
         elif refined.get("conclusion"):
@@ -8991,6 +9476,12 @@ def _render_grounded(data: dict) -> str:
     lines = [f"根拠 {data.get('evidence_citation_count', data.get('citation_count'))} 件 / 引用付き回答 "
              f"{data.get('answers_with_citations')}/{data.get('answered')} 体"
              f" / 合意度 {data.get('agreement')}"]
+    if data.get("quota_report_error"):
+        lines.append(f"⚠️ クォータ報告失敗: {data['quota_report_error']}")
+    for index, row in enumerate(data.get("answers") or [], 1):
+        if row.get("quota_accounting"):
+            lines.append(f"⚠️ #{index} クォータ: {row['quota_accounting']}")
+    warning_end = len(lines)
     # 検索の失敗（未知のソース名など）も人間に見せる（typo を黙って捨てない）。
     lookup = data.get("lookup")
     lookup = lookup if isinstance(lookup, dict) else {}
@@ -9013,7 +9504,7 @@ def _render_grounded(data: dict) -> str:
     credits = [c for cite in (data.get("citations") or []) for c in
                ((cite.get("attributions") or []) + ([cite["attribution"]] if cite.get("attribution") else []))]
     if credits:
-        lines[1:1] = list(dict.fromkeys(credits))
+        lines[warning_end:warning_end] = list(dict.fromkeys(credits))
     return "\n".join(lines[:40])
 def _dropped_lines(data: dict, label: str, cap: int) -> list[str]:
     """上限で実行しなかった件数の警告行（規約 63・無ければ空）。
@@ -9035,6 +9526,11 @@ def _render_map(data: dict) -> str:
     for row in (data.get("results") or [])[:10]:
         text = row.get("output") or f"✗ {row.get('error', '')}"
         lines.append(f"  • {truncate(row.get('item') or '', 60)} → {truncate(text, 160)}")
+    for index, row in enumerate(data.get("results") or [], 1):
+        if row.get("quota_accounting"):
+            lines.append(f"⚠️ #{index} クォータ: {row['quota_accounting']}")
+    if data.get("reduce_quota_accounting"):
+        lines.append(f"⚠️ 統合クォータ: {data['reduce_quota_accounting']}")
     if data.get("reduced"):
         lines.append(f"統合:\n{truncate(data['reduced'], 1200)}")
     return "\n".join(lines)
@@ -9043,6 +9539,10 @@ def _render_consult(data: dict) -> str:
     lines = [f"相談 {data.get('session_id')} / mode={data.get('mode')} / "
              f"ラウンド{data.get('rounds_run')} / stage={data.get('stage')}",
              f"合意度 {data.get('agreement')} / 確信度平均 {data.get('confidence_mean')}"]
+    if data.get("quota_report_error"):
+        lines.append(f"⚠️ クォータ報告失敗: {data['quota_report_error']}")
+    for warning in data.get("quota_accounting") or []:
+        lines.append(f"⚠️ 第{warning['round']}ラウンド {warning['model']} クォータ: {warning['warning']}")
     failed_rows = data.get("failed") or []
     shown = {(row.get("model"), row.get("error")) for row in failed_rows}
     for row in failed_rows:
@@ -9992,7 +10492,7 @@ def handle_tool_call(params: dict) -> dict:
             try:
                 data = handler(args)
             finally:
-                _unregister_active(request_id)
+                _unregister_active(request_id, deadline)
     except Exception as exc:  # ツールは絶対に例外を漏らさない
         data = {"error": f"internal error: {type(exc).__name__}: {exc}"}
     finally:
@@ -10159,6 +10659,7 @@ def serve() -> None:
         # Drain already-dispatched calls before interpreter exit starts closing
         # the optional scheduler or the stdlib ThreadPoolExecutor registry.
         pool.shutdown(wait=True)
+        _drain_parallel_futures()
 
 
 # ================================================================ §10 HTTP (StreamableHTTP)
@@ -10316,10 +10817,13 @@ def _http_process(msg, session, marker=None):
     """
     items = msg if isinstance(msg, list) else [msg]
     replies = []
+    # A stateless HTTP POST has no client identity.  Never share its request
+    # namespace with another POST (or with the stdio transport).
+    request_session = session["cv"] if session is not None else object()
     with bound_progress(_http_progress_maker(session)):
         for item in items:
             rid = item.get("id") if isinstance(item, dict) else None
-            with request_scope(rid):
+            with request_scope(rid, request_session):
                 found = _replies_for(item, marker)
             for reply in found:
                 if isinstance(reply, dict) and "id" in reply:
