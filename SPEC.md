@@ -1685,6 +1685,28 @@ GitHub の harness / skills 系（`obra/superpowers` / `anthropics/skills` / `af
 実測: `tools/list` 21,211 → **22,317 文字（+1,106）**。974 テスト（新規 20 件）。Resource は 4 → 9 本
 （合計 6,984 文字。**読まない限りモデルの入力には乗らない**）。
 
+### 6.39 呼び出し単位の ID と引数補完（v0.38.0）
+
+外部の観測基盤（Langfuse / openlit の span、親子を持つ）と MCP の `completion/complete` を、
+**依存を増やさず**に写した。
+
+- **traces に `run` / `tool` を足した**。traces は 1 行 1 モデル呼び出しなので、これまで
+  「1 回の panel の内訳」が復元できなかった（実測 2026-11-02: 1,812 行で run/parent を持つ行 **0**、
+  複数モデル系 497 行、うち 58 行は「同じ呼び出しの他の枠が使用中」という**呼び出し文脈でしか
+  説明できない失敗**）。`handle_tool_call` が `run_scope(new_run_id(), tool)` を張り、
+  **並列ワーカーへは `_run_worker` で明示的に引き継ぐ**（スレッドローカルは別スレッドに伝播しない。
+  合流器・進捗と同じ非対称）。
+- `freeagent_diagnose` に `runs` / `runs_total` / `unattributed_calls` を足し、`run` で絞れるようにした。
+  **run を持たない旧行は `unattributed_calls` に数える**（黙って捨てない）。**返り値のキーはモードで
+  変えない**（規約 48）。
+- **`completions` capability を宣言し、`completion/complete` を実装**。仕様（2025-06-18 §Completion）で
+  補完の対象は **`ref/prompt` と `ref/resource` だけ**で、**ツール引数の補完は規格に無い**
+  （当初の想定は誤りで、仕様を読んで修正した）。プロンプトは公開していないので `ref/prompt` は空を返し、
+  `ref/resource` はリソース URI（9 本）を前方一致・テンプレート（`resource://freeagent/{name}`）対応で返す。
+  上限は 100 件（仕様の上限）。
+
+実測: `tools/list` 22,317 → **22,463 文字（+146）**。991 テスト（新規 17 件）。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。

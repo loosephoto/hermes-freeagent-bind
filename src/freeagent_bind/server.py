@@ -65,6 +65,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -86,7 +87,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.37.0"
+SERVER_VERSION = "0.38.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -1439,6 +1440,43 @@ def select_models(size: int, requested: list[str] | None = None, *,
 #
 # 1 行 1 呼び出しのメタデータ（本文なし）。上限を超えたら 1 世代だけ退避する。
 
+# ---------------------------------------------------------------- §2.3.1 呼び出し単位の ID
+#
+# traces は 1 行 1 モデル呼び出しなので、**同じツール呼び出しの中の内訳**（panel の 3 体中 2 体が
+# 落ちた、など）を後から復元できなかった（実測 2026-11-02: 1,812 行のうち run/parent を持つ行は 0。
+# 複数モデル系が 497 行、うち 58 行は「同じ呼び出しの他の枠が使用中」という**呼び出し文脈でしか
+# 説明できない失敗**で、集計では other に埋もれていた）。
+#
+# 呼び出し 1 回に 1 つの `run` を張り、**並列ワーカーへは明示的に引き継ぐ**（スレッドローカルは
+# 別スレッドに伝播しない。合流器・進捗と同じ非対称）。ツール名も一緒に持たせる（集計の軸になる）。
+
+_RUN_LOCAL = threading.local()
+
+
+def current_run() -> str:
+    return getattr(_RUN_LOCAL, "run", "") or ""
+
+
+def current_tool() -> str:
+    return getattr(_RUN_LOCAL, "tool", "") or ""
+
+
+@contextlib.contextmanager
+def run_scope(run: str, tool: str = ""):
+    """このスレッドの `run` / `tool` を差し替える（`finally` で必ず戻す）。"""
+    previous = (current_run(), current_tool())
+    _RUN_LOCAL.run = run or ""
+    _RUN_LOCAL.tool = tool or previous[1]
+    try:
+        yield run
+    finally:
+        _RUN_LOCAL.run, _RUN_LOCAL.tool = previous
+
+
+def new_run_id() -> str:
+    return "r" + uuid.uuid4().hex[:12]
+
+
 def trace_path() -> str:
     return os.environ.get("FREEAGENT_TRACE_PATH") or os.path.join(state_dir(), "traces.jsonl")
 
@@ -1449,10 +1487,12 @@ _TRACE_MAX_BYTES = _env_int("FREEAGENT_TRACE_MAX_BYTES", 5_000_000)
 def trace_call(kind: str, ref: str, ok: bool, *, error: str = "", served_by: str = "",
                rate_limited=None, unavailable=None, skipped_cooling=None,
                answer_len: int = 0, answer_sha1: str = "", truncated: bool = False,
-               latency_s: float = 0.0, tokens: dict | None = None) -> None:
+               latency_s: float = 0.0, tokens: dict | None = None,
+               run: str = "", tool: str = "") -> None:
     if not TRACE_ENABLED:
         return
-    row = {"kind": kind, "ref": ref, "ok": bool(ok), "error": error or None,
+    row = {"run": run or current_run(), "tool": tool or current_tool(),
+           "kind": kind, "ref": ref, "ok": bool(ok), "error": error or None,
            "error_class": classify_error(error) if error else None,
            "served_by": served_by or ref, "rate_limited": rate_limited,
            "unavailable": unavailable, "skipped_cooling": skipped_cooling,
@@ -3699,6 +3739,14 @@ def bound_coalescer():
         _COALESCE_LOCAL.coalescer = prev
 
 
+def _run_worker(worker, run: str, tool: str):
+    """ワーカーのスレッドに呼び出し ID を張ってから本体を呼ぶ（`run_parallel` の内側でのみ使う）。"""
+    def wrapped(job):
+        with run_scope(run, tool):
+            return worker(job)
+    return wrapped
+
+
 def _coalescer_worker(worker, coalescer):
     """ワーカーを包んで、合流器を**そのスレッド**にも見せる。
 
@@ -3973,6 +4021,11 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None,
     _coalescer = _call_coalescer()
     if _coalescer is not None:
         worker = _coalescer_worker(worker, _coalescer)
+    # 呼び出し単位の ID も**ワーカーへ明示的に渡す**（スレッドローカルは別スレッドに伝播しない）。
+    # 渡さないと、並列経路の traces だけ run が空になり「呼び出しの内訳」が復元できない。
+    _parent_run, _parent_tool = current_run(), current_tool()
+    if _parent_run:
+        worker = _run_worker(worker, _parent_run, _parent_tool)
     if _fair_eligible(jobs, fair_keys, fair_providers):
         return _run_fair(jobs, worker, workers, deadline, fair_providers)
     if workers == 1:
@@ -8328,6 +8381,7 @@ TOOLS: list[dict] = [
             "（モデル呼び出し 0 回・ネットワーク 0 回）。traces（1 行 1 呼び出しのメタデータ）を集計し、"
             "成功率・失敗理由の内訳・上位のエラー文・遅延の分位（p50/p90/p95/p99）・モデル別の遅さ・"
             "直近の失敗・次の一手（`advice`）を返す。`days` で窓（既定 7 日）、`kind` / `model` で絞れる。"
+            "`run` を渡すと**1 回の呼び出しの内訳**（panel の 3 体中 2 体が落ちた等）に絞れる。"
             "【使わない条件】いま使えるモデルの一覧や Free 判定が要るなら `freeagent_models`。"
             "実際に意見や答えが欲しいなら `panel` / `consult` / `ask`。記録に無いことは返さない"
             "（推測で原因を書かない）。"
@@ -8345,6 +8399,8 @@ TOOLS: list[dict] = [
                                         "eval / probe など traces の kind と同じ語）"},
                 "model": {"type": "string",
                           "description": "モデル（provider/model）で絞る。ref か served_by の部分一致"},
+                "run": {"type": "string",
+                        "description": "呼び出し単位の ID（`r…`）で絞る。1 回の panel / consult の内訳を見るときに使う"},
                 "limit": {"type": "integer", "description": "上位エラー・遅いモデル・直近失敗の件数（既定 5・1〜20）"},
             },
             "required": [],
@@ -8465,6 +8521,7 @@ def tool_diagnose(args: dict) -> dict:
     limit = as_int(args.get("limit"), 5, 1, 20)
     kind_filter = as_str(args.get("kind"))
     model_filter = as_str(args.get("model"))
+    run_filter = as_str(args.get("run"))
     now = now_ts()
     since = now - days * 86400
     rows, info = _diag_rows(since)
@@ -8473,6 +8530,8 @@ def tool_diagnose(args: dict) -> dict:
     if model_filter:
         rows = [r for r in rows
                 if model_filter in (as_str(r.get("ref")), as_str(r.get("served_by")))]
+    if run_filter:
+        rows = [r for r in rows if as_str(r.get("run")) == run_filter]
     ok_rows = [r for r in rows if r.get("ok")]
     fail_rows = [r for r in rows if not r.get("ok")]
     totals = {"calls": len(rows), "ok": len(ok_rows), "failed": len(fail_rows),
@@ -8518,6 +8577,37 @@ def tool_diagnose(args: dict) -> dict:
         slowest.append({"model": ref, "n": len(values),
                         "p50": _diag_pct(values, 0.5), "p95": _diag_pct(values, 0.95)})
     slowest.sort(key=lambda row: (-row["p95"], -row["n"], row["model"]))
+    # 呼び出し単位（run）の内訳。**同じ呼び出しの中の失敗**はここでしか見えない。
+    per_run: dict[str, dict] = {}
+    unattributed = 0
+    for row in rows:
+        rid = as_str(row.get("run"))
+        if not rid:
+            unattributed += 1
+            continue
+        slot = per_run.setdefault(rid, {"run": rid, "tool": as_str(row.get("tool")) or "-",
+                                       "calls": 0, "ok": 0, "failed": 0,
+                                       "first_ts": 0.0, "error_classes": {}})
+        slot["calls"] += 1
+        if row.get("ok"):
+            slot["ok"] += 1
+        else:
+            slot["failed"] += 1
+            key = as_str(row.get("error_class")) or "unknown"
+            slot["error_classes"][key] = slot["error_classes"].get(key, 0) + 1
+        ts = as_float(row.get("ts"), 0.0)
+        if ts and (not slot["first_ts"] or ts < slot["first_ts"]):
+            slot["first_ts"] = ts
+    run_rows = []
+    for slot in per_run.values():
+        run_rows.append({"run": slot["run"], "tool": slot["tool"], "calls": slot["calls"],
+                         "ok": slot["ok"], "failed": slot["failed"],
+                         "ok_rate": round(slot["ok"] / slot["calls"], 3) if slot["calls"] else None,
+                         "at": datetime.datetime.fromtimestamp(slot["first_ts"]).strftime("%Y-%m-%d %H:%M:%S")
+                         if slot["first_ts"] else "",
+                         "error_classes": dict(sorted(slot["error_classes"].items(),
+                                                      key=lambda kv: (-kv[1], kv[0])))})
+    run_rows.sort(key=lambda row: (-row["failed"], -row["calls"], row["run"]))
     recent = []
     for row in fail_rows[-limit:]:
         recent.append({"ts": round(as_float(row.get("ts"), 0.0), 3),
@@ -8536,16 +8626,21 @@ def tool_diagnose(args: dict) -> dict:
         notes.append(f"traces を読めませんでした: {info['error']}")
     if not info["exists"]:
         notes.append("traces がまだありません（FREEAGENT_TRACE=0 で切っている可能性）")
-    if kind_filter or model_filter:
-        notes.append("kind / model で絞った結果です（全体は days だけを指定して見る）")
+    if unattributed:
+        notes.append(f"run を持たない行が {unattributed} 件あります（v0.38.0 より前の記録）")
+    if kind_filter or model_filter or run_filter:
+        notes.append("kind / model / run で絞った結果です（全体は days だけを指定して見る）")
     return {
         "window": {"days": days, "since": round(since, 3), "until": round(now, 3),
                    "since_utc": datetime.datetime.utcfromtimestamp(since).strftime("%Y-%m-%dT%H:%M:%SZ"),
                    "until_utc": datetime.datetime.utcfromtimestamp(now).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                   "filters": {"kind": kind_filter, "model": model_filter}},
+                   "filters": {"kind": kind_filter, "model": model_filter, "run": run_filter}},
         "totals": totals,
         "by_error_class": dict(sorted(by_class.items(), key=lambda kv: (-kv[1], kv[0]))),
         "by_kind": dict(sorted(by_kind.items())),
+        "runs": run_rows[:limit],
+        "runs_total": len(run_rows),
+        "unattributed_calls": unattributed,
         "top_errors": top_errors,
         "latency": latency,
         "slowest_models": slowest[:limit],
@@ -9137,6 +9232,14 @@ def _render_diagnose(data: dict) -> str:
         lines.append("  多い失敗:")
         for row in errors[:5]:
             lines.append(f"    - {as_int(row.get('count'), 0, 0, 10 ** 9)} 件: {truncate(as_str(row.get('error')), 100)}")
+    runs = data.get("runs") or []
+    if runs:
+        lines.append(f"  呼び出し単位の内訳（{as_int(data.get('runs_total'), 0, 0, 10 ** 9)} 件中、失敗の多い順）:")
+        for row in runs[:5]:
+            classes = row.get("error_classes") or {}
+            detail = (" [" + ", ".join(f"{k} {v}" for k, v in list(classes.items())[:3]) + "]") if classes else ""
+            lines.append(f"    - {as_str(row.get('at'))} {as_str(row.get('tool'))} {as_str(row.get('run'))}"
+                         f" {as_int(row.get('ok'), 0, 0, 10 ** 9)}/{as_int(row.get('calls'), 0, 0, 10 ** 9)}{detail}")
     recent = data.get("recent_failures") or []
     if recent:
         lines.append("  直近の失敗:")
@@ -9377,6 +9480,11 @@ def harness_on_initialize(params, marker=None) -> dict:
     info = detect_harness(params, marker=marker)
     announce = False
     with _HARNESS_LOCK:
+        # **鍵の欠落で落ちない**: 状態はテストや再初期化で消えることがある（実測: フルスイートで
+        # `KeyError: 'announced'` になり、initialize が例外になった）。既定値を置いてから読む。
+        _HARNESS.setdefault("announced", False)
+        _HARNESS.setdefault("notified", False)
+        _HARNESS.setdefault("log_level", "info")
         _HARNESS["info"] = info
         if not _HARNESS["announced"] and info["kind"] != "hermes" and harness_warn_enabled():
             _HARNESS["announced"] = announce = True
@@ -9393,6 +9501,7 @@ def harness_on_initialize(params, marker=None) -> dict:
         # resources: 変化の遅い知識（使い分け・在庫・鍵の入れ方・返り値の形）を呼ばれたときだけ読ませる（§11）。
         "capabilities": {"tools": {"listChanged": False},
                          "resources": {"subscribe": False, "listChanged": False},
+                         "completions": {},
                          "logging": {}},
         "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         "instructions": harness_instructions(info),
@@ -9709,6 +9818,41 @@ def resource_list() -> list[dict]:
             for name, (title, _builder) in _RESOURCE_BUILDERS.items()]
 
 
+# --- 引数の補完（MCP の completion/complete）--------------------------------
+#
+# 仕様（2025-06-18 §Completion）で補完の対象になるのは **`ref/prompt` と `ref/resource` だけ**で、
+# ツール引数の補完は規格に無い（2026-11-02 に仕様を確認）。そこで**リソース URI の補完**を実装する
+# （`resource://freeagent/sk…` と打つと候補が出る）。プロンプトは公開していないので空を返す
+# （「知らない名前を捏造しない」）。
+
+COMPLETION_MAX = 100
+
+
+def completion_complete(params: dict) -> dict:
+    """`completion/complete` の応答（values / total / hasMore）。"""
+    params = params if isinstance(params, dict) else {}
+    ref = params.get("ref") if isinstance(params.get("ref"), dict) else {}
+    argument = params.get("argument") if isinstance(params.get("argument"), dict) else {}
+    value = as_str(argument.get("value"))
+    ref_type = as_str(ref.get("type"))
+    candidates: list[str] = []
+    if ref_type == "ref/resource":
+        uris = [row["uri"] for row in resource_list()]
+        template = as_str(ref.get("uri"))
+        if "{" in template and "}" in template:
+            head = template.split("{", 1)[0]
+            tail = template.split("}", 1)[1]
+            prefix = head + value
+            candidates = [u for u in uris
+                          if u.startswith(prefix) and (not tail or u.endswith(tail))]
+        else:
+            prefix = value or template
+            candidates = [u for u in uris if u.startswith(prefix)] if prefix else list(uris)
+    total = len(candidates)
+    values = candidates[:COMPLETION_MAX]
+    return {"completion": {"values": values, "total": total, "hasMore": total > len(values)}}
+
+
 def resource_read(uri) -> str | None:
     """`resources/read` の本文。未知の URI は None（呼び出し側が -32002 を返す）。"""
     text = as_str(uri)
@@ -9786,7 +9930,8 @@ def handle_tool_call(params: dict) -> dict:
         # `budget_scope()` は**この呼び出し 1 回ぶん**の `Deadline` を張る（入れ子の
         # `run_parallel` / refine / reduce / 討論 2 ラウンド目が満額を新しく作らない）。
         # 要求 ID に紐づけておくと、`notifications/cancelled` で**未開始のジョブを投入させない**。
-        with progress_for(params), bound_coalescer(), budget_scope() as deadline:
+        with run_scope(new_run_id(), as_str(name)), progress_for(params), \
+                bound_coalescer(), budget_scope() as deadline:
             _register_active(request_id, deadline)
             try:
                 data = handler(args)
@@ -9874,6 +10019,8 @@ def _replies_for(msg, marker=None) -> list:
                      "error": {"code": -32002, "message": f"resource not found: {uri}"}}]
         return [{"jsonrpc": "2.0", "id": msg_id,
                  "result": {"contents": [{"uri": uri, "mimeType": RESOURCE_MIME, "text": text}]}}]
+    if method == "completion/complete":
+        return [{"jsonrpc": "2.0", "id": msg_id, "result": completion_complete(params)}]
     if method == "ping":
         return [{"jsonrpc": "2.0", "id": msg_id, "result": {}}]
     return [{"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"method not found: {method}"}}]
