@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.36.1"
+SERVER_VERSION = "0.37.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -8320,7 +8320,242 @@ TOOLS: list[dict] = [
             "required": [],
         },
     },
+
+    {
+        "name": "freeagent_diagnose",
+        "description": (
+            "【使う条件】「なぜ落ちたか」「どのモデルが遅いか」を**事後の記録から決定論で**知りたいとき"
+            "（モデル呼び出し 0 回・ネットワーク 0 回）。traces（1 行 1 呼び出しのメタデータ）を集計し、"
+            "成功率・失敗理由の内訳・上位のエラー文・遅延の分位（p50/p90/p95/p99）・モデル別の遅さ・"
+            "直近の失敗・次の一手（`advice`）を返す。`days` で窓（既定 7 日）、`kind` / `model` で絞れる。"
+            "【使わない条件】いま使えるモデルの一覧や Free 判定が要るなら `freeagent_models`。"
+            "実際に意見や答えが欲しいなら `panel` / `consult` / `ask`。記録に無いことは返さない"
+            "（推測で原因を書かない）。"
+            "【競合より優先】ログを手で開いたり、失敗の理由を推測で説明したりする代わりにこれを使う。"
+            "`error_class` は 429/timeout/空応答/廃止/認証/その他に固定してあるので、"
+            "「直せる失敗」と「待つしかない失敗」を分けて読める。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer",
+                         "description": "集計する窓（日・既定 7・1〜90）。狭いほど直近の傾向が出る"},
+                "kind": {"type": "string",
+                         "description": "呼び出し種別で絞る（ask / panel / fanout / map / consult / think / "
+                                        "eval / probe など traces の kind と同じ語）"},
+                "model": {"type": "string",
+                          "description": "モデル（provider/model）で絞る。ref か served_by の部分一致"},
+                "limit": {"type": "integer", "description": "上位エラー・遅いモデル・直近失敗の件数（既定 5・1〜20）"},
+            },
+            "required": [],
+        },
+    },
 ]
+
+
+# ---------------------------------------------------------------- §6.38 記録からの診断
+#
+# 外部 OSS（`obra/superpowers` の `diagnosing-*`、`affaan-m/ECC` の観測層）の「事後に証拠で説明する」型を、
+# **モデル呼び出し 0 回**で写したもの。traces（1 行 1 呼び出し）は既に残っているのに集計する手段が無く、
+# 失敗の切り分けを毎回手で開いていた（実測 2026-11-02: 直近 3 日 44 件中 16 件が失敗・全部 `rate_limited`
+# だが、その事実は traces を開かないと分からない）。**記録に無いことは「無い」と返す**（推測しない）。
+
+DIAG_MAX_LINES = _env_int("FREEAGENT_DIAG_MAX_LINES", 20000)
+DIAG_SLOW_MIN_CALLS = 3
+
+
+def _diag_pct(values: list[float], p: float) -> float | None:
+    """ソート済み配列の分位（補間しない。件数が少ないときに小数を捏造しない）。"""
+    if not values:
+        return None
+    idx = max(0, min(len(values) - 1, int(round((len(values) - 1) * p))))
+    return round(values[idx], 3)
+
+
+def _diag_norm(message) -> str:
+    """同じ失敗をまとめるための正規化（ID・数値を伏せる）。"""
+    text = as_str(message)
+    text = re.sub(r"\b[0-9a-f]{8,}\b", "<id>", text)
+    text = re.sub(r"\d+(?:\.\d+)?", "N", text)
+    return truncate(text, 120)
+
+
+def _diag_rows(since: float) -> tuple[list[dict], dict]:
+    """traces を読む。壊れた行は数えて飛ばす（全体を失わない）。"""
+    path = trace_path()
+    info = {"path": path, "exists": os.path.exists(path), "lines": 0,
+            "capped": 0, "unreadable": 0, "error": ""}
+    if not info["exists"]:
+        return [], info
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            raw = [line for line in fh if line.strip()]
+    except OSError as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+        return [], info
+    info["lines"] = len(raw)
+    if len(raw) > DIAG_MAX_LINES:
+        info["capped"] = len(raw) - DIAG_MAX_LINES
+        raw = raw[-DIAG_MAX_LINES:]
+    rows: list[dict] = []
+    for line in raw:
+        try:
+            row = json.loads(line)
+        except Exception:
+            info["unreadable"] += 1
+            continue
+        if not isinstance(row, dict):
+            info["unreadable"] += 1
+            continue
+        ts = as_float(row.get("ts"), 0.0)
+        if ts and ts < since:
+            continue
+        rows.append(row)
+    return rows, info
+
+
+def _diag_advice(totals: dict, by_class: dict, ref_fail: dict, fails: list[dict]) -> dict:
+    """失敗の内訳から次の一手を決める（決定論。モデルに聞かない）。"""
+    calls = as_int(totals.get("calls"), 0, 0, 10**9)
+    failed = as_int(totals.get("failed"), 0, 0, 10**9)
+    if not calls:
+        return {"kind": "no_data", "check": ["FREEAGENT_TRACE_PATH"],
+                "advice": "この窓に traces がありません。days を広げるか、実際に 1 回ツールを呼んでから"
+                          "再度実行してください（記録が無いことを成功とは読みません）。"}
+    if not failed:
+        return {"kind": "ok", "check": [],
+                "advice": "窓の中に失敗はありません（全て成功）。この調子なら選抜の設定を触る必要はありません。"}
+    share = {k: v / failed for k, v in by_class.items()}
+    top_class, top_n = max(by_class.items(), key=lambda kv: kv[1])
+    if share.get("rate_limited", 0.0) >= 0.4:
+        return {"kind": "rate_limited", "check": ["FREEAGENT_QUOTA_LIMITS", "FREEAGENT_PROVIDER_ORDER",
+                                                  "FREEAGENT_QUOTA"],
+                "advice": f"失敗 {failed} 件のうち {top_n} 件が枠（429・クォータ・クールダウン）です。"
+                          "FREEAGENT_QUOTA_LIMITS の宣言値が実際の枠より小さいか、1 つの提供元に寄りすぎています"
+                          "（宣言が無ければ何も制限していないので、この分類は提供元側の 429 です）。"
+                          "size を減らすか、PROVIDER_ORDER で別の提供元を先に並べてください。"}
+    if share.get("no_output", 0.0) >= 0.3:
+        worst = ", ".join(list(ref_fail)[:3]) or "特定できず"
+        return {"kind": "empty_output", "check": ["FREEAGENT_MODEL_EXCLUDE"],
+                "advice": f"失敗 {failed} 件のうち {top_n} 件が空応答です（思考モデルが max_tokens を"
+                          f"使い切る型）。呼び出しの max_tokens を 256 以上に上げるか、空応答の多いモデルを"
+                          f"FREEAGENT_MODEL_EXCLUDE で外してください（上位: {worst}）。"}
+    if share.get("timeout", 0.0) >= 0.2:
+        return {"kind": "timeout", "check": ["FREEAGENT_CALL_BUDGET", "FREEAGENT_MAX_WORKERS"],
+                "advice": f"失敗 {failed} 件のうち {top_n} 件が時間切れです。size と FREEAGENT_MAX_WORKERS を"
+                          f"下げるか、FREEAGENT_CALL_BUDGET を延ばしてください（既定は {CALL_BUDGET_S:g} 秒）。"}
+    if ref_fail:
+        ref, n = max(ref_fail.items(), key=lambda kv: kv[1])
+        if n >= 4 and n / failed >= 0.6:
+            return {"kind": "one_model", "check": ["FREEAGENT_MODEL_EXCLUDE"],
+                    "advice": f"失敗の {n}/{failed} 件が {ref} に集中しています。"
+                              "そのモデルを FREEAGENT_MODEL_EXCLUDE で外すか、クールダウンが明けるまで"
+                              "別のモデルを使ってください（全体の設定を触る前に 1 体だけ外すのが安い）。"}
+    kinds = sorted(share.items(), key=lambda kv: -kv[1])
+    detail = ", ".join(f"{k} {v:.0%}" for k, v in kinds[:3])
+    return {"kind": "mixed", "check": ["FREEAGENT_DEBUG_LOG"],
+            "advice": f"失敗 {failed} 件の内訳は {detail} です（単一の原因に寄っていません）。"
+                      "recent_failures の実メッセージを見て、直近の 1 件から切り分けてください"
+                      "（推測でまとめない）。"}
+
+
+def tool_diagnose(args: dict) -> dict:
+    """記録（traces）から、失敗の内訳・遅さ・次の一手を決定論で返す（モデル呼び出し 0 回）。"""
+    days = as_int(args.get("days"), 7, 1, 90)
+    limit = as_int(args.get("limit"), 5, 1, 20)
+    kind_filter = as_str(args.get("kind"))
+    model_filter = as_str(args.get("model"))
+    now = now_ts()
+    since = now - days * 86400
+    rows, info = _diag_rows(since)
+    if kind_filter:
+        rows = [r for r in rows if as_str(r.get("kind")) == kind_filter]
+    if model_filter:
+        rows = [r for r in rows
+                if model_filter in (as_str(r.get("ref")), as_str(r.get("served_by")))]
+    ok_rows = [r for r in rows if r.get("ok")]
+    fail_rows = [r for r in rows if not r.get("ok")]
+    totals = {"calls": len(rows), "ok": len(ok_rows), "failed": len(fail_rows),
+              "ok_rate": round(len(ok_rows) / len(rows), 3) if rows else None}
+    by_class: dict[str, int] = {}
+    for row in fail_rows:
+        key = as_str(row.get("error_class")) or "unknown"
+        by_class[key] = by_class.get(key, 0) + 1
+    by_kind: dict[str, dict] = {}
+    for row in rows:
+        key = as_str(row.get("kind")) or "unknown"
+        slot = by_kind.setdefault(key, {"calls": 0, "ok": 0})
+        slot["calls"] += 1
+        slot["ok"] += 1 if row.get("ok") else 0
+    errors: dict[str, int] = {}
+    for row in fail_rows:
+        key = _diag_norm(row.get("error"))
+        errors[key] = errors.get(key, 0) + 1
+    top_errors = [{"count": n, "error": text}
+                  for text, n in sorted(errors.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]]
+    latencies = sorted(as_float(r.get("latency_s"), 0.0) for r in ok_rows
+                       if as_float(r.get("latency_s"), 0.0) > 0)
+    latency = {"n": len(latencies), "p50": _diag_pct(latencies, 0.5),
+               "p90": _diag_pct(latencies, 0.9), "p95": _diag_pct(latencies, 0.95),
+               "p99": _diag_pct(latencies, 0.99),
+               "max": round(latencies[-1], 3) if latencies else None}
+    per_ref: dict[str, list[float]] = {}
+    ref_fail: dict[str, int] = {}
+    for row in rows:
+        ref = as_str(row.get("served_by")) or as_str(row.get("ref"))
+        if not ref:
+            continue
+        if row.get("ok"):
+            if as_float(row.get("latency_s"), 0.0) > 0:
+                per_ref.setdefault(ref, []).append(as_float(row.get("latency_s"), 0.0))
+        else:
+            ref_fail[ref] = ref_fail.get(ref, 0) + 1
+    slowest = []
+    for ref, values in per_ref.items():
+        if len(values) < DIAG_SLOW_MIN_CALLS:
+            continue
+        values.sort()
+        slowest.append({"model": ref, "n": len(values),
+                        "p50": _diag_pct(values, 0.5), "p95": _diag_pct(values, 0.95)})
+    slowest.sort(key=lambda row: (-row["p95"], -row["n"], row["model"]))
+    recent = []
+    for row in fail_rows[-limit:]:
+        recent.append({"ts": round(as_float(row.get("ts"), 0.0), 3),
+                       "at": datetime.datetime.fromtimestamp(as_float(row.get("ts"), 0.0)).strftime("%Y-%m-%d %H:%M:%S")
+                       if as_float(row.get("ts"), 0.0) else "",
+                       "kind": as_str(row.get("kind")),
+                       "model": as_str(row.get("ref")),
+                       "error_class": as_str(row.get("error_class")) or "unknown",
+                       "error": truncate(as_str(row.get("error")), 200)})
+    notes = []
+    if info["capped"]:
+        notes.append(f"古い {info['capped']} 行は読みませんでした（FREEAGENT_DIAG_MAX_LINES={DIAG_MAX_LINES}）")
+    if info["unreadable"]:
+        notes.append(f"壊れた行 {info['unreadable']} 行を飛ばしました")
+    if info["error"]:
+        notes.append(f"traces を読めませんでした: {info['error']}")
+    if not info["exists"]:
+        notes.append("traces がまだありません（FREEAGENT_TRACE=0 で切っている可能性）")
+    if kind_filter or model_filter:
+        notes.append("kind / model で絞った結果です（全体は days だけを指定して見る）")
+    return {
+        "window": {"days": days, "since": round(since, 3), "until": round(now, 3),
+                   "since_utc": datetime.datetime.utcfromtimestamp(since).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "until_utc": datetime.datetime.utcfromtimestamp(now).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "filters": {"kind": kind_filter, "model": model_filter}},
+        "totals": totals,
+        "by_error_class": dict(sorted(by_class.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "by_kind": dict(sorted(by_kind.items())),
+        "top_errors": top_errors,
+        "latency": latency,
+        "slowest_models": slowest[:limit],
+        "recent_failures": recent,
+        "advice": _diag_advice(totals, by_class, ref_fail, fail_rows),
+        "trace": info,
+        "notes": notes,
+        "model_calls": 0,
+    }
+
 
 HANDLERS = {
     "freeagent_models": tool_models,
@@ -8335,6 +8570,7 @@ HANDLERS = {
     "freeagent_agent": tool_agent,
     "freeagent_delegate": tool_delegate,
     "freeagent_admit": tool_admit,
+    "freeagent_diagnose": tool_diagnose,
 }
 
 
@@ -8855,6 +9091,69 @@ def _render_delegate(data: dict) -> str:
     return f"{head}\n{truncate(data.get('stdout') or '', 2000)}"
 # ツール別の本文レンダラ（`_render_body` から機械的に分離した）。
 # 名前 → 関数の対応表。**分岐表を手で書くのは漏れるので、関数名から生成**する。
+def _render_diagnose(data: dict) -> str:
+    """診断の本文（人間向け）。**記録に無いことは「無い」と書く**。"""
+    window = data.get("window") or {}
+    totals = data.get("totals") or {}
+    latency = data.get("latency") or {}
+    advice = data.get("advice") or {}
+    lines = [f"診断: 直近 {as_int(window.get('days'), 7, 0, 365)} 日"
+             f"（{as_str(window.get('since_utc'))} 〜 {as_str(window.get('until_utc'))}）"]
+    filters = window.get("filters") or {}
+    if filters.get("kind") or filters.get("model"):
+        lines.append(f"絞り込み: kind={as_str(filters.get('kind')) or '-'} / "
+                     f"model={as_str(filters.get('model')) or '-'}")
+    calls = as_int(totals.get("calls"), 0, 0, 10 ** 9)
+    if not calls:
+        lines.append("呼び出しの記録がありません（traces が空・窓の外・絞り込みで 0 件）。")
+    else:
+        rate = totals.get("ok_rate")
+        rate_text = f"{as_float(rate, 0.0):.1%}" if rate is not None else "-"
+        lines.append(f"呼び出し {calls} 件 / 成功 {as_int(totals.get('ok'), 0, 0, 10 ** 9)}"
+                     f" / 失敗 {as_int(totals.get('failed'), 0, 0, 10 ** 9)}（成功率 {rate_text}）")
+    classes = data.get("by_error_class") or {}
+    if classes:
+        lines.append("  失敗の内訳: " + ", ".join(f"{k} {v}" for k, v in classes.items()))
+    kinds = data.get("by_kind") or {}
+    if kinds:
+        parts = []
+        for name, slot in list(kinds.items())[:6]:
+            n = as_int((slot or {}).get("calls"), 0, 0, 10 ** 9)
+            ok = as_int((slot or {}).get("ok"), 0, 0, 10 ** 9)
+            parts.append(f"{name} {ok}/{n}")
+        lines.append("  種別（成功/呼び出し）: " + ", ".join(parts))
+    if as_int(latency.get("n"), 0, 0, 10 ** 9):
+        lines.append(f"  遅延: p50 {latency.get('p50')}s / p90 {latency.get('p90')}s"
+                     f" / p95 {latency.get('p95')}s / p99 {latency.get('p99')}s"
+                     f"（n={as_int(latency.get('n'), 0, 0, 10 ** 9)}）")
+    slow = data.get("slowest_models") or []
+    if slow:
+        lines.append("  遅いモデル（p95）:")
+        for row in slow[:5]:
+            lines.append(f"    - {as_str(row.get('model'))} n={as_int(row.get('n'), 0, 0, 10 ** 9)}"
+                         f" p50 {row.get('p50')}s / p95 {row.get('p95')}s")
+    errors = data.get("top_errors") or []
+    if errors:
+        lines.append("  多い失敗:")
+        for row in errors[:5]:
+            lines.append(f"    - {as_int(row.get('count'), 0, 0, 10 ** 9)} 件: {truncate(as_str(row.get('error')), 100)}")
+    recent = data.get("recent_failures") or []
+    if recent:
+        lines.append("  直近の失敗:")
+        for row in recent[:5]:
+            lines.append(f"    - {as_str(row.get('at'))} {as_str(row.get('kind'))}"
+                         f" {as_str(row.get('model'))} [{as_str(row.get('error_class'))}]"
+                         f" {truncate(as_str(row.get('error')), 90)}")
+    if advice:
+        lines.append(f"次の一手（{as_str(advice.get('kind')) or '-'}）: {as_str(advice.get('advice'))}")
+        check = advice.get("check") or []
+        if check:
+            lines.append("  確認する設定: " + ", ".join(check))
+    for note in data.get("notes") or []:
+        lines.append(f"※ {note}")
+    return "\n".join(lines)
+
+
 _RENDERERS = {
     "freeagent_models": _render_models,
     "freeagent_ask": _render_ask,
@@ -8868,6 +9167,7 @@ _RENDERERS = {
     "freeagent_agent": _render_agent,
     "freeagent_delegate": _render_delegate,
     "freeagent_admit": _render_admit,
+    "freeagent_diagnose": _render_diagnose,
 }
 def _render_body(name: str, data: dict) -> str:
     """ツールの応答を `content`（人間向け日本語）にする。
@@ -9194,6 +9494,11 @@ def _resource_api_rules() -> str:
             ["決められた手順で自分に調べさせる", "`freeagent_agent`"],
         ]),
         "",
+        "## 手順が要るとき",
+        "",
+        "- 長い手順は Resource に置いてある（`resource://freeagent/skills` が目録）。",
+        "  必要な 1 本だけ読む: `skills/plan` / `skills/review` / `skills/debug` / `skills/grounded`。",
+        "",
         "## 失敗したとき",
         "",
         "- 失敗応答には `structuredContent.next_action`（`kind` / `advice` / `fallback_tools` / `check` / `reenable`）が付く。",
@@ -9260,12 +9565,140 @@ def _resource_result_shape() -> str:
     ])
 
 
+
+# --- スキル（必要になったときだけ読む手順書）----------------------------------
+#
+# 外部の Agent Skills（`anthropics/skills` / `obra/superpowers`）の「段階開示」を、既存の Resource チャネルへ
+# 写したもの。**ツール定義を増やさない**のが要点で、手順の本文は呼ばれたときだけ渡る（約 1〜1.5KB）。
+# 本文は**実装の定数と登録簿から生成**する（数字や語彙を文章に書き写さない）。
+
+def _resource_skills() -> str:
+    """スキルの目録（どれをいつ読むか）。"""
+    rows = [
+        ["`resource://freeagent/skills/plan`", "大きめの作業を分解してから着手するとき", "plan の粒度・改訂・仮説"],
+        ["`resource://freeagent/skills/review`", "成果物を査読させるとき（`consult` の review）", "4 行の型・重要度・5 軸・質問の上限"],
+        ["`resource://freeagent/skills/debug`", "原因が分からない不具合を追うとき", "症状→再現→仮説→証拠→修正"],
+        ["`resource://freeagent/skills/grounded`", "出典つきで答えさせたいとき", "検索語・ソース・引用の読み方"],
+    ]
+    return "\n".join([
+        "# スキル（必要なときだけ読む手順書）",
+        "",
+        "ツール定義は起動時に丸ごと渡るので、**長い手順はここに置く**（読むのは必要なときだけ）。",
+        "どれも 1〜1.5KB で、読んでも上流のモデルは呼ばれない（ネットワークも出ない）。",
+        "",
+        _md_table(["URI", "いつ読む", "中身"], rows),
+        "",
+        "## 使い方",
+        "",
+        "- まず目録（これ）を見て、必要な 1 本だけ読む。**全部を読み通さない**。",
+        "- 手順は「型」であって、判断と責任はメイン LLM に残る。",
+    ])
+
+
+def _resource_skill_plan() -> str:
+    """計画の型（`freeagent_think` の plan と検証の規律）。"""
+    return "\n".join([
+        "# 計画の立て方（`freeagent_think` の `plan`）",
+        "",
+        "- 各項目は **2〜5 分で終わる単位**で、**対象**（ファイル・節・コマンド）と**検証方法**まで書く。",
+        "  検証できない項目は項目として数えない（数えた時点で「やったつもり」が増える）。",
+        "- 1 項目終わるごとに検証を通してから次へ進む。**最後にまとめて検証しない**。",
+        f"- 1 回のツール呼び出しの予算は既定 {CALL_BUDGET_S:g} 秒（`FREEAGENT_CALL_BUDGET`）。",
+        "  長い調査は項目を分けて、その都度返す（切られると取れていた結果も失う）。",
+        "",
+        "## 台帳の使い方",
+        "",
+        "- 理解が変わったら `revises_thought`（消さずに改訂として残る）。",
+        "- 代替案は `branch_from_thought` で分岐し、`resolve_branch` + `branch_status` で採用/棄却を記録する。",
+        "- 原因の見当は `kind=\"hypothesis\"` で立て、`tests_hypothesis` + `hypothesis_status` で確かめる。",
+        "- `total_thoughts` は見積り。進めながら増減してよい（自動でも引き上げられる）。",
+        "- `subgoal` / `subgoal_done` は**同じ `session_id`** を付ける（落とすと別の台帳に当たる）。",
+        "",
+        "## 完了の条件",
+        "",
+        "- 「終わった」と言う前に、**実行したコマンドとその出力**で確かめる。確かめていない項目は未検証と書く。",
+    ])
+
+
+def _resource_skill_review() -> str:
+    """査読の型（`freeagent_consult` の review モード）。"""
+    return "\n".join([
+        "# 査読の型（`freeagent_consult` の `mode=\"review\"` + `draft`）",
+        "",
+        "- 返るのは 4 行（結論 / 重要度 / 指摘 / 確認したい点）。重要度は "
+        + " / ".join(f"`{sev}`" for sev in REVIEW_SEVERITIES) + "。",
+        "- 見る軸は " + " / ".join(REVIEW_AXES) + " の 5 つ。**軸を名乗らない回答は `unknown`** として",
+        f"  `blocking` に数える（保守側。空を「軽い」と読まない）。",
+        f"- 質問は最大 {QUESTION_CAP} 件。超えた分は `deferred_questions` に残る（捨てない）。",
+        "",
+        "## 2 段で使う",
+        "",
+        "1. **仕様適合**: 頼まれたこと・合意した設計に合っているか。",
+        "2. **品質**: 読めるか・安全か・テストがあるか。",
+        "",
+        "混ぜると「動くが読めない」「速いが仕様違い」を見逃す。v0.33.0 以降は 1 回の consult で 2 段を回せる。",
+        "",
+        "## 指摘の扱い",
+        "",
+        "- 人数で重みを付ける（4 体中 4 体が挙げたものは重い）。合意度の低さ＝意見が割れている、ではない。",
+        "- 採否は自分で決める。直さない場合は理由を残す（黙って捨てない）。",
+    ])
+
+
+def _resource_skill_debug() -> str:
+    """原因追及の型（4 段）。"""
+    return "\n".join([
+        "# デバッグの型（症状 → 再現 → 原因 → 修正）",
+        "",
+        "1. **症状を 1 行で書く**（何が、どこで、期待とどう違う）。",
+        "2. **再現する最小手順**を作る。再現しないなら条件（時刻・状態・並列度・入力）を変えて切り分ける。",
+        "3. **仮説を 2 つ以上**立て、消去法ではなく**証拠**（ログ・実測値・差分）で決める。",
+        "4. 直す前に「直ったことを確かめる手段」（テスト・コマンド）を決める。",
+        "5. 直したら同じ手順で再現しないことを示す。示せないなら**未検証**と書く。",
+        "",
+        "## このサーバーでの道具",
+        "",
+        "- 失敗の切り分け: `freeagent_diagnose`（traces の集計。失敗理由の内訳・遅いモデル・直近の失敗）。",
+        "- 仮説の記録: `freeagent_think`（`kind=\"hypothesis\"` → `tests_hypothesis`）。",
+        "- 独立した目: `freeagent_consult`（`mode=\"review\"`）に原因の説明を読ませる。",
+        "",
+        "**推測で原因を書かない**。記録に無いことは「分からない」と書き、次に測る手段を添える。",
+    ])
+
+
+def _resource_skill_grounded() -> str:
+    """出典つきで答えるときの型。"""
+    defaults = [name for name in DEFAULT_SOURCES if name in KB_BACKENDS]
+    return "\n".join([
+        "# 出典を使うとき（`freeagent_lookup` / `freeagent_grounded`）",
+        "",
+        "- まず `freeagent_lookup`（**モデルを呼ばない**＝幻覚が入らない）。本文を読ませたいなら `freeagent_grounded`。",
+        "- 検索語は**英語の語**にする。日本語の質問のまま arXiv / Crossref / Internet Archive を引くと 0 件になりやすい",
+        "  （`grounded` は `search_query` に分けて渡せる）。",
+        f"- 既定のソースは {len(defaults)} 種: " + ", ".join(defaults) + "。追加は `sources` に明示する。",
+        f"- 取得の締め切りは既定 {KB_DEADLINE:g} 秒（`FREEAGENT_KB_DEADLINE`）。間に合わないソースは `timed_out` として",
+        "  返り、裏の取得は続いて次回はキャッシュから返る。",
+        "",
+        "## 引用の読み方",
+        "",
+        "- 引用は**トップレベルの `citations`** に統合済み（`results[source]` に重ねない）。",
+        "- `metadata_only: true` は本文根拠が無い＝**根拠として数えない**（目録・登録者の自己申告）。",
+        "- 「該当なし」は失敗ではない（そのソースに無い）。**別のソースか別の語で 1 回だけ**言い換える。",
+        "- 番号付きで注入された根拠は `[n]` で引く。根拠に無い番号は `unsupported_citations` に出る。",
+    ])
+
+
 # 資源の目録。**並びは固定**（辞書の挿入順）で、名前は URI の末尾と一致させる。
 _RESOURCE_BUILDERS = {
     "api-rules": ("ツールの使い分けと待ち時間の契約", _resource_api_rules),
     "sources": ("知識ソースの一覧（既定/明示）", _resource_sources),
     "providers": ("推論プロバイダと必要な設定（値は出さない）", _resource_providers),
     "result-shape": ("content / structuredContent の契約と引用の位置", _resource_result_shape),
+    "skills": ("スキルの目録（必要なときだけ読む手順書）", _resource_skills),
+    "skills/plan": ("計画の型（plan の粒度・改訂・仮説）", _resource_skill_plan),
+    "skills/review": ("査読の型（4 行・重要度・5 軸・2 段）", _resource_skill_review),
+    "skills/debug": ("デバッグの型（症状→再現→仮説→証拠→修正）", _resource_skill_debug),
+    "skills/grounded": ("出典つきで答える型（検索語・ソース・引用の読み方）", _resource_skill_grounded),
 }
 
 

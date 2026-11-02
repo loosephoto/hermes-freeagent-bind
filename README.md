@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 12 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社）、検索は **27 ソース（既定 6 ＋ 明示指定 21）** に対応します。
+- 13 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社）、検索は **27 ソース（既定 6 ＋ 明示指定 21）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 **対象分野は科学（物理・数学・計算機）とプログラミングです。医学・生物学は対象外です。**
@@ -117,7 +117,7 @@ hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_HARNESS hermes
 hermes mcp test freeagent-bind
 ```
 
-`Connected` と **12 tools** が出れば、サーバーの登録・接続は成功です。
+`Connected` と **13 tools** が出れば、サーバーの登録・接続は成功です。
 **これだけではモデルが回答できることまでは確認していません。** Hermes を再起動してから、会話で次を試してください。
 
 **まず検索を確認します（推論の接続は不要）。**
@@ -249,6 +249,7 @@ freeagent_think で、この設計案を手順に分解してから検討して�
 | 前提を更新しながら往復相談する | `freeagent_consult` | 1 回だけなら panel。深い討論は待ち時間が増えます |
 | 計画・仮説・改訂・別案を記録する | `freeagent_think` | [思考ノートの使い方](#-複雑な問題を段階的に考えるfreeagent_think) |
 | サブが自分で知識検索する | `freeagent_agent` | 読み取り専用の調査ループ。ステップ上限があります |
+| 失敗の理由・遅さを記録から知る | `freeagent_diagnose` | 決定論（モデル呼び出し 0 回・ネットワーク 0 回）。`traces` を窓（既定 7 日）で集計し、成功率・失敗理由の内訳・上位のエラー文・遅延の分位（p50/p90/p95/p99）・モデル別の遅さ・直近の失敗・次の一手を返します |
 | 依頼してよいかの裁定・完了報告の検査 | `freeagent_admit` | 決定論（モデル呼び出し 0 回）。受付の認可（ポリシー版つき）と、`ready` に証拠を要求する検査。**作業の状態は持ちません**（KANBAN が持ち主） |
 | Hermes 本体を別プロセスで動かす | `freeagent_delegate` | **既定では無効**。フルツールを使うため、許可すると実作業の副作用もありえます |
 
@@ -422,8 +423,15 @@ python scripts/gen_cases.py                              # ケースだけ生成
 | `resource://freeagent/sources` | 知識ソースの在庫（既定 6 種と明示指定 18 種の別） |
 | `resource://freeagent/providers` | 推論プロバイダと「何を入れれば使えるか」（**鍵の値は出しません**） |
 | `resource://freeagent/result-shape` | `content` / `structuredContent` の契約、引用の位置 |
+| `resource://freeagent/skills` | スキルの目録（どれを・いつ読むか。v0.37.0） |
+| `resource://freeagent/skills/plan` | 計画の型（2〜5 分・対象・検証方法／改訂・分岐・仮説） |
+| `resource://freeagent/skills/review` | 査読の型（4 行・重要度・5 軸・質問の上限・2 段） |
+| `resource://freeagent/skills/debug` | デバッグの型（症状→再現→仮説→証拠→修正） |
+| `resource://freeagent/skills/grounded` | 出典つきで答える型（英語の検索語・`metadata_only`・該当なし） |
 
 - 内容は**実装の登録簿から生成**します（ソース数・プロバイダ数を文書に書き写さないので、増やしても古くなりません）。
+- v0.37.0 から、**手順書（`skills/*`）も同じチャネル**に置いています。ツール定義を増やさずに、
+  長い手順を「必要なときだけ読む」形にできます（読んでも上流のモデルは呼ばれません）。
 - 読み出しは**ネットワークを出しません**（登録簿と環境変数だけで組み立てます。1 回読むたびに
   プロバイダへ一覧要求を出すと、上流の枠を使ってしまうため）。
 - 未知の URI は `-32002`（resource not found）を返します。
@@ -775,7 +783,17 @@ v0.14.0 = 17,495 / v0.14.1 = 17,555 / v0.14.2 = 17,666 / v0.22.0 = 17,771 / v0.2
 **v0.29.0 = 18,199 / v0.31.0 = 18,349 / v0.31.1 = 18,646 / v0.32.0 = 20,350 / v0.33.0 = 20,520 /
 v0.34.0 = 20,700 / v0.35.0 = 20,785**。v0.36.0 は**ツール定義に触れていない**（20,785 のまま）。
 v0.36.1 は `sources` の説明に mdn / devdocs を追記して **21,211 文字（+426）**。
+v0.37.0 は `freeagent_diagnose`（13 本目）を足して **22,317 文字（+1,106）**（スキルは Resource なので加算なし）。
 以下は新しい順の内訳です。
+
+**v0.37.0（記録からの診断と、スキルの段階開示）**: 外部 OSS から 2 つを写しました。
+①`freeagent_diagnose`（13 本目・**モデル呼び出し 0 回・ネットワーク 0 回**）: `traces`（1 行 1 呼び出し）を
+窓で集計し、成功率・失敗理由の内訳・上位のエラー文・遅延の分位・モデル別の遅さ・直近の失敗・
+次の一手（`advice`）を返します。`kind` / `model` で絞れます。
+②`resource://freeagent/skills`（目録）と `skills/plan` / `skills/review` / `skills/debug` /
+`skills/grounded` を追加。ツール定義を増やさず、長い手順を必要なときだけ読む形にしました。
+出典は `obra/superpowers` の事後診断と `anthropics/skills` の段階開示（**手順だけ**を写し、
+実装は持ち込んでいません）。回帰は `tests/test_diagnose_v0370.py`（20 件）。SPEC §6.38。
 
 **v0.36.1（監査で見つかった 3 件の追従）**: ①README 冒頭と接続確認の例のツール数が **11 のまま**
 （実装は 12）だったのを修正 ②`freeagent_lookup` / `freeagent_grounded` の `sources` 説明に
@@ -1874,6 +1892,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_SESSION_MAX` | 64 | 相談セッションの保持数上限 |
 | `FREEAGENT_STATS_HALFLIFE_DAYS` | 30 | 品質統計の減衰半減期（日） |
 | `FREEAGENT_TRACE_MAX_BYTES` | 262144 | トレースファイルの最大サイズ（バイト） |
+| `FREEAGENT_DIAG_MAX_LINES` | 20000 | `freeagent_diagnose` が読むトレースの行数上限（末尾から。絞った件数は `notes` に出ます） |
 | `FREEAGENT_EMPTY_TOKEN_CAP` | 2048 | 空応答時の予算引き上げの上限（トークン） |
 | `FREEAGENT_TRACE` / `FREEAGENT_STATS` / `FREEAGENT_COOLDOWN` | 1 | トレース・品質統計・クールダウンの記録 |
 | `FREEAGENT_DEBUG_LOG` | 空 | 指定パスへ stdio の送受信を 1 行ずつ追記（クライアント互換の切り分け用） |

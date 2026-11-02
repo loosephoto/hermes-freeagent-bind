@@ -120,7 +120,7 @@ def main() -> int:
         # 3) tools/list（セッション付き）
         r = call(port, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, session_id=sid)
         tools = (r["json"] or {}).get("result", {}).get("tools") or []
-        check(len(tools) == 12, f"tools/list が {len(tools)} 件")
+        check(len(tools) == 13, f"tools/list が {len(tools)} 件")
 
         # 4) tools/call（LLM を呼ばない freeagent_think）
         r = call(port, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",

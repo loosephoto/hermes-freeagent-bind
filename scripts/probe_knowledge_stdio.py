@@ -221,7 +221,7 @@ def main() -> int:
         proc.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}\n')
         proc.stdin.flush()
         tools = request(2, "tools/list", {})["tools"]
-        if len(tools) != 12:
+        if len(tools) != 13:
             raise ValueError("tool count mismatch")
         properties = next(t for t in tools if t["name"] == "freeagent_lookup")["inputSchema"]["properties"]
         if not {"datacite_kind", "fallback"}.issubset(properties):

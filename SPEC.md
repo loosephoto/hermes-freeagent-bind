@@ -1658,6 +1658,33 @@ description を読まない**ので強制力が無かった（文面だけの規
 
 実測: `tools/list` 20,785 → **21,211 文字（+426）**。954 テスト。
 
+### 6.38 記録からの診断とスキルの段階開示（v0.37.0）
+
+GitHub の harness / skills 系（`obra/superpowers` / `anthropics/skills` / `affaan-m/ECC` /
+`langchain-ai/deepagents`）を実際に読み、**手順だけ**を写した（実装は持ち込まない。依存は増やさない）。
+
+- **`freeagent_diagnose`（13 本目・モデル呼び出し 0 回・ネットワーク 0 回）**。traces は 1 行 1 呼び出しで
+  既に残っていたが、集計する手段が無く、失敗の切り分けを毎回手で開いていた（実測 2026-11-02:
+  直近 3 日 44 件中 16 件が失敗・**全部 `rate_limited`** だが、その事実は traces を開かないと分からない）。
+  返すのは `totals` / `by_error_class` / `by_kind` / `top_errors`（ID・数値を伏せた正規化つき上位）/
+  `latency`（p50・p90・p95・p99・max）/ `slowest_models`（3 回以上のモデルだけ）/ `recent_failures` /
+  `advice`（`kind` と `check` に環境変数名）。**`advice` は決定論**（失敗の 40% 以上が枠 →
+  `FREEAGENT_QUOTA_LIMITS`、30% 以上が空応答 → `max_tokens` と `FREEAGENT_MODEL_EXCLUDE`、20% 以上が
+  時間切れ → `size` と `FREEAGENT_CALL_BUDGET`、1 体に 60% 集中 → その 1 体だけ外す）。
+  **記録に無いことは「無い」と返す**（traces が無ければ `advice.kind="no_data"`）。
+- **壊れた行・知らない `error_class` を落とさない**。`trace.unreadable` に件数を出し、語彙外は `unknown`
+  として残す。行数は `FREEAGENT_DIAG_MAX_LINES`（既定 20,000）で末尾に絞り、絞った件数を `notes` に出す。
+- **スキルは Resource に置く**（`resource://freeagent/skills` が目録、`skills/plan` / `skills/review` /
+  `skills/debug` / `skills/grounded` が本文）。`anthropics/skills` の段階開示を、既存の MCP Resources
+  （§8.5）へ写した形で、**ツールを 1 本も増やさない**。本文は `CALL_BUDGET_S` / `KB_DEADLINE` /
+  `QUESTION_CAP` / `REVIEW_AXES` / `DEFAULT_SOURCES` から生成し、数字や語彙を文章に書き写さない。
+- **却下**: artifact のディスク退避（クライアントが読めない → 読む用のツールが要る）、instincts の自動学習
+  （効果が短期に測れず「規約は人間が決める」と衝突）、token 圧縮プロキシ（品質低下の測定が先）、
+  sandbox 実行（`dependencies = []` と衝突）、worktree 並列（状態機械は KANBAN が持ち主・§6.32）。
+
+実測: `tools/list` 21,211 → **22,317 文字（+1,106）**。974 テスト（新規 20 件）。Resource は 4 → 9 本
+（合計 6,984 文字。**読まない限りモデルの入力には乗らない**）。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。
@@ -1908,6 +1935,11 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
 | `resource://freeagent/sources` | `KB_BACKENDS` / `DEFAULT_SOURCES` | ソース在庫と既定/明示の別 |
 | `resource://freeagent/providers` | `PROVIDER_ORDER` / `PROVIDER_SPECS` / `_provider_missing_settings` | プロバイダと「足りないもの」（**値は返さない**） |
 | `resource://freeagent/result-shape` | 固定文 | `content` / `structuredContent` の契約と引用の位置 |
+| `resource://freeagent/skills` | 固定表（4 本の目録） | どのスキルをいつ読むか（v0.37.0） |
+| `resource://freeagent/skills/plan` | `CALL_BUDGET_S` ＋ 規律 | 計画の型（2〜5 分・対象・検証方法／改訂・分岐・仮説） |
+| `resource://freeagent/skills/review` | `REVIEW_SEVERITIES` / `REVIEW_AXES` / `QUESTION_CAP` | 査読の型（4 行・重要度・5 軸・2 段） |
+| `resource://freeagent/skills/debug` | 固定文 | デバッグの型（症状→再現→仮説→証拠→修正） |
+| `resource://freeagent/skills/grounded` | `DEFAULT_SOURCES` / `KB_DEADLINE` | 出典つきで答える型（英語の検索語・`metadata_only`） |
 
 - **`read` はネットワークを出さない**（登録簿と環境変数だけで組み立てる）。読むたびに一覧要求を出すと
   上流の枠を使う（規約 54 の「早期返却で一覧を出さない」と同じ理由）。テストは
