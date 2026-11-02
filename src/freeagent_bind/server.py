@@ -70,7 +70,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
 
 # `python server.py` / `runpy.run_path(server.py)` で**直接実行される配布形態**を保つ。
@@ -90,7 +90,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.38.3"
+SERVER_VERSION = "0.38.4"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -4100,12 +4100,14 @@ class Deadline:
 
     def __init__(self, seconds: float):
         self.total = max(0.0, float(seconds))
-        self._until = time.monotonic() + self.total
+        # All cutoff and worker-completion readings use the same high-resolution
+        # clock; monotonic() is coarser on Windows Python 3.11/3.12.
+        self._until = time.perf_counter() + self.total
         self._cancel_signal = Future()
         self._cancel_lock = threading.Lock()
 
     def remaining(self) -> float:
-        return max(0.0, self._until - time.monotonic())
+        return max(0.0, self._until - time.perf_counter())
 
     @property
     def expired(self) -> bool:
@@ -4114,9 +4116,13 @@ class Deadline:
     def cancel(self) -> None:
         """打ち切る（回収は即座に終わり、未開始のジョブは投入されない）。"""
         with self._cancel_lock:
-            self._until = min(self._until, time.monotonic())
-            if not self._cancel_signal.done():
-                self._cancel_signal.set_result(None)
+            self._until = min(self._until, time.perf_counter())
+        # Future callbacks execute synchronously and may block or re-enter.
+        # Every canceller can signal even if another is paused before set_result.
+        try:
+            self._cancel_signal.set_result(None)
+        except InvalidStateError:
+            pass  # another canceller has already signalled
 
     def __repr__(self) -> str:
         return f"Deadline(total={self.total:.1f}s, remaining={self.remaining():.1f}s)"
@@ -4278,8 +4284,9 @@ def _run_fair(jobs, worker, workers, deadline, providers):
                 timed_out = True
                 break
             i = futures[future]
-            out[i] = _parallel_future_result(future, deadline)
-            collected.add(i)
+            if not _collect_parallel_future(future, i, out, collected, deadline):
+                timed_out = True
+                break
             done += 1
             progress_emit(done, len(jobs), progress_label(jobs[i]))
             if done == len(futures):
@@ -4323,9 +4330,29 @@ def _drain_parallel_futures():
 def _parallel_future_result(future, deadline):
     try:
         result = future.result()
-        return result[1] if deadline is not None else result
+        return result if deadline is not None else (None, result)
     except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}"}
+        return None, {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _collect_parallel_future(future, i, out, collected, deadline):
+    # Only call this for a done future, and never invoke it under _cancel_lock.
+    completed_at, result = _parallel_future_result(future, deadline)
+    if deadline is None:
+        out[i] = result
+        collected.add(i)
+        return True
+    with deadline._cancel_lock:
+        # This comparison and publication linearize against cancel(). Equal
+        # timestamps cannot establish order and are conservatively rejected.
+        # No timestamp is available for an executor-level exception: retain it
+        # only while the cutoff is still in the future.
+        eligible = (completed_at < deadline._until if completed_at is not None
+                    else time.perf_counter() < deadline._until)
+        if eligible:
+            out[i] = result
+            collected.add(i)
+        return eligible
 
 
 def _collect_completed_parallel(futures, out, collected, deadline):
@@ -4334,13 +4361,7 @@ def _collect_completed_parallel(futures, out, collected, deadline):
     for future, i in futures.items():
         if i in collected or not future.done() or future.cancelled():
             continue
-        try:
-            completed_at, result = future.result()
-        except Exception:
-            continue
-        if completed_at <= deadline._until:
-            out[i] = result
-            collected.add(i)
+        _collect_parallel_future(future, i, out, collected, deadline)
 
 
 def run_parallel(jobs: list, worker, max_workers: int | None = None,
@@ -4380,7 +4401,7 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None,
                         result = inner_worker(job)
                     except Exception as exc:
                         result = {"error": f"{type(exc).__name__}: {exc}"}
-                return time.monotonic(), result
+                return time.perf_counter(), result
             finally:
                 _BUDGET_LOCAL.deadline = previous
         worker = budgeted_worker
@@ -4414,8 +4435,9 @@ def run_parallel(jobs: list, worker, max_workers: int | None = None,
                 timed_out = True
                 break
             i = futures[fut]
-            out[i] = _parallel_future_result(fut, deadline)
-            collected.add(i)
+            if not _collect_parallel_future(fut, i, out, collected, deadline):
+                timed_out = True
+                break
             done += 1
             progress_emit(done, len(jobs), progress_label(jobs[i]))
             if done == len(futures):

@@ -16,6 +16,213 @@ from freeagent_bind import server as S
 
 
 class DeadlineCollectionTest(unittest.TestCase):
+    def test_cancel_between_expiry_check_and_collection(self):
+        from freeagent_bind.fair_scheduler import FairScheduler
+
+        for fair in (False, True):
+            for cutoff, keep in ((10.4, False), (10.5, False), (10.6, True)):
+                with self.subTest(fair=fair, cutoff=cutoff):
+                    scheduler = FairScheduler(1, 8)
+                    entered = threading.Event()
+                    cancelled = threading.Event()
+                    clock = [10.0]
+                    fake_time = mock.Mock(wraps=time)
+                    fake_time.perf_counter.side_effect = lambda: clock[0]
+                    original = S._parallel_future_result
+                    output, errors = [], []
+
+                    def worker(job):
+                        clock[0] = 10.5
+                        return {'value': job}
+
+                    def collect(future, deadline):
+                        entered.set()
+                        if not cancelled.wait(3):
+                            raise RuntimeError('cancel did not reach collection barrier')
+                        return original(future, deadline)
+
+                    def run():
+                        try:
+                            output.extend(S.run_parallel([0], worker, 1, deadline, fair_keys=[0]))
+                        except Exception as exc:
+                            errors.append(exc)
+
+                    caller = None
+                    try:
+                        with mock.patch.object(S, 'time', fake_time), \
+                             mock.patch.object(S, 'FAIR_ENABLED', fair), \
+                             mock.patch.object(S, '_get_fair_scheduler', return_value=scheduler), \
+                             mock.patch.object(S, '_parallel_future_result', side_effect=collect):
+                            deadline = S.Deadline(2)
+                            caller = threading.Thread(target=run)
+                            caller.start()
+                            self.assertTrue(entered.wait(3))
+                            clock[0] = cutoff
+                            deadline.cancel()
+                            cancelled.set()
+                            caller.join(3)
+                            self.assertFalse(caller.is_alive())
+                        self.assertFalse(errors, errors)
+                        self.assertEqual(len(output), 1)
+                        if keep:
+                            self.assertEqual(output[0], {'value': 0})
+                        else:
+                            self.assertTrue(output[0].get('dropped'), output)
+                    finally:
+                        cancelled.set()
+                        if caller is not None:
+                            caller.join(3)
+                        scheduler.shutdown()
+                        S._drain_parallel_futures()
+
+    def test_cancel_signal_callbacks_do_not_hold_cancel_lock(self):
+        deadline = S.Deadline(10)
+        callback_entered = threading.Event()
+        callback_release = threading.Event()
+        second_done = threading.Event()
+        def callback(_):
+            callback_entered.set()
+            callback_release.wait(3)
+        deadline._cancel_signal.add_done_callback(callback)
+        first = threading.Thread(target=deadline.cancel)
+        second = threading.Thread(target=lambda: (deadline.cancel(), second_done.set()))
+        first.start()
+        try:
+            self.assertTrue(callback_entered.wait(3))
+            second.start()
+            self.assertTrue(second_done.wait(1), 'callback held cancel lock')
+        finally:
+            callback_release.set()
+            first.join(3)
+            if second.ident is not None:
+                second.join(3)
+
+    def test_concurrent_cancel_wakes_waiter_if_first_notifier_is_paused(self):
+        from concurrent.futures import wait
+        deadline = S.Deadline(10)
+        first_entered, release_first = threading.Event(), threading.Event()
+        original = deadline._cancel_signal.set_result
+        def paused_set_result(value):
+            if threading.current_thread() is first:
+                first_entered.set()
+                if not release_first.wait(3):
+                    raise RuntimeError('first notifier not released')
+            return original(value)
+        first = threading.Thread(target=deadline.cancel)
+        with mock.patch.object(deadline._cancel_signal, 'set_result', side_effect=paused_set_result):
+            first.start()
+            try:
+                self.assertTrue(first_entered.wait(3))
+                deadline.cancel()
+                self.assertFalse(wait([deadline._cancel_signal], timeout=1).not_done)
+            finally:
+                release_first.set()
+                first.join(3)
+
+    def test_timeout_collection_linearizes_before_concurrent_cancel(self):
+        from concurrent.futures import Future
+        entered, release = threading.Event(), threading.Event()
+        collector_thread = None
+        class ObservedDeadline(S.Deadline):
+            def __getattribute__(self, name):
+                if name == '_until' and threading.current_thread() is collector_thread:
+                    entered.set()
+                    if not release.wait(3):
+                        raise RuntimeError('collector not released')
+                return super().__getattribute__(name)
+        clock = [10.0]
+        fake_time = mock.Mock(wraps=time)
+        fake_time.perf_counter.side_effect = lambda: clock[0]
+        done, pending = Future(), Future()
+        done.set_result((10.5, {'value': 0}))
+        rows, collected, errors = [None, None], set(), []
+        with mock.patch.object(S, 'time', fake_time):
+            deadline = ObservedDeadline(2)
+            def collect():
+                try:
+                    S._collect_completed_parallel({done: 0, pending: 1}, rows, collected, deadline)
+                except Exception as exc:
+                    errors.append(exc)
+            collector_thread = threading.Thread(target=collect)
+            collector_thread.start()
+            canceller = threading.Thread(target=deadline.cancel)
+            try:
+                self.assertTrue(entered.wait(3))
+                self.assertTrue(deadline._cancel_lock.locked())
+                clock[0] = 10.5
+                canceller.start()
+            finally:
+                release.set()
+                collector_thread.join(3)
+                if canceller.ident is not None:
+                    canceller.join(3)
+            self.assertFalse(collector_thread.is_alive())
+            self.assertFalse(canceller.is_alive())
+            self.assertFalse(errors, errors)
+            self.assertEqual(rows, [{'value': 0}, None])
+            self.assertEqual(collected, {0})
+            self.assertEqual(deadline._until, 10.5)
+
+    def test_timeout_collection_cancel_wins_before_comparison(self):
+        from concurrent.futures import Future
+        entered, release = threading.Event(), threading.Event()
+        clock = [10.0]
+        fake_time = mock.Mock(wraps=time)
+        fake_time.perf_counter.side_effect = lambda: clock[0]
+        futures = {}
+        for i, stamp in enumerate((10.75, 11.0, 11.25)):
+            future = Future()
+            future.set_result((stamp, {'value': i}))
+            futures[future] = i
+        rows, collected, errors = [None] * 3, set(), []
+        original = S._parallel_future_result
+        def pause_first(future, deadline):
+            value = original(future, deadline)
+            if futures[future] == 0:
+                entered.set()
+                if not release.wait(3):
+                    raise RuntimeError('collector not released')
+            return value
+        with mock.patch.object(S, 'time', fake_time), \
+             mock.patch.object(S, '_parallel_future_result', side_effect=pause_first):
+            deadline = S.Deadline(10)
+            def collect():
+                try:
+                    S._collect_completed_parallel(futures, rows, collected, deadline)
+                except Exception as exc:
+                    errors.append(exc)
+            thread = threading.Thread(target=collect)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                clock[0] = 11.0
+                deadline.cancel()
+            finally:
+                release.set()
+                thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertFalse(errors, errors)
+            self.assertEqual(rows, [{'value': 0}, None, None])
+            self.assertEqual(collected, {0})
+
+    def test_worker_error_is_returned_with_and_without_deadline(self):
+        from freeagent_bind.fair_scheduler import FairScheduler
+        for fair in (False, True):
+            for budgeted in (False, True):
+                with self.subTest(fair=fair, budgeted=budgeted):
+                    scheduler = FairScheduler(1, 8)
+                    def worker(_):
+                        raise ValueError('worker failed')
+                    try:
+                        with mock.patch.object(S, 'FAIR_ENABLED', fair), \
+                             mock.patch.object(S, '_get_fair_scheduler', return_value=scheduler):
+                            rows = S.run_parallel([0], worker, 1,
+                                S.Deadline(float('inf')) if budgeted else None, fair_keys=[0])
+                        self.assertEqual(rows, [{'error': 'ValueError: worker failed'}])
+                    finally:
+                        scheduler.shutdown()
+                        S._drain_parallel_futures()
+
     def test_budget_scope_propagates_and_is_restored_in_fair_workers(self):
         from freeagent_bind.fair_scheduler import FairScheduler
         scheduler = FairScheduler(1, 16)
@@ -34,6 +241,152 @@ class DeadlineCollectionTest(unittest.TestCase):
         time.sleep(.03)
         deadline.cancel()
         self.assertEqual(deadline._until, cutoff)
+
+    def test_cancellation_cutoff_excludes_equal_completion_timestamp(self):
+        from concurrent.futures import Future
+
+        clock = [10.0]
+        fake_time = mock.Mock(wraps=time)
+        fake_time.perf_counter.side_effect = lambda: clock[0]
+        with mock.patch.object(S, 'time', fake_time):
+            deadline = S.Deadline(10)
+            clock[0] = 11.0
+            deadline.cancel()
+            futures = {}
+            for i, completed_at in enumerate((10.75, 11.0, 11.25)):
+                future = Future()
+                future.set_result((completed_at, {'value': i}))
+                futures[future] = i
+            rows = [None] * 3
+            collected = set()
+            S._collect_completed_parallel(futures, rows, collected, deadline)
+        self.assertEqual(rows, [{'value': 0}, None, None])
+        self.assertEqual(collected, {0})
+
+    def test_progress_collection_uses_exclusive_deadline_boundary(self):
+        from concurrent.futures import wait
+        from freeagent_bind.fair_scheduler import FairScheduler
+
+        for fair in (False, True):
+            with self.subTest(fair=fair):
+                scheduler = FairScheduler(4, 16)
+                started = [threading.Event() for _ in range(4)]
+                release = [threading.Event() for _ in range(4)]
+                clock = [10.0]
+                fake_time = mock.Mock(wraps=time)
+                fake_time.perf_counter.side_effect = lambda: clock[0]
+                futures = []
+                original_as_completed = S.as_completed
+
+                def capture_futures(signals, **kwargs):
+                    futures.extend(signals[:4])
+                    yield from original_as_completed(signals, **kwargs)
+
+                def worker(job):
+                    started[job].set()
+                    if job:
+                        release[job].wait(2)
+                    return {'value': job}
+
+                def progress(done, total, label):
+                    if done != 1:
+                        return
+                    for event in started:
+                        self.assertTrue(event.wait(2))
+                    for job, moment in ((1, 10.75), (2, 11.0), (3, 11.25)):
+                        clock[0] = moment
+                        if job == 2:
+                            self.assertTrue(deadline.expired)
+                        release[job].set()
+                        self.assertFalse(wait([futures[job]], timeout=2).not_done)
+
+                try:
+                    with mock.patch.object(S, 'time', fake_time), \
+                         mock.patch.object(S, 'FAIR_ENABLED', fair), \
+                         mock.patch.object(S, '_get_fair_scheduler', return_value=scheduler), \
+                         mock.patch.object(S, 'as_completed', side_effect=capture_futures), \
+                         mock.patch.object(S, 'progress_emit', side_effect=progress):
+                        deadline = S.Deadline(1.0)
+                        rows = S.run_parallel([0, 1, 2, 3], worker, 4, deadline,
+                                              fair_keys=[0, 1, 2, 3])
+                    self.assertEqual(rows[:2], [{'value': 0}, {'value': 1}])
+                    self.assertTrue(rows[2].get('dropped'), rows[2])
+                    self.assertTrue(rows[3].get('dropped'), rows[3])
+                finally:
+                    for event in release:
+                        event.set()
+                    scheduler.shutdown()
+                    S._drain_parallel_futures()
+
+    def _check_coarse_clock_boundary(self, cancelled):
+        from concurrent.futures import wait
+        from freeagent_bind.fair_scheduler import FairScheduler
+
+        for fair in (False, True):
+            with self.subTest(fair=fair, cancelled=cancelled):
+                scheduler = FairScheduler(4, 16)
+                started = [threading.Event() for _ in range(4)]
+                release = [threading.Event() for _ in range(4)]
+                clock = [10.0]
+                fake_time = mock.Mock(wraps=time)
+                # Reproduce the coarse Windows tick and a distinct fine clock.
+                fake_time.monotonic.side_effect = lambda: (clock[0] // .015625) * .015625
+                fake_time.perf_counter.side_effect = lambda: clock[0]
+                futures = []
+                original_as_completed = S.as_completed
+
+                def capture_futures(signals, **kwargs):
+                    futures.extend(signals[:4])
+                    yield from original_as_completed(signals, **kwargs)
+
+                def worker(job):
+                    started[job].set()
+                    if job == 0:
+                        for event in started:
+                            if not event.wait(2):
+                                raise RuntimeError('worker did not start')
+                    elif not release[job].wait(2):
+                        raise RuntimeError('worker not released')
+                    return {'value': job}
+
+                def progress(done, total, label):
+                    if done != 1:
+                        return
+                    clock[0] = 11.010
+                    release[1].set()
+                    self.assertFalse(wait([futures[1]], timeout=2).not_done)
+                    clock[0] = 11.011
+                    if cancelled:
+                        deadline.cancel()
+                    release[2].set()
+                    self.assertFalse(wait([futures[2]], timeout=2).not_done)
+                    clock[0] = 11.012
+                    release[3].set()
+                    self.assertFalse(wait([futures[3]], timeout=2).not_done)
+
+                try:
+                    with mock.patch.object(S, 'time', fake_time), \
+                         mock.patch.object(S, 'FAIR_ENABLED', fair), \
+                         mock.patch.object(S, '_get_fair_scheduler', return_value=scheduler), \
+                         mock.patch.object(S, 'as_completed', side_effect=capture_futures), \
+                         mock.patch.object(S, 'progress_emit', side_effect=progress):
+                        deadline = S.Deadline(2.0 if cancelled else 1.011)
+                        rows = S.run_parallel([0, 1, 2, 3], worker, 4, deadline,
+                                              fair_keys=[0, 1, 2, 3])
+                    self.assertEqual(rows[:2], [{'value': 0}, {'value': 1}])
+                    self.assertTrue(rows[3].get('dropped'), rows[3])
+                    self.assertTrue(rows[2].get('dropped'), rows[2])
+                finally:
+                    for event in release:
+                        event.set()
+                    scheduler.shutdown()
+                    S._drain_parallel_futures()
+
+    def test_coarse_clock_preserves_precancel_and_rejects_postcancel(self):
+        self._check_coarse_clock_boundary(cancelled=True)
+
+    def test_coarse_clock_rejects_finish_after_fractional_deadline(self):
+        self._check_coarse_clock_boundary(cancelled=False)
 
     def test_slow_progress_preserves_on_time_future_but_not_late_future(self):
         from freeagent_bind.fair_scheduler import FairScheduler
