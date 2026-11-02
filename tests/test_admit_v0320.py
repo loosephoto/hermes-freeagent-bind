@@ -198,12 +198,22 @@ class ReportTest(AdmitTestBase):
 class RecentAndShapeTest(AdmitTestBase):
     def test_list_recent_returns_newest_first_and_filters(self):
         self.policy()
-        S.tool_admit({"triggers": [self.trig(), self.trig(trigger_id="T2", actor="x")]})
+        S.tool_admit({"triggers": [self.trig(card="t_0001"), self.trig(trigger_id="T2", actor="x")]})
         got = S.tool_admit({"action": "list_recent", "limit": 10})
         self.assertEqual(got["count"], 2)
         self.assertEqual(got["decisions"][0]["trigger_id"], "T2", "新しい順")
         only = S.tool_admit({"action": "list_recent", "disposition": "accept"})
         self.assertEqual(only["count"], 1)
+
+    def test_list_recent_render_shows_time_source_and_card(self):
+        self.policy()
+        S.tool_admit({"triggers": [self.trig(card="t_0001")]})
+        got = S.tool_admit({"action": "list_recent"})
+        text = S.render("freeagent_admit", got)
+        self.assertIn("記録の読み戻し: 1 件", text)
+        self.assertIn("T1（github）", text)
+        self.assertIn("card=t_0001", text)
+        self.assertIn("accept/explicit", text)
 
     def test_too_many_triggers_is_an_error_not_a_silent_truncation(self):
         self.policy()

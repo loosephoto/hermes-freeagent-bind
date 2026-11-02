@@ -259,6 +259,40 @@ freeagent_think で、この設計案を手順に分解してから検討して�
 `ask` / `map` は単数の `model`、`panel` などは配列の `models` です。
 HF はモデル ID の末尾に `:提供元` を付けて経路を固定できます。
 
+### 🧪 「仕様どおりか」と「品質」を分けて査読する（2 段）
+
+`mode="review"` に **`basis`（仕様・計画）** を渡すと、1 段目が**仕様適合**、2 段目が**品質**になります。
+段を分けるのは、「品質は悪くないが要件を満たしていない」下書きが 1 段の査読をすり抜けるためです。
+
+```text
+freeagent_consult(mode="review", draft=<下書き>, basis=<仕様・計画>, size=2)
+```
+
+返るもの:
+
+- `compliance_summary`: `compliant` / `partial` / `noncompliant` / `unknown`（判定を名乗らない）/ `blocking`
+- `findings_summary`: 5 軸の重要度（`critical` / `required` / `optional` / `nit` / `unknown`）と `blocking`
+- **どちらかの `blocking` が立ったら差し戻し**。`noncompliant` と判定なしは、品質が軽くても止めます
+
+`basis` を渡さなければ従来どおり 1 段（品質だけ）です。上流へ送る前に `sk-` などの秘密は伏せられ、
+件数が `redactions` に出ます。
+
+### 🚦 頼まれたかを裁定し、完了の証拠を検査する（`freeagent_admit`）
+
+「誰が頼めるか」と「完了を名乗る資格があるか」は**モデルに聞かずに決めます**（呼び出し 0 回）。
+
+```text
+freeagent_admit(triggers=[{source:"github", thread:"gh:o/r#12", trigger_id:"evt-1",
+                          actor:"loosephoto", kind:"mention", scope:"issue"}])
+freeagent_admit(action="report", report={kind:"ready",
+                                         evidence:{commands:[{cmd:"python -m unittest", result:"pass"}]}})
+```
+
+- 既定は **`observe`**。推測候補（bot など）は `would_accept` として記録だけされ、`list_recent` で読めます
+- 同じ `(source, thread, trigger_id)` は replay して**二重起票しません**
+- `ready` に証拠が無い／失敗が混ざる場合は `accepted: false` と `next_action` が返ります
+- **作業の状態（作業中・完了）は KANBAN が持ち主**です。このツールは状態機械を持ちません
+
 ### 🚦 Free モデルを増やしても 429 を踏まない仕組み
 
 複数モデルを使うツールは、必ず**提供元ごとの同時実行枠**を通ります。枠を超えた呼び出しは
@@ -739,7 +773,13 @@ v0.9.5 は**提供元別の同時実行ゲート**と**モデル数の上限の�
 上の表の列は v0.9.5 までです（v0.11.0 以降の文字数: v0.12.0 = 17,198 / v0.13.0 = 17,495 /
 v0.14.0 = 17,495 / v0.14.1 = 17,555 / v0.14.2 = 17,666 / v0.22.0 = 17,771 / v0.26.0 = 17,986 /
 **v0.29.0 = 18,199 / v0.31.0 = 18,349 / v0.31.1 = 18,646 / v0.32.0 = 20,350 / v0.33.0 = 20,520 /
-v0.34.0 = 20,700 / v0.35.0 = 20,785**）。以下は新しい順の内訳です。
+v0.34.0 = 20,700 / v0.35.0 = 20,785**。v0.36.0 は**ツール定義に触れていない**（20,785 のまま）。
+以下は新しい順の内訳です。
+
+**v0.36.0（読みやすさと文書の追補）**: `freeagent_admit(action="list_recent")` の本文を専用にし、
+日時・source・裁定・強度・`card` を 1 行ずつ出すようにした。README に**2 段査読**と
+**受付と報告**の使い方（例つき）を追加、AGENTS に規約 87〜89（受付はモデルに聞かない／査読は
+適合→品質／上流へ送る前に伏せる）を追記。SPEC §6.36。
 
 **v0.35.0（上流へ送る前の伏せ字）**: 送信の唯一の関門 `_call_once` で、既知の形の秘密
 （`sk-` / `ghp_` / `AKIA` / `Bearer` / JWT / 秘密鍵ブロック）を**自動で伏せる**。件数は各ツールの

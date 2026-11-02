@@ -86,7 +86,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.35.0"
+SERVER_VERSION = "0.36.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -7865,6 +7865,21 @@ def _render_admit(data: dict) -> str:
                  f"理由: {data.get('why')}"]
         if data.get("ask"):
             lines.append(f"→ {data['ask']}")
+        return "\n".join(lines)
+    if data.get("action") == "list_recent":
+        lines = [f"記録の読み戻し: {data.get('count', 0)} 件（mode={data.get('accept_mode')} / "
+                 f"ポリシー {data.get('policy_version')}）"]
+        marks = {"accept": "✓", "would_accept": "◎", "ignored": "・"}
+        for row in (data.get("decisions") or [])[:20]:
+            when = as_str(row.get("at"))[5:16].replace("T", " ")
+            card = as_str((row.get("mandate") or {}).get("card"))
+            lines.append(f"  {marks.get(row.get('disposition'), '?')} {when} "
+                         f"{as_str(row.get('trigger_id')) or '—'}（{as_str(row.get('source'))}）"
+                         f" {row.get('disposition')}/{row.get('strength')}"
+                         + (f" card={card}" if card else "")
+                         + ("（再実行）" if row.get("replayed") else ""))
+        if data.get("note"):
+            lines.append("ℹ️ " + data["note"])
         return "\n".join(lines)
     counts = data.get("counts") or {}
     lines = [f"受付 {data.get('action', 'evaluate')} / ポリシー {data.get('policy_version')} "

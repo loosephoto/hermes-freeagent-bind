@@ -664,6 +664,28 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     同じ型で、レート制限の公表が無い提供元は**自制の間隔**（既定 1 req/s）を置き、
     自動アクセスのチャレンジ（403 `ChallengeRequired`）は 5xx の再試行に載せず明示エラーにする。
 
+87. **受付の裁定と報告の検査はモデルに聞かない**（v0.32.0・SPEC §6.32）。`freeagent_admit` は
+    決定論の純関数で、許可リスト・受付表・bot リストから `explicit` / `inferred` / `not_admitted` を
+    決め、認可（Mandate: **内容の sha1 で決めるポリシー版**・強度・一致ルール・`card`）を返す。
+    **作業の状態機械は持たない**（Ticket は KANBAN が持ち主）ので、Ticket / Assignment 相当をここに
+    足さない。同じ `(source, thread, trigger_id)` は replay して**二重起票しない**。`ready` の報告は
+    証拠（`evidence.commands` の cmd / result が全件 pass）が無ければ受理しない。**既定は `observe`**
+    （推測候補は `would_accept` を記録するだけ）で、`off` / `auto` は明示する。
+
+88. **査読は「仕様適合 → 品質」の順に分ける**（v0.33.0・SPEC §6.33）。`basis` を渡したときだけ 2 段にし、
+    1 段目は**品質を書かせない**（`COMPLIANCE_SYSTEM`）。**語彙外・判定なしは blocking**。
+    再開時は保存済みの適合ラウンドを使い回し、**`mode` / `draft` / `basis` をセッションから復元する**
+    （復元漏れで再開が片肺になるのを実測で踏んだ）。品質ラウンドの `kind` は「既に品質ラウンドが
+    あるか」で決める（`round_no == 1` では 2 段のとき誤記される）。重要度も**名乗らない回答は unknown
+    ＝blocking**（v0.31.2）。
+
+89. **上流へ送る前に秘密を伏せる**（v0.35.0・SPEC §6.35）。伏せ字は送信の唯一の関門 `_call_once` に置く
+    （全ツールがここを通る＝1 箇所で漏れなく効く）。対象は**形がはっきりしたものだけ**（`sk-` / `ghp_` /
+    `github_pat_` / `AKIA` / `xox?-` / `AIza` / `Bearer` / JWT / 秘密鍵ブロック）で、曖昧な
+    高エントロピー文字列は伏せない（**誤爆しないことの回帰を置く**）。件数は `redactions` で返す。
+    委譲（`freeagent_delegate`）の完了報告条件は `description` に書くだけでは効かない
+    （サブプロセスは description を読まない）ので、**依頼文に前置きする**（`verify_required`）。
+
 ## ライセンス
 
 MIT。データは各提供元の条件に従い、回答には出典を表示すること。
