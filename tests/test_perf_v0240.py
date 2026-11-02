@@ -25,8 +25,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 後片付けの共有ヘルパー
+from _tmpstate import register_state_dir, remove_tree  # noqa: E402  # type: ignore[import-not-found]
+
+
 def _isolated():
-    tmp = tempfile.mkdtemp(prefix="fa-v0240-")
+    tmp = register_state_dir(tempfile.mkdtemp(prefix="fa-v0240-"))
     os.environ["FREEAGENT_STATE_DIR"] = tmp
     return tmp
 
@@ -38,7 +42,7 @@ from freeagent_bind.sources import wikidata as W  # noqa: E402
 class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = _isolated()
-        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.addCleanup(lambda: remove_tree(self.tmp))  # 1 回で諦めない（Windows のロック・作り直し）
         self.addCleanup(self._reset)
         self._reset()
 

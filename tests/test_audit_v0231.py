@@ -25,8 +25,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 後片付けの共有ヘルパー
+from _tmpstate import register_state_dir, remove_tree  # noqa: E402  # type: ignore[import-not-found]
+
+
 def _isolated():
-    tmp = tempfile.mkdtemp(prefix="fa-v0231-")
+    tmp = register_state_dir(tempfile.mkdtemp(prefix="fa-v0231-"))
     os.environ["FREEAGENT_STATE_DIR"] = tmp
     return tmp
 
@@ -37,7 +41,7 @@ import freeagent_bind.server as S  # noqa: E402
 class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = _isolated()
-        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.addCleanup(lambda: remove_tree(self.tmp))  # 1 回で諦めない（Windows のロック）
         # 統計・クールダウン・セッションはモジュール全体で共有される（前のテストの行を持ち越さない）。
         self.addCleanup(self._reset_state)
         self._reset_state()

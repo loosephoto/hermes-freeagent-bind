@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 11 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社）、検索は **27 ソース（既定 6 ＋ 明示指定 21）** に対応します。
+- 12 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社）、検索は **27 ソース（既定 6 ＋ 明示指定 21）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 **対象分野は科学（物理・数学・計算機）とプログラミングです。医学・生物学は対象外です。**
@@ -117,7 +117,7 @@ hermes config set mcp_servers.freeagent-bind.env.FREEAGENT_HARNESS hermes
 hermes mcp test freeagent-bind
 ```
 
-`Connected` と **11 tools** が出れば、サーバーの登録・接続は成功です。
+`Connected` と **12 tools** が出れば、サーバーの登録・接続は成功です。
 **これだけではモデルが回答できることまでは確認していません。** Hermes を再起動してから、会話で次を試してください。
 
 **まず検索を確認します（推論の接続は不要）。**
@@ -774,7 +774,17 @@ v0.9.5 は**提供元別の同時実行ゲート**と**モデル数の上限の�
 v0.14.0 = 17,495 / v0.14.1 = 17,555 / v0.14.2 = 17,666 / v0.22.0 = 17,771 / v0.26.0 = 17,986 /
 **v0.29.0 = 18,199 / v0.31.0 = 18,349 / v0.31.1 = 18,646 / v0.32.0 = 20,350 / v0.33.0 = 20,520 /
 v0.34.0 = 20,700 / v0.35.0 = 20,785**。v0.36.0 は**ツール定義に触れていない**（20,785 のまま）。
+v0.36.1 は `sources` の説明に mdn / devdocs を追記して **21,211 文字（+426）**。
 以下は新しい順の内訳です。
+
+**v0.36.1（監査で見つかった 3 件の追従）**: ①README 冒頭と接続確認の例のツール数が **11 のまま**
+（実装は 12）だったのを修正 ②`freeagent_lookup` / `freeagent_grounded` の `sources` 説明に
+**mdn / devdocs**（v0.30.0 で追加）が抜けていたのを追記し、devdocs が**索引だけで本文を返さない**
+ことを明記 ③テストが import 時に作る `FREEAGENT_STATE_DIR` を `atexit` で消すようにした
+（実測: 全実行 1 回で **7 個**の空ディレクトリが `%TEMP%` に残り、累積 537 個 / 22.4MB）。
+後片付けの後に遅れて走る書き手が**消したディレクトリを作り直す**分（別モジュールで 1 個）も、
+終了時にもう一度消す。修正後は**全実行で増加 0**。
+回帰は `tests/test_audit_v0361.py`（7 件）。SPEC §6.37。
 
 **v0.36.0（読みやすさと文書の追補）**: `freeagent_admit(action="list_recent")` の本文を専用にし、
 日時・source・裁定・強度・`card` を 1 行ずつ出すようにした。README に**2 段査読**と

@@ -14,7 +14,10 @@ from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
-os.environ.setdefault("FREEAGENT_STATE_DIR", tempfile.mkdtemp(prefix="fa-select-test-"))
+sys.path.insert(0, os.path.join(ROOT, "tests"))  # 状態ディレクトリの後始末を共有する
+from _tmpstate import isolated_state  # noqa: E402  # type: ignore[import-not-found]
+
+isolated_state("fa-select-test-")  # 終了時に消す（import 時なので addCleanup が付けられない）
 
 import freeagent_bind.server as S  # noqa: E402
 

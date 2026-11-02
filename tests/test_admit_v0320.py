@@ -1,11 +1,15 @@
 """v0.32.0: freeagent_admit（決定論ゲート・Mandate・証拠つき報告・冪等フェンス）。ネット不要。"""
 import json
 import os
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from freeagent_bind import server as S
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "src"))  # 他のテストと同じく src を自前で足す（editable 無しでも動く）
+
+from freeagent_bind import server as S  # noqa: E402
 
 
 class AdmitTestBase(unittest.TestCase):

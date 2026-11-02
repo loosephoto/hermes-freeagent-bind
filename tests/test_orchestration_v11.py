@@ -16,9 +16,11 @@ import time
 import unittest
 from unittest import mock
 
-_TMP = tempfile.mkdtemp(prefix="fa-orch-test-")
-os.environ["FREEAGENT_STATE_DIR"] = _TMP
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 状態ディレクトリの後始末を共有する
+from _tmpstate import isolated_state  # noqa: E402  # type: ignore[import-not-found]
+
+_TMP = isolated_state("fa-orch-test-")  # 終了時に消す（import 時なので addCleanup が付けられない）
 
 from freeagent_bind import server as S  # noqa: E402
 
