@@ -2,12 +2,13 @@
 """hermes-freeagent-bind — Hermes Agent の Free モデルをサブLLMとして並列に走らせ、
 外部知識（既定6ソース＋DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates / CiNii /
 OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Libraries.io /
-Internet Archive / Qiita）で
+Internet Archive / Qiita / OpenReview / MDN / DevDocs）で
 根拠づける MCP サーバー。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は
 対象外**（第6段階で採った生命・医学系ソースは 2026-10-05 に方針変更で削除。§5.19 に記録）。
 
-**モジュラーモノリス**として書く。本体はこの 1 ファイル（§0〜§4・§5 の横断部・§6〜§10）で、
-知識ソース 25 種だけを `sources/<name>.py`（1 ソース 1 ファイル）に置く。配布物は今も
+**モジュラーモノリス**として書く。本体はこの 1 ファイル（§0〜§4・§5 の横断部・§6〜§11）で、
+知識ソース 27 種は `sources/<name>.py`（1 ソース 1 ファイル）、プロバイダ 18 社は
+`providers/<name>.py`（1 社 1 ファイル）に置く。配布物は今も
 **stdio スクリプト 1 本**で完結する（`python server.py` / `runpy.run_path(server.py)` の直接実行は、
 冒頭の互換シムがパッケージ版を import して `main()` を呼ぶ。実測: stdio 起動後にネイティブ拡張を
 import すると無応答になる環境があるため、起動経路は増やさない）。肥大化は前提なので、増築は
@@ -24,8 +25,10 @@ import すると無応答になる環境があるため、起動経路は増や�
                     §5.10 明示許可代替 / §5.11 ホスト予算 / §5.12 OpenAIRE / §5.13 引用統合 / §5.14 Zenodo / §5.15 ROR /
                     §5.16 DOAJ・npm・crates.io / §5.17 CiNii Research（appid 必須） / §5.18 プログラミング・標準 /
                     §5.19 科学（医学・生物学は対象外） / §5.20 プログラミング特化: HN・Software Heritage・Libraries.io /
-                    §5.21 Internet Archive（明示指定のみ） / §5.22 日本語の技術記事: Qiita（明示指定のみ））
-  §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号）
+                    §5.21 Internet Archive（明示指定のみ） / §5.22 日本語の技術記事: Qiita（明示指定のみ） /
+                    §5.23 OpenReview（明示指定のみ） / §5.24 MDN・DevDocs（明示指定のみ））
+  §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号 /
+                 §6.12 panel の統合 / §6.32 受付と報告 / §6.37 記録からの診断）
   §7 ツール定義         §8 表示（content）
   §8.5 失敗時の「次の一手」（structuredContent.next_action）
   §8.6 ハーネス判別（Hermes 以外で起動されたときの警告）   §9 JSON-RPC / stdio
@@ -87,7 +90,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.38.1"
+SERVER_VERSION = "0.38.2"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -943,9 +946,14 @@ def classify_error(err: str) -> str:
     # 「キーが無い・廃止された」と同じ扱いになり、復旧可能な失敗の内訳が見えなくなる（v0.18.0）。
     if "空応答" in (err or "") or "empty response" in t or "no output" in t:
         return "no_output"
-    if any(part.strip(".,:;()[]") == "429" for part in t.split()) or "rate limit" in t or "rate_limit" in t or "rate-limit" in t or "too many requests" in t or "quota" in t:
+    raw_err = err or ""
+    if (any(part.strip(".,:;()[]") == "429" for part in t.split())
+            or "rate limit" in t or "rate_limit" in t or "rate-limit" in t
+            or "too many requests" in t or "quota" in t
+            or "同時実行枠" in raw_err or ("上限" in raw_err and "達しました" in raw_err)):
         return "rate_limited"
-    if "timeout" in t or "timed out" in t:
+    if ("timeout" in t or "timed out" in t or "時間切れ" in raw_err
+            or "締め切り" in raw_err or "並列実行の予算" in raw_err or "予算を使い切った" in raw_err):
         return "timeout"
     if "404" in t or "410" in t or "gone" in t:
         return "gone"
@@ -1353,10 +1361,25 @@ def _order_for_selection(refs: list[str]) -> list[str]:
     return _tier_order(base, tier) if tier in ROUTING_TIERS else base
 
 
+def env_excluded_models() -> list[str]:
+    """`FREEAGENT_MODEL_EXCLUDE`（カンマ区切り）で指定された除外モデル一覧."""
+    raw = os.environ.get("FREEAGENT_MODEL_EXCLUDE") or ""
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _is_model_excluded(ref: str, excluded: set[str]) -> bool:
+    """完全一致または `:free` 等のサフィックスを除いた基底名で除外判定する."""
+    if not excluded or not ref:
+        return False
+    return ref in excluded or ref.rsplit(":", 1)[0] in excluded
+
+
 def select_models(size: int, requested: list[str] | None = None, *,
                   prefer: list[str] | None = None, exclude: list[str] | None = None,
                   free_only: bool = True) -> tuple[list[str], dict]:
     """参加モデルを決める。明示 > prefer > 品質統計 の順に効かせる（選んだ根拠を返す）。"""
+    all_exclude = list(dict.fromkeys(as_str_list(exclude) + env_excluded_models()))
+    ex_set = set(all_exclude)
     available = free_model_refs(free_only=free_only)
     if not available:
         return [], {"reason": "no_models", "available": 0}
@@ -1391,9 +1414,8 @@ def select_models(size: int, requested: list[str] | None = None, *,
         # 在庫の全 Free を使うので、名指しされたモデルはこれまでどおり試す。
         chat_ok = set(free_model_refs(free_only=free_only, chat_only=True))
         pool = [r for r in available if r not in chosen and r in chat_ok]
-        if exclude:
-            ex = set(exclude)
-            pool = [r for r in pool if r not in ex]
+        if ex_set:
+            pool = [r for r in pool if not _is_model_excluded(r, ex_set)]
         # クールダウン中を**先に選ばない**（除外ではなく後回し）。選んだ直後に 429 が記録されると
         # 「全候補がクールダウン中」で 1 体へ縮退し、失敗に見える（実測）。空きが足りないときだけ補充する。
         cooling = cooling_refs()
@@ -1413,9 +1435,8 @@ def select_models(size: int, requested: list[str] | None = None, *,
             picked += diverse_order(_order_for_selection(waiting))[:need - len(picked)]
             notes.append(f"空きが足りずクールダウン中から補充: {', '.join(waiting[:3])}")
         chosen.extend(picked)
-    if exclude:
-        ex = set(exclude)
-        chosen = [r for r in chosen if r not in ex]
+    if ex_set:
+        chosen = [r for r in chosen if not _is_model_excluded(r, ex_set)]
 
     # **明示指定は size で切り落とさない**。実測: `models` に 8 件渡しても size=3 で 3 件に切られ、
     # 「在庫のモデルを全部走らせる」ができなかった。`size` は**自動選抜の目標本数**として扱う。
@@ -1424,7 +1445,7 @@ def select_models(size: int, requested: list[str] | None = None, *,
     info = {
         "requested": bool(requested),
         "prefer": as_str_list(prefer),
-        "exclude": as_str_list(exclude),
+        "exclude": all_exclude,
         "available": len(available),
         "ranking": RANK_ENABLED,
         "selection_strategy": selection_strategy(),
@@ -1501,7 +1522,7 @@ def trace_call(kind: str, ref: str, ok: bool, *, error: str = "", served_by: str
            "tokens": tokens or {}, "ts": now_ts()}
     path = trace_path()
     try:
-        with _STATE_LOCK:
+        with _STATE_LOCK, _file_lock(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             try:
                 if os.path.getsize(path) > _TRACE_MAX_BYTES:
@@ -3317,8 +3338,10 @@ def _candidates(ref: str, free_only: bool = True) -> list[str]:
     if len(out) >= _MAX_ATTEMPTS:
         return out[:_MAX_ATTEMPTS]
     blocked = {name for name in PROVIDER_ORDER if provider_auth_blocked(name)}
+    ex_set = set(env_excluded_models())
     pool = [other for other in free_model_refs(free_only=free_only, chat_only=True)
             if other != ref and other not in cooling and other not in out
+            and not _is_model_excluded(other, ex_set)
             and other.split("/", 1)[0] not in blocked]
     for other in diverse_order(_order_for_selection(pool)):
         out.append(other)
@@ -6069,20 +6092,29 @@ def _refine_answers(question: str, answers: list[dict], refs: list[str], args: d
     if requested:
         model, why = requested, "refine_model の指定"
     else:
-        # 統合役は**参加していないモデル**を優先する。同じモデルに自分の答えを統合させると
-        # 合意度が上がるだけで新しい情報が入らない。全員参加しているときだけ最上位が兼務する。
-        pool = [r for r in free_model_refs(free_only=True, chat_only=True) if r not in refs]
+        # 統合役は**参加していないモデル**（要求 ref と実応答 served_by の両方）を優先する。
+        # 同じモデルに自分の答えを統合させると合意度が上がるだけで新しい情報が入らない。
+        # 全員参加しているときだけ最上位が兼務する。
+        used = set(refs) | {as_str(a.get("served_by")) for a in good if as_str(a.get("served_by"))}
+        ex_set = set(as_str_list(args.get("exclude")) + env_excluded_models())
+        cooling = cooling_refs()
+        blocked = {p for p in PROVIDER_ORDER if provider_auth_blocked(p)}
+        pool = [r for r in free_model_refs(free_only=True, chat_only=True)
+                if r not in used and not _is_model_excluded(r, ex_set)
+                and r not in cooling and r.split("/", 1)[0] not in blocked]
         if pool:
             model, why = _pick_refiner(pool, fallback="参加していないモデルの最上位")
         else:
-            model, why = _pick_refiner(refs, fallback="全員参加のため最上位が兼務")
+            fallback_pool = [r for r in refs if not _is_model_excluded(r, ex_set)] or list(refs)
+            model, why = _pick_refiner(fallback_pool, fallback="全員参加のため最上位が兼務")
     candidates = "\n".join(
         f"[{i + 1}] {a['model']}: {truncate(a.get('answer') or a.get('conclusion') or '', 900)}"
         for i, a in enumerate(good))
     res = call_model(model, _REFINE_PROMPT.format(question=question, candidates=candidates),
                      max_tokens=as_int(args.get("max_tokens"), 500, 16, 4000),
                      temperature=0.0, kind="panel_refine")
-    out: dict = {"model": model, "calls": 1, "reason": why, "from_panel": model in refs}
+    out: dict = {"model": model, "calls": 1, "reason": why,
+                 "from_panel": model in (set(refs) if requested else used)}
     if res.get("error"):
         out["error"] = truncate(res["error"], 240)
         return out
@@ -6404,7 +6436,7 @@ def tool_consult(args: dict) -> dict:
         return {"error": "question は必須です（session_id を付けると前回の問いを引き継ぎます）"}
 
     if stored and stored.get("models"):
-        refs = [m for m in stored["models"] if m and not is_cooling(m)][:3]
+        refs = [m for m in stored["models"] if m and not is_cooling(m)][:MAX_MODELS_PER_CALL]
         info = {"requested": True, "resumed_from": sid, "models": refs}
         if not refs:
             refs, info = _select_or_error(args, default_size=3)
@@ -6709,6 +6741,8 @@ def tool_agent(args: dict) -> dict:
     if main_reply:
         base += f"\n\n【メインからの回答（最優先の前提）】\n{truncate(main_reply, 3000)}"
 
+    claims = _ModelClaims(refs, as_str_list(args.get("exclude")) + env_excluded_models() or None)
+
     def run_one(ref: str) -> dict:
         history = base
         trace: list[dict] = []
@@ -6735,11 +6769,17 @@ def tool_agent(args: dict) -> dict:
             return added
 
         for step in range(max_steps):
+            if budget_expired():
+                return {"model": ref, "steps": step, "trace": trace, "answer": "",
+                        "steps_exhausted": True, "timed_out": True, "dropped": True,
+                        "error": f"並列実行の予算で打ち切りました（ステップ {step}/{max_steps}）",
+                        "evidence": evidence[:8], "citations": registry, "bibliography": bibliography,
+                        "injected_citations": sorted(injected), "cited": [], "cited_ok": False}
             final_step = step == max_steps - 1
             res = call_model(ref, history + f"\n\n（{step + 1}/{max_steps} ステップ目。"
                                             "JSON を1つだけ出力）",
                              system=AGENT_SYSTEM_FINAL if final_step else AGENT_SYSTEM,
-                             max_tokens=max_tokens, kind="agent")
+                             max_tokens=max_tokens, kind="agent", claims=claims)
             if res.get("error"):
                 return {"model": ref, "error": res["error"], "steps": step, "trace": trace}
             parsed = _parse_agent_reply(res["text"])
@@ -8491,7 +8531,8 @@ def _diag_advice(totals: dict, by_class: dict, ref_fail: dict, fails: list[dict]
                           "（宣言が無ければ何も制限していないので、この分類は提供元側の 429 です）。"
                           "size を減らすか、PROVIDER_ORDER で別の提供元を先に並べてください。"}
     if share.get("no_output", 0.0) >= 0.3:
-        worst = ", ".join(list(ref_fail)[:3]) or "特定できず"
+        ranked_fail = [r for r, _ in sorted(ref_fail.items(), key=lambda kv: (-kv[1], kv[0]))]
+        worst = ", ".join(ranked_fail[:3]) or "特定できず"
         return {"kind": "empty_output", "check": ["FREEAGENT_MODEL_EXCLUDE"],
                 "advice": f"失敗 {failed} 件のうち {top_n} 件が空応答です（思考モデルが max_tokens を"
                           f"使い切る型）。呼び出しの max_tokens を 256 以上に上げるか、空応答の多いモデルを"
@@ -8536,9 +8577,20 @@ def tool_diagnose(args: dict) -> dict:
     fail_rows = [r for r in rows if not r.get("ok")]
     totals = {"calls": len(rows), "ok": len(ok_rows), "failed": len(fail_rows),
               "ok_rate": round(len(ok_rows) / len(rows), 3) if rows else None}
+    def _row_error_class(row: dict) -> str:
+        raw_cls = as_str(row.get("error_class"))
+        err_text = as_str(row.get("error"))
+        if raw_cls and raw_cls != "other":
+            return raw_cls
+        if err_text:
+            reclassified = classify_error(err_text)
+            if reclassified != "other":
+                return reclassified
+        return raw_cls or "unknown"
+
     by_class: dict[str, int] = {}
     for row in fail_rows:
-        key = as_str(row.get("error_class")) or "unknown"
+        key = _row_error_class(row)
         by_class[key] = by_class.get(key, 0) + 1
     by_kind: dict[str, dict] = {}
     for row in rows:
@@ -8593,7 +8645,7 @@ def tool_diagnose(args: dict) -> dict:
             slot["ok"] += 1
         else:
             slot["failed"] += 1
-            key = as_str(row.get("error_class")) or "unknown"
+            key = _row_error_class(row)
             slot["error_classes"][key] = slot["error_classes"].get(key, 0) + 1
         ts = as_float(row.get("ts"), 0.0)
         if ts and (not slot["first_ts"] or ts < slot["first_ts"]):
@@ -8615,7 +8667,7 @@ def tool_diagnose(args: dict) -> dict:
                        if as_float(row.get("ts"), 0.0) else "",
                        "kind": as_str(row.get("kind")),
                        "model": as_str(row.get("ref")),
-                       "error_class": as_str(row.get("error_class")) or "unknown",
+                       "error_class": _row_error_class(row),
                        "error": truncate(as_str(row.get("error")), 200)})
     notes = []
     if info["capped"]:
@@ -8632,8 +8684,8 @@ def tool_diagnose(args: dict) -> dict:
         notes.append("kind / model / run で絞った結果です（全体は days だけを指定して見る）")
     return {
         "window": {"days": days, "since": round(since, 3), "until": round(now, 3),
-                   "since_utc": datetime.datetime.utcfromtimestamp(since).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                   "until_utc": datetime.datetime.utcfromtimestamp(now).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "since_utc": datetime.datetime.fromtimestamp(since, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "until_utc": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                    "filters": {"kind": kind_filter, "model": model_filter, "run": run_filter}},
         "totals": totals,
         "by_error_class": dict(sorted(by_class.items(), key=lambda kv: (-kv[1], kv[0]))),
@@ -9596,11 +9648,15 @@ def _resource_api_rules() -> str:
         _md_table(["場面", "ツール"], [
             ["出典が要る事実確認（LLM を呼ばない＝幻覚が入らない）", "`freeagent_lookup`"],
             ["根拠を読ませた上で答えさせたい", "`freeagent_grounded`"],
+            ["1 モデルに下読み・分類・要約を 1 回任せる", "`freeagent_ask`"],
             ["同じ問いを複数モデルに当てて多様性が要る", "`freeagent_panel` / `freeagent_fanout`"],
             ["大量の要素へ同じ指示を並列適用", "`freeagent_map`"],
             ["設計・デバッグなど 2 段以上の推論", "`freeagent_think` → 必要なら `freeagent_consult`"],
             ["在庫・Free 判定・生存確認", "`freeagent_models`"],
-            ["決められた手順で自分に調べさせる", "`freeagent_agent`"],
+            ["失敗の理由・遅さを記録（traces）から決定論で知る", "`freeagent_diagnose`"],
+            ["外部依頼の受付裁定・完了報告の証拠検査（決定論）", "`freeagent_admit`"],
+            ["決められた手順で自分に調べさせる（読み取り専用）", "`freeagent_agent`"],
+            ["フルツール付き Hermes を別プロセスで動かす（既定 off）", "`freeagent_delegate`"],
         ]),
         "",
         "## 手順が要るとき",

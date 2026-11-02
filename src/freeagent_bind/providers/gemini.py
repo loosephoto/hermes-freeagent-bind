@@ -1,4 +1,4 @@
-"""gemini — Gemini Free tierと非機密データ利用の両確認が必須。Unpaid prompts/outputs may be reviewed and used（server.py §0 から分割・v0.16.0）.
+"""gemini — Gemini Developer API（Free tier とデータ利用確認必須・server.py §0 から分割・v0.16.0）.
 
 SPEC の各フィールドの意味は SPEC.md §4.1。値は import 時に環境変数から読む。
 """

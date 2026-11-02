@@ -40,9 +40,11 @@ class _StateIsolated(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="fa-orch-case-", dir=_TMP)
         self.addCleanup(shutil.rmtree, self.tmp, True)
         patcher = mock.patch.dict(os.environ, {
+            "FREEAGENT_STATE_DIR": self.tmp,
             "FREEAGENT_STATS_PATH": os.path.join(self.tmp, "model_stats.json"),
             "FREEAGENT_COOLDOWN_PATH": os.path.join(self.tmp, "cooldowns.json"),
             "FREEAGENT_QUOTA_PATH": os.path.join(self.tmp, "quota.json"),
+            "FREEAGENT_TRACE_PATH": os.path.join(self.tmp, "traces.jsonl"),
         })
         patcher.start()
         self.addCleanup(patcher.stop)

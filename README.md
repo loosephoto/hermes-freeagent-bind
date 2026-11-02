@@ -141,11 +141,11 @@ freeagent_ask で「接続できました」と一言だけ答えさせて。
 **既定は stdio です（1 クライアント = 1 プロセス）。何も指定しなければ従来どおりです。**
 
 KANBAN のワーカーや複数の Bot から同時に使うと、stdio では**クライアントごとに別プロセス**が立ちます。
-するとプロセス内に持っているものが分割されます: ホストごとのアクセス間隔、クールダウン、品質統計、
-モデル一覧のキャッシュ（600 秒）、同時実行の上限です。同じホストへ二重に投げたり、統計が上書きされたりします。
-**ただしモデル一覧だけは v0.9.0 からディスクにも載ります**（プロセスを入れ替えても温かく、起動直後の
-選抜が待たされません・SPEC §4.4）。これは `AGENTS.md` 規約 28 が警告している状態そのものです。
-HTTP モードでは **1 プロセスを複数クライアントが共有**します。
+永続ストア（モデル一覧・品質統計・クールダウン・クォータ・思考台帳・相談セッション・認証記憶）は
+ファイルロックと更新時刻検知でプロセス間でも共有されますが（v0.25.0・SPEC §6.23）、**メモリ上の知識検索キャッシュ・
+ホストごとのアクセス間隔・提供元ごとの同時実行枠（`PROVIDER_GATE`）はプロセスごとに分割**されます。
+そのため stdio を複数立てると、同じ検索先へ同時に投げたり同時実行枠がプロセス数ぶん倍増したりします（規約 28・55）。
+HTTP モードではこれらも含めて **1 プロセスを複数クライアントが共有**します。
 
 ```bash
 # サーバーを HTTP モードで起動する（動かしたままにする）
@@ -420,7 +420,7 @@ python scripts/gen_cases.py                              # ケースだけ生成
 | URI | 内容 |
 |---|---|
 | `resource://freeagent/api-rules` | どのツールをどの場面で使うか／失敗時の `next_action` の読み方／待ち時間と上限 |
-| `resource://freeagent/sources` | 知識ソースの在庫（既定 6 種と明示指定 18 種の別） |
+| `resource://freeagent/sources` | 知識ソースの在庫（既定 6 種と明示指定 21 種の別） |
 | `resource://freeagent/providers` | 推論プロバイダと「何を入れれば使えるか」（**鍵の値は出しません**） |
 | `resource://freeagent/result-shape` | `content` / `structuredContent` の契約、引用の位置 |
 | `resource://freeagent/skills` | スキルの目録（どれを・いつ読むか。v0.37.0） |
@@ -636,7 +636,7 @@ freeagent_think で、API の p99 遅延が 3 倍になった原因を探して�
 | 症状 | 確認・対処 |
 |---|---|
 | ツールが出てこない | `hermes mcp test freeagent-bind` で登録と接続を確認。設定変更後は Hermes を再起動 |
-| 接続テストは成功したが回答できない | 接続テストは 12 ツールの発見まで。`freeagent_ask` で実応答を試し、キー・利用枠・プロキシを確認 |
+| 接続テストは成功したが回答できない | 接続テストは 13 ツールの発見まで。`freeagent_ask` で実応答を試し、キー・利用枠・プロキシを確認 |
 | 検索はできるが相談だけ失敗する | 推論の接続問題です。キー未設定なら設定。Nous を使うなら `hermes proxy start` |
 | `nous` が `WinError 10061` | ローカルプロキシが停止しています。他プロバイダが使えるなら全体は止まりません |
 | `401`、認証を示す `403` | キー・トークン権限を確認。HF では **Make calls to Inference Providers** が必要。変更後は再起動 |
@@ -1135,10 +1135,10 @@ API キーに加えて、契約プランやデータの扱いを確認したこ�
 | `FREEAGENT_LIBRARIESIO_KEY` | librariesio | **このソースを使う場合は必須**。[Libraries.io](https://libraries.io/account)の無料アカウントで取得する API キー。未設定なら librariesio は HTTP を出さず、登録先を案内します（60 req/分） |
 | `FREEAGENT_QIITA_TOKEN` | qiita | **任意**（キーが無くても 60 回/時で動きます）。[個人用アクセストークン](https://qiita.com/settings/tokens/new)を設定すると 1,000 回/時に上がり、アクセス間隔が 60 秒 → 3.6 秒になります |
 
-キーなしで動くのは **23 ソース**です（25 ソースのうち、下の 2 つを除いた全部）:
+キーなしで動くのは **25 ソース**です（27 ソースのうち、下の 2 つを除いた全部）:
 `wikipedia` / `wikidata` / `arxiv` / `crossref` / `openalex` / `github` / `datacite` / `openaire` /
 `zenodo` / `ror` / `doaj` / `npm` / `crates` / `osv` / `ietf` / `inspirehep` / `oeis` / `hfhub` /
-`hn` / `swh` / `ia` / `qiita` / `openreview`。
+`hn` / `swh` / `ia` / `qiita` / `openreview` / `mdn` / `devdocs`。
 このうち `openalex` と `github` は、キーを入れると枠と安定性が上がります（無くても動きます）。
 
 **必須なのは `cinii` と `librariesio` の 2 つだけ**です。利用者自身の appid / API キーが要り、
@@ -1308,7 +1308,7 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `openalex` | 論文のメタデータ・被引用数・アブストラクト | 匿名検索の制限あり。API キーを推奨 |
 | `github` | リポジトリ / Issue / コードの検索結果。コード検索は一致箇所の**断片**（`snippet`）も返す | コード検索はトークン必須（10 req/分）。**ライセンス情報を含まない**ので取り込み前に確認 |
 
-### 📘 明示指定で使う19ソース
+### 📘 明示指定で使う21ソース
 
 通常の検索には自動で追加されません。表の名前を会話で指定してください。
 
@@ -1361,6 +1361,7 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | アーカイブの存在を調べる | 「Software Heritage に cargo のリポジトリがあるか調べて」 | `swh` |
 | 当時の一次資料を探す | 「Internet Archive で FORTRAN のマニュアルを探して」 | `ia`（**英語の語で**） |
 | 日本語の技術記事を探す | 「Qiita で Python の非同期処理の記事を探して」 | `qiita` |
+| Web 標準・API リファレンスを引く | 「MDN で AbortController の仕様を調べて」「DevDocs で Python 3.14 の asyncio を引いて」 | `mdn`, `devdocs` |
 
 **CiNii の利用目的は学術研究／非営利の情報利活用に限定され、appid の貸与・譲渡は禁止です。**
 自分の利用が条件を満たすか確認してから設定してください
@@ -1408,6 +1409,9 @@ Zenodo は非軍事用途に限ります。各ソースの帰属表示と利用�
 {"query":"mixture of experts","sources":["openreview"],"limit":2}
 // 日本語の技術記事（Qiita。検索構文が使える）
 {"query":"tag:Python created:>2026-01-01","sources":["qiita"],"limit":2}
+// Web 技術ドキュメント（MDN）と開発者ドキュメント索引（DevDocs）
+{"query":"AbortController","sources":["mdn"],"limit":2}
+{"query":"python","sources":["devdocs"],"limit":2}
 // 自然語arXiv検索の失敗・遅延時にのみ、DataCiteの追加利用を明示許可
 {"query":"language model hallucination","sources":["arxiv"],"fallback":true,"limit":2}
 ```
@@ -1499,7 +1503,7 @@ librariesio はキー未設定なら検査・計測せずに外します。脱�
 | 症状 | 理由・対処 |
 |---|---|
 | 追加ソースが検索されない | `sources`に明示指定してください。既定6ソースは変えていません |
-| 「ローカルのアクセス間隔制御」 | 同じホストの予算待ちです。DataCiteは0.61秒、OpenAIREは60.1秒、Zenodoは2.01秒、RORは6.1秒、DOAJは0.51秒、npmは1秒、crates.ioは1.01秒、librariesioは1秒間隔。第6段階は osv 0.5秒（エンドポイント単位）、ietf / inspirehep / oeis / hfhub は1秒。第7段階は hn 0.4秒、swh 1秒。第8段階は ia 1秒（`archive.org/advancedsearch` を metadata API と別の予算に分けています）。第10段階は openreview 1秒（エンドポイント単位）。**qiita は未認証 60秒 / トークンあり 3.6秒**（公称 60 回/時・1,000 回/時）。待機せずエラーを返すため表示された秒数後に再試行 |
+| 「ローカルのアクセス間隔制御」 | 同じホストの予算待ちです。DataCiteは0.61秒、OpenAIREは60.1秒、Zenodoは2.01秒、RORは6.1秒、DOAJは0.51秒、npmは1秒、crates.ioは1.01秒、librariesioは1秒間隔。第6段階は osv 0.5秒（エンドポイント単位）、ietf / inspirehep / oeis / hfhub は1秒。第7段階は hn 0.4秒、swh 1秒。第8段階は ia 1秒（`archive.org/advancedsearch` を metadata API と別の予算に分けています）。第10段階は openreview 1秒（エンドポイント単位）、第11段階は mdn / devdocs とも 1秒。**qiita は未認証 60秒 / トークンあり 3.6秒**（公称 60 回/時・1,000 回/時）。待機せずエラーを返すため表示された秒数後に再試行 |
 | OpenAIREを別プロセスでも使う | 間隔制御はプロセス内のみ。同一IPの別MCP/CLIを含め提供元の枠を共有するため、並行実行を避ける。今回のOpenAIRE認証枠の拡張は未実装 |
 | 書誌はあるがgroundedの根拠がない | 抄録無しの追加ソースは本文を生成で補いません。別ソースを明示指定 |
 | arXivの代替が起動しない | `fallback=true`、自然語検索、締切内、障害/遅延という条件を確認 |
@@ -1522,6 +1526,8 @@ python scripts/probe_knowledge_stdio.py --sources ia --query "FORTRAN manual"
 python scripts/probe_knowledge_stdio.py --sources oeis --query Fibonacci
 python scripts/probe_knowledge_stdio.py --sources hfhub --query llama
 python scripts/probe_knowledge_stdio.py --sources openreview --query "mixture of experts"
+python scripts/probe_knowledge_stdio.py --sources mdn --query "fetch API"
+python scripts/probe_knowledge_stdio.py --sources devdocs --query python
 python scripts/probe_knowledge_stdio.py --sources qiita --query "tag:Python"
 python scripts/measure_kb.py --sources zenodo ror
 python scripts/measure_kb.py --sources doaj npm crates
@@ -1561,7 +1567,9 @@ python scripts/measure_relevance.py --report
 [Libraries.io](https://libraries.io/terms)（**利用者自身の無料APIキーが必要**・60 req/min。§6.10） /
 [Internet Archive](https://archive.org/developers/bots.html)（読み取りはキー不要。`robots.txt` の Disallow は `/control/` と `/report/` のみ。AI エージェントを含む自動アクセスに説明的 User-Agent と間隔・429 の尊重を IA が明示。**日本語クエリは不可**。§6.11） /
 [Qiita](https://qiita.com/terms)（記事の著作権は投稿者に帰属。未認証は 60 回/時、`FREEAGENT_QIITA_TOKEN` で 1,000 回/時） /
-[OpenReview](https://openreview.net/legal/terms)（API は data upload / search / download のための公式インターフェース。Works の著作権は著者に残るので、引用はタイトル・抄録・著者・forum URL までとし、PDF は取得しません。レート制限の公表値が無いため 1 req/s に自制。§6.27）。
+[OpenReview](https://openreview.net/legal/terms)（API は data upload / search / download のための公式インターフェース。Works の著作権は著者に残るので、引用はタイトル・抄録・著者・forum URL までとし、PDF は取得しません。レート制限の公表値が無いため 1 req/s に自制。§6.27） /
+[MDN Web Docs](https://developer.mozilla.org/en-US/docs/MDN/Writing_guidelines/Attrib_copyright_license)（Mozilla contributors の CC-BY-SA 2.5。帰属表示が必須・1 req/s に自制） /
+[DevDocs](https://devdocs.io/)（freeCodeCamp による索引。本文は取得せず `metadata_only`。各 docset の原ライセンスに従う・1 req/s に自制）。
 
 リンク先全文・パッケージ本体の利用条件はメタデータの条件とは別です。
 
@@ -1597,7 +1605,7 @@ Wikipedia は「データモデル」を返したので、取得成功でも問�
 
 | # | 条件 | 確かめ方 |
 |---|---|---|
-| 1 | ツールが**見えている**（接続できている） | `hermes mcp test freeagent-bind` が 12 ツールを返す |
+| 1 | ツールが**見えている**（接続できている） | `hermes mcp test freeagent-bind` が 13 ツールを返す |
 | 2 | **毎ターン読まれる場所**に判断規則がある | `SOUL.md` にマーカーブロックがある |
 | 3 | 似たことをする**汎用ツールが邪魔していない** | `apply_proactive.py --check` が「競合 0 件」 |
 
@@ -1623,10 +1631,10 @@ python scripts/apply_proactive.py          # 表示のみ（1 バイトも書き
 hermes mcp test freeagent-bind
 #   Transport: HTTP → http://127.0.0.1:8790/mcp
 #   ✓ Connected (1093ms)
-#   ✓ Tools discovered: 11
+#   ✓ Tools discovered: 13
 ```
 
-**11 個出ないときは、この 3 つのどれかです。**
+**13 個出ないときは、この 3 つのどれかです。**
 
 | 症状 | 原因 | 対処 |
 |---|---|---|
@@ -1688,7 +1696,7 @@ python scripts/measure_adoption.py --sessions 20
 
 | 症状 | 見るところ |
 |---|---|
-| まったく使われない | ① `hermes mcp test` で 12 ツール出るか ② `SOUL.md` にマーカーブロックがあるか ③ `--check` で競合が 0 件か |
+| まったく使われない | ① `hermes mcp test` で 13 ツール出るか ② `SOUL.md` にマーカーブロックがあるか ③ `--check` で競合が 0 件か |
 | 簡単な質問でも使って遅い | 規則の「1 問 1 答では使わない」が効いていない。`--write-snippet` で文面を更新して再起動 |
 | 使うが結果が浅い | モデル側の限界。`freeagent_models` で在庫を確認し、`size` を上げる／`refine` を付ける（[🔗 回答を 1 つに統合する](#-回答を-1-つに統合するfreeagent_panel-の-refine)） |
 | 別端末・別プロファイルで使われない | 登録と `SOUL.md` は**環境ごと**に必要（設定は共有されません） |
@@ -1732,7 +1740,7 @@ hermes -p reviewer config get mcp_servers.freeagent-bind
 
 ### ワーカーが呼ぶ形（実測）
 
-ワーカーは普通のセッションと同じ 12 ツールを呼べます。実測した最小の例:
+ワーカーは普通のセッションと同じ 13 ツールを呼べます。実測した最小の例:
 
 ```
 freeagent_lookup(query="大規模言語モデル", sources=["wikipedia"], limit=3)
@@ -1844,6 +1852,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 |---|---|---|
 | `FREEAGENT_STATE_DIR` | `%LOCALAPPDATA%\hermes-freeagent-bind` | 蓄積ストア（統計・クールダウン・相談セッション）。**一時領域に置かない** |
 | `FREEAGENT_DEFAULT_MODEL` | 空（自動選抜） | 既定モデル（`provider/model`） |
+| `FREEAGENT_MODEL_EXCLUDE` | 空 | 自動選抜・フォールバック・統合役から常に外すモデル（カンマ区切り。例: `nous/poolside/laguna-xs-2.1:free`。`:free` 無しの基底名でも一致） |
 | `FREEAGENT_MAX_WORKERS` | 8 | 並列処理 1 回のワーカー上限（1〜32）。プロセス全体の上限ではない。**429 の抑止は提供元の枠が担う** |
 | `FREEAGENT_FAIR_SCHEDULER` | 0 | `1` で LLM の並列呼び出しを要求単位で順番回しする共有スケジューラを試用。既定では従来方式。**厳密なプロセス全体の上限ではない**（上記） |
 | `FREEAGENT_FAIR_WORKERS` | `FREEAGENT_MAX_WORKERS` | 指定先の提供元ごとの共有ワーカー数（1〜32）。複数提供元では合算される |
@@ -1902,13 +1911,11 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_CATALOG_CACHE` | 1 | `0` でモデル一覧のプロセス間キャッシュ（`model_catalog.json`）を無効化する |
 | `FREEAGENT_KB_INFLIGHT_WAIT_MAX` | 8.0（= `KB_DEADLINE`） | 同一キーの取得を待つ上限（秒）。超えたら待たずに自分で取得する（利用者を待たせない） |
 | `FREEAGENT_CROSSREF_INTERVAL` | 0.1 | Crossref のローカル最小間隔（秒）。429 は間隔ではなく**再試行**で対処する（実測: 間隔では直らない） |
-| `FREEAGENT_KB_HEDGE_DELAY` / `FREEAGENT_KB_HEDGE_MIN_REMAINING` | 0.6 / 0.05 | 代替取得（arXiv→DataCite）を始めるまでの待ちと、締め切り直前に始めないための下限（秒） |
-| `FREEAGENT_EVIDENCE_ITEM_CHARS` / `FREEAGENT_EVIDENCE_TOTAL_CHARS` | 360 / 3200 | 根拠本文の 1 件あたり・全体の注入上限（文字） |
-| `FREEAGENT_SESSION_MAX` | 64 | 相談セッションの保持数上限 |
-| `FREEAGENT_STATS_HALFLIFE_DAYS` | 30 | 品質統計の減衰半減期（日） |
-| `FREEAGENT_TRACE_MAX_BYTES` | 262144 | トレースファイルの最大サイズ（バイト） |
+| `FREEAGENT_KB_HEDGE_DELAY` / `FREEAGENT_KB_HEDGE_MIN_REMAINING` | 2.0 / 0.05 | 代替取得（arXiv→DataCite）を始めるまでの待ちと、締め切り直前に始めないための下限（秒） |
+| `FREEAGENT_SESSION_MAX` | 32 | 相談セッションの保持数上限 |
+| `FREEAGENT_STATS_HALFLIFE_DAYS` | 14.0 | 品質統計の減衰半減期（日） |
+| `FREEAGENT_TRACE_MAX_BYTES` | 5000000 | トレースファイルの最大サイズ（バイト） |
 | `FREEAGENT_DIAG_MAX_LINES` | 20000 | `freeagent_diagnose` が読むトレースの行数上限（末尾から。絞った件数は `notes` に出ます） |
-| `FREEAGENT_EMPTY_TOKEN_CAP` | 2048 | 空応答時の予算引き上げの上限（トークン） |
 | `FREEAGENT_TRACE` / `FREEAGENT_STATS` / `FREEAGENT_COOLDOWN` | 1 | トレース・品質統計・クールダウンの記録 |
 | `FREEAGENT_DEBUG_LOG` | 空 | 指定パスへ stdio の送受信を 1 行ずつ追記（クライアント互換の切り分け用） |
 | `FREEAGENT_HERMES_BIN` | `hermes`（`which` で探索） | `freeagent_delegate` に使う実行ファイル |
@@ -2002,8 +2009,9 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_TRACE_PATH` | `traces.jsonl`（トレース） |
 | `FREEAGENT_SESSIONS_PATH` | `sessions.json`（相談セッション） |
 | `FREEAGENT_THOUGHTS_PATH` | `thoughts.json`（思考台帳・TTL と上限つき。**知識は蓄積しない**） |
+| `FREEAGENT_QUOTA_PATH` | `quota.json`（宣言した提供元の RPM/RPD/TPM/TPD 使用量） |
 
-`model_catalog.json`（**モデル一覧のプロセス間キャッシュ**・SPEC §4.4）は `FREEAGENT_STATE_DIR` 直下に固定で、パスを上書きする変数はありません（`FREEAGENT_CATALOG_CACHE=0` で無効化）。
+`model_catalog.json`（**モデル一覧のプロセス間キャッシュ**・SPEC §4.4）と `admit_policy.json` / `admission.jsonl`（`freeagent_admit` の受付ポリシーと認可記録・SPEC §6.32）は `FREEAGENT_STATE_DIR` 直下に固定で、パスを上書きする変数はありません（一覧キャッシュは `FREEAGENT_CATALOG_CACHE=0` で無効化）。
 
 ---
 
@@ -2076,4 +2084,4 @@ python scripts/measure_kb.py --unschedule  # 登録したタスクを解除
 
 ## 📄 ライセンス
 
-MIT。データは各提供元（arXiv / Crossref / OpenAlex / Wikimedia / GitHub、明示指定の DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates.io / CiNii / OSV / IETF / INSPIRE-HEP / OEIS / Hugging Face / Hacker News / Software Heritage / Libraries.io / Internet Archive）の条件に従って利用し、回答には出典を表示してください。対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は対象外です。
+MIT。データは各提供元（arXiv / Crossref / OpenAlex / Wikimedia / GitHub、明示指定の DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates.io / CiNii / OSV / IETF / INSPIRE-HEP / OEIS / Hugging Face / Hacker News / Software Heritage / Libraries.io / Internet Archive / Qiita / OpenReview / MDN Web Docs / DevDocs）の条件に従って利用し、回答には出典を表示してください。対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は対象外です。

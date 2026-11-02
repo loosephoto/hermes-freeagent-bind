@@ -18,6 +18,8 @@ from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+from _tmpstate import register_state_dir, remove_tree  # noqa: E402  # type: ignore[import-not-found]
 
 from freeagent_bind import server as S  # noqa: E402
 
@@ -34,9 +36,9 @@ def row(kind="ask", ref="nous/x:free", ok=True, error="", error_class=None,
 
 class DiagnoseTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="fa-diag-")
+        self.tmp = register_state_dir(tempfile.mkdtemp(prefix="fa-diag-"))
         self.path = os.path.join(self.tmp, "traces.jsonl")
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        self.addCleanup(lambda: remove_tree(self.tmp))
         self.env = mock.patch.dict(os.environ, {"FREEAGENT_TRACE_PATH": self.path,
                                                 "FREEAGENT_STATE_DIR": self.tmp})
         self.env.start()

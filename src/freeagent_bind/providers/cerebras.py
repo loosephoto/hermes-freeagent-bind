@@ -1,4 +1,4 @@
-"""cerebras — Cerebras Inference。Free trial（$5 クレジット・カード登録・30 日）＋無料枠のレート制限。一覧はキー必須（実測: 未認証 401（server.py §0 から分割・v0.16.0）.
+"""cerebras — Cerebras Inference（Free trial 確認必須・server.py §0 から分割・v0.16.0）.
 
 SPEC の各フィールドの意味は SPEC.md §4.1。値は import 時に環境変数から読む。
 """

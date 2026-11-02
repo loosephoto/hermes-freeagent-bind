@@ -11,6 +11,9 @@ python scripts/probe_knowledge_stdio.py --sources librariesio --query "json sche
 python scripts/probe_knowledge_stdio.py --sources ia --query "FORTRAN manual"
 python scripts/probe_knowledge_stdio.py --sources qiita --query "tag:Python"
 python scripts/probe_knowledge_stdio.py --sources oeis --query Fibonacci
+python scripts/probe_knowledge_stdio.py --sources openreview --query "mixture of experts"
+python scripts/probe_knowledge_stdio.py --sources mdn --query "fetch API"
+python scripts/probe_knowledge_stdio.py --sources devdocs --query python
 
 各指定ソースの有効応答・出典・両チャネルを検査。失敗はexit 1（成功を捏造しない）。
 OpenAIREは匿名60/h。同一IP上の他プロセスも含め、連続実行には60秒以上の間隔を空ける。
@@ -146,6 +149,10 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
             raise ValueError("OpenReview citation must carry a forum id and a review-state kind")
         if cite["source"] == "cinii" and not cite.get("metadata_only"):
             raise ValueError("CiNii は書誌のみ（抄録を返さない）ので metadata_only であること")
+        if cite["source"] == "mdn" and (cite.get("summary_kind") != "structured_record" or not cite.get("summary")):
+            raise ValueError("MDN citation must carry a structured_record summary")
+        if cite["source"] == "devdocs" and not cite.get("metadata_only"):
+            raise ValueError("DevDocs citation is an index entry and must be metadata_only")
         S._kb_http_url(cite["url"])
         if not set(cite.get("providers") or [cite["source"]]).issubset(served):
             raise ValueError("merged citation provider mismatch")

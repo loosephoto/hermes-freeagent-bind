@@ -11,8 +11,8 @@
 
 ## 1. 構成（モジュラーモノリス）
 
-本体は `src/freeagent_bind/server.py`（§0〜§4・§5 の横断部・§6〜§10）。**データの一覧は 2 つの
-パッケージに出している**: 知識ソース 25 種は `sources/<name>.py`（1 ソース 1 ファイル）、
+本体は `src/freeagent_bind/server.py`（§0〜§4・§5 の横断部・§6〜§11）。**データの一覧は 2 つの
+パッケージに出している**: 知識ソース 27 種は `sources/<name>.py`（1 ソース 1 ファイル）、
 プロバイダ 18 社は `providers/<name>.py`（1 社 1 ファイル）。`sources/__init__.py` のレジストリが
 `SOURCES` / `KB_BACKENDS` を import 順に 1 回だけ組み立て、`providers/__init__.py` が
 `PROVIDER_SPECS` と `PROVIDER_ORDER` の既定順を作る（既定順の手書き列挙は持たない）。区画の追加は「行を足す」ではなく
@@ -31,15 +31,17 @@
 |---|---|
 | §0 | 定数・環境変数・プロバイダ仕様 |
 | §1 | ユーティリティ（防御的変換・テキスト類似・原子書き込み） |
-| §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳） |
-| §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行） |
+| §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 / §2.7 台帳の構造） |
+| §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行・§3.5 クォータ） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
-| §5 | 知識バックエンド25種（**実装は `sources/<name>.py`**。ここには横断検索・締め切り・引用統合・ホスト予算だけを残す）＝既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須） / §5.21 Internet Archive（明示指定のみ） / §5.22 Qiita（明示指定のみ） / §5.23 OpenReview（明示指定のみ）） |
-| §6 | ツール実装（12本、§6.11 本文の注入番号・引用認定・§6.10 受付と報告） |
+| §5 | 知識バックエンド27種（**実装は `sources/<name>.py`**。ここには横断検索・締め切り・引用統合・ホスト予算だけを残す）＝既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須） / §5.21 Internet Archive（明示指定のみ） / §5.22 Qiita（明示指定のみ） / §5.23 OpenReview（明示指定のみ） / §5.24 MDN・DevDocs（明示指定のみ）） |
+| §6 | ツール実装（13本、§6.11 本文の注入番号・引用認定・§6.32 受付と報告・§6.37 記録からの診断） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
 | §8.5 / §8.6 | 失敗時の「次の一手」（`next_action`） / ハーネス判別（Hermes 以外で起動されたときの警告） |
 | §9 | JSON-RPC 2.0 / stdio |
+| §10 | HTTP (StreamableHTTP) トランスポート（1 プロセス共有） |
+| §11 | MCP Resources / Completions（オンデマンド知識・スキル公開・URI 補完） |
 
 **依存は標準ライブラリのみ**。遅延 import するネイティブ拡張は、stdio 起動後に import すると
 ツールが無応答になる環境があるため、必要なら起動前に import する（このサーバーは現状それを要しない）。
@@ -55,6 +57,8 @@
 | `thoughts.json` | 進行中の思考台帳（思考・計画・分岐の状態・改訂の印・仮説の状態・見積りの履歴・検証結果・代替案） | 消えると思考の連鎖が切れる（TTL 2 時間・台帳 32 件・1 台帳 24 思考） |
 | `provider_auth.json` | 認証で失敗したプロバイダ（15 分・自動選抜から外す） | 消えてよい（次の 403 で再記録） |
 | `model_catalog.json` | プロバイダ別のモデル一覧（TTL 600 秒・§4.4） | 消えてよい（次の選抜で取り直す。**プロセスをまたいで温かくするためだけ**のキャッシュ） |
+| `quota.json` | 宣言した提供元の RPM/RPD/TPM/TPD 使用量（UTC 境界・§3.5） | 消えると当日のカウントが 0 に戻る（宣言が無ければ作らない） |
+| `admit_policy.json` / `admission.jsonl` | 外部依頼の受付ポリシーと認可・報告の記録（§6.32） | 消えると過去の trigger の冪等 replay が効かなくなる |
 
 いずれも **tmp へ書いて `os.replace` で原子置換**し、`threading.Lock` で保護する。原子置換は
 **書きかけの `<name>.<pid>.<tid>.tmp` を掃除してから**行う（実測: 途中で落ちた書きかけが状態
@@ -604,7 +608,7 @@ v0.11.0 は GitHub の実装（`freellmapi` の設計文書・MoA・FrugalGPT・
   1 本の接続で通すと **3.096 秒**（**-0.636 秒・17%**。TLS ハンドシェイクが 163〜183ms/回なので
   2 回ぶん ≈ 0.35 秒は確実に消える。実測 2026-10-21・この環境）。
 - **共用経路（`kb_http`）には入れない**。`kb_http` はリダイレクト追従・プロキシ env・読み取り途中の
-  打ち切りを持つ 25 ソース共通の道で、接続の使い回しを混ぜると影響範囲が一気に広がる。§5.2.1 は
+  打ち切りを持つ 27 ソース共通の道で、接続の使い回しを混ぜると影響範囲が一気に広がる。§5.2.1 は
   **接続の再利用だけ**を担う専用の道（`kb_json_keepalive`）にする:
   * リダイレクトは追わない（wikidata の api.php は 200 を返す。実測）
   * プロキシが設定された環境では `kb_json` へ委譲する（`ProxyHandler` の挙動を変えない）
@@ -635,7 +639,7 @@ v0.11.0 は GitHub の実装（`freellmapi` の設計文書・MoA・FrugalGPT・
   `FREEAGENT_STATE_DIR/kb_latency.jsonl`・最大 20,000 行・超えたら古い行から tmp + `os.replace` で捨てる）へ追記。
   記録は `ts` / `hour`（日本時間）/ `source` / `elapsed_s` / `ok` / `items` / `error`（160 字）/ `mailto` /
   `openalex_key` / `cinii_appid` / `env_failure` に加え `datacite_kind` / `summaries`（本文がある件数）を記録し、**タイトル・本文は残さない**。
-  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応25ソースを測る（cinii / librariesio はキー未設定なら外す・§6.7 / §6.10）。論文キーワードだと空振りするソース（ror / npm / crates / librariesio / osv / ietf / hn / swh / ia / qiita / openreview / inspirehep / oeis / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
+  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応27ソースを測る（cinii / librariesio はキー未設定なら外す・§6.7 / §6.10）。論文キーワードだと空振りするソース（ror / npm / crates / librariesio / osv / ietf / hn / swh / ia / qiita / openreview / mdn / devdocs / inspirehep / oeis / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
 - 全ソースが接続系の失敗なら `env_failure=true`（こちらのネットワーク障害）とし、`--report` の集計から外す。
 - `--schedule N` は Windows のタスク（`pythonw`＝窓を出さない）を 1 時間おきに登録し、残り回数を
   `kb_latency.jsonl.schedule.json` で数えて、最後の 1 回でタスクを自分で消す（`/ED` `/ET` は HOURLY との
@@ -1734,6 +1738,28 @@ GitHub の harness / skills 系（`obra/superpowers` / `anthropics/skills` / `af
 超える ③本文が無い。将来入れるなら「**明示指定のみ・`dpid=ndl-dl` 固定・日本語クエリ・
 `measure_relevance.py` で的中率を測ってから**」が条件（規約 28・30・39・40）。
 
+### 6.41 健全性監査と横断契約の硬化（v0.38.2）
+
+本番 `traces.jsonl`（1,828 行）とテストスイート（991 件）の横断監査で見つかった実害を塞いだ。
+
+- **テストによる本番ストア汚染の遮断**: `tests/test_grounded_search_v0260.py` が `tearDown` で元の値を保存せず
+  `os.environ.pop("FREEAGENT_STATE_DIR", None)` を呼んでいたため、後続のテスト群で `FREEAGENT_STATE_DIR` が
+  未設定になり、`test_orchestration_v11.py` が本番 `traces.jsonl` に `nous/a:free`（78 行）を書き込んでいた。
+  元の値を復元するよう修正し、残存していた固定名 `setdefault` 6 ファイルも `_tmpstate.isolated_state` へ統一、
+  `test_diagnose_v0370` / `test_run_completion_v0380` も `register_state_dir` + `remove_tree` に揃えた。
+- **`FREEAGENT_MODEL_EXCLUDE` の実装**: `freeagent_diagnose` の `advice` が案内していた `FREEAGENT_MODEL_EXCLUDE`
+  を `env_excluded_models()` として実装し、`select_models`・`_candidates`・`_refine_answers`・`tool_agent`
+  でカンマ区切りの除外指定（完全一致または `:free` を除いた基底名一致）が効くようにした。
+- **`freeagent_diagnose` の旧行再分類と日本語エラー分類**: v0.18.0 より前に記録された `error_class="other"` の
+  空応答行（本番 302 行）で `_diag_advice` の `empty_output` 判定（>=30%）が空振りしていたため、
+  `error_class == "other"` の行は現行の `classify_error(error)` で再評価するようにした（明示の未知分類は保持）。
+  あわせて `classify_error` に日本語の枠待ち（`同時実行枠` / `上限…達しました`）と予算・締め切り超過
+  （`時間切れ` / `締め切り` / `並列実行の予算` / `予算を使い切った`）を追加した。
+- **横断契約の補完**: ①`tool_agent` の並列ワーカーに `_ModelClaims` とステップごとの `budget_expired()` 検査を追加、
+  ②`_refine_answers` の非参加モデル判定にフォールバック後の `served_by`・除外リスト・冷却中・認証ブロックを反映、
+  ③`tool_consult` の再開時に `stored["models"]` を `[:3]` で切らず `MAX_MODELS_PER_CALL` まで保持、
+  ④`trace_call` に `_file_lock(path)` を追加、⑤`resource://freeagent/api-rules` に全 13 ツールを掲載。
+
 ## 7. ツールの規約（§6–§8）
 
 - 全ツールが `content`（人間向け・日本語）と `structuredContent`（LLM 向け純粋 JSON）を返す。
@@ -1850,7 +1876,7 @@ KANBAN のワーカー（`hermes -p <profile> chat -q "work kanban task t_x"`）
 ## 7.6 利用者向け説明と実装の境界
 
 README は利用開始・結果の読み方・障害時の対処を先に置き、実装上の設計理由はこの SPEC に置く。
-利用者が用途から選べる導線を設け、既定6ソースと明示指定18ソースを区別する。
+利用者が用途から選べる導線を設け、既定6ソースと明示指定21ソースを区別する。
 引数一覧・追加プロバイダの確認設定・過去の計測記録は折りたたみ、
 無料枠・データ送信・保存・引用の限界は利用者が確認できる形で残す。
 次の既存挙動を、保証されている機能として過大に説明しない。

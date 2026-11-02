@@ -1,4 +1,4 @@
-"""modelscope — ModelScope API-Inference（魔搭社区）。無料枠（公称 2,000 リクエスト/日・日次回復）の確認が必須（FREEAGENT_MODELS（server.py §0 から分割・v0.16.0）.
+"""modelscope — ModelScope API-Inference（無料枠確認必須・server.py §0 から分割・v0.16.0）.
 
 SPEC の各フィールドの意味は SPEC.md §4.1。値は import 時に環境変数から読む。
 """

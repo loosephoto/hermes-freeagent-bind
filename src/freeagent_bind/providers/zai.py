@@ -1,4 +1,4 @@
-"""zai — Z.ai（Zhipu GLM）。公式価格表で $0 の GLM-4.7-Flash / 4.5-Flash / 4.6V-Flash だけを許可（一覧 API （server.py §0 から分割・v0.16.0）.
+"""zai — Z.ai / Zhipu GLM（$0 Flash 3 ID 許可リスト・server.py §0 から分割・v0.16.0）.
 
 SPEC の各フィールドの意味は SPEC.md §4.1。値は import 時に環境変数から読む。
 """

@@ -1,4 +1,4 @@
-"""groq — Groq Free tier確認が必須（FREEAGENT_GROQ_FREE_TIER=1）。Free対象モデルだけ許可。Developer tierは有料で（server.py §0 から分割・v0.16.0）.
+"""groq — Groq（Free tier 確認必須・許可リスト 3 ID・server.py §0 から分割・v0.16.0）.
 
 SPEC の各フィールドの意味は SPEC.md §4.1。値は import 時に環境変数から読む。
 """

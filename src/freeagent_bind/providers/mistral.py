@@ -1,4 +1,4 @@
-"""mistral — Mistral La Plateforme。Experiment plan（無料・月 約10億トークン・電話確認）の確認が必須（FREEAGENT_MISTRA（server.py §0 から分割・v0.16.0）.
+"""mistral — Mistral La Plateforme（Experiment plan 確認必須・server.py §0 から分割・v0.16.0）.
 
 SPEC の各フィールドの意味は SPEC.md §4.1。値は import 時に環境変数から読む。
 """

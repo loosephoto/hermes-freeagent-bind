@@ -89,7 +89,8 @@ class TestCrossProcessStats(_Base):
                   "    S.note_observation('p/m', 'ask', lat_ms=10.0)\n")
         procs = [self._spawn(script) for _ in range(2)]
         self._join(procs)
-        data = json.load(open(os.path.join(self.tmp, "model_stats.json"), encoding="utf-8"))
+        with open(os.path.join(self.tmp, "model_stats.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
         row = data["models"]["p/m"]["kinds"]["ask"]
         # 実測（修正前）: 2 プロセス × 50 件で期待 100 件に対し **50 件**しか残らない
         self.assertAlmostEqual(row["n"], 50.0, delta=0.5,
@@ -112,7 +113,8 @@ class TestCrossProcessStats(_Base):
                   "    S.note_observation('p/x', 'ask')\n")
         procs = [self._spawn(script) for _ in range(4)]
         self._join(procs)
-        data = json.load(open(os.path.join(self.tmp, "model_stats.json"), encoding="utf-8"))
+        with open(os.path.join(self.tmp, "model_stats.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
         self.assertEqual(data.get("version"), 1)
         self.assertAlmostEqual(data["models"]["p/x"]["kinds"]["ask"]["n"], 40.0, delta=1.0)
 
@@ -122,7 +124,8 @@ class TestCrossProcessCooldown(_Base):
         a = self._spawn("S.note_cooldown('p/a', 60.0, 'HTTP 429')\n")
         b = self._spawn("S.note_cooldown('p/b', 60.0, 'HTTP 404')\n")
         self._join([a, b])
-        data = json.load(open(os.path.join(self.tmp, "cooldowns.json"), encoding="utf-8"))
+        with open(os.path.join(self.tmp, "cooldowns.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
         self.assertEqual(set(data["cooldowns"]), {"p/a", "p/b"},
                          f"他プロセスのクールダウンが消えている: {sorted(data['cooldowns'])}")
 
@@ -132,7 +135,8 @@ class TestCrossProcessCooldown(_Base):
         time.sleep(1.2)
         b = self._spawn("S.note_cooldown('p/live', 60.0, 'x')\n")
         self._join([b])
-        data = json.load(open(os.path.join(self.tmp, "cooldowns.json"), encoding="utf-8"))
+        with open(os.path.join(self.tmp, "cooldowns.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
         self.assertEqual(set(data["cooldowns"]), {"p/live"})
 
 
@@ -145,7 +149,8 @@ class TestCrossProcessQuota(_Base):
         env = {"FREEAGENT_QUOTA_LIMITS": "nous:rpd=10"}
         procs = [self._spawn(script, env) for _ in range(4)]
         self._join(procs)
-        data = json.load(open(os.path.join(self.tmp, "quota.json"), encoding="utf-8"))
+        with open(os.path.join(self.tmp, "quota.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
         row = data["providers"]["nous"]
         # 4 プロセス × 3 回 = 12 要求のうち、**共有の上限 10** で止まる
         self.assertEqual(int(row["day_req"]), 10,

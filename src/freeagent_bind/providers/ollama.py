@@ -1,4 +1,4 @@
-"""ollama — Ollama Cloud Free plan確認が必須（FREEAGENT_OLLAMA_FREE_PLAN=1）。無料は starter モデルだけで範囲は非（server.py §0 から分割・v0.16.0）.
+"""ollama — Ollama Cloud（Free plan 確認必須・server.py §0 から分割・v0.16.0）.
 
 SPEC の各フィールドの意味は SPEC.md §4.1。値は import 時に環境変数から読む。
 """

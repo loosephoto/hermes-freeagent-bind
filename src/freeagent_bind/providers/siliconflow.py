@@ -1,4 +1,4 @@
-"""siliconflow — SiliconFlow（硅基流动）。**無料モデル**（レート制限つき）と有料モデルが同居し、一覧は未認証で 401（実測）。Free/paid を API が（server.py §0 から分割・v0.16.0）.
+"""siliconflow — SiliconFlow（無料モデル確認必須・server.py §0 から分割・v0.16.0）.
 
 SPEC の各フィールドの意味は SPEC.md §4.1。値は import 時に環境変数から読む。
 """

@@ -98,6 +98,9 @@ SOURCE_QUERIES = {
     # openreview は会議論文なので、英語の研究語を回す（日本語は 0 件・HTTP を出さない）。
     "openreview": ["retrieval augmented generation", "mixture of experts", "diffusion model",
                    "graph neural network", "reinforcement learning", "vision transformer"],
+    "mdn": ["Array.prototype.map", "fetch API", "Promise.all",
+            "CSS grid layout", "WebSocket", "AbortController"],
+    "devdocs": ["python", "javascript", "react", "postgresql", "django", "sqlite"],
 }
 
 def measure_round(index: int | None = None, sources: list[str] | None = None,
@@ -132,8 +135,9 @@ def measure_round(index: int | None = None, sources: list[str] | None = None,
             terms = SOURCE_QUERIES[src]
             query = terms[slot % len(terms)]
         start = time.monotonic()
+        lang_opt = "en-US" if src == "mdn" else "ja"
         try:
-            res = S.KB_BACKENDS[src](query, 3, {"lang": "ja", "kind": "repo", "datacite_kind": datacite_kind})
+            res = S.KB_BACKENDS[src](query, 3, {"lang": lang_opt, "kind": "repo", "datacite_kind": datacite_kind})
         except Exception as exc:  # noqa: BLE001
             res = {"error": f"{type(exc).__name__}: {exc}"}
         elapsed = round(time.monotonic() - start, 3)
@@ -299,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rounds", type=int, default=1)
     ap.add_argument("--interval", type=float, default=600.0)
     ap.add_argument("--report", action="store_true")
-    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help="計測対象（既定は対応24ソース）")
+    ap.add_argument("--sources", nargs="+", choices=S.SOURCES, help=f"計測対象（既定は対応{len(S.SOURCES)}ソース）")
     ap.add_argument("--datacite-kind", choices=("all", "arxiv", "dataset"), default="all")
     ap.add_argument("--schedule", type=int, metavar="HOURS")
     ap.add_argument("--unschedule", action="store_true")

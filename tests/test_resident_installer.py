@@ -245,10 +245,18 @@ class InstallerCase(unittest.TestCase):
         real_dir = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
                                 "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
         real_launcher = os.path.join(real_dir, self.m.WORKER_NAME)
-        before = open(real_launcher, "rb").read() if os.path.exists(real_launcher) else None
+        if os.path.exists(real_launcher):
+            with open(real_launcher, "rb") as fh:
+                before = fh.read()
+        else:
+            before = None
         self.m.main(["--hermes-home", self.home, "--repo", self.repo,
                      "--startup-dir", self.startup_dir, "--write", "--force"])
-        after = open(real_launcher, "rb").read() if os.path.exists(real_launcher) else None
+        if os.path.exists(real_launcher):
+            with open(real_launcher, "rb") as fh:
+                after = fh.read()
+        else:
+            after = None
         self.assertEqual(before, after, "テストが実機の Startup を書き換えた")
         self.assertTrue(os.path.exists(os.path.join(self.startup_dir, self.m.WORKER_NAME)))
 

@@ -69,13 +69,13 @@ def record_path() -> str:
     return os.path.join(S.state_dir(), "relevance.jsonl")
 
 
-def top_of(source: str, query: str, limit: int = 3) -> tuple[str, str]:
+def top_of(source: str, query: str, limit: int = 3, lang: str | None = None) -> tuple[str, str]:
     """(トップ1のタイトル, 状態) を返す。状態は ok / empty / error。"""
     fn = S.KB_BACKENDS.get(source)
     if fn is None:
         return "", "unknown_source"
     try:
-        got = fn(query, limit, {"lang": ""})
+        got = fn(query, limit, {"lang": lang or ""})
     except Exception as exc:                      # 例外は漏らさない（規約 1）
         return f"{type(exc).__name__}: {exc}", "error"
     if got.get("error"):
@@ -92,7 +92,7 @@ def run(json_only: bool = False) -> int:
     rows = []
     for query, source, expect, lang in CASES:
         t0 = time.perf_counter()
-        top, status = top_of(source, query)
+        top, status = top_of(source, query, lang=lang)
         ms = round((time.perf_counter() - t0) * 1000)
         hit = None
         if status == "ok" and expect:

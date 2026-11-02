@@ -1,4 +1,4 @@
-"""cloudflare — Workers Free plan確認が必須（FREEAGENT_CLOUDFLARE_FREE_PLAN=1）。Neuronsは10,000/日を全用途で共有（server.py §0 から分割・v0.16.0）.
+"""cloudflare — Cloudflare Workers AI（Free plan 確認必須・server.py §0 から分割・v0.16.0）.
 
 SPEC の各フィールドの意味は SPEC.md §4.1。値は import 時に環境変数から読む。
 """

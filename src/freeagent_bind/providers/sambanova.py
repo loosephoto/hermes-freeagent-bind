@@ -1,4 +1,4 @@
-"""sambanova — SambaNova Cloud。**支払い方法を登録していないアカウントが Free tier**（公式レート制限表・実測で一覧は未認証でも 200）。Free（server.py §0 から分割・v0.16.0）.
+"""sambanova — SambaNova Cloud（Free tier 確認必須・server.py §0 から分割・v0.16.0）.
 
 SPEC の各フィールドの意味は SPEC.md §4.1。値は import 時に環境変数から読む。
 """

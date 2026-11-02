@@ -25,8 +25,11 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-os.environ.setdefault("FREEAGENT_STATE_DIR", os.path.join(tempfile.gettempdir(), "fa-test-state"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _tmpstate import isolated_state  # noqa: E402  # type: ignore[import-not-found]
+
+isolated_state("fa-wikidata-test-")
 
 from freeagent_bind import server as S  # noqa: E402
 

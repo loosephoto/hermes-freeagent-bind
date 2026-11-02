@@ -13,6 +13,8 @@ from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+from _tmpstate import register_state_dir, remove_tree  # noqa: E402  # type: ignore[import-not-found]
 
 import freeagent_bind.server as S  # noqa: E402
 
@@ -37,13 +39,17 @@ def _answer(text):
 
 class _Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="fa-v0260-")
+        self._old_state = os.environ.get("FREEAGENT_STATE_DIR")
+        self.tmp = register_state_dir(tempfile.mkdtemp(prefix="fa-v0260-"))
         os.environ["FREEAGENT_STATE_DIR"] = self.tmp
-        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.addCleanup(lambda: remove_tree(self.tmp))
         self.addCleanup(self._restore)
 
     def _restore(self):
-        os.environ.pop("FREEAGENT_STATE_DIR", None)
+        if self._old_state is None:
+            os.environ.pop("FREEAGENT_STATE_DIR", None)
+        else:
+            os.environ["FREEAGENT_STATE_DIR"] = self._old_state
 
     def _run(self, args, calls, answer="答え [1]"):
         with mock.patch.object(S, "knowledge_lookup", side_effect=_kb_stub(calls)), \

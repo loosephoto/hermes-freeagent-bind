@@ -1,4 +1,4 @@
-"""opencode — opencode Zen。**-free 接尾辞のモデルだけ**を許可リストで許可（一覧に pricing が無いため・実測 40 件中 8 件）。キーは OP（server.py §0 から分割・v0.16.0）.
+"""opencode — opencode Zen（-free 接尾辞モデル許可リスト・server.py §0 から分割・v0.16.0）.
 
 SPEC の各フィールドの意味は SPEC.md §4.1。値は import 時に環境変数から読む。
 """

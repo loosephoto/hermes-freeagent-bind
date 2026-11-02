@@ -16,15 +16,18 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
-os.environ.setdefault("FREEAGENT_STATE_DIR", os.path.join(tempfile.gettempdir(), "fa-audit-tests"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _tmpstate import isolated_state, register_state_dir, remove_tree  # noqa: E402  # type: ignore[import-not-found]
+
+isolated_state("fa-audit-reg-test-")
 from freeagent_bind import server as S  # noqa: E402
 
 
 class TestAuditRegressions(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="fa-audit-")
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        self.tmp = register_state_dir(tempfile.mkdtemp(prefix="fa-audit-"))
+        self.addCleanup(lambda: remove_tree(self.tmp))
         self.env = {key: os.environ.get(key) for key in (
             "FREEAGENT_STATE_DIR", "FREEAGENT_STATS_PATH", "FREEAGENT_SESSIONS_PATH")}
         os.environ["FREEAGENT_STATE_DIR"] = self.tmp
