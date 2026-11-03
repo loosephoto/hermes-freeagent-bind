@@ -11,7 +11,12 @@
 
 ## 1. 構成（モジュラーモノリス）
 
-本体は `src/freeagent_bind/server.py`（§0〜§4・§5 の横断部・§6〜§11）。**データの一覧は 2 つの
+本体は `src/freeagent_bind/server.py`（§0〜§4・§5 の横断部・§6〜§9）。通信・公開面の 3 区画は
+単体モジュールへ切り出してある: HTTP トランスポート（旧 §10）= `transport_http.py`、MCP Resources と
+`completion/complete`（§11）= `resources.py`、ハーネス判別（§8.6）= `harness.py`。JSON の入出力
+（NaN・孤立サロゲート・文章からの JSON 抽出・複製）は `jsonutil.py` に集約した。切り出した区画は
+共有ヘルパーを `S.<name>` の属性参照で呼び、**テストが差し替える名前**（`HTTP_MAX_SESSIONS`・
+`_HARNESS`・`resource_list`）は呼び出し側も `S.` 経由にする。**データの一覧は 2 つの
 パッケージに出している**: 知識ソース 30 種は `sources/<name>.py`（1 ソース 1 ファイル）、
 プロバイダ 18 社は `providers/<name>.py`（1 社 1 ファイル）。`sources/__init__.py` のレジストリが
 `SOURCES` / `KB_BACKENDS` を import 順に 1 回だけ組み立て、`providers/__init__.py` が

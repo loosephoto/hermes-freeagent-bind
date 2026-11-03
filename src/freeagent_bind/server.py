@@ -90,7 +90,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.39.0"
+SERVER_VERSION = "0.40.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -167,6 +167,9 @@ DEBUG_LOG = os.environ.get("FREEAGENT_DEBUG_LOG", "")
 # プロバイダ定義は `providers/<name>.py`（1 社 1 ファイル・v0.16.0）。`SPECS` の挿入順が
 # そのまま既定の巡回順で、`PROVIDER_ORDER` の既定値もそこから生成する（手書きの列挙を持たない）。
 from . import providers as _providers  # noqa: E402
+from . import jsonutil as _jsonutil  # noqa: E402  JSON の入出力（NaN・サロゲート・抽出）
+from .jsonutil import deep_copy as _deep_copy  # noqa: E402
+from .jsonutil import dumps as _dumps  # noqa: E402
 
 PROVIDER_SPECS: dict[str, dict] = dict(_providers.SPECS)
 # MCP の `initialize` 応答に載せる `instructions`。**Hermes はこれを読まない**（実測: 旧実装で
@@ -244,7 +247,7 @@ def _debug(kind: str, payload) -> None:
     if not DEBUG_LOG:
         return
     try:
-        line = json.dumps(payload, ensure_ascii=False)
+        line = _dumps(payload)
     except Exception:
         line = repr(payload)
     try:
@@ -590,8 +593,7 @@ def _cooldown_save() -> bool:
                 if not cur or as_float(entry.get("until"), 0.0) > as_float(cur.get("until"), 0.0):
                     merged[ref] = entry
         merged = _cooldown_prune(merged, now)
-        ok = _atomic_write(path, json.dumps({"version": 1, "saved_at": now, "cooldowns": merged},
-                                            ensure_ascii=False))
+        ok = _atomic_write(path, _dumps({"version": 1, "saved_at": now, "cooldowns": merged}))
         with _COOLDOWN_LOCK:
             _COOLDOWN.clear()
             _COOLDOWN.update(merged)
@@ -740,7 +742,7 @@ def _auth_save() -> bool:
                     merged[p] = e
             merged = _auth_prune(merged, now)
             payload = {"version": 1, "saved_at": now, "providers": merged}
-            ok = _atomic_write(path, json.dumps(payload, ensure_ascii=False))
+            ok = _atomic_write(path, _dumps(payload))
             if ok:
                 _AUTH.clear()
                 _AUTH.update(merged)
@@ -781,7 +783,7 @@ def clear_provider_auth(provider: str) -> None:
             now = now_ts()
             merged = _auth_prune(merged, now)
             payload = {"version": 1, "saved_at": now, "providers": merged}
-            ok = _atomic_write(path, json.dumps(payload, ensure_ascii=False))
+            ok = _atomic_write(path, _dumps(payload))
             if ok:
                 _AUTH.clear()
                 _AUTH.update(merged)
@@ -935,7 +937,7 @@ def _stats_save() -> bool:
         with _STATS_LOCK:
             models = _stats_prune(copy.deepcopy(_STATS["models"]), now)
         payload = {"version": 1, "models": models}
-        return _atomic_write(path, json.dumps(payload, ensure_ascii=False))
+        return _atomic_write(path, _dumps(payload))
 
 
 def classify_error(err: str) -> str:
@@ -1014,7 +1016,7 @@ def note_observation(ref: str, kind: str, *, error: str = "", leak: bool = False
         models = _stats_apply(_stats_read(path), ref, kind, now=now, error=error,
                               leak=leak, trunc=trunc, empty=empty, lat_ms=lat_ms)
         models = _stats_prune(models, now)
-        _atomic_write(path, json.dumps({"version": 1, "models": models}, ensure_ascii=False))
+        _atomic_write(path, _dumps({"version": 1, "models": models}))
         with _STATS_LOCK:
             _STATS["models"] = models
             _STATS_LOADED = True
@@ -1560,7 +1562,7 @@ def trace_call(kind: str, ref: str, ok: bool, *, error: str = "", served_by: str
             except OSError:
                 pass
             with open(path, "a", encoding="utf-8", newline="\n") as fh:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                fh.write(_dumps(row) + "\n")
     except OSError:
         pass
 
@@ -1676,7 +1678,7 @@ def _sessions_save() -> bool:
                     merged[sid] = row
             merged = _sessions_prune(merged, now_ts())
             payload = {"version": 1, "saved_at": now_ts(), "sessions": merged}
-            ok = _atomic_write(path, json.dumps(payload, ensure_ascii=False))
+            ok = _atomic_write(path, _dumps(payload))
             if ok:
                 _SESSIONS.clear()
                 _SESSIONS.update(merged)
@@ -1699,7 +1701,7 @@ def session_get(sid: str) -> dict | None:
         if not row or as_float(row.get("updated_at"), 0.0) <= now - SESSION_TTL_S:
             _SESSIONS.pop(sid, None)
             return None
-        return json.loads(json.dumps(row))  # 呼び出し側の書き換えが他へ波及しないよう複製を渡す
+        return _deep_copy(row)  # 呼び出し側の書き換えが他へ波及しないよう複製を渡す
 
 
 def session_put(sid: str, row: dict) -> None:
@@ -1728,7 +1730,7 @@ def session_drop(sid: str) -> None:
             merged.pop(sid, None)
             merged = _sessions_prune(merged, now_ts())
             payload = {"version": 1, "saved_at": now_ts(), "sessions": merged}
-            ok = _atomic_write(path, json.dumps(payload, ensure_ascii=False))
+            ok = _atomic_write(path, _dumps(payload))
             if ok:
                 _SESSIONS.clear()
                 _SESSIONS.update(merged)
@@ -1826,7 +1828,7 @@ def _thoughts_merge_row(base: dict, mine: dict) -> dict:
     newer, older = (mine, base)
     if as_float(base.get("updated_at"), 0.0) > as_float(mine.get("updated_at"), 0.0):
         newer, older = base, mine
-    out = json.loads(json.dumps(older))
+    out = _deep_copy(older)
     # ステップは番号の和集合（古い方 → 新しい方 で上書き）。
     steps: dict[int, dict] = {}
     for s in list(older.get("steps") or []) + list(newer.get("steps") or []):
@@ -1857,7 +1859,7 @@ def _thoughts_write_locked(path: str, chains: dict) -> bool:
     """ロックの中で台帳を書き出す（**呼び出し側がロックを持っている**前提）。"""
     global _THOUGHTS_MTIME
     payload = {"version": 1, "saved_at": now_ts(), "chains": chains}
-    ok = _atomic_write(path, json.dumps(payload, ensure_ascii=False))
+    ok = _atomic_write(path, _dumps(payload))
     if ok:
         _THOUGHTS_MTIME = _file_mtime(path) or 0.0
     return ok
@@ -1905,7 +1907,7 @@ def thought_get(sid: str) -> dict | None:
         row = _THOUGHTS.get(sid)
         if not row:
             return None
-        result = json.loads(json.dumps(row))
+        result = _deep_copy(row)
         if THOUGHTS_ENABLED:
             result["verifier_models"] = result.get("verifier_models") or []
             result["verifier_generation"] = result.get("verifier_generation", 0)
@@ -1953,7 +1955,7 @@ def thought_merge(sid: str, step: dict, *, question: str = "", verifier_models: 
         if not THOUGHTS_ENABLED:
             # 台帳が無効なら**ロックファイルも作らない**（状態ディレクトリを汚さない）。
             target = sid if sid in _THOUGHTS else new_thought_id()
-            row = json.loads(json.dumps(_THOUGHTS.get(target) or {}))
+            row = _deep_copy(_THOUGHTS.get(target) or {})
             steps = [s for s in (row.get("steps") or []) if isinstance(s, dict)]
             step = dict(step)
             if not _thought_subgoal_still_matches(row, steps, step, ops or {}):
@@ -1995,7 +1997,7 @@ def thought_merge(sid: str, step: dict, *, question: str = "", verifier_models: 
                 return {"error": "読み取り後に思考台帳が削除または期限切れになりました。記録していません。"}
             base = disk[known] if known else {}
             target = known or new_thought_id()
-            row = json.loads(json.dumps(base))
+            row = _deep_copy(base)
             steps = [s for s in (row.get("steps") or []) if isinstance(s, dict)]
             step = dict(step)
             if not _thought_subgoal_still_matches(row, steps, step, ops or {}):
@@ -2309,11 +2311,16 @@ def provider_http(path: str, provider: str = "nous", payload: dict | None = None
     headers = {"Authorization": f"Bearer {spec['key']}", "Accept": "application/json"}
     data = None
     if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
+        data = _dumps(payload).encode("utf-8")     # 孤立サロゲート・NaN を除いた UTF-8（上流が 400 にしない）
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers)
     with _urlopen(req, timeout or READ_TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8", "replace"))
+        body = resp.read().decode("utf-8", "replace")
+    try:
+        return json.loads(body)
+    except (ValueError, RecursionError) as exc:
+        # HTML のエラーページ等を 200 で返す上流がある。素の「Expecting value」では原因が分からない。
+        raise ValueError(f"上流の応答が JSON ではありません（{type(exc).__name__}）: {truncate(body, 80)}") from exc
 
 
 def _is_hf(provider: str) -> bool:
@@ -2473,8 +2480,7 @@ def _catalog_disk_store(provider: str, rows: list[dict]) -> bool:
         data = _load_json(path, {})
         providers = dict(data.get("providers") or {}) if isinstance(data, dict) else {}
         providers[provider] = entry
-        ok = _atomic_write(path, json.dumps({"version": 1, "providers": providers},
-                                            ensure_ascii=False))
+        ok = _atomic_write(path, _dumps({"version": 1, "providers": providers}))
     if ok:
         with _CATALOG_DISK_LOCK:
             _CATALOG_DISK[provider] = entry
@@ -2885,14 +2891,20 @@ def _cot_leak(text: str) -> bool:
     return any(m in head for m in markers)
 
 
-def _extract_text(data: dict) -> str:
-    choices = data.get("choices") or []
-    if not choices or not isinstance(choices[0], dict):
+def _extract_text(data: object) -> str:
+    """応答から本文を取る。形が想定外（配列・文字列・null・パートの text が null）でも例外にしない。"""
+    if not isinstance(data, dict):
         return ""
-    msg = choices[0].get("message") or {}
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return ""
+    msg = choices[0].get("message")
+    if not isinstance(msg, dict):
+        return ""
     text = msg.get("content")
     if isinstance(text, list):  # 一部プロバイダは content をパート配列で返す
-        text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
+        text = "".join(part["text"] for part in text
+                       if isinstance(part, dict) and isinstance(part.get("text"), str))
     return text if isinstance(text, str) else ""
 
 
@@ -3230,7 +3242,7 @@ def _ensure_quota_loaded() -> None:
 
 def _quota_write(rows: dict) -> bool:
     """ロックの内側から呼ぶ（`providers` 全体を書く）。"""
-    ok = _atomic_write(quota_path(), json.dumps({"version": 1, "providers": rows}, ensure_ascii=False))
+    ok = _atomic_write(quota_path(), _dumps({"version": 1, "providers": rows}))
     global _QUOTA_MTIME
     _QUOTA_MTIME = _file_mtime(quota_path())
     return ok
@@ -3543,13 +3555,19 @@ def _call_once(provider: str, model: str, prompt: str, system: str,
             exc.close()
         raise HttpStatusError(int(exc.code), body, retry_after)
     latency = now_ts() - started
+    if not isinstance(data, dict):
+        raise ValueError(f"上流の応答が JSON オブジェクトではありません（{type(data).__name__}）")
     text = _extract_text(data)
     finish = ""
     try:
         finish = (data.get("choices") or [{}])[0].get("finish_reason") or ""
     except Exception:
         finish = ""
-    usage = data.get("usage") or {}
+    if not isinstance(finish, str):
+        finish = ""
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
     return {"text": text, "latency_s": round(latency, 3), "finish_reason": finish,
             "truncated": finish == "length", "redactions": redactions,
             "tokens": {"prompt": usage.get("prompt_tokens"), "completion": usage.get("completion_tokens")}}
@@ -4708,7 +4726,7 @@ def kb_json(url: str, *, extra_headers: dict | None = None,
         if extra_headers:
             headers.update(extra_headers)
         status, body = kb_http(url, extra_headers=headers,
-                               body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                               body=_dumps(payload).encode("utf-8"),
                                method="POST")
     if status != 200:
         return None, f"HTTP {status}: {body[:200]}" if status else body
@@ -5232,7 +5250,7 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
 
 def _literal_search(query: str) -> str:
     """自然語の各語を引用して AND 結合する。提供元の演算子として解釈させない。"""
-    return " AND ".join(json.dumps(word, ensure_ascii=False) for word in query.split())
+    return " AND ".join(_dumps(word) for word in query.split())
 
 
 def _kb_new_cached(key: str, source: str, producer) -> dict:
@@ -6863,7 +6881,7 @@ def tool_consult(args: dict) -> dict:
     compliance_summary = None
     if review_mode and basis:
         import hashlib
-        fingerprint = hashlib.sha256(json.dumps([question, draft, basis, main_reply], ensure_ascii=False).encode("utf-8")).hexdigest()
+        fingerprint = hashlib.sha256(_dumps([question, draft, basis, main_reply]).encode("utf-8")).hexdigest()
         stored_compliance = next((r for r in reversed(rounds) if r.get("kind") == "compliance"), None)
         # Legacy rounds with no fingerprint (or an older fingerprint) are re-reviewed conservatively.
         if stored_compliance and stored_compliance.get("fingerprint") != fingerprint:
@@ -7137,15 +7155,8 @@ def _agent_tool_call(parsed: dict) -> dict:
 
 
 def _parse_agent_reply(text: str) -> dict:
-    """JSON だけを取り出す（コードフェンスや前置きが混ざっても最初の {...} を読む）。"""
-    m = re.search(r"\{.*\}", text or "", re.S)
-    if not m:
-        return {}
-    try:
-        obj = json.loads(m.group(0))
-        return obj if isinstance(obj, dict) else {}
-    except ValueError:
-        return {}
+    """JSON だけを取り出す（コードフェンスや前置き・末尾の補足に `{}` が混ざっても最初の dict を読む）。"""
+    return _jsonutil.extract_object(text)
 
 
 
@@ -7858,7 +7869,7 @@ def _think_active(steps: list[dict], row: dict | None) -> list[dict]:
 
 def _think_preview_row(row: dict, st: dict) -> dict:
     """今回の呼び出しで決まる計画・分岐の決着を反映した台帳メタの写し（検証者に見せる用。書かない）。"""
-    out = json.loads(json.dumps({k: row.get(k) for k in ("plan", "plan_retired", "branch_meta")}))
+    out = _deep_copy({k: row.get(k) for k in ("plan", "plan_retired", "branch_meta")})
     if st.get("plan"):
         # 実際のマージと同じ id 割当てにする（検証者に別の plan を見せない）。
         old_plan = [p for p in (out.get("plan") or []) if isinstance(p, dict)]
@@ -8155,7 +8166,7 @@ def admit_policy() -> dict:
     """
     import hashlib
 
-    policy = json.loads(json.dumps(ADMIT_DEFAULT_POLICY))
+    policy = _deep_copy(ADMIT_DEFAULT_POLICY)
     path = _admit_policy_path()
     if os.path.exists(path):
         loaded: object = {}
@@ -8174,10 +8185,9 @@ def admit_policy() -> dict:
         policy["sources"] = {}
     if not isinstance(policy.get("rules"), list):
         policy["rules"] = []
-    canonical = json.dumps(
+    canonical = _dumps(
         {"accept_mode": policy["accept_mode"], "sources": policy["sources"],
-         "rules": [r for r in policy["rules"] if isinstance(r, dict)]},
-        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+         "rules": [r for r in policy["rules"] if isinstance(r, dict)]}, sort_keys=True, separators=(",", ":"))
     policy["version"] = "p" + hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:8]
     return policy
 
@@ -8301,7 +8311,7 @@ def _admit_append(rows: list[dict]) -> None:
     with _file_lock(path):
         with open(path, "a", encoding="utf-8") as fh:
             for row in rows:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                fh.write(_dumps(row) + "\n")
 
 
 def _admit_report(args: dict) -> dict:
@@ -9743,7 +9753,7 @@ def _render_agent(data: dict) -> str:
                 lines.append(f"      根拠: {truncate(ev, 130)}")
         for step in (row.get("trace") or [])[:3]:
             lines.append(f"      ↳ {step['tool']}"
-                         f"({truncate(json.dumps(step['args'], ensure_ascii=False), 60)})"
+                         f"({truncate(_dumps(step['args']), 60)})"
                          f" hits={step['hits']}")
     if data.get("citations"):
         lines.append("出典:")
@@ -9872,7 +9882,7 @@ def _render_body(name: str, data: dict) -> str:
     if renderer is not None:
         return renderer(data)
 
-    return truncate(json.dumps(data, ensure_ascii=False), 2000)
+    return truncate(_dumps(data), 2000)
 
 
 # ================================================================ §8.5 失敗時の「次の一手」
@@ -9945,504 +9955,11 @@ def error_advice(data: dict) -> dict:
     return advice
 
 
-# ================================================================ §8.6 ハーネス判別（Hermes 以外で起動されたときの警告）
-#
-# このサーバーは Hermes Agent 前提の部分を持つ: 推論の既定の接続先は `hermes proxy`
-# （127.0.0.1:8645 の nous プロバイダ）で、自発利用の設定（SOUL.md・tools.exclude）も Hermes 専用。
-# 他のハーネス（Claude Code など）で起動されたら、止めずに**警告だけ**出す。
-#
-# 判別の実測（`hermes mcp test` にプローブを繋いで確認）:
-#   * Hermes の clientInfo は MCP Python SDK 既定の {"name": "mcp", "version": "0.1.0"} で**Hermes 固有でない**
-#   * HERMES_* の環境変数は子に渡らない（許可リスト方式: PATH/HOME/TMPDIR/TEMP など）
-#   * 設定の `env:` ブロックはそのまま渡る → **明示の目印 FREEAGENT_HARNESS=hermes** を入れるのが唯一確実
-#   * 親プロセス名は Windows 11 で wmic が無く取れず、PowerShell/CIM は起動が秒単位で遅い → 使わない
-# よって判定は三値: hermes（目印あり／clientInfo に hermes を含む）・other（SDK 既定以外の名前）・
-# unknown（名前が "mcp" で目印なし＝目印を入れる前の Hermes がほぼこれ）。
-#
-# 出し方（重複させない）:
-#   other   → initialize の instructions 先頭に注記（Hermes は読まないが他クライアントは読む）
-#             ＋ stderr に 1 行 ＋ notifications/message(level=warning)（表示はクライアント次第＝補助）
-#             ＋ **最初のツール結果だけ** content に ⚠ 1 行
-#   unknown → stderr に 1 行と、最初のツール結果の structuredContent.harness だけ（Hermes 利用者を煩わせない）
-#   hermes  → 何も出さない
-# FREEAGENT_HARNESS_WARN=0 で警告を止める（判定結果は structuredContent.harness に残す）。
 
-HARNESS_MARKER_ENV = "FREEAGENT_HARNESS"
-# HTTP では子プロセスの env が渡らないので、同じ目印をヘッダでも受ける（Hermes の mcp_servers は
-# `headers:` を毎リクエスト送る）。stdio は従来どおり env の目印。
-HARNESS_MARKER_HEADER = "x-freeagent-harness"
-HARNESS_WARN_ENV = "FREEAGENT_HARNESS_WARN"
-_SDK_DEFAULT_CLIENT = "mcp"
-_LOG_LEVELS = ("debug", "info", "notice", "warning", "error", "critical", "alert", "emergency")
-_HARNESS_LOCK = threading.Lock()
-_HARNESS: dict = {"info": None, "announced": False, "notified": False, "log_level": "info"}
-
-
-def detect_harness(params, env=None, marker=None) -> dict:
-    """initialize の params・目印（env か HTTP ヘッダ）からハーネスを判定する（文字列比較だけ・サブプロセスなし）。
-
-    `marker` は HTTP のヘッダ（`HARNESS_MARKER_HEADER`）由来。HTTP では子プロセスの env が渡らないため、
-    明示の目印はヘッダで受ける（stdio は env）。
-    """
-    env = os.environ if env is None else env
-    params = params if isinstance(params, dict) else {}
-    client = params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else {}
-    name = client.get("name") if isinstance(client.get("name"), str) else ""
-    version = client.get("version") if isinstance(client.get("version"), str) else ""
-    from_header = (marker or "").strip()
-    declared = from_header or (env.get(HARNESS_MARKER_ENV) or "").strip()
-    info = {"client": name, "client_version": version, "marker": declared}
-    if declared:
-        kind = "hermes" if declared.lower() == "hermes" else "other"
-        return {**info, "kind": kind, "source": "header" if from_header else "env",
-                "reason": (f"{HARNESS_MARKER_HEADER}={declared}" if from_header
-                           else f"{HARNESS_MARKER_ENV}={declared}")}
-    if "hermes" in name.lower():
-        return {**info, "kind": "hermes", "source": "clientInfo", "reason": f"clientInfo.name={name}"}
-    if name and name != _SDK_DEFAULT_CLIENT:
-        return {**info, "kind": "other", "source": "clientInfo", "reason": f"clientInfo.name={name}"}
-    return {**info, "kind": "unknown", "source": "none",
-            "reason": (f"clientInfo.name={name or '（なし）'}（MCP SDK の既定値で Hermes と区別できない）"
-                       f"・{HARNESS_MARKER_ENV} 未設定")}
-
-
-def harness_warn_enabled(env=None) -> bool:
-    env = os.environ if env is None else env
-    return (env.get(HARNESS_WARN_ENV) or "").strip().lower() not in ("0", "false", "off", "no")
-
-
-def _harness_backend_is_default() -> bool:
-    return PROVIDER_SPECS["nous"]["base_url"].startswith("http://127.0.0.1:8645")
-
-
-def harness_message(info: dict) -> str:
-    """人間向けの 1 段落（stderr・content・ログ通知で共用）。LLM への指示は書かない（規約 3）。"""
-    if not info or info.get("kind") == "hermes":
-        return ""
-    fix = (f"HTTP なら設定の headers に {HARNESS_MARKER_HEADER}: hermes、"
-           f"stdio なら `hermes config set mcp_servers.freeagent-bind.env.{HARNESS_MARKER_ENV} hermes`")
-    if info.get("kind") == "unknown":
-        return (f"ハーネスを判別できません（{info.get('reason')}）。Hermes Agent で使っているなら "
-                f"{fix} で目印を入れると判別できます。")
-    parts = [f"Hermes Agent 以外のクライアント（{info.get('client') or info.get('marker') or '不明'}）で"
-             "動作しています。"]
-    if _harness_backend_is_default():
-        parts.append("既定の推論先 hermes proxy（127.0.0.1:8645）が無いと nous プロバイダは使えません"
-                     "（FREEAGENT_BASE_URL で変更可。OpenRouter / NVIDIA / Hugging Face / Groq / Cloudflare / Gemini はキーと必要なFree-tier確認があれば使えます）。")
-    parts.append("自発利用の設定（SOUL.md・tools.exclude・apply_proactive.py）は Hermes 専用です。")
-    parts.append(f"この警告は {HARNESS_WARN_ENV}=0 で止められます。")
-    return "".join(parts)
-
-
-def harness_instructions(info: dict) -> str:
-    """initialize.instructions の先頭に付ける注記（other のときだけ。他クライアントは instructions を読む）。"""
-    if not info or info.get("kind") != "other" or not harness_warn_enabled():
-        return PROACTIVE_INSTRUCTIONS
-    note = ("【注意】このサーバーは Hermes Agent 向けです。推論の既定の接続先は hermes proxy で、"
-            "つながらないときは freeagent_models で使えるプロバイダを確認してから使う。"
-            "失敗応答の structuredContent.next_action に従い、同じ呼び出しを繰り返さない。")
-    return note + PROACTIVE_INSTRUCTIONS
-
-
-def harness_on_initialize(params, marker=None) -> dict:
-    """initialize で呼ぶ。判定を保存し、stderr に 1 回だけ書く。initialize 応答（dict）を返す。
-
-    `marker` は HTTP のヘッダ（`HARNESS_MARKER_HEADER`）由来の目印。HTTP では 1 プロセスを複数
-    クライアントが共有するので、この判定はプロセス内で最後に initialize したクライアントのものになる
-    （警告は 1 プロセス 1 回・最初のツール結果の注記も 1 回だけ、という従来の性質は変わらない）。
-    """
-    info = detect_harness(params, marker=marker)
-    announce = False
-    with _HARNESS_LOCK:
-        # **鍵の欠落で落ちない**: 状態はテストや再初期化で消えることがある（実測: フルスイートで
-        # `KeyError: 'announced'` になり、initialize が例外になった）。既定値を置いてから読む。
-        _HARNESS.setdefault("announced", False)
-        _HARNESS.setdefault("notified", False)
-        _HARNESS.setdefault("log_level", "info")
-        _HARNESS["info"] = info
-        if not _HARNESS["announced"] and info["kind"] != "hermes" and harness_warn_enabled():
-            _HARNESS["announced"] = announce = True
-    if announce:
-        try:
-            sys.stderr.write(f"[freeagent-bind] {harness_message(info)}\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-    offered = params.get("protocolVersion", "") if isinstance(params, dict) else ""
-    return {
-        "protocolVersion": negotiate_protocol(offered),
-        # logging: サーバーが notifications/message を送るなら宣言が MUST（MCP 2025-11-25 Logging）。
-        # resources: 変化の遅い知識（使い分け・在庫・鍵の入れ方・返り値の形）を呼ばれたときだけ読ませる（§11）。
-        "capabilities": {"tools": {"listChanged": False},
-                         "resources": {"subscribe": False, "listChanged": False},
-                         "completions": {},
-                         "logging": {}},
-        "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-        "instructions": harness_instructions(info),
-    }
-
-
-def harness_set_level(params) -> dict | None:
-    """logging/setLevel。不正な値は -32602（仕様どおり）。"""
-    level = params.get("level") if isinstance(params, dict) else None
-    if level not in _LOG_LEVELS:
-        return {"code": -32602, "message": f"invalid log level: {level}"}
-    with _HARNESS_LOCK:
-        _HARNESS["log_level"] = level
-    return None
-
-
-def harness_log_notification() -> dict | None:
-    """notifications/initialized の後に 1 回だけ送るログ通知（other のときだけ）。送らないなら None。"""
-    with _HARNESS_LOCK:
-        info = _HARNESS["info"]
-        if (_HARNESS["notified"] or not info or info.get("kind") != "other" or not harness_warn_enabled()
-                or _LOG_LEVELS.index(_HARNESS["log_level"]) > _LOG_LEVELS.index("warning")):
-            return None
-        _HARNESS["notified"] = True
-    return {"jsonrpc": "2.0", "method": "notifications/message",
-            "params": {"level": "warning", "logger": "freeagent-bind.harness",
-                       "data": {"harness": info["kind"], "client": info.get("client"),
-                                "message": harness_message(info)}}}
-
-
-def harness_first_call(data: dict) -> str:
-    """最初のツール結果にだけ判定結果を載せる。content に前置する文字列（other のときだけ ⚠ 1 行）を返す。"""
-    with _HARNESS_LOCK:
-        info = _HARNESS["info"]
-        if not info or _HARNESS.get("first_call_done"):
-            return ""
-        _HARNESS["first_call_done"] = True
-    if info["kind"] == "hermes":
-        return ""
-    data["harness"] = {k: info[k] for k in ("kind", "client", "source", "reason")}
-    if info["kind"] == "other" and harness_warn_enabled():
-        return f"⚠️ {harness_message(info)}\n"
-    return ""
-
-
-def harness_status() -> dict | None:
-    """freeagent_models が常に返す判定結果（未判定＝initialize 前なら None）。"""
-    with _HARNESS_LOCK:
-        info = _HARNESS["info"]
-    if not info:
-        return None
-    return {**{k: info[k] for k in ("kind", "client", "client_version", "source", "reason")},
-            "warn": harness_warn_enabled()}
-
-
-def _harness_reset() -> None:
-    """テスト用: 判定状態を初期化する。"""
-    with _HARNESS_LOCK:
-        _HARNESS.clear()
-        _HARNESS.update({"info": None, "announced": False, "notified": False, "log_level": "info"})
-
-
-# ================================================================ §11 MCP Resources（知識のオンデマンド公開）
-#
-# `tools/list` は起動時に丸ごとモデルへ渡るので、変化の遅い長い知識を description に置くと毎回の文脈を食う。
-# Resources は**呼ばれたときだけ**読まれる別チャネルなので、使い分け・在庫・鍵の入れ方・返り値の形を
-# ここへ逃がす（v0.22.0）。Hermes は `capabilities.resources` を見て `list_resources` / `read_resource` を
-# 自動で生やす（実測: hermes-agent の `tools/mcp_tool_registration.py` は capabilities で分岐する）。
-# **read はネットワークを出さない**（登録簿と環境変数だけで組み立てる）。読むたびにプロバイダへ一覧を
-# 要求すると、モデルが 1 回読むだけで上流の枠を使う（規約 54 の「早期返却で一覧を出さない」と同じ理由）。
-
-RESOURCE_SCHEME = "resource://freeagent/"
-RESOURCE_MIME = "text/markdown"
-
-
-def _md_table(headers: list[str], rows: list[list[str]]) -> str:
-    """Markdown の表。Resources の本文を組み立てるためだけに使う（content には使わない）。"""
-    out = ["| " + " | ".join(headers) + " |",
-           "|" + "|".join("---" for _ in headers) + "|"]
-    for row in rows:
-        out.append("| " + " | ".join(str(cell) for cell in row) + " |")
-    return "\n".join(out)
-
-
-def _resource_api_rules() -> str:
-    """どのツールを選ぶか（列挙は実装のツール名から書く）と、待ち時間の契約。"""
-    return "\n".join([
-        "# hermes-freeagent-bind の使い分け",
-        "",
-        "## どのツールを選ぶか",
-        "",
-        _md_table(["場面", "ツール"], [
-            ["出典が要る事実確認（LLM を呼ばない＝幻覚が入らない）", "`freeagent_lookup`"],
-            ["根拠を読ませた上で答えさせたい", "`freeagent_grounded`"],
-            ["1 モデルに下読み・分類・要約を 1 回任せる", "`freeagent_ask`"],
-            ["同じ問いを複数モデルに当てて多様性が要る", "`freeagent_panel` / `freeagent_fanout`"],
-            ["大量の要素へ同じ指示を並列適用", "`freeagent_map`"],
-            ["設計・デバッグなど 2 段以上の推論", "`freeagent_think` → 必要なら `freeagent_consult`"],
-            ["在庫・Free 判定・生存確認", "`freeagent_models`"],
-            ["失敗の理由・遅さを記録（traces）から決定論で知る", "`freeagent_diagnose`"],
-            ["外部依頼の受付裁定・完了報告の証拠検査（決定論）", "`freeagent_admit`"],
-            ["決められた手順で自分に調べさせる（読み取り専用）", "`freeagent_agent`"],
-            ["フルツール付き Hermes を別プロセスで動かす（既定 off）", "`freeagent_delegate`"],
-        ]),
-        "",
-        "## 手順が要るとき",
-        "",
-        "- 長い手順は Resource に置いてある（`resource://freeagent/skills` が目録）。",
-        "  必要な 1 本だけ読む: `skills/plan` / `skills/review` / `skills/debug` / `skills/grounded`。",
-        "",
-        "## 失敗したとき",
-        "",
-        "- 失敗応答には `structuredContent.next_action`（`kind` / `advice` / `fallback_tools` / `check` / `reenable`）が付く。",
-        "  同じ呼び出しを繰り返さず、そこの次の一手に従う。",
-        "",
-        "## 待ち時間と上限",
-        "",
-        f"- 1 回の呼び出しの予算は既定 {CALL_BUDGET_S:g} 秒（`FREEAGENT_CALL_BUDGET`。0 で無制限）。",
-        f"- 知識取得の締め切りは既定 {KB_DEADLINE:g} 秒（`FREEAGENT_KB_DEADLINE`）。間に合わなかったソースは",
-        "  `timed_out` として返り、裏の取得は続いて次回はキャッシュから返る。",
-        f"- 同時実行は既定 {MAX_WORKERS} 本（`FREEAGENT_MAX_WORKERS`）。`fanout` のプロンプト上限は {MAX_PROMPTS_PER_CALL} 件、",
-        f"  `map` の要素上限は {MAX_MAP_ITEMS} 件。上限で切った件数は `<label>_dropped` に残る（黙って捨てない）。",
-    ])
-
-
-def _resource_sources() -> str:
-    """知識ソースの在庫。既定/明示の別は `DEFAULT_SOURCES` から引く（手で並べない・規約 5）。"""
-    defaults = [name for name in DEFAULT_SOURCES if name in KB_BACKENDS]
-    rows = [[name, "既定" if name in defaults else "明示指定のみ"] for name in KB_BACKENDS]
-    return "\n".join([
-        f"# 知識ソース（{len(KB_BACKENDS)} 種）",
-        "",
-        f"既定で引くのは {len(defaults)} 種: " + ", ".join(defaults),
-        "",
-        "明示指定は `freeagent_lookup` / `freeagent_grounded` の `sources` に名前を並べる",
-        "（`sources` の説明に使う条件がある）。",
-        "",
-        _md_table(["source", "既定/明示"], rows),
-    ])
-
-
-def _resource_providers() -> str:
-    """推論プロバイダと「何を入れれば ready か」。**鍵の値は出さない**（名前だけ）。"""
-    rows = []
-    for name in PROVIDER_ORDER:
-        spec = PROVIDER_SPECS.get(name) or {}
-        missing = _provider_missing_settings(spec)
-        rows.append([name, "ready" if provider_ready(name) else "未設定",
-                     as_str(spec.get("key_env")) or "-",
-                     ", ".join(missing) if missing else "-",
-                     as_str(spec.get("free_kind")) or "-"])
-    return "\n".join([
-        f"# 推論プロバイダ（{len(PROVIDER_ORDER)} 社）",
-        "",
-        "`未設定` は鍵または確認フラグが足りない状態（**値はここに出さない**）。",
-        "キーの置き場所は stdio なら MCP の `env`、常駐 HTTP なら `%LOCALAPPDATA%\\hermes\\.env`。",
-        "",
-        _md_table(["provider", "状態", "key_env", "足りないもの", "free_kind"], rows),
-    ])
-
-
-def _resource_result_shape() -> str:
-    """`content` / `structuredContent` の契約と、引用をどこから読むか。"""
-    return "\n".join([
-        "# 返り値の形（契約）",
-        "",
-        "- `content`: 人間向けの日本語テキスト（表・箇条書き）。LLM 向けの指示は書かない。",
-        "- `structuredContent`: LLM 向けの純粋な JSON。失敗も `error` としてここに入る。",
-        "- 失敗時は `structuredContent.next_action` に次の一手が入る。",
-        "- `freeagent_lookup` の引用は**トップレベルの `citations`** に統合済み。",
-        "  `results[source]` の中に同じ引用は重ねない（`citations_in_results` が false なら統合済み）。",
-        "- 引用 1 件は `source` / `title` / `url` / `summary`（+ `year` / `doi` / `summary_kind` / `metadata_only`）。",
-        "- 本文根拠が無いものは `metadata_only: true` で、根拠として数えない。",
-    ])
-
-
-
-# --- スキル（必要になったときだけ読む手順書）----------------------------------
-#
-# 外部の Agent Skills（`anthropics/skills` / `obra/superpowers`）の「段階開示」を、既存の Resource チャネルへ
-# 写したもの。**ツール定義を増やさない**のが要点で、手順の本文は呼ばれたときだけ渡る（約 1〜1.5KB）。
-# 本文は**実装の定数と登録簿から生成**する（数字や語彙を文章に書き写さない）。
-
-def _resource_skills() -> str:
-    """スキルの目録（どれをいつ読むか）。"""
-    rows = [
-        ["`resource://freeagent/skills/plan`", "大きめの作業を分解してから着手するとき", "plan の粒度・改訂・仮説"],
-        ["`resource://freeagent/skills/review`", "成果物を査読させるとき（`consult` の review）", "4 行の型・重要度・5 軸・質問の上限"],
-        ["`resource://freeagent/skills/debug`", "原因が分からない不具合を追うとき", "症状→再現→仮説→証拠→修正"],
-        ["`resource://freeagent/skills/grounded`", "出典つきで答えさせたいとき", "検索語・ソース・引用の読み方"],
-    ]
-    return "\n".join([
-        "# スキル（必要なときだけ読む手順書）",
-        "",
-        "ツール定義は起動時に丸ごと渡るので、**長い手順はここに置く**（読むのは必要なときだけ）。",
-        "どれも 1〜1.5KB で、読んでも上流のモデルは呼ばれない（ネットワークも出ない）。",
-        "",
-        _md_table(["URI", "いつ読む", "中身"], rows),
-        "",
-        "## 使い方",
-        "",
-        "- まず目録（これ）を見て、必要な 1 本だけ読む。**全部を読み通さない**。",
-        "- 手順は「型」であって、判断と責任はメイン LLM に残る。",
-    ])
-
-
-def _resource_skill_plan() -> str:
-    """計画の型（`freeagent_think` の plan と検証の規律）。"""
-    return "\n".join([
-        "# 計画の立て方（`freeagent_think` の `plan`）",
-        "",
-        "- 各項目は **2〜5 分で終わる単位**で、**対象**（ファイル・節・コマンド）と**検証方法**まで書く。",
-        "  検証できない項目は項目として数えない（数えた時点で「やったつもり」が増える）。",
-        "- 1 項目終わるごとに検証を通してから次へ進む。**最後にまとめて検証しない**。",
-        f"- 1 回のツール呼び出しの予算は既定 {CALL_BUDGET_S:g} 秒（`FREEAGENT_CALL_BUDGET`）。",
-        "  長い調査は項目を分けて、その都度返す（切られると取れていた結果も失う）。",
-        "",
-        "## 台帳の使い方",
-        "",
-        "- 理解が変わったら `revises_thought`（消さずに改訂として残る）。",
-        "- 代替案は `branch_from_thought` で分岐し、`resolve_branch` + `branch_status` で採用/棄却を記録する。",
-        "- 原因の見当は `kind=\"hypothesis\"` で立て、`tests_hypothesis` + `hypothesis_status` で確かめる。",
-        "- `total_thoughts` は見積り。進めながら増減してよい（自動でも引き上げられる）。",
-        "- `subgoal` / `subgoal_done` は**同じ `session_id`** を付ける（落とすと別の台帳に当たる）。",
-        "",
-        "## 完了の条件",
-        "",
-        "- 「終わった」と言う前に、**実行したコマンドとその出力**で確かめる。確かめていない項目は未検証と書く。",
-    ])
-
-
-def _resource_skill_review() -> str:
-    """査読の型（`freeagent_consult` の review モード）。"""
-    return "\n".join([
-        "# 査読の型（`freeagent_consult` の `mode=\"review\"` + `draft`）",
-        "",
-        "- 返るのは 4 行（結論 / 重要度 / 指摘 / 確認したい点）。重要度は "
-        + " / ".join(f"`{sev}`" for sev in REVIEW_SEVERITIES) + "。",
-        "- 見る軸は " + " / ".join(REVIEW_AXES) + " の 5 つ。**軸を名乗らない回答は `unknown`** として",
-        f"  `blocking` に数える（保守側。空を「軽い」と読まない）。",
-        f"- 質問は最大 {QUESTION_CAP} 件。超えた分は `deferred_questions` に残る（捨てない）。",
-        "",
-        "## 2 段で使う",
-        "",
-        "1. **仕様適合**: 頼まれたこと・合意した設計に合っているか。",
-        "2. **品質**: 読めるか・安全か・テストがあるか。",
-        "",
-        "混ぜると「動くが読めない」「速いが仕様違い」を見逃す。v0.33.0 以降は 1 回の consult で 2 段を回せる。",
-        "",
-        "## 指摘の扱い",
-        "",
-        "- 人数で重みを付ける（4 体中 4 体が挙げたものは重い）。合意度の低さ＝意見が割れている、ではない。",
-        "- 採否は自分で決める。直さない場合は理由を残す（黙って捨てない）。",
-    ])
-
-
-def _resource_skill_debug() -> str:
-    """原因追及の型（4 段）。"""
-    return "\n".join([
-        "# デバッグの型（症状 → 再現 → 原因 → 修正）",
-        "",
-        "1. **症状を 1 行で書く**（何が、どこで、期待とどう違う）。",
-        "2. **再現する最小手順**を作る。再現しないなら条件（時刻・状態・並列度・入力）を変えて切り分ける。",
-        "3. **仮説を 2 つ以上**立て、消去法ではなく**証拠**（ログ・実測値・差分）で決める。",
-        "4. 直す前に「直ったことを確かめる手段」（テスト・コマンド）を決める。",
-        "5. 直したら同じ手順で再現しないことを示す。示せないなら**未検証**と書く。",
-        "",
-        "## このサーバーでの道具",
-        "",
-        "- 失敗の切り分け: `freeagent_diagnose`（traces の集計。失敗理由の内訳・遅いモデル・直近の失敗）。",
-        "- 仮説の記録: `freeagent_think`（`kind=\"hypothesis\"` → `tests_hypothesis`）。",
-        "- 独立した目: `freeagent_consult`（`mode=\"review\"`）に原因の説明を読ませる。",
-        "",
-        "**推測で原因を書かない**。記録に無いことは「分からない」と書き、次に測る手段を添える。",
-    ])
-
-
-def _resource_skill_grounded() -> str:
-    """出典つきで答えるときの型。"""
-    defaults = [name for name in DEFAULT_SOURCES if name in KB_BACKENDS]
-    return "\n".join([
-        "# 出典を使うとき（`freeagent_lookup` / `freeagent_grounded`）",
-        "",
-        "- まず `freeagent_lookup`（**モデルを呼ばない**＝幻覚が入らない）。本文を読ませたいなら `freeagent_grounded`。",
-        "- 検索語は**英語の語**にする。日本語の質問のまま arXiv / Crossref / Internet Archive を引くと 0 件になりやすい",
-        "  （`grounded` は `search_query` に分けて渡せる）。",
-        f"- 既定のソースは {len(defaults)} 種: " + ", ".join(defaults) + "。追加は `sources` に明示する。",
-        f"- 取得の締め切りは既定 {KB_DEADLINE:g} 秒（`FREEAGENT_KB_DEADLINE`）。間に合わないソースは `timed_out` として",
-        "  返り、裏の取得は続いて次回はキャッシュから返る。",
-        "",
-        "## 引用の読み方",
-        "",
-        "- 引用は**トップレベルの `citations`** に統合済み（`results[source]` に重ねない）。",
-        "- `metadata_only: true` は本文根拠が無い＝**根拠として数えない**（目録・登録者の自己申告）。",
-        "- 「該当なし」は失敗ではない（そのソースに無い）。**別のソースか別の語で 1 回だけ**言い換える。",
-        "- 番号付きで注入された根拠は `[n]` で引く。根拠に無い番号は `unsupported_citations` に出る。",
-    ])
-
-
-# 資源の目録。**並びは固定**（辞書の挿入順）で、名前は URI の末尾と一致させる。
-_RESOURCE_BUILDERS = {
-    "api-rules": ("ツールの使い分けと待ち時間の契約", _resource_api_rules),
-    "sources": ("知識ソースの一覧（既定/明示）", _resource_sources),
-    "providers": ("推論プロバイダと必要な設定（値は出さない）", _resource_providers),
-    "result-shape": ("content / structuredContent の契約と引用の位置", _resource_result_shape),
-    "skills": ("スキルの目録（必要なときだけ読む手順書）", _resource_skills),
-    "skills/plan": ("計画の型（plan の粒度・改訂・仮説）", _resource_skill_plan),
-    "skills/review": ("査読の型（4 行・重要度・5 軸・2 段）", _resource_skill_review),
-    "skills/debug": ("デバッグの型（症状→再現→仮説→証拠→修正）", _resource_skill_debug),
-    "skills/grounded": ("出典つきで答える型（検索語・ソース・引用の読み方）", _resource_skill_grounded),
-}
-
-
-def resource_list() -> list[dict]:
-    """`resources/list` の応答（MCP の Resource 形）。"""
-    return [{"uri": RESOURCE_SCHEME + name, "name": name, "title": title,
-             "description": title, "mimeType": RESOURCE_MIME}
-            for name, (title, _builder) in _RESOURCE_BUILDERS.items()]
-
-
-# --- 引数の補完（MCP の completion/complete）--------------------------------
-#
-# 仕様（2025-06-18 §Completion）で補完の対象になるのは **`ref/prompt` と `ref/resource` だけ**で、
-# ツール引数の補完は規格に無い（2026-11-02 に仕様を確認）。そこで**リソース URI の補完**を実装する
-# （`resource://freeagent/sk…` と打つと候補が出る）。プロンプトは公開していないので空を返す
-# （「知らない名前を捏造しない」）。
-
-COMPLETION_MAX = 100
-
-
-def completion_complete(params: dict) -> dict:
-    """`completion/complete` の応答（values / total / hasMore）。"""
-    params = params if isinstance(params, dict) else {}
-    ref = params.get("ref") if isinstance(params.get("ref"), dict) else {}
-    argument = params.get("argument") if isinstance(params.get("argument"), dict) else {}
-    value = as_str(argument.get("value"))
-    ref_type = as_str(ref.get("type"))
-    candidates: list[str] = []
-    if ref_type == "ref/resource":
-        uris = [row["uri"] for row in resource_list()]
-        template = as_str(ref.get("uri"))
-        if "{" in template and "}" in template:
-            head = template.split("{", 1)[0]
-            tail = template.split("}", 1)[1]
-            prefix = head + value
-            candidates = [u for u in uris
-                          if u.startswith(prefix) and (not tail or u.endswith(tail))]
-        else:
-            prefix = value or template
-            candidates = [u for u in uris if u.startswith(prefix)] if prefix else list(uris)
-    total = len(candidates)
-    values = candidates[:COMPLETION_MAX]
-    return {"completion": {"values": values, "total": total, "hasMore": total > len(values)}}
-
-
-def resource_read(uri) -> str | None:
-    """`resources/read` の本文。未知の URI は None（呼び出し側が -32002 を返す）。"""
-    text = as_str(uri)
-    if not text.startswith(RESOURCE_SCHEME):
-        return None
-    builder = _RESOURCE_BUILDERS.get(text[len(RESOURCE_SCHEME):])
-    if builder is None:
-        return None
-    try:
-        return builder[1]()
-    except Exception as exc:   # 例外は外へ漏らさない（規約 1）。読めなかったことを本文で示す。
-        return f"# 生成に失敗しました\n\n{type(exc).__name__}: {exc}\n"
+from . import harness as _harness  # noqa: E402  §から切り出し（ハーネス判別（Hermes 以外で起動されたときの警告））
+globals().update(_harness.EXPORTS)  # `server.<name>` の互換（テストが参照する）
+from . import resources as _resources  # noqa: E402  §から切り出し（MCP Resources（知識のオンデマンド公開）と completion/complete）
+globals().update(_resources.EXPORTS)  # `server.<name>` の互換（テストが参照する）
 
 
 # ================================================================ §9 JSON-RPC / stdio
@@ -10455,7 +9972,7 @@ def write_line(line: str) -> None:
     クライアント側の UTF-8 デコードで壊れ、`Failed to parse JSONRPC message from server` として
     **応答が黙って捨てられ**、接続が connect_timeout まで固まる。
     """
-    data = (line + "\n").encode("utf-8")
+    data = (line + "\n").encode("utf-8", "replace")      # 孤立サロゲートで例外にしない（応答を失わない）
     buf = getattr(sys.stdout, "buffer", None)
     if buf is not None:
         buf.write(data)
@@ -10483,7 +10000,7 @@ def respond(msg_id, result=None, error=None) -> None:
         out["result"] = result
     _debug("out", out)
     with WRITE_LOCK:
-        write_line(json.dumps(out, ensure_ascii=False))
+        write_line(_dumps(out))
 
 
 def handle_tool_call(params: dict) -> dict:
@@ -10538,7 +10055,7 @@ def handle_tool_call(params: dict) -> dict:
         render_failed = True
         text = (f"⚠️ 表示の生成に失敗しました（{type(exc).__name__}: {exc}）。"
                 "結果は structuredContent に入っています。\n"
-                + truncate(json.dumps(data, ensure_ascii=False), 2000))
+                + truncate(_dumps(data), 2000))
     if is_error and not render_failed:
         # `error` を持たない失敗（描画だけ）に「error を確認してください」と書かない。
         text = "⚠️ 実行は失敗しました。structuredContent.error を確認してください。\n" + text
@@ -10609,7 +10126,7 @@ def _emit(replies: list) -> None:
     if not replies:
         return
     with WRITE_LOCK:
-        write_line(json.dumps(replies, ensure_ascii=False))
+        write_line(_dumps(replies))
 
 
 def _stdio_progress_maker(token=None):
@@ -10617,7 +10134,7 @@ def _stdio_progress_maker(token=None):
 
     def sender(note):
         with WRITE_LOCK:
-            write_line(json.dumps(note, ensure_ascii=False))
+            write_line(_dumps(note))
 
     return sender
 
@@ -10646,7 +10163,7 @@ def _dispatch_message(msg: dict, pool: ThreadPoolExecutor) -> None:
     for reply in _replies_for(msg):
         _debug("out", reply)
         with WRITE_LOCK:
-            write_line(json.dumps(reply, ensure_ascii=False))
+            write_line(_dumps(reply))
 
 
 def serve() -> None:
@@ -10664,7 +10181,7 @@ def serve() -> None:
                 continue
             try:
                 msg = json.loads(raw)
-            except Exception:
+            except (ValueError, RecursionError):
                 respond(None, error={"code": -32700, "message": "parse error"})
                 continue
             _debug("in", msg)
@@ -10684,26 +10201,6 @@ def serve() -> None:
         _drain_parallel_futures()
 
 
-# ================================================================ §10 HTTP (StreamableHTTP)
-
-# 既定は stdio（1 クライアント 1 プロセス）。HTTP モードでは **1 プロセスを複数のクライアントが共有**する。
-# 共有されるのは、いままで「プロセスの数だけ複製されていた」もの:
-#   * `_KB_CACHE` / `_KB_INFLIGHT` … 同じ問いはキャッシュに当たり、**同時実行は 1 回の上流取得に畳まれる**
-#   * `_KB_RATE_NEXT` … ホスト単位のアクセス間隔（規約 28 が警告する「複数 MCP による同一 IP の連打」を防ぐ）
-#   * `_MODELS_CACHE`（600 秒）・`_COOLDOWN`・`model_stats`・`_ModelClaims`
-#   * `PROVIDER_GATE` … 推論先ごとの同時送信枠は共有。MAX_WORKERS は呼び出し単位の制限
-# stdio を N 本立てるとこれらが N 分割され、レート制限も統計も守られない（どちらもプロセス内ロック）。
-#
-# 実装は**標準ライブラリのみ**（依存ゼロは維持）。仕様の範囲は、Hermes の MCP クライアント
-# （`mcp.client.streamable_http`）が実際に要求する経路に絞る。実測で確かめた要求:
-#   * POST … 単一メッセージには **JSON オブジェクト 1 個**で応答する（配列で返すとクライアントは
-#     `Failed to parse JSON response` で切る）。batch のときだけ配列
-#   * POST … 通知（id なし）には **202**（本文なし）。要求に 202 を返すとクライアントは失敗にする
-#   * initialize の応答に `mcp-session-id` を付けると、以降クライアントが同じヘッダを返す
-#   * GET … `Accept: text/event-stream` でサーバー起点の通知（§8.6 の警告）を流す。セッション必須
-#   * DELETE … セッション終了（204）
-# 認証は `FREEAGENT_HTTP_TOKEN` を設定したときだけ要求する（既定は 127.0.0.1 のみに束縛）。
-
 HTTP_TRANSPORT_ENV = "FREEAGENT_TRANSPORT"
 HTTP_HOST_ENV = "FREEAGENT_HTTP_HOST"
 HTTP_PORT_ENV = "FREEAGENT_HTTP_PORT"
@@ -10718,477 +10215,8 @@ HTTP_SSE_KEEPALIVE = _env_float("FREEAGENT_HTTP_KEEPALIVE", 15.0)
 HTTP_MAX_BODY = max(65536, _env_int("FREEAGENT_HTTP_MAX_BODY", 4 * 1024 * 1024))
 HTTP_MAX_SESSIONS = max(1, _env_int("FREEAGENT_HTTP_MAX_SESSIONS", 64))
 
-_HTTP_SESSIONS: dict = {}
-_HTTP_SESSIONS_LOCK = threading.Lock()
-
-
-def http_config(argv=None) -> dict:
-    """HTTP/stdio の設定を env と argv から決める（argv が勝つ）。
-
-    未知の引数は**エラーにしない**（古いクライアントが余分な引数を渡しても起動を止めない）。stderr に
-    1 行だけ出して続行する。既定は従来どおり stdio。
-    """
-    import argparse
-    env_transport = (os.environ.get(HTTP_TRANSPORT_ENV) or "stdio").strip().lower()
-    parser = argparse.ArgumentParser(prog=SERVER_NAME, add_help=True,
-                                     description="Free モデルをサブ LLM として並列に走らせる MCP サーバー")
-    parser.add_argument("--transport", choices=("stdio", "http"), default=env_transport or "stdio",
-                        help=f"stdio（既定・1 クライアント 1 プロセス）か http（{HTTP_TRANSPORT_ENV}）")
-    parser.add_argument("--host", default=os.environ.get(HTTP_HOST_ENV, HTTP_DEFAULT_HOST))
-    parser.add_argument("--port", type=int, default=_env_int(HTTP_PORT_ENV, HTTP_DEFAULT_PORT))
-    parser.add_argument("--path", default=os.environ.get(HTTP_PATH_ENV, HTTP_DEFAULT_PATH))
-    parser.add_argument("--token", default=os.environ.get(HTTP_TOKEN_ENV, ""))
-    args, unknown = parser.parse_known_args(argv)
-    if unknown:
-        try:
-            sys.stderr.write(f"[{SERVER_NAME}] 未知の引数を無視します: {unknown}\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-    path = args.path if args.path.startswith("/") else "/" + args.path
-    return {"transport": args.transport, "host": args.host, "port": args.port,
-            "path": path.rstrip("/") or HTTP_DEFAULT_PATH, "token": args.token or ""}
-
-
-def _http_session_new() -> str:
-    sid = os.urandom(16).hex()
-    with _HTTP_SESSIONS_LOCK:
-        if len(_HTTP_SESSIONS) >= HTTP_MAX_SESSIONS:
-            _http_sessions_prune_locked(force=True)
-        _HTTP_SESSIONS[sid] = {"created": now_ts(), "seen": now_ts(),
-                               "queue": [], "cv": threading.Condition(), "closed": False}
-    return sid
-
-
-def _http_session_get(sid: str):
-    if not sid:
-        return None
-    with _HTTP_SESSIONS_LOCK:
-        session = _HTTP_SESSIONS.get(sid)
-        if session is not None:
-            session["seen"] = now_ts()
-        return session
-
-
-def _http_session_touch(session) -> None:
-    if session is not None:
-        session["seen"] = now_ts()
-
-
-def _http_sessions_prune_locked(force: bool = False) -> int:
-    """呼び出し側が `_HTTP_SESSIONS_LOCK` を保持した状態で期限切れセッションを落とす。"""
-    now = now_ts()
-    stale = [k for k, v in _HTTP_SESSIONS.items() if now - as_float(v.get("seen"), 0.0) > HTTP_SESSION_TTL]
-    if not stale and force:
-        order = sorted(_HTTP_SESSIONS, key=lambda k: as_float(_HTTP_SESSIONS[k].get("seen"), 0.0))
-        stale = order[:max(1, HTTP_MAX_SESSIONS // 4)]
-    for k in stale:
-        session = _HTTP_SESSIONS.pop(k, None)
-        if session is None:
-            continue
-        session["closed"] = True
-        with session["cv"]:
-            session["cv"].notify_all()
-    return len(stale)
-
-
-def _http_sessions_prune(force: bool = False) -> int:
-    """期限切れのセッションを落とす。上限に達したら古い順に落とす（force）。"""
-    with _HTTP_SESSIONS_LOCK:
-        return _http_sessions_prune_locked(force)
-
-
-def _http_session_drop(sid: str) -> bool:
-    with _HTTP_SESSIONS_LOCK:
-        session = _HTTP_SESSIONS.pop(sid, None)
-    if session is None:
-        return False
-    session["closed"] = True
-    with session["cv"]:
-        session["cv"].notify_all()
-    return True
-
-
-def _http_queue_notification(session, note) -> None:
-    """サーバー起点の通知をセッションの SSE 待ち行列へ入れる（GET が無ければ溜めておく）。"""
-    if session is None or not isinstance(note, dict):
-        return
-    with session["cv"]:
-        if len(session["queue"]) < 128:
-            session["queue"].append(note)
-        session["cv"].notify_all()
-
-
-def _http_progress_maker(session):
-    """HTTP の送り手: セッションの SSE 待ち行列へ入れる（GET が無ければ溜める）。"""
-
-    def maker(token=None):
-        def sender(note):
-            _http_queue_notification(session, note)
-
-        return sender
-
-    return maker
-
-
-def _http_process(msg, session, marker=None):
-    """POST の本文 1 件を処理する。(本文に載せる応答, 202 を返すべきか) を返す。
-
-    通知は本文に載せずセッションの待ち行列へ回す（MCP 仕様: 通知に応答してはならない）。
-    `marker` は `HARNESS_MARKER_HEADER` の値（§8.6 の目印）。
-    """
-    items = msg if isinstance(msg, list) else [msg]
-    replies = []
-    # A stateless HTTP POST has no client identity.  Never share its request
-    # namespace with another POST (or with the stdio transport).
-    request_session = session["cv"] if session is not None else object()
-    with bound_progress(_http_progress_maker(session)):
-        for item in items:
-            rid = item.get("id") if isinstance(item, dict) else None
-            with request_scope(rid, request_session):
-                found = _replies_for(item, marker)
-            for reply in found:
-                if isinstance(reply, dict) and "id" in reply:
-                    replies.append(reply)
-                else:
-                    _http_queue_notification(session, reply)
-    if not replies:
-        return None, True
-    if isinstance(msg, list):
-        return replies, False
-    return replies[0], False
-
-
-def _http_auth_ok(headers, token: str) -> bool:
-    """トークン未設定なら素通し。設定時は Authorization: Bearer か x-freeagent-token を要求する。"""
-    if not token:
-        return True
-    import secrets
-    given = ""
-    auth = headers.get("authorization") or ""
-    if auth.lower().startswith("bearer "):
-        given = auth[7:].strip()
-    if not given:
-        given = (headers.get("x-freeagent-token") or "").strip()
-    return bool(given) and secrets.compare_digest(given, token)
-
-
-def _http_origin_ok(headers, allowed_hosts: set[str]) -> tuple[bool, str]:
-    """`Origin` ヘッダを検証する（ブラウザからのクロスサイト呼び出しの抑止）。
-
-    MCP の StreamableHTTP は **`Origin` ヘッダの検証を要求**する（仕様の MUST）。
-    素通しだと、ブラウザで開いた別ページが `http://127.0.0.1:8790/mcp` へ
-    JSON-RPC を送れて、推論の消費や台帳の書き込みを体外から起こせる（実測: 検証前は
-    `Origin: https://evil.example` でも 200 を返していた）。
-
-    判定:
-      * `Origin` が無い（CLI / ネイティブクライアント）→ 通し。
-      * `Origin` が `http://` / `https://` で、**ホストが待ち受のホストと一致** → 通し。
-        （待受が 127.0.0.1 なら `http://127.0.0.1:8790` と同じオリジンだけ許可）
-      * `Origin: null`（file:// など）→ 通ししない（ローカルファイルからの呼び出しは
-        恣意的なサイトからも生成できる）。
-      * 上のどれにも当たらなければ 403。
-    """
-    origin = (headers.get("origin") or "").strip()
-    if not origin:
-        return True, ""
-    if origin.lower() == "null":
-        return False, "Origin: null は拒否しました（ローカルファイルからの呼び出しは遮断します）"
-    parsed = urllib.parse.urlsplit(origin)
-    if parsed.scheme not in ("http", "https"):
-        return False, f"Origin のスキームが不正です: {origin[:80]}"
-    host = (parsed.hostname or "").lower()
-    if host in allowed_hosts:
-        return True, ""
-    return False, (f"Origin が許可されていません: {origin[:80]}"
-                   f"（許可: {', '.join(sorted(allowed_hosts))}）")
-
-
-def _http_host_ok(headers, allowed_hosts: set[str]) -> tuple[bool, str]:
-    """`Host` ヘッダが待ち受のホストと一致するか（DNS rebinding の防御）。
-
-    `Host` が偽装されると、攻撃者のドメインが 127.0.0.1 へ解決される。
-    ブラウザは `Origin` も付けるので Origin 検証が主だが、非ブラウザの
-    クライアントにもこの制約を掛ける。
-    """
-    host_header = (headers.get("host") or "").strip().lower()
-    if not host_header:
-        return True, ""   # HTTP/1.0 には Host が無い
-    if ":" in host_header:
-        host_header = host_header.rsplit(":", 1)[0]
-    if host_header in allowed_hosts:
-        return True, ""
-    return False, f"Host が許可されていません: {host_header[:80]}"
-
-
-def _http_make_handler(config: dict):
-    import http.server
-
-    # Origin / Host の検証で許可するホスト。待受のホスト自身と、そのローカル別名。
-    # 待ち受けが 0.0.0.0 / :: なら wildcard 扱いでどの Host も通す（LAN 公開のとき）。
-    bind_host = str(config.get("host") or HTTP_DEFAULT_HOST).strip().lower()
-    if bind_host in ("0.0.0.0", "::", "[::]", "*", ""):
-        allowed_hosts: set[str] = set()      # 空 = 制限しない
-    else:
-        allowed_hosts = {bind_host, "127.0.0.1", "localhost", "::1"}
-        allowed_hosts.discard("")
-    # 空集合のときは「制限なし」なので判定を緩める（allowed_hosts が空なら常に通す）。
-    def _origin_allowed(headers) -> tuple[bool, str]:
-        if not allowed_hosts:
-            return True, ""
-        return _http_origin_ok(headers, allowed_hosts)
-
-    def _host_allowed(headers) -> tuple[bool, str]:
-        if not allowed_hosts:
-            return True, ""
-        return _http_host_ok(headers, allowed_hosts)
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-        server_version = f"{SERVER_NAME}/{SERVER_VERSION}"
-        sys_version = ""
-
-        def log_message(self, fmt, *args):  # noqa: A003 - 親の API 名
-            _debug("http", f"{self.address_string()} {fmt % args}")
-
-        # ---- 応答の共通形 ----
-        def _json(self, status: int, payload, *, session_id=None) -> None:
-            body = b"" if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            if body:
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            if session_id:
-                self.send_header(HTTP_SESSION_HEADER, session_id)
-            self.end_headers()
-            if body:
-                self.wfile.write(body)
-
-        def _error(self, status: int, code: int, message: str) -> None:
-            self._json(status, {"jsonrpc": "2.0", "id": None, "error": {"code": code, "message": message}})
-
-        def _path_ok(self) -> bool:
-            path = urllib.parse.urlparse(self.path).path
-            return path.rstrip("/") == _http_path(config).rstrip("/")
-
-        def _guard(self) -> bool:
-            """パス・認証・Origin/Host。通れば True、拒否したら応答を書いて False。"""
-            if not self._path_ok():
-                self._error(404, -32601, f"unknown path: {self.path}（待受は {_http_path(config)}）")
-                return False
-            # Origin / Host の検証（MCP StreamableHTTP の仕様 MUST・DNS rebinding の防御）。
-            # ブラウザからのクロスサイト呼び出しを体外から起こせないようにする（実測: 検証前は
-            # `Origin: https://evil.example` でも 200 を返していた）。
-            ok, why = _origin_allowed(self.headers)
-            if not ok:
-                self._error(403, -32003, why)
-                return False
-            ok, why = _host_allowed(self.headers)
-            if not ok:
-                self._error(403, -32004, why)
-                return False
-            if not _http_auth_ok(self.headers, config.get("token") or ""):
-                self._error(401, -32000, f"unauthorized（{HTTP_TOKEN_ENV} のトークンが必要です）")
-                return False
-            return True
-
-        # ---- 本体 ----
-        def do_POST(self):  # noqa: N802 - 親の API 名
-            if not self._guard():
-                return
-            try:
-                length = int(self.headers.get("content-length") or 0)
-            except (TypeError, ValueError):
-                length = 0
-            if length > HTTP_MAX_BODY:
-                return self._error(413, -32600, f"request body too large（上限 {HTTP_MAX_BODY} バイト）")
-            raw = self.rfile.read(length) if length > 0 else b""
-            try:
-                msg = json.loads(raw.decode("utf-8")) if raw else None
-            except Exception:
-                return self._error(400, -32700, "parse error")
-            if msg is None:
-                return self._error(400, -32600, "invalid request")
-            sid = (self.headers.get(HTTP_SESSION_HEADER) or "").strip()
-            session = _http_session_get(sid) if sid else None
-            if sid and session is None:
-                return self._error(404, -32001, "session not found（initialize からやり直してください）")
-            new_sid = None
-            if isinstance(msg, dict) and msg.get("method") == "initialize" and session is None:
-                new_sid = _http_session_new()
-                session = _http_session_get(new_sid)
-            marker = (self.headers.get(HARNESS_MARKER_HEADER) or "").strip() or None
-            try:
-                payload, accepted = _http_process(msg, session, marker)
-            except Exception as exc:   # ツールは例外を漏らさない（規約 1）。ここも最後の砦
-                _debug("http_error", f"{type(exc).__name__}: {exc}")
-                return self._error(500, -32603, f"internal error: {type(exc).__name__}: {exc}")
-            _http_session_touch(session)
-            if accepted:
-                self.send_response(202)
-                self.send_header("Content-Length", "0")
-                if new_sid:
-                    self.send_header(HTTP_SESSION_HEADER, new_sid)
-                self.end_headers()
-                return
-            return self._json(200, payload, session_id=new_sid)
-
-        def do_GET(self):  # noqa: N802 - 親の API 名
-            if not self._guard():
-                return
-            sid = (self.headers.get(HTTP_SESSION_HEADER) or "").strip()
-            if not sid:
-                return self._error(400, -32600, f"GET には {HTTP_SESSION_HEADER} ヘッダが必要です")
-            session = _http_session_get(sid)
-            if session is None:
-                return self._error(404, -32001, "session not found")
-            if "text/event-stream" not in (self.headers.get("accept") or "").lower():
-                return self._error(406, -32600, "GET には Accept: text/event-stream が必要です")
-            self.close_connection = True
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            # MCP Streamable HTTP（2025-06-18 / 2026-07-28）が SHOULD とする指定。リバースプロキシ
-            # （nginx 等）が SSE をバッファすると、進捗通知が**まとめて遅れて**届く。
-            self.send_header("X-Accel-Buffering", "no")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            try:
-                self.wfile.flush()
-                while True:
-                    with session["cv"]:
-                        if session["queue"]:
-                            note = session["queue"].pop(0)
-                        else:
-                            session["cv"].wait(HTTP_SSE_KEEPALIVE)
-                            note = session["queue"].pop(0) if session["queue"] else None
-                    if note is None:
-                        if session.get("closed"):
-                            break
-                        self.wfile.write(b": keep-alive\n\n")   # SSE のコメント行（クライアントは無視する）
-                    else:
-                        data = json.dumps(note, ensure_ascii=False)
-                        self.wfile.write(f"event: message\ndata: {data}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-                pass
-            return
-
-        def do_DELETE(self):  # noqa: N802 - 親の API 名
-            if not self._guard():
-                return
-            sid = (self.headers.get(HTTP_SESSION_HEADER) or "").strip()
-            if sid and not _http_session_drop(sid):
-                return self._error(404, -32001, "session not found")
-            self.send_response(204)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-
-    return Handler
-
-
-def _http_path(config: dict) -> str:
-    """待受パス（キーが無い / None / 空 のときだけ既定）。
-
-    部分的な config（`{"host","port"}` だけ）でも **KeyError で全リクエストを無言で切らない**
-    ために、`config["path"]` の直引きはしない（実測: 直引きだと全リクエストが
-    `RemoteDisconnected` になり、サーバー側には traceback だけが残る）。
-    **明示された不正値は既定へ読み替えず例外にする**（下の `_http_port` と同じ理由）。
-    """
-    raw = config.get("path")
-    if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return HTTP_DEFAULT_PATH
-    if not isinstance(raw, str):
-        raise ValueError(f"path が不正です: {raw!r}（文字列。省略時は {HTTP_DEFAULT_PATH}）")
-    path = raw.strip()
-    return path if path.startswith("/") else "/" + path
-
-
-def _http_host(config: dict) -> str:
-    """待受ホスト（キーが無い / None / 空 のときだけ既定）。"""
-    raw = config.get("host")
-    if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return HTTP_DEFAULT_HOST
-    if not isinstance(raw, str):
-        raise ValueError(f"host が不正です: {raw!r}（文字列。省略時は {HTTP_DEFAULT_HOST}）")
-    return raw.strip()
-
-
-def _http_port(config: dict) -> int:
-    """待受ポート（キーが無い / None のときだけ既定。0 は OS に選ばせる正当な値）。
-
-    **明示された不正値を既定へ読み替えない**。`"not-a-port"` を既定（8765）で読み替えると、
-    利用者が指定したのと**違うポートで黙って待ち受ける**（クライアントは指定したポートへ繋ぐので
-    気づけない。実測 2026-10-27: この読み替えのせいで既存テストが 8765 で `serve_forever` に入り、
-    テストスイートが 51 分ハングした）。
-    """
-    raw = config.get("port")
-    if raw is None:
-        return HTTP_DEFAULT_PORT
-    bad = ValueError(f"port が不正です: {raw!r}（0〜65535 の整数。省略時は {HTTP_DEFAULT_PORT}）")
-    if isinstance(raw, bool):                       # bool は int の派生なので先に弾く
-        raise bad
-    if isinstance(raw, int):
-        value = raw
-    elif isinstance(raw, str) and raw.strip().isdigit():   # 全角数字は isdigit も int() も受ける
-        value = int(raw.strip())
-    else:                                           # "8765.7" / [] / "not-a-port" は切り捨てず拒否
-        raise bad
-    if not 0 <= value <= 65535:                     # 範囲外も**丸めずに拒否**（70000 → 65535 にしない）
-        raise bad
-    return value
-
-
-def _http_build_server(config: dict):
-    """待受ソケットを作って返す（`serve_forever` は呼び出し側。テストが自前で止められるように分ける）。"""
-    import http.server
-
-    class _Server(http.server.ThreadingHTTPServer):
-        # Windows の SO_REUSEADDR は「同じポートへの二重バインド」を許す。共有が目的なので、
-        # 二重起動は黙って通さず必ず失敗させる（状態が 2 つに割れると気づけない）。
-        allow_reuse_address = False
-        daemon_threads = True
-
-    return _Server((_http_host(config), _http_port(config)), _http_make_handler(config))
-
-
-def serve_http(config: dict) -> None:
-    """HTTP モードで待ち受ける（1 プロセスを複数クライアントで共有する）。"""
-    try:
-        server = _http_build_server(config)
-    except (TypeError, ValueError) as exc:
-        # 設定の不正は**起動前に**止める（不正値を既定へ読み替えて別のポートで待ち受けない）。
-        try:
-            sys.stderr.write(f"[{SERVER_NAME}] HTTP の設定が不正です: {exc}\n"
-                             f"  --host / --port / --path（または {HTTP_HOST_ENV} / {HTTP_PORT_ENV} / "
-                             f"{HTTP_PATH_ENV}）を確認してください。\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-        raise SystemExit(2)
-    except OSError as exc:
-        try:
-            sys.stderr.write(f"[{SERVER_NAME}] HTTP を {_http_host(config)}:{_http_port(config)} で開始できません: {exc}\n"
-                             f"  同じポートで既に動いていませんか（1 プロセス共有が目的なので二重起動は不要です）。"
-                             f"別ポートは --port / {HTTP_PORT_ENV} で指定できます。\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-        raise SystemExit(2)
-    host, port = server.server_address[0], server.server_address[1]
-    try:
-        sys.stderr.write(f"[{SERVER_NAME}] HTTP 待受 http://{host}:{port}{_http_path(config)}"
-                         f"（token {'あり' if config.get('token') else 'なし'}・pid {os.getpid()}）\n")
-        sys.stderr.flush()
-    except Exception:
-        pass
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+from . import transport_http as _transport_http  # noqa: E402  §から切り出し（HTTP (StreamableHTTP) トランスポート）
+globals().update(_transport_http.EXPORTS)  # `server.<name>` の互換（テストが参照する）
 
 
 def main(argv=None) -> None:
