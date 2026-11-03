@@ -101,6 +101,12 @@ SOURCE_QUERIES = {
     "mdn": ["Array.prototype.map", "fetch API", "Promise.all",
             "CSS grid layout", "WebSocket", "AbortController"],
     "devdocs": ["python", "javascript", "react", "postgresql", "django", "sqlite"],
+    "nvd": ["sql injection", "buffer overflow", "deserialization", "path traversal",
+            "log4j", "openssl"],
+    "terraform": ["aws vpc", "kubernetes", "azure network", "gcp storage",
+                  "eks cluster", "cloudfront"],
+    "zbmath": ["moduli space", "Riemann hypothesis", "large language model",
+               "graph coloring", "stochastic differential equation", "prime distribution"],
 }
 
 def measure_round(index: int | None = None, sources: list[str] | None = None,

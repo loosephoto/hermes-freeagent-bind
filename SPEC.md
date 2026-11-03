@@ -12,7 +12,7 @@
 ## 1. 構成（モジュラーモノリス）
 
 本体は `src/freeagent_bind/server.py`（§0〜§4・§5 の横断部・§6〜§11）。**データの一覧は 2 つの
-パッケージに出している**: 知識ソース 27 種は `sources/<name>.py`（1 ソース 1 ファイル）、
+パッケージに出している**: 知識ソース 30 種は `sources/<name>.py`（1 ソース 1 ファイル）、
 プロバイダ 18 社は `providers/<name>.py`（1 社 1 ファイル）。`sources/__init__.py` のレジストリが
 `SOURCES` / `KB_BACKENDS` を import 順に 1 回だけ組み立て、`providers/__init__.py` が
 `PROVIDER_SPECS` と `PROVIDER_ORDER` の既定順を作る（既定順の手書き列挙は持たない）。区画の追加は「行を足す」ではなく
@@ -34,7 +34,7 @@
 | §2 | 永続ストア（§2.1 クールダウン / §2.2 品質統計 / §2.3 トレース / §2.4 相談セッション / §2.5 プロバイダ認証の記憶 / §2.6 思考台帳 / §2.7 台帳の構造） |
 | §3 | プロバイダとモデル（Free 判定・解決・選抜・並列実行・§3.5 クォータ） |
 | §4 | サブ LLM 呼び出し（フォールバック・空応答・CoT 検出） |
-| §5 | 知識バックエンド27種（**実装は `sources/<name>.py`**。ここには横断検索・締め切り・引用統合・ホスト予算だけを残す）＝既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須） / §5.21 Internet Archive（明示指定のみ） / §5.22 Qiita（明示指定のみ） / §5.23 OpenReview（明示指定のみ） / §5.24 MDN・DevDocs（明示指定のみ）） |
+| §5 | 知識バックエンド30種（**実装は `sources/<name>.py`**。ここには横断検索・締め切り・引用統合・ホスト予算だけを残す）＝既定6＋§5.9 DataCite / §5.10明示許可代替 / §5.11ホスト予算 / §5.12 OpenAIRE / §5.13引用統合 / §5.14 Zenodo / §5.15 ROR / §5.16 DOAJ・npm・crates.io / §5.17 CiNii（appid必須） / §5.18 OSV・IETF / §5.19 科学（医学・生物学は対象外） / §5.20 HN・Software Heritage・Libraries.io（キー必須） / §5.21 Internet Archive（明示指定のみ） / §5.22 Qiita（明示指定のみ） / §5.23 OpenReview（明示指定のみ） / §5.24 MDN・DevDocs（明示指定のみ） / §5.25 NVD・Terraform Registry・zbMATH（明示指定のみ・zbMATH は規約同意が前提）） |
 | §6 | ツール実装（13本、§6.11 本文の注入番号・引用認定・§6.32 受付と報告・§6.37 記録からの診断） |
 | §7 | ツール定義（`TOOLS` / `HANDLERS`） |
 | §8 | 表示（`render`） |
@@ -596,7 +596,7 @@ v0.11.0 は GitHub の実装（`freellmapi` の設計文書・MoA・FrugalGPT・
 - 注入する本文は 1 件あたり `FREEAGENT_EVIDENCE_ITEM_CHARS`（既定 360）、全体で
   `FREEAGENT_EVIDENCE_TOTAL_CHARS`（既定 3200）に収める。入れすぎると小型 Free モデルが予算を
   使い切って空応答・切断になる（逆効果）。
-- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加18種（datacite / openaire / zenodo / ror / doaj / npm / crates / cinii / osv / ietf / inspirehep / oeis / hfhub / hn / swh / librariesio / ia / qiita）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。ciniiは`FREEAGENT_CINII_APPID`、librariesioは`FREEAGENT_LIBRARIESIO_KEY`が前提で、未設定ならHTTPを出さずに案内を返す（§6.7 / §6.10）。qiitaは`FREEAGENT_QIITA_TOKEN`があれば1,000回/時（無くても60回/時で動く。未認証では別の問いが1分待ちになる）。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は含まない**（§6.9）。
+- `sources`省略時は`DEFAULT_SOURCES`（従来6種）だけ。追加24種（datacite / openaire / zenodo / ror / doaj / npm / crates / cinii / osv / ietf / inspirehep / oeis / hfhub / hn / swh / librariesio / ia / qiita / openreview / mdn / devdocs / nvd / terraform / zbmath）は明示指定。重複指定を除き、無効名だけなら全ソースへ送らない。ciniiは`FREEAGENT_CINII_APPID`、librariesioは`FREEAGENT_LIBRARIESIO_KEY`が前提で、未設定ならHTTPを出さずに案内を返す（§6.7 / §6.10）。zbmathは利用規約への同意の申告（`FREEAGENT_ZBMATH_ACK`）が前提で、未同意ならHTTPを出さず規約URLを案内する（§6.42）。qiitaは`FREEAGENT_QIITA_TOKEN`があれば1,000回/時（無くても60回/時で動く。未認証では別の問いが1分待ちになる）。nvdは`FREEAGENT_NVD_API_KEY`があれば0.6秒間隔（無認証は6秒）。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は含まない**（§6.9）。
 - `fallback=true`のJSON真偽値だけが、自然語arXiv検索をDataCiteへ追加送信する明示許可。文字列`"true"`等は許可にしない。
 - 1 ソースの失敗で全体を落とさない（`errors` に集約し、成功分だけ返す）。
 
@@ -625,7 +625,7 @@ v0.11.0 は GitHub の実装（`freellmapi` の設計文書・MoA・FrugalGPT・
   1 本の接続で通すと **3.096 秒**（**-0.636 秒・17%**。TLS ハンドシェイクが 163〜183ms/回なので
   2 回ぶん ≈ 0.35 秒は確実に消える。実測 2026-10-21・この環境）。
 - **共用経路（`kb_http`）には入れない**。`kb_http` はリダイレクト追従・プロキシ env・読み取り途中の
-  打ち切りを持つ 27 ソース共通の道で、接続の使い回しを混ぜると影響範囲が一気に広がる。§5.2.1 は
+  打ち切りを持つ 30 ソース共通の道で、接続の使い回しを混ぜると影響範囲が一気に広がる。§5.2.1 は
   **接続の再利用だけ**を担う専用の道（`kb_json_keepalive`）にする:
   * リダイレクトは追わない（wikidata の api.php は 200 を返す。実測）
   * プロキシが設定された環境では `kb_json` へ委譲する（`ProxyHandler` の挙動を変えない）
@@ -656,7 +656,7 @@ v0.11.0 は GitHub の実装（`freellmapi` の設計文書・MoA・FrugalGPT・
   `FREEAGENT_STATE_DIR/kb_latency.jsonl`・最大 20,000 行・超えたら古い行から tmp + `os.replace` で捨てる）へ追記。
   記録は `ts` / `hour`（日本時間）/ `source` / `elapsed_s` / `ok` / `items` / `error`（160 字）/ `mailto` /
   `openalex_key` / `cinii_appid` / `env_failure` に加え `datacite_kind` / `summaries`（本文がある件数）を記録し、**タイトル・本文は残さない**。
-  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応27ソースを測る（cinii / librariesio はキー未設定なら外す・§6.7 / §6.10）。論文キーワードだと空振りするソース（ror / npm / crates / librariesio / osv / ietf / hn / swh / ia / qiita / openreview / mdn / devdocs / inspirehep / oeis / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
+  `--sources`で対象、`--datacite-kind`でモードを指定。省略時は対応30ソースを測る（cinii / librariesio はキー未設定なら外す・§6.7 / §6.10、zbmath は規約未同意なら外す・§6.42）。論文キーワードだと空振りするソース（ror / npm / crates / librariesio / osv / ietf / hn / swh / ia / qiita / openreview / mdn / devdocs / nvd / terraform / zbmath / inspirehep / oeis / hfhub）は `SOURCE_QUERIES` の**分野の合う問い**を巡回し、空振りと障害を混同しない。巡回ごとにキャッシュとホスト遮断記憶を消すが、プロセス内レート制御は消さない。
 - 全ソースが接続系の失敗なら `env_failure=true`（こちらのネットワーク障害）とし、`--report` の集計から外す。
 - `--schedule N` は Windows のタスク（`pythonw`＝窓を出さない）を 1 時間おきに登録し、残り回数を
   `kb_latency.jsonl.schedule.json` で数えて、最後の 1 回でタスクを自分で消す（`/ED` `/ET` は HOURLY との
@@ -1910,7 +1910,7 @@ KANBAN のワーカー（`hermes -p <profile> chat -q "work kanban task t_x"`）
 ## 7.6 利用者向け説明と実装の境界
 
 README は利用開始・結果の読み方・障害時の対処を先に置き、実装上の設計理由はこの SPEC に置く。
-利用者が用途から選べる導線を設け、既定6ソースと明示指定21ソースを区別する。
+利用者が用途から選べる導線を設け、既定6ソースと明示指定24ソースを区別する。
 引数一覧・追加プロバイダの確認設定・過去の計測記録は折りたたみ、
 無料枠・データ送信・保存・引用の限界は利用者が確認できる形で残す。
 次の既存挙動を、保証されている機能として過大に説明しない。
@@ -2120,6 +2120,65 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   ブロックを最新の文面に差し替え**（旧形式＝終端マーカー無しも可。ブロック外は触らない。改行コードは元の
   ファイルに合わせる）、`--remove-snippet` はブロックだけを外す（MCP を外したときに規則が空振りし続けない）。
   規則自体にも「無効・不通なら存在しないツールを探さず代替で完遂」を含める。
+
+### 6.42 第12段階 NVD / Terraform Registry / zbMATH（§5.25・明示指定のみ・v0.39.0）
+
+**25 の候補 API とホスト 20 件の robots.txt を実測した（2026-11-03・本機）。採用 2・条件付き 1・却下 22。**
+受け入れ規則は §6.5〜§6.10 と同じ（検索できる公認 API・利用条件が明確・既存と重複しない・8 秒の締切に収まる・
+領域は科学とプログラミング）。
+
+- **nvd**（採用）: `/rest/json/cves/2.0?keywordSearch=` は 200・**0.62 / 0.81 / 0.86 秒**（初回だけ 5.12 秒）。
+  osv は**パッケージ名か CVE-/GHSA- 等の ID**しか受けないので、「脆弱性クラス（sql injection 等）」で引く経路が
+  無かったのが差分。英語の説明文・CVSS（v3.1 → v3.0 → v2 の順）・参照件数を引用にする。
+  説明文が無い行は `metadata_only`。**無認証は 5 req/30s**（公表値・6 秒 sleep 推奨）なので既定 6.0 秒、
+  `FREEAGENT_NVD_API_KEY`（ヘッダ `apiKey`）があると 50 req/30s → 0.6 秒。robots.txt は 404（制限なし）。
+  ToU は 17 USC のパブリックドメインで、帰属表示
+  「This product uses the NVD API but is not endorsed or certified by the NVD」を要求する。
+- **terraform**（採用）: `/v1/modules/search?q=` は**公式 API 文書に明記**。200・**0.34〜0.53 秒**。
+  `namespace/name/provider`・説明・DL 数・GitHub source・版が揃う。説明は公開者の自己申告なので
+  `summary_kind=registry_description`。robots は `User-agent: *` の Disallow が空。
+  **レートの公表値が無い**ので npm と同じ「自制」型で 1 req/s（`FREEAGENT_TERRAFORM_INTERVAL`）。
+- **zbmath**（条件付き）: `/v1/document/_search?search_string=` は 200・**1.26〜2.32 秒**。
+  **抄録は返らない**（`editorial_contributions` は "unavailable due to conflicting licenses" が多く、
+  レビュー本文がある行だけ `summary_kind=editorial_review`、それ以外は `structured_metadata` + `metadata_only`）。
+  素の語は緩い OR になる（実測: "scaling laws of large language models" で無関係な 3 件）ので、
+  `_literal_search` で**各語を引用して AND** に組み直す（"large language" AND "scaling" で 7 件・先頭は関連論文）。
+  **日本語だけの問いは 404** なので CJK は HTTP を出さない。T&C は同意が前提（FIZ Karlsruhe・1 年契約・
+  データは CC BY-SA 4.0・帰属表示と項目ごとの license 遵守）なので、`FREEAGENT_ZBMATH_ACK` の申告が
+  無ければ HTTP を出さず規約 URL を案内する（§6.7 の「キーが前提のソース」と同じ型。ただし**同意そのものは
+  サーバーが代行しない**）。robots.txt は 404。
+
+**同じ回で実測して落とした候補**（再確認なしに登録しない）:
+
+| 候補 | 実測 | 判定 |
+|---|---|---|
+| Discourse（discuss.python.org / users.rust-lang.org） | 200 / **0.83・0.93 秒** / posts 50・本文あり | 却下（robots `User-agent: *` が **`/search` を Disallow**） |
+| Hoogle | 200 / 0.64 秒 / docs あり | 却下（robots **`/*?hoogle=`**） |
+| Rosetta Code | 200 / 0.75 秒 | 却下（robots **`/w/` と `/*?action=`**） |
+| GitLab | 200 / 2.36 秒 | 却下（robots **`/api/v*`**） |
+| Open Library | 200 / 1.83 秒 | 却下（robots `/search`・領域も書籍） |
+| Dryad | 200 / 0.57 秒 | 却下（robots `/search`・Zenodo/DataCite と重複） |
+| OpenML | 200 / 1.76 秒 | 却下（名前一致のみ・キーワード検索 API 無し） |
+| CIRCL CVE | 200 / 1.89 秒 | 却下（vendor/product パスのみ・NVD/OSV と重複） |
+| MS Learn 検索 | 200 / 1.08 秒 / 30 件・description あり | 却下（**非公開の内部 API**・規約 33 の Zenn と同じ型） |
+| Sourcegraph stream | 200 / 2.55 秒 / SSE | 却下（非公開の内部 API・本文が返る保証なし） |
+| searchcode | **404**（API 廃止）+ robots `/*?q=` | 却下 |
+| CDS（CERN） | 200 だが **Anubis のボット壁 HTML** | 却下 |
+| HepData | Cloudflare の壁・`/api/search` は 404 | 却下 |
+| scholar.archive.org | 0.85 秒で検証ページ | 却下 |
+| fatcat | **20 秒タイムアウト** | 却下 |
+| grep.app | **429** 即時 | 却下（規約 33 の既判定どおり） |
+| lore.kernel.org | 6.94 秒（Atom）・robots が **403** | 却下（遅い＋許諾を確認できない） |
+| Semantic Scholar | **429**（再現 3 回目） | 保留継続（キー運用のみ・§6.5） |
+| Google Books | **429**（共有プロジェクトの日次クォータ枯渇） | 却下 |
+| ConceptNet | **502** + robots `Disallow: /` | 却下 |
+
+- **既判定の保留は再測定していない**（Stack Exchange / CORE / J-STAGE / CiNii / HAL / NDL。§6.5 / §6.6 / §6.40）。
+- **再検討条件**: Discourse は「公式文書つき documented endpoint」の例外（MDN の型・§6.27 の注記）を適用するかが
+  方針判断。zbMATH の抄録が要る場合は既定ソースの crossref で DOI を引く方が確実。
+- 回帰: `tests/test_knowledge_stage12.py`（27 件。登録・間隔・`budget_key`・CJK と同意のゲート・引用の形・
+  CVSS の版優先・`metadata_only`）。stdio probe の実測は nvd 0.85 秒 / terraform 0.40 秒 / zbmath 1.16 秒。
+  `tools/list` は **22,463 → 23,110 文字（+647・+2.9%）**、ツール数は 13 のまま。
 
 ## 12. 検証
 

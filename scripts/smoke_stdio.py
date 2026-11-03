@@ -91,7 +91,8 @@ def main() -> int:
         lookup = next((t for t in tools if t.get("name") == "freeagent_lookup"), {})
         props = (lookup.get("inputSchema") or {}).get("properties") or {}
         check({"datacite_kind", "fallback"}.issubset(props), "追加検索のスキーマがありません")
-        for source in ("datacite", "openaire", "hn", "swh", "librariesio", "ia", "qiita", "openreview"):
+        for source in ("datacite", "openaire", "hn", "swh", "librariesio", "ia", "qiita", "openreview",
+                       "mdn", "devdocs", "nvd", "terraform", "zbmath"):
             check(source in str((props.get("sources") or {}).get("description")),
                   f"sources の説明に {source} がありません")
         check(all(t.get("name", "").startswith("freeagent_") for t in tools),

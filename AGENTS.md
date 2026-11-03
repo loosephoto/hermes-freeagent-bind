@@ -686,6 +686,15 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     委譲（`freeagent_delegate`）の完了報告条件は `description` に書くだけでは効かない
     （サブプロセスは description を読まない）ので、**依頼文に前置きする**（`verify_required`）。
 
+90. **第12段階は「キーワードで引ける公認 API」＋「利用条件が明確」で選ぶ**（v0.39.0・§5.25 / SPEC §6.42）。
+    nvd は osv が受けない**キーワード検索**（無認証 5 req/30s＝6 秒・`FREEAGENT_NVD_API_KEY` で 0.6 秒・
+    帰属表示が必須）、terraform は公式文書の `/v1/modules/search`（レート公表なし＝1 req/s に自制）、
+    zbmath は MSC 分類つきの数学書誌（**抄録を返さない行は `metadata_only`**・`FREEAGENT_ZBMATH_ACK` の
+    同意申告が無ければ HTTP を出さない・日本語だけの問いは 404 なので CJK は送らない）。
+    **200 と robots 404 だけで採らない**: Discourse / Hoogle / Rosetta Code / GitLab / Open Library /
+    Dryad は robots の Disallow（検索パスを名指し）で落ち、MS Learn / Sourcegraph は非公開の内部 API、
+    CDS / HepData / scholar.archive はボット壁、searchcode / fatcat は廃止・到達不能だった。
+
 ## ライセンス
 
 MIT。データは各提供元の条件に従い、回答には出典を表示すること。

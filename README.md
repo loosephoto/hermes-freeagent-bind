@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 13 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社）、検索は **27 ソース（既定 6 ＋ 明示指定 21）** に対応します。
+- 13 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社）、検索は **30 ソース（既定 6 ＋ 明示指定 24）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 **対象分野は科学（物理・数学・計算機）とプログラミングです。医学・生物学は対象外です。**
@@ -442,7 +442,7 @@ python scripts/gen_cases.py                              # ケースだけ生成
 | URI | 内容 |
 |---|---|
 | `resource://freeagent/api-rules` | どのツールをどの場面で使うか／失敗時の `next_action` の読み方／待ち時間と上限 |
-| `resource://freeagent/sources` | 知識ソースの在庫（既定 6 種と明示指定 21 種の別） |
+| `resource://freeagent/sources` | 知識ソースの在庫（既定 6 種と明示指定 24 種の別） |
 | `resource://freeagent/providers` | 推論プロバイダと「何を入れれば使えるか」（**鍵の値は出しません**） |
 | `resource://freeagent/result-shape` | `content` / `structuredContent` の契約、引用の位置 |
 | `resource://freeagent/skills` | スキルの目録（どれを・いつ読むか。v0.37.0） |
@@ -819,7 +819,14 @@ v0.34.0 = 20,700 / v0.35.0 = 20,785**。v0.36.0 は**ツール定義に触れて
 v0.36.1 は `sources` の説明に mdn / devdocs を追記して **21,211 文字（+426）**。
 v0.37.0 は `freeagent_diagnose`（13 本目）を足して **22,317 文字（+1,106）**（スキルは Resource なので加算なし）。
 v0.38.0 は診断に `run`（呼び出し単位）を足して **22,463 文字（+146）**。v0.38.1 は記録のみ（ツール定義は不変）。
+v0.39.0 は第12段階の 3 ソース（nvd / terraform / zbmath）を `sources` の説明に足して **23,110 文字（+647・+2.9%）**（ツール数は 13 のまま）。
 以下は新しい順の内訳です。
+
+**v0.39.0（第12段階：NVD / Terraform Registry / zbMATH を追加）**: 25 の候補 API とホスト 20 件の
+robots.txt を実測し、**採用 2・条件付き 1・却下 22** でした（詳細と実測値は SPEC §6.42）。
+`nvd` は osv が受けない**キーワード検索**（説明文・CVSS 付き）、`terraform` は IaC モジュール、
+`zbmath` は MSC 分類つきの数学書誌（規約同意が前提・抄録なし）。3 本とも**既定 off の明示指定**で、
+`DEFAULT_SOURCES` は 6 のままです。
 
 **v0.38.1（NDL の API 調査を記録）**: 国立国会図書館デジタルコレクションに**専用の検索 API は無く**、
 メタデータは NDLサーチ API（OpenSearch / SRU / OAI-PMH、`dpid=ndl-dl`）経由であることを実測で確認し、
@@ -1166,15 +1173,20 @@ API キーに加えて、契約プランやデータの扱いを確認したこ�
 | `FREEAGENT_CINII_APPID` | cinii | **このソースを使う場合は必須**。CiNii Research の[利用登録](https://support.nii.ac.jp/ja/cinii/api/developer)で取得したアプリケーションID。未設定なら cinii は HTTP を出さず、登録先を案内します |
 | `FREEAGENT_LIBRARIESIO_KEY` | librariesio | **このソースを使う場合は必須**。[Libraries.io](https://libraries.io/account)の無料アカウントで取得する API キー。未設定なら librariesio は HTTP を出さず、登録先を案内します（60 req/分） |
 | `FREEAGENT_QIITA_TOKEN` | qiita | **任意**（キーが無くても 60 回/時で動きます）。[個人用アクセストークン](https://qiita.com/settings/tokens/new)を設定すると 1,000 回/時に上がり、アクセス間隔が 60 秒 → 3.6 秒になります |
+| `FREEAGENT_NVD_API_KEY` | nvd | **任意**。無認証は 5 req/30s（6 秒間隔）で、キーを入れると 50 req/30s（0.6 秒間隔）に上がります。[NVD API Key](https://nvd.nist.gov/developers/request-an-api-key) |
+| `FREEAGENT_ZBMATH_ACK` | zbmath | **このソースを使う場合は必須**（`1`）。zbMATH Open API の[利用規約](https://static.zbmath.org/legal/api-terms-and-conditions.html)への同意の申告。未設定なら zbmath は HTTP を出さず規約の URL を案内します（**同意の判断は利用者**。サーバーは代わりに同意しません） |
+| `FREEAGENT_NVD_INTERVAL` / `FREEAGENT_TERRAFORM_INTERVAL` / `FREEAGENT_ZBMATH_INTERVAL` | nvd / terraform / zbmath | アクセス間隔（秒）。既定は nvd 6.0（キーあり 0.6）/ terraform 1.0 / zbmath 1.0 |
 
-キーなしで動くのは **25 ソース**です（27 ソースのうち、下の 2 つを除いた全部）:
+キーも規約同意も無しで動くのは **27 ソース**です（30 ソースのうち、下の 3 つを除いた全部）:
 `wikipedia` / `wikidata` / `arxiv` / `crossref` / `openalex` / `github` / `datacite` / `openaire` /
 `zenodo` / `ror` / `doaj` / `npm` / `crates` / `osv` / `ietf` / `inspirehep` / `oeis` / `hfhub` /
-`hn` / `swh` / `ia` / `qiita` / `openreview` / `mdn` / `devdocs`。
+`hn` / `swh` / `ia` / `qiita` / `openreview` / `mdn` / `devdocs` / `nvd` / `terraform`。
 このうち `openalex` と `github` は、キーを入れると枠と安定性が上がります（無くても動きます）。
+`nvd` はキー無しだと 5 req/30s（6 秒間隔）に制限されます。
 
-**必須なのは `cinii` と `librariesio` の 2 つだけ**です。利用者自身の appid / API キーが要り、
-未設定なら HTTP を出さずに登録先を案内します（利用目的に当たるかの判断は利用者。SPEC §6.7 / §6.10）。
+**必須なのは `cinii` と `librariesio` の 2 つ**で、利用者自身の appid / API キーが要ります
+（未設定なら HTTP を出さずに登録先を案内。利用目的に当たるかの判断は利用者。SPEC §6.7 / §6.10）。
+加えて **`zbmath` は利用規約への同意が前提**です（同意の申告が無ければ HTTP を出しません。SPEC §6.42）。
 
 ### 📤 キーの渡し方
 
@@ -1262,10 +1274,10 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 
 ## 📚 知識バックエンド
 
-**検索先は27ソースです。何も指定しなければ既定の6ソースだけを使います。**
+**検索先は30ソースです。何も指定しなければ既定の6ソースだけを使います。**
 `sources` を指定すると、指定したソースだけを検索します（既定の6ソースに追加されるのではありません）。
 
-**まず「何を探したいか」で選んでください**（27 ソースすべてが、どれかの行に入っています）。
+**まず「何を探したいか」で選んでください**（30 ソースすべてが、どれかの行に入っています）。
 
 | 探したいもの | ソース |
 |---|---|
@@ -1273,8 +1285,10 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | 論文（プレプリント・書誌・OA） | `arxiv` / `crossref` / `openalex` / `doaj` / `inspirehep` / `datacite` / `openaire` |
 | 会議論文の採択・撤回まで | `openreview` |
 | 日本語文献の書誌 | `cinii`（appid 必須） |
+| 数学の書誌・MSC 分類 | `zbmath`（規約同意が必須） |
 | パッケージ・ライブラリ | `npm` / `crates` / `librariesio`（キー必須） |
-| 既知の脆弱性 | `osv` |
+| インフラ・IaC モジュール | `terraform` |
+| 既知の脆弱性 | `osv` / `nvd` |
 | 標準文書・整数列・ML モデル | `ietf` / `oeis` / `hfhub` |
 | コード・リポジトリ | `github` / `swh` |
 | ドキュメント・API リファレンス | `mdn` / `devdocs` |
@@ -1284,9 +1298,9 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 
 先に知っておくと迷わない 3 点:
 
-- **英語の語で指定するソース**: `arxiv` / `openreview` / `ia`。日本語のままでは 0 件なので、サーバーは HTTP を出さずに理由を返します（`crossref` などは日本語でも引けますが、無関係な結果が混じります）。
-- **利用者自身のキー・登録が要るソース**: `cinii`（appid） / `librariesio`（API キー）。未設定なら登録先を案内して HTTP を出しません。
-- **summary が抄録ではなく目録・属性の整形になるソース**: `ror` / `swh` / `ia` / `hfhub` / `zenodo`。`cinii` は抄録を返さないので常に `metadata_only` で、`freeagent_grounded` の本文根拠には入りません。
+- **英語の語で指定するソース**: `arxiv` / `openreview` / `ia` / `nvd` / `terraform` / `zbmath`。日本語のままでは 0 件（`zbmath` は 404）なので、サーバーは HTTP を出さずに理由を返します（`crossref` などは日本語でも引けますが、無関係な結果が混じります）。
+- **利用者自身のキー・登録が要るソース**: `cinii`（appid） / `librariesio`（API キー） / `zbmath`（規約同意の申告）。未設定なら案内を返して HTTP を出しません。
+- **summary が抄録ではなく目録・属性の整形になるソース**: `ror` / `swh` / `ia` / `hfhub` / `zenodo` / `zbmath`。`cinii` は抄録を返さないので常に `metadata_only` で、`freeagent_grounded` の本文根拠には入りません（`zbmath` もレビュー本文が無い行は `metadata_only`）。
 
 **取得するのは説明・抄録・目録までで、原典の全文を取得する機能ではありません。**
 
@@ -1340,7 +1354,7 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `openalex` | 論文のメタデータ・被引用数・アブストラクト | 匿名検索の制限あり。API キーを推奨 |
 | `github` | リポジトリ / Issue / コードの検索結果。コード検索は一致箇所の**断片**（`snippet`）も返す | コード検索はトークン必須（10 req/分）。**ライセンス情報を含まない**ので取り込み前に確認 |
 
-### 📘 明示指定で使う21ソース
+### 📘 明示指定で使う24ソース
 
 通常の検索には自動で追加されません。表の名前を会話で指定してください。
 
@@ -1367,8 +1381,11 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | `openreview` | OpenReview の会議論文（タイトル・抄録・著者・会議名・**査読状態**・forum URL） | **query は英語の語で**指定します（日本語クエリは 0 件なので HTTP を出しません）。会議名に `Poster` / `Spotlight` / `Oral` / `Workshop` / **`Withdrawn`** / **`Desk Rejected`** が出るので、撤回済みを根拠に使う前に確認できます（機械可読な `kind` の値は下の折りたたみ）。レート制限の公表値が無いため **1 req/s に自制**（`FREEAGENT_OPENREVIEW_INTERVAL`） |
 | `mdn` | MDN Web Docs の Web 技術ドキュメント（HTML/CSS/JS/Web API 等のタイトル・公式要約・URL） | 公開検索 API（`/api/v1/search`）。**帰属表示が必須**（Mozilla contributors, CC-BY-SA 2.5）。`lang` でロケール指定可（省略時 `en-US`）。内容は Web 技術に特化 |
 | `devdocs` | DevDocs の 779+ docset の索引（Python/JavaScript/React/Django/PostgreSQL 等の API 名・パス・URL） | `doc` で docset slug を指定して index を引く（例: `doc="python~3.14"`）。`doc` 省略時は `query` に一致する docset の一覧を返す。本文は取得しない（`metadata_only`）。各 docset のライセンスに従う |
+| `nvd` | NIST 脆弱性データベースの CVE（**キーワードで引ける**）。ID・英語の説明文・CVSS スコア/深刻度・参照件数・公開日 | `osv` が ID とパッケージ名しか受けないのに対し、`sql injection` のような**脆弱性クラスで引けます**。無認証は 5 req/30s なので既定 6 秒間隔（`FREEAGENT_NVD_API_KEY` で 50 req/30s・0.6 秒）。帰属表示「This product uses the NVD API but is not endorsed or certified by the NVD」が必須 |
+| `terraform` | Terraform Registry の公開モジュール（`namespace/name/provider`・説明・DL 数・GitHub source・版） | 公式 API の `/v1/modules/search?q=`。**説明はモジュール公開者の自己申告**（`registry_description`）。レート公表が無いので 1 req/s に自制（`FREEAGENT_TERRAFORM_INTERVAL`） |
+| `zbmath`（**規約同意が必須**） | 数学の書誌（タイトル・著者・掲載誌・年・zbMATH 識別子）と **MSC 分類**、レビュー本文がある場合はその抜粋、DOI/arXiv リンク | **利用規約への同意の申告**（`FREEAGENT_ZBMATH_ACK=1`）が無い限り HTTP を出しません（FIZ Karlsruhe・データは CC BY-SA 4.0・帰属表示と項目ごとの license 遵守が義務）。**抄録は返らない**ので書誌だけの行は `metadata_only`。英語の語が必須で、各語を引用して AND に組み直します |
 
-**追加21ソースを毎回自動送信することはありません**（指定したときだけ引きます）。未知の名前は報告し、
+**追加24ソースを毎回自動送信することはありません**（指定したときだけ引きます）。未知の名前は報告し、
 同じ名前の重複指定は1回にまとめます。`limit` は**各ソースの上限**で、全体の結果は重複除去などで
 減るため、合計件数を保証する値ではありません。
 
@@ -1386,6 +1403,9 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 | パッケージを探す | 「npm と crates.io で JSON スキーマ検証のパッケージを探して」 | `npm`, `crates` |
 | 登録簿を横断検索する | 「Libraries.io で JSON スキーマ検証のパッケージを探して」 | `librariesio`（キー必須） |
 | 既知の脆弱性を調べる | 「OSV で jinja2 の既知脆弱性を調べて」 | `osv` |
+| 脆弱性クラスから CVE を探す | 「NVD で sql injection の CVE を調べて」 | `nvd`（**英語の語で**） |
+| インフラのモジュールを探す | 「Terraform Registry で aws vpc のモジュールを探して」 | `terraform` |
+| 数学の書誌と分類を引く | 「zbMATH で moduli space の論文を調べて」 | `zbmath`（規約同意が必須・**英語の語で**） |
 | 標準文書を調べる | 「IETF で RFC 9110 の概要を調べて」 | `ietf` |
 | 物理・数学・ML を調べる | 「INSPIRE-HEP でヒッグス粒子の論文を」「OEIS で Fibonacci 数列を」「HF Hub で Llama を探して」 | `inspirehep`, `oeis`, `hfhub` |
 | 開発者の議論を探す | 「Hacker News で Rust の所有権についての議論を探して」 | `hn` |
@@ -1601,7 +1621,10 @@ python scripts/measure_relevance.py --report
 [Qiita](https://qiita.com/terms)（記事の著作権は投稿者に帰属。未認証は 60 回/時、`FREEAGENT_QIITA_TOKEN` で 1,000 回/時） /
 [OpenReview](https://openreview.net/legal/terms)（API は data upload / search / download のための公式インターフェース。Works の著作権は著者に残るので、引用はタイトル・抄録・著者・forum URL までとし、PDF は取得しません。レート制限の公表値が無いため 1 req/s に自制。§6.27） /
 [MDN Web Docs](https://developer.mozilla.org/en-US/docs/MDN/Writing_guidelines/Attrib_copyright_license)（Mozilla contributors の CC-BY-SA 2.5。帰属表示が必須・1 req/s に自制） /
-[DevDocs](https://devdocs.io/)（freeCodeCamp による索引。本文は取得せず `metadata_only`。各 docset の原ライセンスに従う・1 req/s に自制）。
+[DevDocs](https://devdocs.io/)（freeCodeCamp による索引。本文は取得せず `metadata_only`。各 docset の原ライセンスに従う・1 req/s に自制） /
+[NVD API](https://nvd.nist.gov/developers/terms-of-use)（米国政府著作物・パブリックドメイン。**帰属表示が必須**「This product uses the NVD API but is not endorsed or certified by the NVD」。無認証 5 req/30s・6 秒 sleep 推奨。§6.42） /
+[Terraform Registry API](https://developer.hashicorp.com/terraform/registry/api-docs)（`/v1/modules/search` は公式文書に明記。**レート公表なし**のため 1 req/s に自制。説明は公開者の自己申告で、各モジュールのライセンスに従う。§6.42） /
+[zbMATH Open API](https://static.zbmath.org/legal/api-terms-and-conditions.html)（**利用規約への同意が前提**（1 年・データは CC BY-SA 4.0・帰属表示と項目ごとの license 遵守）。同意の申告が無ければ HTTP を出さない。「reasonable rate」の定めのみなので 1 req/s に自制。§6.42）。
 
 リンク先全文・パッケージ本体の利用条件はメタデータの条件とは別です。
 

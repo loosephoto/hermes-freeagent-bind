@@ -53,5 +53,8 @@ from . import qiita  # noqa: E402,F401
 from . import openreview  # noqa: E402,F401
 from . import mdn  # noqa: E402,F401
 from . import devdocs  # noqa: E402,F401
+from . import nvd  # noqa: E402,F401
+from . import terraform  # noqa: E402,F401
+from . import zbmath  # noqa: E402,F401
 
 NAMES = tuple(REGISTRY)

@@ -2,12 +2,12 @@
 """hermes-freeagent-bind — Hermes Agent の Free モデルをサブLLMとして並列に走らせ、
 外部知識（既定6ソース＋DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates / CiNii /
 OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Libraries.io /
-Internet Archive / Qiita / OpenReview / MDN / DevDocs）で
+Internet Archive / Qiita / OpenReview / MDN / DevDocs / NVD / Terraform Registry / zbMATH）で
 根拠づける MCP サーバー。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は
 対象外**（第6段階で採った生命・医学系ソースは 2026-10-05 に方針変更で削除。§5.19 に記録）。
 
 **モジュラーモノリス**として書く。本体はこの 1 ファイル（§0〜§4・§5 の横断部・§6〜§11）で、
-知識ソース 27 種は `sources/<name>.py`（1 ソース 1 ファイル）、プロバイダ 18 社は
+知識ソース 30 種は `sources/<name>.py`（1 ソース 1 ファイル）、プロバイダ 18 社は
 `providers/<name>.py`（1 社 1 ファイル）に置く。配布物は今も
 **stdio スクリプト 1 本**で完結する（`python server.py` / `runpy.run_path(server.py)` の直接実行は、
 冒頭の互換シムがパッケージ版を import して `main()` を呼ぶ。実測: stdio 起動後にネイティブ拡張を
@@ -90,7 +90,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.38.4"
+SERVER_VERSION = "0.39.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -5879,7 +5879,7 @@ AGENT_SYSTEM = (
     "あなたは調査補佐です。次のいずれか**1つだけ**を JSON で出力してください。\n"
     '  ツールを使う: {"tool": "lookup", "query": "<検索語>", "sources": ["arxiv","crossref",...]}\n'
     '  使える source: wikipedia, wikidata, arxiv, crossref, openalex, github, datacite, openaire, zenodo, ror, doaj, npm, crates, cinii\n'
-    '  追加（明示指定のみ）: osv, ietf, inspirehep, oeis, hfhub, hn, swh, librariesio, ia, qiita, openreview\n'
+    '  追加（明示指定のみ）: osv, ietf, inspirehep, oeis, hfhub, hn, swh, librariesio, ia, qiita, openreview, mdn, devdocs, nvd, terraform, zbmath\n'
     '  追加sourceは明示指定のみ。datacite_kind: all / arxiv / dataset。fallback: trueでarXivのDataCite代替を許可。\n'
     '  回答する:     {"answer": "<回答。使った根拠の番号 [n] を本文に書く>"}\n'
     "ツール結果は [1] [2] … の番号つきで返ります。回答では使った根拠の番号を本文に書き、"
@@ -8632,7 +8632,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "query": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6ソース: wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件） / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。検索構文 tag:Python user:foo created:>2026-01-01。**未認証は 60 回/時**で別の問いは 1 分待ち、FREEAGENT_QIITA_TOKEN を設定すると 1,000 回/時）／openreview（OpenReview の会議論文。**query は英語の語**で指定する。日本語クエリは 0 件。venue に採択・スポットライト・撤回・Desk Reject が出るので、撤回済みを根拠に使う前に確認できる）／mdn（MDN Web Docs の Web 技術ドキュメント。**帰属表示が必須**（Mozilla contributors, CC-BY-SA 2.5）。lang でロケール指定可、内容は HTML/CSS/JS/Web API に限る）／devdocs（DevDocs の docset 索引。doc で docset slug を指定（例: `python~3.14`）。**索引だけで本文は取得しない**＝`metadata_only`）。対象は科学とプログラミングまでで医学・生物学は含まない"},
+                            "description": "既定6ソース: wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件） / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。検索構文 tag:Python user:foo created:>2026-01-01。**未認証は 60 回/時**で別の問いは 1 分待ち、FREEAGENT_QIITA_TOKEN を設定すると 1,000 回/時）／openreview（OpenReview の会議論文。**query は英語の語**で指定する。日本語クエリは 0 件。venue に採択・スポットライト・撤回・Desk Reject が出るので、撤回済みを根拠に使う前に確認できる）／mdn（MDN Web Docs の Web 技術ドキュメント。**帰属表示が必須**（Mozilla contributors, CC-BY-SA 2.5）。lang でロケール指定可、内容は HTML/CSS/JS/Web API に限る）／devdocs（DevDocs の docset 索引。doc で docset slug を指定（例: `python~3.14`）。**索引だけで本文は取得しない**＝`metadata_only`）。／nvd（NIST 脆弱性 DB。**query は英語の語**で指定する。osv が ID・パッケージ名しか受けないのに対し**キーワードで CVE を引ける**。説明文と CVSS が付く。無認証 5 req/30s＝既定 6 秒間隔、FREEAGENT_NVD_API_KEY で 0.6 秒）／terraform（Terraform Registry のモジュール検索。説明は公開者の自己申告）／zbmath（数学の書誌・MSC 分類・レビュー。**抄録は返らない**ので metadata_only が主。英語の語が必須で、規約同意として FREEAGENT_ZBMATH_ACK=1 が必要）。対象は科学とプログラミングまでで医学・生物学は含まない"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
                 "lang": {"type": "string", "description": "Wikipedia / Wikidata の言語。**wikipedia は省略時に問いから自動**（日本語・中国語・韓国語なら ja、それ以外は en。英語の語（Transformer など）は自動で en になるので、通常は指定しない。**wikidata は既定 ja 固定**（実測で ja の方が当たったため。en にすると機械学習の項目が電気機器に化ける）。明示するとその言語で引く"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須・10 req/分）。code はファイルへのポインタと一致箇所の断片を返し、ライセンス情報を含まない（取り込む前に repo 検索で確認する）。repo: owner/name・path:・language:・filename:・in:file の修飾子を付けると精度が上がる"},
@@ -8663,7 +8663,7 @@ TOOLS: list[dict] = [
                                                 "ここに置くと質問文はそのままモデルへ渡る。"
                                                 "省略すると question をそのまま検索語にする"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6種（wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件）/ crossref / openalex / github）。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**question は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。**未認証は 60 回/時**、FREEAGENT_QIITA_TOKEN で 1,000 回/時）／openreview（OpenReview の会議論文。**question は英語の語**で指定する。日本語クエリは 0 件。venue に採択・撤回・Desk Reject が出る）／mdn（MDN Web Docs の Web 技術ドキュメント。**帰属表示が必須**（Mozilla contributors, CC-BY-SA 2.5）。lang でロケール指定可）／devdocs（DevDocs の docset 索引。doc で docset slug を指定（例: `python~3.14`）。**索引だけで本文が無い**ので grounded の根拠にはならない）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。**crossref は抄録が無い書誌が多い**（grounded では抄録の有る論文に絞る） / **hn は議論のコメントが本文根拠になる**（故事的リンク投稿は本文が無い）。医学・生物学は対象外"},
+                            "description": "既定6種（wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件）/ crossref / openalex / github）。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**question は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。**未認証は 60 回/時**、FREEAGENT_QIITA_TOKEN で 1,000 回/時）／openreview（OpenReview の会議論文。**question は英語の語**で指定する。日本語クエリは 0 件。venue に採択・撤回・Desk Reject が出る）／mdn（MDN Web Docs の Web 技術ドキュメント。**帰属表示が必須**（Mozilla contributors, CC-BY-SA 2.5）。lang でロケール指定可）／devdocs（DevDocs の docset 索引。doc で docset slug を指定（例: `python~3.14`）。**索引だけで本文が無い**ので grounded の根拠にはならない）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。**crossref は抄録が無い書誌が多い**（grounded では抄録の有る論文に絞る） / **hn は議論のコメントが本文根拠になる**（故事的リンク投稿は本文が無い）。／nvd（NIST 脆弱性 DB。**question は英語の語**で指定する。osv が ID・パッケージ名しか受けないのに対し**キーワードで CVE を引ける**。説明文と CVSS が付く＝grounded の根拠に使える。無認証 5 req/30s＝既定 6 秒間隔、FREEAGENT_NVD_API_KEY で 0.6 秒）／terraform（Terraform Registry のモジュール検索。説明は公開者の自己申告）／zbmath（数学の書誌・MSC 分類・レビュー。**抄録は返らない**ので metadata_only が主で grounded の根拠にはなりにくい。英語の語が必須で、規約同意として FREEAGENT_ZBMATH_ACK=1 が必要）。医学・生物学は対象外"},
                 "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
                 "limit": {"type": "integer"},

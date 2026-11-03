@@ -14,11 +14,16 @@ python scripts/probe_knowledge_stdio.py --sources oeis --query Fibonacci
 python scripts/probe_knowledge_stdio.py --sources openreview --query "mixture of experts"
 python scripts/probe_knowledge_stdio.py --sources mdn --query "fetch API"
 python scripts/probe_knowledge_stdio.py --sources devdocs --query python
+python scripts/probe_knowledge_stdio.py --sources nvd --query "sql injection"
+python scripts/probe_knowledge_stdio.py --sources terraform --query "aws vpc"
+python scripts/probe_knowledge_stdio.py --sources zbmath --query "moduli space"
 
 各指定ソースの有効応答・出典・両チャネルを検査。失敗はexit 1（成功を捏造しない）。
 OpenAIREは匿名60/h。同一IP上の他プロセスも含め、連続実行には60秒以上の間隔を空ける。
 cinii は利用者自身の appid（FREEAGENT_CINII_APPID）が要る。未設定なら**検査せずに外す**
 （未設定は失敗ではない。登録: https://support.nii.ac.jp/ja/cinii/api/developer）。
+zbmath は利用規約への同意（FREEAGENT_ZBMATH_ACK=1）が前提。未同意なら**検査せずに外す**
+（同意の判断は利用者。https://static.zbmath.org/legal/api-terms-and-conditions.html）。
 qiita は未認証だと 60 回/時（ローカル間隔 60 秒）なので、連続で回すと 2 回目以降は
 「ローカルのアクセス間隔制御」で落ちる（記録としては正しい。間隔は FREEAGENT_QIITA_TOKEN で 3.6 秒になる）。
 """
@@ -153,6 +158,15 @@ def validate_lookup(data: dict, sources: list[str], fallback: bool) -> list[dict
             raise ValueError("MDN citation must carry a structured_record summary")
         if cite["source"] == "devdocs" and not cite.get("metadata_only"):
             raise ValueError("DevDocs citation is an index entry and must be metadata_only")
+        if cite["source"] == "nvd" and (cite.get("summary_kind") != "structured_record"
+                                        or not str(cite.get("identifier", "")).startswith("CVE-")):
+            raise ValueError("NVD citation must carry a CVE id and a structured record")
+        if cite["source"] == "terraform" and (cite.get("summary_kind") != "registry_description"
+                                              or not cite.get("identifier")):
+            raise ValueError("Terraform Registry citation must be a registry description with an id")
+        if cite["source"] == "zbmath" and cite.get("summary_kind") not in ("editorial_review",
+                                                                          "structured_metadata"):
+            raise ValueError("zbMATH citation must say whether the text is a review or metadata")
         S._kb_http_url(cite["url"])
         if not set(cite.get("providers") or [cite["source"]]).issubset(served):
             raise ValueError("merged citation provider mismatch")
@@ -180,6 +194,13 @@ def main() -> int:
         print("skip: librariesio は FREEAGENT_LIBRARIESIO_KEY 未設定のため検査しません"
               "（登録: https://libraries.io/account）")
         args.sources = [s for s in args.sources if s != "librariesio"]
+        if not args.sources:
+            return 0
+    if "zbmath" in args.sources and not S.zbmath_ready():
+        # 規約同意は利用者の申告。未同意は失敗ではない（サーバーは代わりに同意しない）。
+        print("skip: zbmath は FREEAGENT_ZBMATH_ACK 未設定（規約未同意）のため検査しません"
+              "（https://static.zbmath.org/legal/api-terms-and-conditions.html）")
+        args.sources = [s for s in args.sources if s != "zbmath"]
         if not args.sources:
             return 0
     env = dict(os.environ)
