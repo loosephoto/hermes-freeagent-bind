@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 import freeagent_bind.server as S  # noqa: E402
 
-SPEC = open(os.path.join(ROOT, "SPEC.md"), encoding="utf-8").read()
+with open(os.path.join(ROOT, "SPEC.md"), encoding="utf-8") as _spec_fh:
+    SPEC = _spec_fh.read()
 SECTION = SPEC[SPEC.index("### 4.1.2"):SPEC.index("### 4.2")] if "### 4.1.2" in SPEC else ""
 
 

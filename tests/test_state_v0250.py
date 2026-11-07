@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -167,7 +168,18 @@ class TestFileLockPrimitive(_Base):
             f"with S._file_lock(r'{path}', timeout=5.0) as got:\n"
             "    print('held', got, flush=True)\n"
             "    time.sleep(1.5)\n")
-        time.sleep(0.6)                      # 子がロックを取るまで待つ
+        # 子がロックを取った印（'held' の行）を待つ。固定待ち（0.6 秒）は負荷や tracemalloc で
+        # 子の起動が遅れると、まだ取っていない状態で親が試して二重取得に見える偽失敗になった
+        # （v0.40.1 の監査の tracemalloc 実測で 1 回再現）。
+        assert holder.stdout is not None
+        ready = threading.Event()
+
+        def _await_held():
+            holder.stdout.readline()
+            ready.set()
+
+        threading.Thread(target=_await_held, daemon=True).start()
+        self.assertTrue(ready.wait(10.0), "子プロセスが 10 秒以内にロックを取らなかった")
         start = time.monotonic()
         with S._file_lock(path, timeout=0.3) as got:
             self.assertFalse(got, "同じロックを二重に取れてしまった")
@@ -183,7 +195,9 @@ class TestFileLockPrimitive(_Base):
             f"with S._file_lock(r'{path}', timeout=5.0):\n"
             "    print('held', flush=True)\n"
             "    os._exit(9)\n")
-        holder.wait(timeout=60)
+        # wait だけだとパイプが閉じず ResourceWarning（未クローズの TextIOWrapper）が出る
+        # （v0.40.1 の監査で実測）。communicate で待ち兼残余の読み取りとクローズまで済ませる。
+        holder.communicate(timeout=60)
         start = time.monotonic()
         with S._file_lock(path, timeout=2.0) as got:
             self.assertTrue(got, "落ちたプロセスのロックが残っている（stale lock）")

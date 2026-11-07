@@ -90,7 +90,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.40.0"
+SERVER_VERSION = "0.40.1"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -8628,8 +8628,10 @@ TOOLS: list[dict] = [
             "【使う条件】出典URLが要る／判断の前に知識を補強したい／LLM を介さず一次情報に当たりたい。"
             "【差分】LLM を使わないので幻覚が無い。arXiv・Crossref・OpenAlex（論文）／Wikipedia・Wikidata"
             "（百科・構造化）／GitHub（コード）を並列に引く。追加の datacite / openaire / zenodo / ror / "
-            "doaj（OA論文）/ npm / crates / librariesio（パッケージ検索）／osv・ietf（脆弱性・標準）／"
-            "inspirehep・oeis・hfhub（物理・数学・ML）／hn（Hacker News の議論）／swh（Software Heritage の"
+            "doaj / openreview（OA論文・会議の査読状態）／cinii（日本語論文・APPID が前提）／"
+            "npm / crates / librariesio / terraform（パッケージ・モジュール検索）／osv・nvd（脆弱性）／"
+            "ietf（標準）／inspirehep・oeis・zbmath（物理・数学。zbmath は規約同意が前提）／hfhub（ML）／"
+            "mdn・devdocs（Web 標準のリファレンス）／hn（Hacker News の議論）／swh（Software Heritage の"
             "コードアーカイブ）／ia（Internet Archive のアイテム検索。**query は英語の語で**）／qiita（Qiita の日本語技術記事）は sources で明示指定する。"
             "DataCite は自然語の各語を AND 検索、datacite_kind=dataset で研究データ。"
             "fallback=true のときだけ自然語 arXiv検索の失敗/遅延を DataCite で代替する（取得元を明示）。"

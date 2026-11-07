@@ -820,6 +820,7 @@ v0.36.1 は `sources` の説明に mdn / devdocs を追記して **21,211 文字
 v0.37.0 は `freeagent_diagnose`（13 本目）を足して **22,317 文字（+1,106）**（スキルは Resource なので加算なし）。
 v0.38.0 は診断に `run`（呼び出し単位）を足して **22,463 文字（+146）**。v0.38.1 は記録のみ（ツール定義は不変）。
 v0.39.0 は第12段階の 3 ソース（nvd / terraform / zbmath）を `sources` の説明に足して **23,110 文字（+647・+2.9%）**（ツール数は 13 のまま）。
+v0.40.1 は `freeagent_lookup` の本文列挙に 7 ソース（openreview / cinii / terraform / nvd / zbmath / mdn / devdocs）を足して **23,227 文字（+117・+0.5%）**（ツール数は 13 のまま）。
 以下は新しい順の内訳です。
 
 **v0.39.0（第12段階：NVD / Terraform Registry / zbMATH を追加）**: 25 の候補 API とホスト 20 件の

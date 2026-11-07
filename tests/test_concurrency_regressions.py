@@ -611,6 +611,14 @@ S.serve()
             if p.poll() is None:
                 p.kill()
             p.communicate(timeout=3)
+            # 3 本のパイプを明示的に閉じる。communicate が閉じ切る前に参照が落ちると
+            # ResourceWarning（未クローズの TextIOWrapper）が出る（v0.40.0 の監査で 3 件を実測）。
+            for _pipe in (p.stdin, p.stdout, p.stderr):
+                try:
+                    if _pipe is not None and not _pipe.closed:
+                        _pipe.close()
+                except OSError:
+                    pass
         self.addCleanup(cleanup)
         p.stdin.write(json.dumps({'jsonrpc':'2.0','id':9,'method':'tools/call',
                                   'params':{'name':'probe'}})+'\n')

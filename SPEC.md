@@ -2185,6 +2185,22 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   CVSS の版優先・`metadata_only`）。stdio probe の実測は nvd 0.85 秒 / terraform 0.40 秒 / zbmath 1.16 秒。
   `tools/list` は **22,463 → 23,110 文字（+647・+2.9%）**、ツール数は 13 のまま。
 
+### 6.43 説明本文の列挙の追従とテストの資源閉鎖（v0.40.1）
+
+- `freeagent_lookup` の本文（`description`）の追加ソース列挙は `sources` 引数の説明と同じ契約で
+  **在庫の全部を名指しする**（規約 5・20。v0.36.1 は引数側だけを固定していた）。
+  v0.40.0 の監査で本文列挙が 17/24（openreview / cinii / terraform / nvd / zbmath / mdn / devdocs の
+  7 名が本文に無い）だったのを追記し、`tools/list` は **23,110 → 23,227 文字（+117・+0.5%）**、
+  ツール数は 13 のまま。回帰は `tests/test_audit_v0401.py`（本文に `KB_BACKENDS` の全部が出る）。
+- 同じ監査で見つかったテストの資源閉鎖（tracemalloc で特定した未クローズの utf-8 ファイル 3 件）を
+  修正した: `tests/test_docs_provider_table.py` の `SPEC` 読み込みを with 化（1 件）、
+  `tests/test_state_v0250.py` の `os._exit` 試験は `holder.wait` を `communicate` に替えて
+  残余の読み取りとクローズまで済ませる（パイプ 2 件）。`tests/test_concurrency_regressions.py` の
+  cleanup にも同じ型の明示クローズを足す。
+- 同じ tracemalloc 実測で `test_state_v0250.py` の排他ロック試験が固定待ち（0.6 秒）のために
+  負荷で子の起動が遅れると偽失敗になる型（子がまだ取っていない状態で親が試して二重取得に見える）が
+  見えたので、子がロックを取った印（`held` の行）を待つ確定的な同期に替えた。
+
 ## 12. 検証
 
 ```bash
