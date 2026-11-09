@@ -153,7 +153,8 @@ class InstallerCase(unittest.TestCase):
 
     def test_vbs_artifacts_are_ascii_only(self):
         """WSH は BOM 無しの .vbs を ANSI として読むので、非 ASCII を混ぜない。"""
-        for text in (self.m.render_worker(self.cfg), self.m.render_startup(self.cfg)):
+        for text in (self.m.render_worker(self.cfg), self.m.render_startup(self.cfg),
+                     self.m.render_proxy_worker(self.cfg), self.m.render_proxy_startup(self.cfg)):
             for ch in text:
                 self.assertLess(ord(ch), 128, "非 ASCII 文字 %r が混ざっている" % ch)
 
@@ -194,15 +195,18 @@ class InstallerCase(unittest.TestCase):
         plan = self.m.build_plan(self.cfg)
         for line in self.m.write_plan(plan, force=True):
             self.assertTrue(line.startswith("wrote:"), line)
-        for path in (self.cfg["paths"]["worker"], self.cfg["paths"]["startup"]):
+        for path in (self.cfg["paths"]["worker"], self.cfg["paths"]["startup"],
+                     self.cfg["paths"]["proxy_worker"], self.cfg["paths"]["proxy_startup"],
+                     self.cfg["paths"]["proxy_startup_template"]):
             with open(path, "rb") as fh:
                 raw = fh.read()
             self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"), ".vbs は全行 CRLF であること")
 
             raw.decode("ascii")  # 非 ASCII が混ざれば UnicodeDecodeError
-        with open(self.cfg["paths"]["launcher"], "rb") as fh:
-            launcher = fh.read()
-        self.assertNotIn(b"\r\n", launcher, "pythonw が読む .pyw は LF でよい")
+        for pyw_path in (self.cfg["paths"]["launcher"], self.cfg["paths"]["proxy_launcher"]):
+            with open(pyw_path, "rb") as fh:
+                launcher = fh.read()
+            self.assertNotIn(b"\r\n", launcher, "pythonw が読む .pyw は LF でよい")
 
     def test_existing_files_are_kept_without_force(self):
         plan = self.m.build_plan(self.cfg)
@@ -234,6 +238,13 @@ class InstallerCase(unittest.TestCase):
                             "テストは一時ディレクトリを使う")
         self.assertEqual([p for p, _ in self.m.build_plan(self.cfg)],
                          [paths["launcher"], paths["worker"], paths["startup"],
+                          paths["apply"], paths["revert"],
+                          paths["proxy_launcher"], paths["proxy_worker"],
+                          paths["proxy_startup_template"], paths["proxy_startup"]])
+        no_proxy_cfg = self.m.build_config(self.home, self.repo, "127.0.0.1", 8790,
+                                           startup_dir=self.startup_dir, with_proxy=False)
+        self.assertEqual([p for p, _ in self.m.build_plan(no_proxy_cfg)],
+                         [paths["launcher"], paths["worker"], paths["startup"],
                           paths["apply"], paths["revert"]])
 
     def test_write_never_touches_the_real_startup_folder(self):
@@ -244,21 +255,21 @@ class InstallerCase(unittest.TestCase):
         """
         real_dir = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
                                 "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
-        real_launcher = os.path.join(real_dir, self.m.WORKER_NAME)
-        if os.path.exists(real_launcher):
-            with open(real_launcher, "rb") as fh:
-                before = fh.read()
-        else:
-            before = None
+        real_launchers = [os.path.join(real_dir, self.m.WORKER_NAME),
+                          os.path.join(real_dir, self.m.PROXY_WORKER_NAME)]
+        def _read_bytes(p):
+            if not os.path.exists(p):
+                return None
+            with open(p, "rb") as fh:
+                return fh.read()
+
+        before = [_read_bytes(p) for p in real_launchers]
         self.m.main(["--hermes-home", self.home, "--repo", self.repo,
                      "--startup-dir", self.startup_dir, "--write", "--force"])
-        if os.path.exists(real_launcher):
-            with open(real_launcher, "rb") as fh:
-                after = fh.read()
-        else:
-            after = None
+        after = [_read_bytes(p) for p in real_launchers]
         self.assertEqual(before, after, "テストが実機の Startup を書き換えた")
         self.assertTrue(os.path.exists(os.path.join(self.startup_dir, self.m.WORKER_NAME)))
+        self.assertTrue(os.path.exists(os.path.join(self.startup_dir, self.m.PROXY_WORKER_NAME)))
 
     def test_default_invocation_writes_nothing(self):
         """引数なしの実行は表示だけ（実機の配線を勝手に触らない）。"""
@@ -347,6 +358,91 @@ class InstallerCase(unittest.TestCase):
         with open(env_path, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "FREEAGENT_OLLAMA_FREE_PLAN=1\n",
                              "--force でも利用者のフラグを消さないこと")
+
+    # --- プロキシ常駐配線（5 分おきの複数黒窓防止・未認証スキップの回帰） ---
+
+    def test_proxy_worker_declares_every_variable_and_never_spawns_a_console(self):
+        vbs = self.m.render_proxy_worker(self.cfg)
+        dims = ""
+        for line in vbs.splitlines():
+            if line.strip().startswith("Dim "):
+                dims += line.split("Dim ", 1)[1]
+        for name in ("bestName", "pyw", "tools", "port", "startupLauncher", "templateLauncher"):
+            self.assertIn(name, dims, f"{name} が Dim に無い（Option Explicit で即死する）")
+        code = _code_lines(vbs)
+        for forbidden in ("netstat", ".Exec(", "cmd /c", "cmd.exe", "wscript.exe "):
+            self.assertNotIn(forbidden, code, "実行行に %r があると黒い窓が出る" % forbidden)
+        self.assertIn("Win32_Process", code)
+        self.assertIn("-m hermes_cli.main proxy start", code)
+        self.assertIn("hermes.cmd", code, "旧来の起動形態も判定して二重起動を防ぐこと")
+        self.assertIn("pythonw.exe", code)
+        self.assertIn("StrComp(f.Name, bestName", code)
+
+    def test_proxy_launcher_uses_create_no_window_and_forbids_detached_process(self):
+        """`DETACHED_PROCESS (0x00000008)` を使うと孫の python.exe / git.exe が 4 個の黒窓を開く（実測）。"""
+        pyw = self.m.render_proxy_launcher(self.cfg)
+        compile(pyw, "run_proxy.pyw", "exec")
+        body = pyw.split('"""', 2)[2]
+        code = _code_lines(body)
+        self.assertNotIn("DETACHED_PROCESS", code,
+                         "実行行に DETACHED_PROCESS があるとコンソール無しになり孫が黒窓を開く")
+        self.assertIn("CREATE_NO_WINDOW = 0x08000000", code)
+        self.assertIn("CREATE_NEW_PROCESS_GROUP = 0x00000200", code)
+        self.assertIn("creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP", code)
+
+    def test_proxy_launcher_skips_when_nous_not_authenticated_and_runs_when_ready(self):
+        """Nous Portal が未認証／トークン失効のときは起動自体をスキップし、ログを重複追記しない。"""
+        import json as _json
+        import subprocess as _subprocess
+
+        source = self.m.render_proxy_launcher(self.cfg)
+        tree = ast.parse(source)
+        # if __name__ == "__main__": を除いてモジュール空間として評価する。
+        nodes = [n for n in tree.body if not isinstance(n, ast.If)]
+        ns = {"__builtins__": __builtins__}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<run_proxy.pyw>", "exec"), ns)
+
+        auth_path = os.path.join(self.home, "auth.json")
+        log_path = os.path.join(self.home, "logs", "proxy-service.log")
+        ns["AUTH_FILE"] = auth_path
+        ns["LOG"] = log_path
+
+        spawned = []
+
+        class _FakeChild:
+            pid = 42424
+
+        def fake_popen(argv, **kwargs):
+            spawned.append((argv, kwargs))
+            return _FakeChild()
+
+        with mock.patch.object(_subprocess, "Popen", side_effect=fake_popen), \
+             mock.patch.object(ns["sys"], "argv", ["run_proxy.pyw", "hermes-proxy-8645"]), \
+             mock.patch.dict(os.environ, {"HERMES_PROXY_FORCE_START": ""}, clear=False):
+            # 1) auth.json 無し -> スキップ（Popen 0 回）
+            self.assertEqual(ns["main"](), 0)
+            self.assertEqual(len(spawned), 0)
+            # 2) トークン失効・隔離後（last_auth_error のみ）-> スキップ・ログは 1 行のまま重複しない
+            os.makedirs(self.home, exist_ok=True)
+            with open(auth_path, "w", encoding="utf-8") as fh:
+                _json.dump({"providers": {"nous": {"last_auth_error": {"relogin_required": True}}}}, fh)
+            self.assertEqual(ns["main"](), 0)
+            self.assertEqual(len(spawned), 0)
+            with open(log_path, encoding="utf-8") as fh:
+                lines = [ln.strip() for ln in fh if ln.strip()]
+            self.assertEqual(len(lines), 1, f"skipped ログが重複している: {lines}")
+            self.assertIn("skipped: Nous Portal not authenticated", lines[0])
+
+            # 3) refresh_token + access_token あり -> CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP で起動
+            with open(auth_path, "w", encoding="utf-8") as fh:
+                _json.dump({"providers": {"nous": {"refresh_token": "r", "access_token": "a"}}}, fh)
+            self.assertEqual(ns["main"](), 0)
+            self.assertEqual(len(spawned), 1)
+            argv, kwargs = spawned[0]
+            self.assertEqual(argv[1:], ["-m", "hermes_cli.main", "proxy", "start"])
+            flags = kwargs["creationflags"]
+            self.assertEqual(flags, 0x08000000 | 0x00000200)
+            self.assertEqual(flags & 0x00000008, 0, "DETACHED_PROCESS ビットが立っていてはいけない")
 
 
 if __name__ == "__main__":

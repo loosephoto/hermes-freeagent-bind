@@ -2033,7 +2033,14 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   **数分おきに黒いウィンドウが一瞬出る**（実測: 5 分周期の見張りで毎回 1 個。ウィンドウを隠す指定でも表示された）。
   二重起動の判定は launcher が付ける目印 `freeagent-resident-<port>` と旧来の `server.py … --port <port>` の
   **両方**に当てる（片方だけだと起動方式を変えた直後に二重起動し、`allow_reuse_address = False` の
-  ため起動が失敗する）。検証: `tests/test_resident_installer.py`。
+  ため起動が失敗する）。あわせて Nous Portal プロキシ（`proxy-service\run_proxy.pyw` / `Hermes_Proxy.vbs` /
+  `Startup\Hermes_Proxy.vbs` / `Hermes_Proxy_Watchdog`）も同じ生成器で出力する。`run_proxy.pyw` は
+  `python.exe -m hermes_cli.main proxy start` を **`CREATE_NO_WINDOW (0x08000000) | CREATE_NEW_PROCESS_GROUP (0x00000200)`**
+  で起動し、**`DETACHED_PROCESS (0x00000008)` を混ぜない**（`DETACHED_PROCESS` は親のコンソールを剥奪し、
+  起動処理中の孫プロセス `Scripts\python.exe` × 2・`cmd\git.exe` × 2 が Windows 11 で 4 個の黒窓を開くため。
+  また MSDN 仕様により両フラグ併用時は `CREATE_NO_WINDOW` が無視される）。さらに `auth.json` の
+  `providers.nous` に有効な資格情報が無い（未ログイン・トークン失効）ときは起動自体をスキップし、
+  5 分おきの再起動ループとログ肥大化を防ぐ。検証: `tests/test_resident_installer.py`。
 - **目印（ハーネス判別）の点検も HTTP に対応する**: `scripts/apply_proactive.py --check` は
   `x-freeagent-harness` ヘッダを env と同じ目印として読み、HTTP なら不足時にヘッダを足すコマンドを出す
   （ヘッダを読まないと常駐運用の実機で「未設定」と誤警告した）。

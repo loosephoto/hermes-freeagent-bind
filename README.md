@@ -187,6 +187,9 @@ python scripts/install_resident_windows.py --write --force --task    # 5 分ご�
 | `<hermes-home>\freeagent-service\Hermes_Freeagent.vbs` | worker。待受済みなら何もせず終了（二重起動の防止） |
 | `Startup\Hermes_Freeagent.vbs` | ログオン時に worker を隠して起動 |
 | `…\apply_freeagent_http.sh` / `revert_freeagent_stdio.sh` | `hermes config` の切替と戻し |
+| `<hermes-home>\proxy-service\run_proxy.pyw` | Nous Portal プロキシ（`127.0.0.1:8645`）を非表示コンソールで起動・未認証時はスキップ |
+| `<hermes-home>\proxy-service\Hermes_Proxy.vbs` / `Hermes_Proxy_Launcher.vbs` | プロキシ用 worker と Startup 復元テンプレート |
+| `Startup\Hermes_Proxy.vbs` | ログオン時にプロキシ worker を隠して起動（`--no-proxy` でプロキシ側を省略可能） |
 
 - **生存確認は WMI（`Win32_Process` のコマンドライン照合）**で行います。子プロセスを作らないので、
   netstat のためのコンソールも生まれません。WMI が使えない環境では `WinHttp` の接続確認に落ちます。
@@ -194,7 +197,8 @@ python scripts/install_resident_windows.py --write --force --task    # 5 分ご�
   `WshShell.Exec("cmd /c netstat …")` や `cmd /c … >> log` は**使いません**。子プロセスにコンソールが付き、
   Windows 11（既定のターミナルが Windows Terminal）では**数分おきに黒いウィンドウが一瞬出ます**
   （実測: 5 分周期の見張りで毎回 1 個。ウィンドウを隠す指定でも表示されました）。
-- 見張りは `schtasks` の 5 分間隔で、**生きていれば何もしない**冪等な設計です。落ちていたときだけ起動します。
+- **プロキシ（`run_proxy.pyw`）は `CREATE_NO_WINDOW (0x08000000) | CREATE_NEW_PROCESS_GROUP (0x00000200)` で起動し、`DETACHED_PROCESS (0x00000008)` は使いません**。`DETACHED_PROCESS` で起動された `python.exe` は「コンソール無し」になるため、`hermes_cli.main` の起動処理が呼ぶコンソール孫プロセス（`Scripts\python.exe` × 2、`cmd\git.exe` × 2）がそれぞれ新しくコンソールを割り当て、Windows 11 で 1 回の起動につき 4 個の黒い画面が表示されます（実測）。`CREATE_NO_WINDOW` なら親 `python.exe` の非表示コンソール（`conhost.exe 0x4`）を孫プロセスが継承するため黒い画面は 0 個になります。さらに `auth.json` に Nous Portal の有効な資格情報が無い（未ログイン・トークン失効）ときは起動前にスキップし、5 分おきの無駄な再起動ループを防ぎます。
+- 見張りは `schtasks` の 5 分間隔（`Hermes_Freeagent_Watchdog` / `Hermes_Proxy_Watchdog`）で、**生きていれば何もしない**冪等な設計です。落ちていたときだけ起動します。
 - 二重起動の判定は、launcher が付ける目印 `freeagent-resident-<port>` と、旧来の
   `server.py … --port <port>` の**両方**に当てます（片方だけだと、起動方式を変えた直後に二重起動します）。
 - 既定のポートは 8790 です（`--port` で変更できます。Hermes 側の `url` も同じ値にしてください）。

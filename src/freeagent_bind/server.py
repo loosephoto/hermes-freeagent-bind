@@ -90,7 +90,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.40.1"
+SERVER_VERSION = "0.40.2"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -2279,9 +2279,10 @@ def _refresh_ssl_context(url: str) -> None:
                                     "System32", "curl.exe")
             if os.path.exists(curl_bin):
                 try:
+                    _nw = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
                     subprocess.run([curl_bin, "-sI", "--max-time", "5", url],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   timeout=6, check=False)
+                                   timeout=6, check=False, creationflags=_nw)
                 except Exception:
                     pass
         ctx = ssl.create_default_context()
@@ -7327,8 +7328,10 @@ def tool_delegate(args: dict) -> dict:
     import subprocess
     started = now_ts()
     try:
+        _nw = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         proc = subprocess.run([HERMES_BIN, "chat", "-q", effective], capture_output=True,
-                              timeout=timeout, text=True, encoding="utf-8", errors="replace")
+                              timeout=timeout, text=True, encoding="utf-8", errors="replace",
+                              creationflags=_nw)
         return {"task": truncate(task, 300), "verification_enforced": verify_required,
                 "task_effective": truncate(effective, 400),
                 "exit_code": proc.returncode,

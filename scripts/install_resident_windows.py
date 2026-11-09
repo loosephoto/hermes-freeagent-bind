@@ -55,13 +55,20 @@ for _stream in (sys.stdout, sys.stderr):
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8790
+DEFAULT_PROXY_PORT = 8645
 DEFAULT_TASK_NAME = "Hermes_Freeagent_Watchdog"
+DEFAULT_PROXY_TASK_NAME = "Hermes_Proxy_Watchdog"
 DEFAULT_INTERVAL_MINUTES = 5
 SERVICE_DIR_NAME = "freeagent-service"
 LOG_NAME = "freeagent-autostart.log"
 LAUNCHER_NAME = "run_server.pyw"
 ENV_NAME = "freeagent.env"
 WORKER_NAME = "Hermes_Freeagent.vbs"
+PROXY_SERVICE_DIR_NAME = "proxy-service"
+PROXY_LOG_NAME = "proxy-service.log"
+PROXY_LAUNCHER_NAME = "run_proxy.pyw"
+PROXY_WORKER_NAME = "Hermes_Proxy.vbs"
+PROXY_TEMPLATE_NAME = "Hermes_Proxy_Launcher.vbs"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -80,6 +87,11 @@ def marker_for(port: int) -> str:
     return "freeagent-resident-%d" % port
 
 
+def proxy_marker_for(port: int) -> str:
+    """プロキシのコマンドラインに載る目印。"""
+    return "hermes-proxy-%d" % port
+
+
 def _interpreter_ok(exe: str) -> bool:
     """その `python.exe` が**実際に起動して式を評価できる**か。
 
@@ -89,8 +101,10 @@ def _interpreter_ok(exe: str) -> bool:
     （起動ログには `starting` だけが残り、サーバーは LISTENING しない）。だから実行して確かめる。
     """
     try:
+        nw = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         proc = subprocess.run([exe, "-c", "import sys;print(sys.version_info[0])"],
-                              capture_output=True, text=True, timeout=20)
+                              capture_output=True, text=True, timeout=20,
+                              creationflags=nw)
     except (OSError, subprocess.SubprocessError):
         return False
     out = (proc.stdout or "").strip()
@@ -128,6 +142,7 @@ def service_paths(hermes_home: str, startup_dir: str = "") -> dict:
     実測では実機の launcher が一時ディレクトリを指す状態になり、ログオン起動が壊れた。
     """
     service = os.path.join(hermes_home, SERVICE_DIR_NAME)
+    proxy_service = os.path.join(hermes_home, PROXY_SERVICE_DIR_NAME)
     startup_root = startup_dir or os.path.join(
         os.environ.get("APPDATA") or os.path.expanduser("~"),
         "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
@@ -140,6 +155,12 @@ def service_paths(hermes_home: str, startup_dir: str = "") -> dict:
         "apply": os.path.join(service, "apply_freeagent_http.sh"),
         "revert": os.path.join(service, "revert_freeagent_stdio.sh"),
         "startup": os.path.join(startup_root, WORKER_NAME),
+        "proxy_service_dir": proxy_service,
+        "proxy_launcher": os.path.join(proxy_service, PROXY_LAUNCHER_NAME),
+        "proxy_worker": os.path.join(proxy_service, PROXY_WORKER_NAME),
+        "proxy_startup_template": os.path.join(proxy_service, PROXY_TEMPLATE_NAME),
+        "proxy_startup": os.path.join(startup_root, PROXY_WORKER_NAME),
+        "proxy_log": os.path.join(hermes_home, "logs", PROXY_LOG_NAME),
     }
 
 
@@ -309,10 +330,10 @@ If fso.FolderExists(tools) Then
       ' then died silently: pythonw has no console and the log showed only "starting".
       ' We cannot verify the interpreter here (WshShell.Exec would spawn a console),
       ' so choose by name instead.
-      If fso.FileExists(f.Path & "\python.exe") And StrComp(f.Name, bestName, vbTextCompare) > 0 Then
+      If fso.FileExists(f.Path & "\\python.exe") And StrComp(f.Name, bestName, vbTextCompare) > 0 Then
         bestName = f.Name
-        py = f.Path & "\python.exe"
-        pyw = f.Path & "\pythonw.exe"
+        py = f.Path & "\\python.exe"
+        pyw = f.Path & "\\pythonw.exe"
       End If
     End If
   Next
@@ -355,6 +376,304 @@ If Not fso.FileExists(target) Then WScript.Quit 0
 Set sh = CreateObject("WScript.Shell")
 sh.Run "wscript.exe " & Chr(34) & target & Chr(34), 0, False
 '''.replace("__WORKER__", cfg["paths"]["worker"]).lstrip("\n")
+
+
+def render_proxy_launcher(cfg: dict) -> str:
+    """ローカル OpenAI 互換プロキシ（`hermes proxy start`）を黒窓無しで起動するランチャ。
+
+    重要（2026-11-09 実測）:
+    - `DETACHED_PROCESS (0x00000008)` を使ってはいけない。`DETACHED_PROCESS` の子は
+      「コンソール無し」になるため、`hermes_cli.main` の起動処理が呼ぶコンソール孫プロセス
+      （`Scripts\\python.exe` × 2、`cmd\\git.exe` × 2）がそれぞれ自分のコンソールを新造し、
+      Windows 11 の Windows Terminal が **1 回の起動につき 4 個の黒い画面**を連続表示する。
+      さらに MSDN 仕様により `DETACHED_PROCESS` と `CREATE_NO_WINDOW` の併用は
+      `CREATE_NO_WINDOW` が無視される。
+    - 正しくは `CREATE_NO_WINDOW (0x08000000) | CREATE_NEW_PROCESS_GROUP (0x00000200)`
+      （`DETACHED_PROCESS` は混ぜない）で起動し、親 `python.exe` が所有する非表示コンソール
+      （`conhost.exe 0x4`）を孫プロセスに継承させる。
+    - Nous Portal が未認証／トークン失効のときは `auth.json` を事前確認して起動自体をスキップする。
+    """
+    return '''# -*- coding: utf-8 -*-
+r"""ローカル OpenAI 互換プロキシを**コンソール無しで**起動する薄いランチャ。
+
+`Hermes_Proxy.vbs`（ログオン launcher と 5 分周期の見張りタスクの両方）が
+`pythonw.exe` から呼ぶ。
+
+重要（Windows 11 で黒い画面が複数出る罠と対策）:
+  1. `DETACHED_PROCESS (0x00000008)` を使ってはいけない。
+     `DETACHED_PROCESS` で起動された `python.exe` は「コンソール無し」になるため、
+     `hermes_cli.main` の起動処理中に呼ばれるコンソール子プロセス
+     （`pm-runtime\\...\\Scripts\\python.exe` × 2、`cmd\\git.exe` × 2）がそれぞれ新しく
+     自分のコンソールを割り当て、Windows 11 の Windows Terminal が **1 回の起動につき
+     4 個の黒い画面**を連続表示する（`EnumWindows` で 4 窓・11 イベントを実測）。
+     さらに MSDN 仕様により `DETACHED_PROCESS` と `CREATE_NO_WINDOW` を併用すると
+     `CREATE_NO_WINDOW` は無視される。
+  2. 正しくは **`CREATE_NO_WINDOW (0x08000000) | CREATE_NEW_PROCESS_GROUP (0x00000200)`**
+     （`DETACHED_PROCESS` は混ぜない）で起動する。これにより親 `python.exe` が
+     非表示コンソール（`conhost.exe 0x4`）を所有し、子孫の `python.exe` や `git.exe` も
+     その非表示コンソールを継承するため、黒い画面は **0 個**になる（実測で確認済み）。
+  3. Nous Portal が未ログイン／トークン失効（`auth.json` の `providers.nous` に
+     `agent_key` も `refresh_token`+`access_token` も無い状態）のときは、起動しても
+     即 `exit 2 (Not logged into Nous Portal)` になるため、5 分おきに無駄な起動を
+     繰り返さないよう事前判定してスキップする（`HERMES_PROXY_FORCE_START=1` で強制起動可）。
+"""
+import json
+import os
+import subprocess
+import sys
+
+HOME = os.path.expandvars(r"__HERMES_HOME__")
+REPO = os.path.join(HOME, "hermes-agent")
+LOG = os.environ.get("HERMES_PROXY_LOG") or os.path.join(HOME, "logs", "__PROXY_LOG_NAME__")
+AUTH_FILE = os.path.join(HOME, "auth.json")
+MARKER_PREFIX = "hermes-proxy-"
+
+# 0x00000008（コンソール剥奪フラグ）は絶対に入れない（子孫の git.exe / python.exe が黒窓を開くため）。
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_NO_WINDOW = 0x08000000
+
+
+def _console_python():
+    """子に使う `python.exe`（コンソール版）のパス。
+
+    `pythonw.exe` は GUI サブシステムなので、そのまま CLI を回すと stdio 前提の出力や
+    子プロセス起動で問題が起きる。必ず `python.exe` を使い、窓は `CREATE_NO_WINDOW`
+    （非表示コンソールの所有＋子孫への継承）で抑える。
+    """
+    exe = sys.executable or ""
+    base = os.path.dirname(exe)
+    if base:
+        cand = os.path.join(base, "python.exe")
+        if os.path.isfile(cand):
+            return cand
+    return exe
+
+
+def _split_argv(argv):
+    """目印（hermes-proxy-<port>）を落として CLI に渡す引数だけを返す。"""
+    keep = []
+    for arg in argv:
+        if arg.startswith(MARKER_PREFIX) and len(arg) > len(MARKER_PREFIX):
+            continue
+        keep.append(arg)
+    return keep
+
+
+def _target_provider(extra_args):
+    """引数から `--provider` の値を取り出す（未指定は既定の `nous`）。"""
+    for i, arg in enumerate(extra_args):
+        if arg == "--provider" and i + 1 < len(extra_args):
+            return (extra_args[i + 1] or "").strip().lower() or "nous"
+        if arg.startswith("--provider="):
+            return arg.partition("=")[2].strip().lower() or "nous"
+    return "nous"
+
+
+def _nous_authenticated():
+    """`auth.json` に Nous Portal の有効な資格情報があるか（`NousPortalAdapter.is_authenticated` と同条件）。"""
+    if not os.path.isfile(AUTH_FILE):
+        return False
+    try:
+        with open(AUTH_FILE, encoding="utf-8-sig", errors="replace") as fh:
+            store = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(store, dict):
+        return False
+    providers = store.get("providers")
+    if not isinstance(providers, dict):
+        return False
+    state = providers.get("nous")
+    if not isinstance(state, dict):
+        return False
+    return bool(state.get("agent_key") or (state.get("refresh_token") and state.get("access_token")))
+
+
+def _last_log_line(path):
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+        return lines[-1] if lines else ""
+    except OSError:
+        return ""
+
+
+def main():
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    extra = _split_argv(sys.argv[1:])
+    provider = _target_provider(extra)
+    force_start = os.environ.get("HERMES_PROXY_FORCE_START", "").strip().lower() in ("1", "true", "yes", "on")
+
+    if not force_start and provider == "nous" and not _nous_authenticated():
+        skip_msg = "[launcher] skipped: Nous Portal not authenticated (run `hermes auth add nous` to enable proxy)"
+        if _last_log_line(LOG) != skip_msg:
+            try:
+                with open(LOG, "a", encoding="utf-8", errors="replace", buffering=1) as log:
+                    log.write(skip_msg + "\\n")
+            except OSError:
+                pass
+        return 0
+
+    args = ["-m", "hermes_cli.main", "proxy", "start"] + extra
+
+    env = dict(os.environ)
+    env.setdefault("HERMES_HOME", HOME)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = REPO + (";" + existing if existing else "")
+
+    with open(LOG, "a", encoding="utf-8", errors="replace", buffering=1) as log:
+        child = subprocess.Popen(
+            [_console_python(), *args],
+            cwd=HOME,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+        log.write("[launcher] started pid=%d args=%s\\n" % (child.pid, " ".join(args)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''.replace("__HERMES_HOME__", cfg["hermes_home"]).replace(
+        "__PROXY_LOG_NAME__", PROXY_LOG_NAME).lstrip("\n")
+
+
+def render_proxy_worker(cfg: dict) -> str:
+    """プロキシ用 worker VBS（WMI 生存確認・WinHttp フォールバック・pythonw 起動・ASCII のみ）。"""
+    proxy_port = str(cfg.get("proxy_port", DEFAULT_PROXY_PORT))
+    return r'''
+' Hermes Agent - local OpenAI-compatible proxy autostart
+' Serves Nous Portal credentials on 127.0.0.1:__PROXY_PORT__ for local MCP servers
+' (e.g. freeagent-bind's sub-LLM tools). Skips when the proxy is already up.
+'
+' NO CONSOLE PROCESS IS EVER SPAWNED HERE:
+'   - liveness = a WMI query of Win32_Process CommandLine (no child process at all),
+'     with a WinHttp connection probe only if WMI is unavailable;
+'   - the server is started by run_proxy.pyw (via pythonw.exe), which launches
+'     "python.exe -m hermes_cli.main proxy start" with CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+'     (never DETACHED_PROCESS, so all grandchild git/python processes inherit the hidden console)
+'     and skips launch when Nous Portal is not authenticated.
+' ASCII only: Windows Script Host reads a .vbs without a UTF-16 BOM as ANSI.
+Option Explicit
+Dim sh, fso, home, launcher, logDir, running, http, svc, procs, p, cl, wmiOk
+Dim tools, f, pyw, bestName, port, startupDir, startupLauncher, templateLauncher
+
+Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+
+home = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\hermes"
+launcher = home & "\__PROXY_SERVICE_DIR__\__PROXY_LAUNCHER_NAME__"
+logDir = home & "\logs"
+
+port = "__PROXY_PORT__"
+If WScript.Arguments.Count > 0 Then port = WScript.Arguments(0)
+
+If Not fso.FileExists(launcher) Then WScript.Quit 0
+If Not fso.FolderExists(logDir) Then fso.CreateFolder(logDir)
+
+' Restore the Startup launcher from the template when an update or test removed it.
+startupDir = sh.SpecialFolders("Startup")
+startupLauncher = startupDir & "\__PROXY_WORKER_NAME__"
+templateLauncher = home & "\__PROXY_SERVICE_DIR__\__PROXY_TEMPLATE_NAME__"
+On Error Resume Next
+If Not fso.FileExists(startupLauncher) Then
+  If fso.FileExists(templateLauncher) Then fso.CopyFile templateLauncher, startupLauncher, True
+End If
+On Error GoTo 0
+
+' Liveness: WMI on the proxy's own command line. Pure COM - no child process and no
+' stray connection (an HTTP probe makes the server log ConnectionResetError).
+running = False
+wmiOk = False
+On Error Resume Next
+Set svc = GetObject("winmgmts:\\.\root\cimv2")
+If Err.Number = 0 And IsObject(svc) Then
+  Set procs = svc.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process")
+  If Err.Number = 0 And IsObject(procs) Then
+    wmiOk = True
+    For Each p In procs
+      cl = p.CommandLine
+      If Not IsNull(cl) Then
+        If InStr(cl, "-m hermes_cli.main proxy start") > 0 Then
+          If InStr(cl, " --port " & port) > 0 Or port = "__PROXY_PORT__" Then running = True
+        End If
+        ' Legacy shape (started by the old cmd.exe launcher): the cmd.exe parent carries
+        ' hermes.cmd + "proxy start". Accept it so a transition never starts a second one.
+        If InStr(cl, "hermes.cmd") > 0 And InStr(cl, "proxy start") > 0 Then running = True
+      End If
+    Next
+  End If
+  Err.Clear
+End If
+If running Then WScript.Quit 0
+
+' WMI unavailable -> connection probe with WinHttp (still no console window).
+If Not wmiOk Then
+  Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
+  If Err.Number = 0 And IsObject(http) Then
+    http.SetTimeouts 1000, 1000, 1000, 2000
+    http.Open "GET", "http://127.0.0.1:" & port & "/", False
+    http.Send
+    If Err.Number = 0 Then running = True
+    Err.Clear
+  End If
+  If running Then WScript.Quit 0
+End If
+On Error GoTo 0
+
+' pythonw.exe lives in a folder whose name changes per install (version + build),
+' so enumerate the tools folder instead of hardcoding a path.
+pyw = ""
+bestName = ""
+tools = home & "\tools"
+If fso.FolderExists(tools) Then
+  For Each f In fso.GetFolder(tools).SubFolders
+    If Left(f.Name, 7) = "python-" Then
+      If fso.FileExists(f.Path & "\pythonw.exe") And StrComp(f.Name, bestName, vbTextCompare) > 0 Then
+        bestName = f.Name
+        pyw = f.Path & "\pythonw.exe"
+      End If
+    End If
+  Next
+End If
+If pyw = "" Then WScript.Quit 0
+
+' Console-free launch: pythonw (GUI subsystem) runs the thin launcher, which starts
+' the CLI with CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, so no window is ever shown.
+sh.CurrentDirectory = home
+If port = "__PROXY_PORT__" Then
+  sh.Run """" & pyw & """ """ & launcher & """ hermes-proxy-" & port, 0, False
+Else
+  sh.Run """" & pyw & """ """ & launcher & """ --port " & port & " hermes-proxy-" & port, 0, False
+End If
+'''.replace("__PROXY_SERVICE_DIR__", PROXY_SERVICE_DIR_NAME).replace(
+        "__PROXY_LAUNCHER_NAME__", PROXY_LAUNCHER_NAME).replace(
+        "__PROXY_WORKER_NAME__", PROXY_WORKER_NAME).replace(
+        "__PROXY_TEMPLATE_NAME__", PROXY_TEMPLATE_NAME).replace(
+        "__PROXY_PORT__", proxy_port).lstrip("\n")
+
+
+def render_proxy_startup(cfg: dict) -> str:
+    """ログオン時にプロキシ worker を隠して起動する launcher（ASCII のみ）。"""
+    return '''
+' Hermes Agent - local OpenAI-compatible proxy autostart (logon launcher)
+' ASCII only.
+Option Explicit
+Dim fso, sh, target
+target = "__PROXY_WORKER__"
+Set fso = CreateObject("Scripting.FileSystemObject")
+If Not fso.FileExists(target) Then WScript.Quit 0
+Set sh = CreateObject("WScript.Shell")
+sh.Run "wscript.exe " & Chr(34) & target & Chr(34), 0, False
+'''.replace("__PROXY_WORKER__", cfg["paths"]["proxy_worker"]).lstrip("\n")
 
 
 def render_apply(cfg: dict) -> str:
@@ -425,7 +744,9 @@ def render_service_env(cfg: dict) -> str:
 
 
 def build_config(hermes_home: str, repo: str, host: str, port: int,
-                 python: str = "", pythonw: str = "", startup_dir: str = "") -> dict:
+                 python: str = "", pythonw: str = "", startup_dir: str = "",
+                 proxy_port: int = DEFAULT_PROXY_PORT,
+                 with_proxy: bool = True) -> dict:
     """生成に必要な値一式（見つかった python を含む）。
 
     `startup_dir` を空にすると**実機の Startup フォルダ**を使う。テストは必ず与える。
@@ -437,23 +758,41 @@ def build_config(hermes_home: str, repo: str, host: str, port: int,
         "repo": repo,
         "host": host,
         "port": port,
+        "proxy_port": proxy_port,
+        "with_proxy": with_proxy,
         "python": python or found_py,
         "pythonw": pythonw or found_pyw,
         "marker": marker_for(port),
+        "proxy_marker": proxy_marker_for(proxy_port),
         "paths": paths,
     }
+
+
+def build_proxy_plan(cfg: dict) -> list[tuple[str, str]]:
+    """`proxy-service` 側の `(出力パス, 内容)` の一覧。書き込みはしない。"""
+    p = cfg["paths"]
+    startup_vbs = render_proxy_startup(cfg)
+    return [
+        (p["proxy_launcher"], render_proxy_launcher(cfg)),
+        (p["proxy_worker"], render_proxy_worker(cfg)),
+        (p["proxy_startup_template"], startup_vbs),
+        (p["proxy_startup"], startup_vbs),
+    ]
 
 
 def build_plan(cfg: dict) -> list[tuple[str, str]]:
     """`(出力パス, 内容)` の一覧。書き込みはしない。"""
     p = cfg["paths"]
-    return [
+    plan = [
         (p["launcher"], render_launcher(cfg)),
         (p["worker"], render_worker(cfg)),
         (p["startup"], render_startup(cfg)),
         (p["apply"], render_apply(cfg)),
         (p["revert"], render_revert(cfg)),
     ]
+    if cfg.get("with_proxy", True):
+        plan.extend(build_proxy_plan(cfg))
+    return plan
 
 
 def write_plan(plan: list[tuple[str, str]], force: bool = False) -> list[str]:
@@ -476,15 +815,27 @@ def write_plan(plan: list[tuple[str, str]], force: bool = False) -> list[str]:
     return written
 
 
-def register_task(cfg: dict, task_name: str, interval_minutes: int) -> str:
-    """見張りタスクを登録する（落ちたときだけ worker が起動する・冪等）。"""
-    tr = 'wscript.exe "%s"' % cfg["paths"]["worker"]
+def _register_schtask(worker_path: str, task_name: str, interval_minutes: int) -> str:
+    """指定した worker VBS の見張りタスクを登録する（冪等）。"""
+    tr = 'wscript.exe "%s"' % worker_path
     cmd = ["schtasks", "/create", "/tn", task_name, "/sc", "minute",
            "/mo", str(interval_minutes), "/tr", tr, "/f"]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    nw = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=nw)
     if proc.returncode != 0:
         return "task failed (%d): %s" % (proc.returncode, (proc.stderr or proc.stdout).strip())
     return "task registered: %s (every %d min)" % (task_name, interval_minutes)
+
+
+def register_task(cfg: dict, task_name: str, interval_minutes: int) -> str:
+    """見張りタスクを登録する（落ちたときだけ worker が起動する・冪等）。"""
+    return _register_schtask(cfg["paths"]["worker"], task_name, interval_minutes)
+
+
+def register_proxy_task(cfg: dict, task_name: str = DEFAULT_PROXY_TASK_NAME,
+                        interval_minutes: int = DEFAULT_INTERVAL_MINUTES) -> str:
+    """ローカルプロキシの見張りタスクを登録する（落ちたときだけ worker が起動する・冪等）。"""
+    return _register_schtask(cfg["paths"]["proxy_worker"], task_name, interval_minutes)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -494,6 +845,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=REPO_ROOT, help="freeagent-bind のリポジトリ根")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--proxy-port", type=int, default=DEFAULT_PROXY_PORT)
+    parser.add_argument("--no-proxy", action="store_true",
+                        help="proxy-service 側の配線生成・見張りタスク登録を行わない")
     parser.add_argument("--python", default="", help="python.exe を明示（既定は tools から列挙）")
     parser.add_argument("--pythonw", default="", help="pythonw.exe を明示")
     parser.add_argument("--write", action="store_true", help="生成する（既定は表示のみ）")
@@ -504,16 +858,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="ログオン起動 launcher を置くフォルダ（既定: %%APPDATA%%\\...\\Startup）。"
                              "テストは必ず一時ディレクトリを渡す")
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
+    parser.add_argument("--proxy-task-name", default=DEFAULT_PROXY_TASK_NAME)
     parser.add_argument("--interval-minutes", type=int, default=DEFAULT_INTERVAL_MINUTES)
     args = parser.parse_args(argv)
 
     cfg = build_config(args.hermes_home, args.repo, args.host, args.port,
-                       args.python, args.pythonw, args.startup_dir)
+                       args.python, args.pythonw, args.startup_dir,
+                       proxy_port=args.proxy_port, with_proxy=not args.no_proxy)
     plan = build_plan(cfg)
 
     print("hermes home : %s" % cfg["hermes_home"])
     print("repo        : %s" % cfg["repo"])
     print("endpoint    : http://%s:%d/mcp" % (cfg["host"], cfg["port"]))
+    if cfg.get("with_proxy", True):
+        print("proxy       : http://127.0.0.1:%d/v1" % cfg["proxy_port"])
     print("python      : %s" % (cfg["python"] or "(not found - pass --python)"))
     print("pythonw     : %s" % (cfg["pythonw"] or "(not found - pass --pythonw)"))
     print("")
@@ -543,6 +901,8 @@ def main(argv: list[str] | None = None) -> int:
             print("wrote: %s" % _env_path)
         if args.task:
             print(register_task(cfg, args.task_name, args.interval_minutes))
+            if cfg.get("with_proxy", True):
+                print(register_proxy_task(cfg, args.proxy_task_name, args.interval_minutes))
     return 0
 
 
