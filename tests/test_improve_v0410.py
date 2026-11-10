@@ -236,7 +236,7 @@ class DenseHead(unittest.TestCase):
 
 class SnippetMentionsDeferredCatalog(unittest.TestCase):
     def test_snippet_has_the_tool_search_flow(self):
-        here = pathlib.Path(r"C:\Users\oresama\hermes-freeagent-bind\scripts\apply_proactive.py")
+        here = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "apply_proactive.py")
         text = here.read_text(encoding="utf-8")
         self.assertIn("tool_search", text)
         self.assertIn("tool_describe", text)
