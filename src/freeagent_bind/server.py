@@ -7,6 +7,9 @@ Internet Archive / Qiita / OpenReview / MDN / DevDocs / NVD / Terraform Registry
 対象外**（第6段階で採った生命・医学系ソースは 2026-10-05 に方針変更で削除。§5.19 に記録）。
 
 **モジュラーモノリス**として書く。本体はこの 1 ファイル（§0〜§4・§5 の横断部・§6〜§11）で、
+HTTP トランスポート・MCP Resources・ハーネス判別・JSON ヘルパーは分割モジュール
+（`transport_http.py` / `resources.py` / `harness.py` / `jsonutil.py`・v0.40.0）に切り出してある
+（テストが patch.object で差し替える名前はこのファイルに残す）。
 知識ソース 30 種は `sources/<name>.py`（1 ソース 1 ファイル）、プロバイダ 18 社は
 `providers/<name>.py`（1 社 1 ファイル）に置く。配布物は今も
 **stdio スクリプト 1 本**で完結する（`python server.py` / `runpy.run_path(server.py)` の直接実行は、
@@ -26,7 +29,8 @@ import すると無応答になる環境があるため、起動経路は増や�
                     §5.16 DOAJ・npm・crates.io / §5.17 CiNii Research（appid 必須） / §5.18 プログラミング・標準 /
                     §5.19 科学（医学・生物学は対象外） / §5.20 プログラミング特化: HN・Software Heritage・Libraries.io /
                     §5.21 Internet Archive（明示指定のみ） / §5.22 日本語の技術記事: Qiita（明示指定のみ） /
-                    §5.23 OpenReview（明示指定のみ） / §5.24 MDN・DevDocs（明示指定のみ））
+                    §5.23 OpenReview（明示指定のみ） / §5.24 MDN・DevDocs（明示指定のみ） /
+                    §5.25 NVD・Terraform Registry・zbMATH（明示指定のみ・v0.39.0））
   §6 ツール実装（§6.9 思考台帳 / §6.10 台帳の構造の検証・閲覧・代替案 / §6.11 本文注入番号 /
                  §6.12 panel の統合 / §6.32 受付と報告 / §6.37 記録からの診断）
   §7 ツール定義         §8 表示（content）
@@ -90,7 +94,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.40.2"
+SERVER_VERSION = "0.40.3"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -1040,15 +1044,19 @@ def _kind_quality(row: dict) -> tuple[float, float]:
     leak = as_float(row.get("leak"), 0.0)
     trunc = as_float(row.get("trunc"), 0.0)
     empty = as_float(row.get("empty"), 0.0)
-    score = (ok + 0.5 * trunc + 0.3 * leak) / n
-    score *= (1.0 - min(1.0, empty / n))
     err = row.get("err") or {}
     if isinstance(err, dict):
         soft = as_float(err.get("no_output"), 0.0)
         hard = sum(as_float(v, 0.0) for k, v in err.items() if k != "no_output")
     else:
         soft, hard = 0.0, 0.0
-    score *= max(0.0, 1.0 - min(1.0, (hard + 0.5 * soft) / n))
+    # 失敗は **1 回だけ** 数える（v0.40.3）。旧実装は「成功比」（分子が既に失敗を含まない）に
+    # さらに (1 - 失敗率) を掛けていたため失敗率が 2 乗で効き、勝率 50% のモデルが
+    # 実質 1 勝 3 敗相当に歪んだ（本番 model_stats 実測: ok=2/n=4 で _rank_score 0.4328＜未観測 0.5722）。
+    # 追加の減点はハード失敗（404・5xx・auth 等）だけに留め、空応答（soft・本番失敗の 80%）は
+    # 「成功に数えない」1 回の減点にとどめる。`empty`（旧フィールド）は参照しない。
+    score = (ok + 0.5 * trunc + 0.3 * leak) / n
+    score *= max(0.0, 1.0 - min(1.0, hard / n))
     return round(max(0.0, min(1.0, score)), 4), n
 
 
@@ -3741,7 +3749,7 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
     wait_left = GATE_WAIT_S
     gate_wait = 0.0
 
-    def note_failure(cand: str, message: str) -> None:
+    def note_failure(cand: str, message: str, result: dict | None = None) -> None:
         """**フォールバックで落ちた候補**を統計へ残す（成功した候補だけ記録してはいけない）。
 
         成功時だけ `observe_call` を呼ぶと、毎回 5xx / 404 で落ちるモデルは観測 0 件のまま
@@ -3753,7 +3761,12 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
         nonlocal last_observed_error
         if not message:
             return
-        observe_call({"ref": cand, "error": message}, kind, "")
+        row = {"ref": cand, "error": message}
+        if isinstance(result, dict):
+            # 空応答でも finish_reason と消費 tokens は記録する（length 枯渇とそれ以外を区別する）。
+            row.update({"truncated": bool(result.get("truncated")),
+                        "tokens": result.get("tokens") or {}})
+        observe_call(row, kind, "")
         last_observed_error = message
 
     for idx, cand in enumerate(attempts):
@@ -3828,6 +3841,8 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
         if not text.strip():
             # 空応答。**成功として返さない**（メインLLMが「無回答」を回答と誤解する）。思考トークンで
             # 予算を使い切った可能性が高いので、予算を上げて 1 回だけ同じ候補で引き上げる。
+            retry_note = ""
+            bumped = max_tokens
             if max_tokens < _EMPTY_RETRY_CAP:
                 bumped = min(max(max_tokens * 3, _EMPTY_TOKEN_FLOOR), _EMPTY_RETRY_CAP)
                 try:
@@ -3840,12 +3855,35 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
                         quota_warnings.append(retry["quota_accounting"])
                     if (retry.get("text") or "").strip():
                         result, text = retry, retry["text"]
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # **リトライの失敗を「空応答」に潰さない**（v0.40.3）。429・環境障害は
+                    # モデルの成績ではないので observe_call に流さない（規約 21）。
+                    if isinstance(exc, HttpStatusError):
+                        retry_note = f"HTTP {exc.status}: {(exc.body or '')[:120]}"
+                        if exc.status == 429:
+                            note_rate_limited(cand, exc.retry_after)
+                    else:
+                        retry_note = f"{type(exc).__name__}: {exc}"
             if not text.strip():
-                last_error = (f"空応答（{cand}）。max_tokens={max_tokens} を思考トークンで使い切った"
-                              "可能性があります。max_tokens を増やしてください")
-                note_failure(cand, last_error)
+                if retry_note:
+                    if is_env_failure(retry_note):
+                        # 環境障害: 別候補も同じ経路で失敗するので打ち切る（モデルの成績に数えない）。
+                        last_error = f"再試行（max_tokens={bumped}）でも環境障害: {retry_note}"
+                        break
+                    # **「空応答」で始めない**: classify_error は語を先に見るので、429 を含む文を
+                    # 空応答（no_output）に誤分類させる（v0.40.3）。
+                    last_error = f"再試行（max_tokens={bumped}）でも失敗: {retry_note}"
+                    if "429" not in retry_note:
+                        note_failure(cand, last_error)
+                    skipped.append(cand)
+                    continue
+                finish = as_str(result.get("finish_reason")) if isinstance(result, dict) else ""
+                why = "（finish_reason=length: 思考トークンで予算を使い切った）" if finish == "length" else ""
+                tried = f"・再試行 {bumped} も空" if max_tokens < _EMPTY_RETRY_CAP else ""
+                last_error = (f"空応答（{cand}）。max_tokens={max_tokens}{tried} を思考トークンで"
+                              f"使い切った可能性があります{why}。max_tokens を増やすか、"
+                              "FREEAGENT_MODEL_EXCLUDE で外してください")
+                note_failure(cand, last_error, result)
                 skipped.append(cand)
                 continue
 
@@ -5194,7 +5232,7 @@ def _kb_gather(picked: list[str], query: str, limit: int, opts: dict,
 def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int = 3,
                      lang: str = "ja", kind: str = "repo", max_workers: int | None = None,
                      deadline: float | None = None, datacite_kind: str = "all", fallback: bool = False,
-                     need_evidence: bool = False) -> dict:
+                     need_evidence: bool = False, doc: str = "") -> dict:
     """指定ソースを**並列に**引いて、出典つきでまとめる。LLM を使わないので幻覚が入らない。
 
     全体の締め切り（`KB_DEADLINE`）までに届いた分だけ返す（§5.8）。`max_workers` は互換のため
@@ -5215,6 +5253,10 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
     # lang 未指定は「空」で渡す（wikipedia が問いから自動判定する。wikidata は or "ja" で従来どおり）。
     opts = {"lang": as_str(lang, ""), "kind": as_str(kind, "repo"),
             "datacite_kind": as_str(datacite_kind, "all"), "fallback": fallback is True,
+            # devdocs の docset 選択（v0.40.3）。**ここで渡さないと docset 内検索が届かない**
+            # （sources/devdocs.py の backend() は opts.get("doc") を読む。実測: v0.40.2 では
+            # tool_lookup に doc を渡しても docs.json の一覧検索になっていた）。
+            "doc": as_str(doc),
             # 「本文根拠が要る場面か」= `grounded`。**根拠の確保を最優先する場面**と
             # **書誌の網羅性を最優先する場面**は違う（§6.18）。
             "need_evidence": need_evidence is True}
@@ -6593,7 +6635,8 @@ def tool_lookup(args: dict) -> dict:
                             limit=as_int(args.get("limit"), 3, 1, 10),
                             lang=as_str(args.get("lang"), ""),
                             kind=as_str(args.get("github_kind"), "repo"),
-                            datacite_kind=as_str(args.get("datacite_kind"), "all"), fallback=args.get("fallback") is True)
+                            datacite_kind=as_str(args.get("datacite_kind"), "all"), fallback=args.get("fallback") is True,
+                            doc=as_str(args.get("doc")))
 
 
 # 根拠としてサブLLMへ注入する本文の量。**入れないと幻覚は減らない**（実測: 以前はタイトルと URL
@@ -6658,6 +6701,7 @@ def tool_grounded(args: dict) -> dict:
                           lang=as_str(args.get("lang"), ""),
                           kind=as_str(args.get("github_kind"), "repo"),
                           datacite_kind=as_str(args.get("datacite_kind"), "all"), fallback=args.get("fallback") is True,
+                          doc=as_str(args.get("doc")),
                           # **本文根拠が要る場面**（§6.18）。crossref は `has-abstract:true` を、
                           # hn はコメントも検索する（根拠の充填率を上げる）。
                           need_evidence=True)
@@ -8561,7 +8605,7 @@ TOOLS: list[dict] = [
         "name": "freeagent_fanout",
         "description": (
             "【使う条件】複数のプロンプト×複数モデルを並列に当てて相互検証・ベストオブN・多数決をしたい。"
-            "【競合より優先】`deliberation` の ask_* を N 回並べるより速い（1 ターンを待たずに同時に走る）。"
+            "【競合より優先】`deliberation` の ask-* を N 回並べるより速い（1 ターンを待たずに同時に走る）。"
             "【差分】速度と失敗の集計（wall と逐次見積り）付き。合意度が要るなら panel。"
             "**`models: [\"all\"]` で在庫の全 Free を束ねられる**（プロンプト 1 本なら全部が 1 回で走る。"
             "合計呼び出しは FREEAGENT_MAX_CALLS_PER_RUN・既定 40 で打ち切る）。"
@@ -8648,6 +8692,9 @@ TOOLS: list[dict] = [
                 "query": {"type": "string"},
                 "sources": {"type": "array", "items": {"type": "string"},
                             "description": "既定6ソース: wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件） / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。検索構文 tag:Python user:foo created:>2026-01-01。**未認証は 60 回/時**で別の問いは 1 分待ち、FREEAGENT_QIITA_TOKEN を設定すると 1,000 回/時）／openreview（OpenReview の会議論文。**query は英語の語**で指定する。日本語クエリは 0 件。venue に採択・スポットライト・撤回・Desk Reject が出るので、撤回済みを根拠に使う前に確認できる）／mdn（MDN Web Docs の Web 技術ドキュメント。**帰属表示が必須**（Mozilla contributors, CC-BY-SA 2.5）。lang でロケール指定可、内容は HTML/CSS/JS/Web API に限る）／devdocs（DevDocs の docset 索引。doc で docset slug を指定（例: `python~3.14`）。**索引だけで本文は取得しない**＝`metadata_only`）。／nvd（NIST 脆弱性 DB。**query は英語の語**で指定する。osv が ID・パッケージ名しか受けないのに対し**キーワードで CVE を引ける**。説明文と CVSS が付く。無認証 5 req/30s＝既定 6 秒間隔、FREEAGENT_NVD_API_KEY で 0.6 秒）／terraform（Terraform Registry のモジュール検索。説明は公開者の自己申告）／zbmath（数学の書誌・MSC 分類・レビュー。**抄録は返らない**ので metadata_only が主。英語の語が必須で、規約同意として FREEAGENT_ZBMATH_ACK=1 が必要）。対象は科学とプログラミングまでで医学・生物学は含まない"},
+                "doc": {"type": "string",
+                        "description": "devdocs の docset slug（例: python~3.14）。指定すると docset の"
+                                       "索引を引き、省略時は docset 名の一覧を返す"},
                 "limit": {"type": "integer", "description": "各ソースの件数（既定 3）"},
                 "lang": {"type": "string", "description": "Wikipedia / Wikidata の言語。**wikipedia は省略時に問いから自動**（日本語・中国語・韓国語なら ja、それ以外は en。英語の語（Transformer など）は自動で en になるので、通常は指定しない。**wikidata は既定 ja 固定**（実測で ja の方が当たったため。en にすると機械学習の項目が電気機器に化ける）。明示するとその言語で引く"},
                 "github_kind": {"type": "string", "description": "repo / issue / code（code はトークン必須・10 req/分）。code はファイルへのポインタと一致箇所の断片を返し、ライセンス情報を含まない（取り込む前に repo 検索で確認する）。repo: owner/name・path:・language:・filename:・in:file の修飾子を付けると精度が上がる"},
@@ -8678,9 +8725,15 @@ TOOLS: list[dict] = [
                                                 "ここに置くと質問文はそのままモデルへ渡る。"
                                                 "省略すると question をそのまま検索語にする"},
                 "sources": {"type": "array", "items": {"type": "string"},
-                            "description": "既定6種（wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件）/ crossref / openalex / github）。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**question は英語の語**で指定する。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。**未認証は 60 回/時**、FREEAGENT_QIITA_TOKEN で 1,000 回/時）／openreview（OpenReview の会議論文。**question は英語の語**で指定する。日本語クエリは 0 件。venue に採択・撤回・Desk Reject が出る）／mdn（MDN Web Docs の Web 技術ドキュメント。**帰属表示が必須**（Mozilla contributors, CC-BY-SA 2.5）。lang でロケール指定可）／devdocs（DevDocs の docset 索引。doc で docset slug を指定（例: `python~3.14`）。**索引だけで本文が無い**ので grounded の根拠にはならない）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。**crossref は抄録が無い書誌が多い**（grounded では抄録の有る論文に絞る） / **hn は議論のコメントが本文根拠になる**（故事的リンク投稿は本文が無い）。／nvd（NIST 脆弱性 DB。**question は英語の語**で指定する。osv が ID・パッケージ名しか受けないのに対し**キーワードで CVE を引ける**。説明文と CVSS が付く＝grounded の根拠に使える。無認証 5 req/30s＝既定 6 秒間隔、FREEAGENT_NVD_API_KEY で 0.6 秒）／terraform（Terraform Registry のモジュール検索。説明は公開者の自己申告）／zbmath（数学の書誌・MSC 分類・レビュー。**抄録は返らない**ので metadata_only が主で grounded の根拠にはなりにくい。英語の語が必須で、規約同意として FREEAGENT_ZBMATH_ACK=1 が必要）。医学・生物学は対象外"},
+                            "description": "既定6種（wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件）/ crossref / openalex / github）。明示追加: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（FREEAGENT_CINII_APPID 必須）/ librariesio（FREEAGENT_LIBRARIESIO_KEY 必須。19+ 登録簿の横断検索）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**search_query は英語の語**で指定する（question は日本語のままでよい）。日本語クエリは IA 側が拒否する。summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。**未認証は 60 回/時**、FREEAGENT_QIITA_TOKEN で 1,000 回/時）／openreview（OpenReview の会議論文。**search_query は英語の語**で指定する（question は日本語のままでよい）。日本語クエリは 0 件。venue に採択・撤回・Desk Reject が出る）／mdn（MDN Web Docs の Web 技術ドキュメント。**帰属表示が必須**（Mozilla contributors, CC-BY-SA 2.5）。lang でロケール指定可）／devdocs（DevDocs の docset 索引。doc で docset slug を指定（例: `python~3.14`）。**索引だけで本文が無い**ので grounded の根拠にはならない）。RORは機関属性、Zenodoは説明メタデータで全文ではない。npm / crates / librariesioの説明は登録者の自己申告。hfhub は構造化レコードを1行にまとめた summary_kind=structured_record。**crossref は抄録が無い書誌が多い**（grounded では抄録の有る論文に絞る） / **hn は議論のコメントが本文根拠になる**（story はリンク投稿で本文が無い）。／nvd（NIST 脆弱性 DB。**search_query は英語の語**で指定する（question は日本語のままでよい）。osv が ID・パッケージ名しか受けないのに対し**キーワードで CVE を引ける**。説明文と CVSS が付く＝grounded の根拠に使える。無認証 5 req/30s＝既定 6 秒間隔、FREEAGENT_NVD_API_KEY で 0.6 秒）／terraform（Terraform Registry のモジュール検索。説明は公開者の自己申告）／zbmath（数学の書誌・MSC 分類・レビュー。**抄録は返らない**ので metadata_only が主で grounded の根拠にはなりにくい。英語の語が必須で、規約同意として FREEAGENT_ZBMATH_ACK=1 が必要）。医学・生物学は対象外"},
+                "doc": {"type": "string", "description": "devdocs の docset slug（例: python~3.14）。"
+                        "指定すると docset の索引を引き、省略時は docset 名の一覧を返す（索引のみで本文は無い）"},
                 "fallback": {"type": "boolean", "description": "自然語 arXiv検索の DataCite 代替を明示許可"},
                 "datacite_kind": {"type": "string", "enum": ["all", "arxiv", "dataset"]},
+                "github_kind": {"type": "string", "description": "github ソースの対象（repo / issue / code。"
+                                "code はトークン必須・10 req/分）"},
+                "exclude": {"type": "array", "items": {"type": "string"},
+                            "description": "除外するモデル（provider/model）"},
                 "limit": {"type": "integer"},
                 "lang": {"type": "string", "description": "Wikipedia / Wikidata の言語。**wikipedia は省略時に問いから自動**（日本語・中国語・韓国語なら ja、それ以外は en）。**wikidata は既定 ja 固定**（明示すればその言語で引く）"},
                 "models": {"type": "array", "items": {"type": "string"},
@@ -8711,6 +8764,9 @@ TOOLS: list[dict] = [
                 "model": {"type": "string"},
                 "reduce": {"type": "boolean", "description": "true なら全出力を統合する"},
                 "reduce_model": {"type": "string"},
+                "reduce_max_tokens": {"type": "integer",
+                                      "description": "reduce 段の上限トークン（省略時は max_tokens）"},
+                "system": {"type": "string", "description": "instruction の別名"},
                 "max_tokens": {"type": "integer"},
             },
             "required": ["items", "instruction"],
@@ -8743,6 +8799,9 @@ TOOLS: list[dict] = [
                 "main_reply": {"type": "string", "description": "サブの問いへのメインの回答"},
                 "mode": {"type": "string", "description": "discuss / review（review は draft を査読）"},
                 "draft": {"type": "string", "description": "mode=review のときの査読対象"},
+                "basis": {"type": "string",
+                          "description": "仕様・計画（モードが review のとき）。渡すと**仕様適合 → 品質**の"
+                                         "2 段査読になり、compliance_summary が返る"},
                 "debate_depth": {"type": "string", "description": "normal / deep"},
                 "models": {"type": "array", "items": {"type": "string"},
                            "description": "明示するモデル（provider/model）。[\"all\"] を渡すと在庫の"
@@ -8855,6 +8914,8 @@ TOOLS: list[dict] = [
                 "size": {"type": "integer", "description": "サブエージェント数（既定 2）"},
                 "max_steps": {"type": "integer", "description": "1体あたりのツール呼び出し上限（既定 2）"},
                 "main_reply": {"type": "string", "description": "メインの補足（最優先の前提として注入）"},
+                "exclude": {"type": "array", "items": {"type": "string"},
+                            "description": "除外するモデル（provider/model）"},
                 "max_tokens": {"type": "integer"},
             },
             "required": ["task"],
@@ -9043,8 +9104,9 @@ def _diag_advice(totals: dict, by_class: dict, ref_fail: dict, fails: list[dict]
         worst = ", ".join(ranked_fail[:3]) or "特定できず"
         return {"kind": "empty_output", "check": ["FREEAGENT_MODEL_EXCLUDE"],
                 "advice": f"失敗 {failed} 件のうち {by_class['no_output']} 件が空応答です（思考モデルが max_tokens を"
-                          f"使い切る型）。呼び出しの max_tokens を 256 以上に上げるか、空応答の多いモデルを"
-                          f"FREEAGENT_MODEL_EXCLUDE で外してください（上位: {worst}）。"}
+                          f"使い切る型。サーバーは既定で {_EMPTY_TOKEN_FLOOR}→{_EMPTY_RETRY_CAP} まで引き上げて"
+                          "再試行するので、それでも空になるモデルは FREEAGENT_MODEL_EXCLUDE で外すか、"
+                          f"呼び出しの max_tokens をさらに上げてください（上位: {worst}）。"}
     if share.get("timeout", 0.0) >= 0.2:
         return {"kind": "timeout", "check": ["FREEAGENT_CALL_BUDGET", "FREEAGENT_MAX_WORKERS"],
                 "advice": f"失敗 {failed} 件のうち {by_class['timeout']} 件が時間切れです。size と FREEAGENT_MAX_WORKERS を"
@@ -9242,7 +9304,7 @@ _EXTRA_DESC: dict[str, str] = {
                      "1 つの独立意見だけで足りるならこちらが速い。",
     "freeagent_map": "要素ごとに別モデルへ並列に投げる必要が無いなら `panel` で足りる。",
     "freeagent_panel": "`delegate_task`（同一モデルの分身＝多様性ゼロ）や "
-                       "`deliberation` の ask_* を N 回並べる代わりにこれを使う。",
+                       "`deliberation` の ask-* を N 回並べる代わりにこれを使う。",
     "freeagent_consult": "`deliberation`（単発の意見集約）にはラウンド・合意度の推移・"
                          "少数意見の保持が無い。往復して前提を更新したいならこれ。",
     "freeagent_think": "思考を記録するだけのツール（sequential-thinking 系）は番号を積むだけで、"

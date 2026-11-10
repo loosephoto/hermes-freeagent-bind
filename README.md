@@ -59,7 +59,7 @@
 | やりたいこと | できること | 注意点 |
 |---|---|---|
 | 設計案の見落としを探す | 同じ問いを複数のモデルに聞き、一致点・対立点を返す | 同じ誤りに賛成することもあります。多数決は正しさの保証ではありません |
-| 出典を探す | 27 の検索先（論文・百科・パッケージ・脆弱性・標準・議論・アーカイブ）から URL と説明を取得する | 検索結果の関連性・情報の正確さは別途確認が必要です。既定は6ソースで、追加は[明示指定](#-知識バックエンド) |
+| 出典を探す | 30 の検索先（論文・百科・パッケージ・脆弱性・標準・議論・アーカイブ）から URL と説明を取得する | 検索結果の関連性・情報の正確さは別途確認が必要です。既定は6ソースで、追加は[明示指定](#-知識バックエンド) |
 | 出典を読ませて回答させる | 取得した説明やアブストラクトをサブ LLM に渡す | 論文の全文を読む機能ではありません。引用番号の検査も内容の正しさは判定しません |
 | 多数の文章を分類・要約する | 同じ指示を各要素へ並列適用し、必要なら統合する | `map` は 1 回最大 64 件。超過分は処理されず、先頭 64 件だけになるため、100 件なら分割してください。失敗した要素も確認してください |
 | 長い検討の続きを忘れない | 計画・仮説・改訂・分岐を思考ノートへ記録する | ノートは期限つきです。AI の知能が増えるわけではありません |
@@ -825,6 +825,7 @@ v0.37.0 は `freeagent_diagnose`（13 本目）を足して **22,317 文字（+1
 v0.38.0 は診断に `run`（呼び出し単位）を足して **22,463 文字（+146）**。v0.38.1 は記録のみ（ツール定義は不変）。
 v0.39.0 は第12段階の 3 ソース（nvd / terraform / zbmath）を `sources` の説明に足して **23,110 文字（+647・+2.9%）**（ツール数は 13 のまま）。
 v0.40.1 は `freeagent_lookup` の本文列挙に 7 ソース（openreview / cinii / terraform / nvd / zbmath / mdn / devdocs）を足して **23,227 文字（+117・+0.5%）**（ツール数は 13 のまま）。
+v0.40.3 は監査修正（devdocs の `doc` 配線・ハンドラ引数の schema 追加）で **24,106 文字（+879）**（ツール数は 13 のまま）。
 以下は新しい順の内訳です。
 
 **v0.39.0（第12段階：NVD / Terraform Registry / zbMATH を追加）**: 25 の候補 API とホスト 20 件の
@@ -1323,7 +1324,7 @@ HF は `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN` も読みます。
 > Hacker News の story は**リンク投稿**なので本文が無く、根拠になりません。
 > 議論の中身は**コメント**に書いてあります（`freeagent_grounded` は comment も検索します）。
 
-**残りの 25 ソースは `lookup` と `grounded` で同じ引き方をします。** 違いは、本文根拠の無い引用
+**残りの 28 ソースは `lookup` と `grounded` で同じ引き方をします。** 違いは、本文根拠の無い引用
 （`metadata_only`）を `grounded` がプロンプトに注入しないことだけです。
 
 ### 🔎 質問は日本語のまま、検索語だけ英語にする（`search_query`）
@@ -1980,6 +1981,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_DIAG_MAX_LINES` | 20000 | `freeagent_diagnose` が読むトレースの行数上限（末尾から。絞った件数は `notes` に出ます） |
 | `FREEAGENT_TRACE` / `FREEAGENT_STATS` / `FREEAGENT_COOLDOWN` | 1 | トレース・品質統計・クールダウンの記録 |
 | `FREEAGENT_DEBUG_LOG` | 空 | 指定パスへ stdio の送受信を 1 行ずつ追記（クライアント互換の切り分け用） |
+| `FREEAGENT_REDACT_SECRETS` | 1 | 上流へ送る前に既知の形の秘密（`sk-` / `ghp_` / `AKIA` / Bearer / JWT / 秘密鍵）を伏せる（0 で無効）。件数は返り値の `redactions` に出る（v0.35.0） |
 | `FREEAGENT_HERMES_BIN` | `hermes`（`which` で探索） | `freeagent_delegate` に使う実行ファイル |
 | `FREEAGENT_TRANSPORT` | `stdio` | `http` で HTTP モード（1 プロセス共有）。`--transport` が優先 |
 | `FREEAGENT_HTTP_HOST` / `FREEAGENT_HTTP_PORT` | `127.0.0.1` / `8765` | HTTP の待受（`--host` / `--port` が優先） |
@@ -2038,6 +2040,11 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_LIBRARIESIO_KEY` | 空 | Libraries.io の検索。利用者自身の API キーが必須 |
 | `FREEAGENT_QIITA_TOKEN` | 空 | Qiita の検索枠を 60 回/時 → 1,000 回/時に上げる（任意） |
 | `FREEAGENT_OPENREVIEW_INTERVAL` | 1.0 | OpenReview の最小呼び出し間隔（秒）。公表レートが無いので既定 1 req/s に自制する |
+| `FREEAGENT_NVD_API_KEY` | 空 | NVD の検索枠を 5 req/30s → 50 req/30s に上げる（任意。ヘッダ `apiKey`） |
+| `FREEAGENT_NVD_INTERVAL` | 6.0（キーあり 0.6） | NVD の最小呼び出し間隔（秒） |
+| `FREEAGENT_TERRAFORM_INTERVAL` | 1.0 | Terraform Registry の最小呼び出し間隔（秒。公表レートが無いので自制） |
+| `FREEAGENT_ZBMATH_INTERVAL` | 1.0 | zbMATH の最小呼び出し間隔（秒） |
+| `FREEAGENT_ZBMATH_ACK` | 未設定（無効） | zbMATH の利用規約への同意の申告。未設定なら HTTP を出さず案内を返す |
 
 **接続先の上書き（通常は触らない）**
 
@@ -2146,4 +2153,5 @@ python scripts/measure_kb.py --unschedule  # 登録したタスクを解除
 
 ## 📄 ライセンス
 
-MIT。データは各提供元（arXiv / Crossref / OpenAlex / Wikimedia / GitHub、明示指定の DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates.io / CiNii / OSV / IETF / INSPIRE-HEP / OEIS / Hugging Face / Hacker News / Software Heritage / Libraries.io / Internet Archive / Qiita / OpenReview / MDN Web Docs / DevDocs）の条件に従って利用し、回答には出典を表示してください。対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は対象外です。
+MIT。データは各提供元（arXiv / Crossref / OpenAlex / Wikimedia / GitHub、明示指定の DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates.io / CiNii / OSV / IETF / INSPIRE-HEP / OEIS / Hugging Face / Hacker News / Software Heritage / Libraries.io / Internet Archive / Qiita / OpenReview / MDN Web Docs / DevDocs / NVD / Terraform Registry /
+zbMATH）の条件に従って利用し、回答には出典を表示してください。対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は対象外です。

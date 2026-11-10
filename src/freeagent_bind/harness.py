@@ -94,7 +94,9 @@ def harness_message(info: dict) -> str:
              "動作しています。"]
     if _harness_backend_is_default():
         parts.append("既定の推論先 hermes proxy（127.0.0.1:8645）が無いと nous プロバイダは使えません"
-                     "（FREEAGENT_BASE_URL で変更可。OpenRouter / NVIDIA / Hugging Face / Groq / Cloudflare / Gemini はキーと必要なFree-tier確認があれば使えます）。")
+                     "（FREEAGENT_BASE_URL で変更可。nous 以外の " + str(len(S.PROVIDER_ORDER) - 1) +
+                     " 社（OpenRouter / NVIDIA / Hugging Face ほか・一覧は freeagent_models）は"
+                     "キーと必要な Free-tier 確認があれば使えます）。")
     parts.append("自発利用の設定（SOUL.md・tools.exclude・apply_proactive.py）は Hermes 専用です。")
     parts.append(f"この警告は {HARNESS_WARN_ENV}=0 で止められます。")
     return "".join(parts)

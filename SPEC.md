@@ -2208,6 +2208,34 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   負荷で子の起動が遅れると偽失敗になる型（子がまだ取っていない状態で親が試して二重取得に見える）が
   見えたので、子がロックを取った印（`held` の行）を待つ確定的な同期に替えた。
 
+### 6.44 監査修正: devdocs の doc 配線・schema 欠落・空応答会計・品質スコア（v0.40.3）
+
+監査（2026-11-11・traces 1,778 行と model_stats 37 モデルの実測）で見つかった 4 型を直した。
+
+- **devdocs の `doc` 引数が未配線だった**: `sources/devdocs.py` の backend は `opts.get("doc")` を読むが、
+  `knowledge_lookup` / `tool_lookup` / `tool_grounded` のどこにも `doc` が無く、README と description に
+  書かれた `doc="python~3.14"` 指定が捨てられて docs.json の一覧検索になっていた（実測で再現）。
+  3 経路に `doc` を通し、両ツールの schema に宣言した。
+- **ハンドラが読む引数が schema に無かった**: `consult.basis`（2 段査読・v0.33.0）、
+  `grounded.github_kind` / `grounded.exclude`、`agent.exclude`、`map.reduce_max_tokens` / `map.system`。
+  `tools/list` は **23,227 → 24,106 文字（+879）**、ツール数は 13 のまま。
+- **空応答の引き上げ再試行が例外を握り潰していた**: 再試行の 429・環境障害を「空応答（モデルの成績）」
+  に潰して observe_call に流していた（規約 21 違反）。再試行の失敗は種別をそのまま返し、環境障害は
+  打ち切る・429 はクールダウンへ記録する。空応答の本文には `finish_reason`（length 枯渇）と
+  再試行後の上限を添える。再試行失敗の文は「空応答」で始めない（classify_error が語を先に見るため、
+  429 を含む文を no_output に誤分類させる）。あわせて `_diag_advice` の空応答案内を実態
+  （既定の引き上げ 512→2048 でも空になるモデルがある）に合わせた。
+- **`_kind_quality` の失敗二重減点を撤去**: 成功比（分子が既に失敗を含まない）にさらに
+  `(1 - 失敗率)` を掛けていたため失敗率が 2 乗で効き、本番 stats で勝率 50% のモデルが
+  実質 1 勝 3 敗相当に沈んでいた（`zai/glm-4.5-flash`: ok=2/n=4 → _rank_score 0.4328＜未観測 0.5722）。
+  追加減点はハード失敗だけに留め、空応答（本番失敗の 80.4%＝438/545 件）は 1 回の減点にした。
+- **説明文の不整合**: `deliberation` の誤記 `ask_*`（実名は `ask-*`・規約 23）を 2 箇所、
+  `grounded` の `sources` 説明の「question は英語の語」（`search_query` の誤り）3 箇所と
+  中国語語彙「故事的リンク投稿」を修正。`harness` の案内文のプロバイダ列挙を 6 社固定から
+  実装参照（`PROVIDER_ORDER`）に変えた。
+
+回帰は `tests/test_fix_v0403.py`（14 件）。
+
 ## 12. 検証
 
 ```bash

@@ -1,10 +1,11 @@
 # AGENTS.md — hermes-freeagent-bind
 
 Hermes Agent の **Free モデルをサブ LLM として並列に走らせる** MCP サーバー（Python 3.11+ / 実行時依存ゼロ /
-モジュラーモノリス＝本体 1 ファイル＋`sources/` パッケージ）。メイン LLM の知識補助として **arXiv / Crossref / OpenAlex / Wikipedia /
-Wikidata / GitHub** を既定で引き、**DataCite / OpenAIRE / Zenodo / ROR / DOAJ / npm / crates / CiNii /
-OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage / Libraries.io /
-Internet Archive / Qiita** は
+モジュラーモノリス＝本体 1 ファイル＋`sources/`・`providers/` パッケージ＋分割モジュール
+（`transport_http.py` / `resources.py` / `harness.py` / `jsonutil.py`・v0.40.0））。メイン LLM の知識補助として
+**arXiv / Crossref / OpenAlex / Wikipedia / Wikidata / GitHub** を既定で引き、**DataCite / OpenAIRE / Zenodo /
+ROR / DOAJ / npm / crates / CiNii / OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage /
+Libraries.io / Internet Archive / Qiita / OpenReview / MDN / DevDocs / NVD / Terraform Registry / zbMATH** は
 明示指定で追加する。**対象は科学（物理・数学・計算機）とプログラミングまでで、医学・生物学は対象外**。
 
 - 全体像は `README.md`、**実装の契約は `SPEC.md`**（変更時は両方を同一変更内で更新する）。
