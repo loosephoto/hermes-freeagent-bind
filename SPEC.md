@@ -2266,6 +2266,21 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
 実測: `tools/list` は **24,106 → 24,520 文字（+414）**、ツール数は 13 のまま。
 回帰は `tests/test_improve_v0410.py`（12 件）。
 
+### 6.46 表示の切り出し（`rendering.py`・v0.42.0）
+
+§8 の `_render_*` 本体（13 関数＋ `_dropped_lines` ＋ `_render_body`）を `rendering.py` へ機械的に
+切り出した（`references/module-split.md` の型）。**`render` と `_RENDERERS` はテストが差し替える名前
+なので server.py に残し**、移動先からは `S.render` / `S._RENDERERS` で参照させる
+（共有ヘルパー `as_str` / `truncate` / `_dumps` ほかも `S.` 経由）。
+server.py 側は `globals().update(rendering.EXPORTS)` で旧名の互換を保つ
+（テストは `server._render_body` 等を直接参照するため）。`python server.py` / `runpy.run_path`
+の直接実行は変わらない（互換シムが `main()` を渡す）。
+
+**golden baseline**: 切り出し前後で `render(name, data)` を 13 ツール × 3 形（空 dict・エラー・
+代表キー入り）＝39 サンプルで**バイト一致**（規約 75 の「空 dict でも落ちない」も含む）。
+検証: unittest 1,253 件 OK / smoke_stdio・smoke_http・check_offline・直接実行の initialize /
+tools/list。`tools/list` は **24,520 文字のまま**（ツール定義に触れていない）。
+
 ## 12. 検証
 
 ```bash

@@ -827,6 +827,7 @@ v0.39.0 は第12段階の 3 ソース（nvd / terraform / zbmath）を `sources`
 v0.40.1 は `freeagent_lookup` の本文列挙に 7 ソース（openreview / cinii / terraform / nvd / zbmath / mdn / devdocs）を足して **23,227 文字（+117・+0.5%）**（ツール数は 13 のまま）。
 v0.40.3 は監査修正（devdocs の `doc` 配線・ハンドラ引数の schema 追加）で **24,106 文字（+879）**（ツール数は 13 のまま）。
 v0.41.0 は改良（遅延カタログ先頭の凝縮・`FREEAGENT_RANK_KIND_BIAS`（既定 off）・空応答再試行の精緻化・記録のローテーション）で **24,520 文字（+414）**（ツール数は 13 のまま）。
+v0.42.0 は表示（`_render_*` 本体）を `rendering.py` へ切り出した（**ツール定義に触れない**ので 24,520 文字のまま。切り出し前後で `render` の出力 39 サンプルがバイト一致）。
 以下は新しい順の内訳です。
 
 **v0.39.0（第12段階：NVD / Terraform Registry / zbMATH を追加）**: 25 の候補 API とホスト 20 件の
