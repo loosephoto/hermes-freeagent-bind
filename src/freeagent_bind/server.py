@@ -94,7 +94,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.40.3"
+SERVER_VERSION = "0.41.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -1145,6 +1145,34 @@ def _rank_latency_key(ref: str) -> float:
 # 選びたい場面（`map` のように件数が多い呼び出し）では順位が遅いモデルに固定され得る。
 # **既定を静かに変えない**ため、重み 0 では `_rank_score` の値を 1 ミリも変えない（`_latency_penalty`
 # が厳密に 0.0 を返す）＝オフの並びは v0.26.0 と同一。
+# **kind 別の品質バイアス（既定 off**・v0.41.0）。本番 traces の実測では失敗の 80.4% が空応答で、
+# その多くは「短答の kind（eval 等）で好成績の思考モデルが、長答の kind（consult 700〜800 tokens）
+# でも上位選抜され続ける」型だった。on にすると、**同じ kind の観測**の失敗率（空応答・ハード失敗）
+# を選抜順位から引く（他 kind の成績は参照しない＝短答での実績で長答を選ばない）。off では
+# `_rank_score` の値を 1 ミリも変えない（v0.27.0 の遅延項と同じ「既定 off」の型）。
+RANK_KIND_BIAS = _env_on("FREEAGENT_RANK_KIND_BIAS", False)
+_KIND_BIAS_MIN_CALLS = 3
+_KIND_BIAS_CAP = 0.30
+
+
+def _kind_bias(ref: str, kind: str) -> float:
+    """同じ kind の失敗率から引くペナルティ（0〜`_KIND_BIAS_CAP`。未観測は 0）。"""
+    if not RANK_KIND_BIAS or not kind:
+        return 0.0
+    _ensure_stats_loaded()
+    row = ((_STATS["models"].get(ref) or {}).get("kinds") or {}).get(kind)
+    if not isinstance(row, dict):
+        return 0.0
+    n = as_float(row.get("n"), 0.0)
+    if n < _KIND_BIAS_MIN_CALLS:
+        return 0.0
+    err = row.get("err") or {}
+    soft = as_float(err.get("no_output"), 0.0) if isinstance(err, dict) else 0.0
+    hard = (sum(as_float(v, 0.0) for k, v in err.items() if k != "no_output")
+            if isinstance(err, dict) else 0.0)
+    return round(min(_KIND_BIAS_CAP, 0.3 * soft / n + 0.5 * hard / n), 4)
+
+
 RANK_LATENCY_W = max(0.0, min(1.0, _env_float("FREEAGENT_RANK_LATENCY", 0.0)))
 RANK_LATENCY_FULL_S = max(1.0, _env_float("FREEAGENT_RANK_LATENCY_FULL_S", 20.0))
 
@@ -1350,7 +1378,7 @@ def _tier_order(refs: list[str], tier: str) -> list[str]:
     return list(refs)
 
 
-def _order_for_selection(refs: list[str]) -> list[str]:
+def _order_for_selection(refs: list[str], kind: str | None = None) -> list[str]:
     """自動選抜の並び順を strategy ごとに決める（`diverse_order` は呼び出し側で共通）。"""
     strategy = selection_strategy()
     if strategy == "catalog":
@@ -1366,6 +1394,10 @@ def _order_for_selection(refs: list[str]) -> list[str]:
         base = sorted(refs, key=busy_key)
     else:
         base = rank_models(refs)
+        if kind and RANK_KIND_BIAS:
+            # **kind 別バイアス**: 同じ kind の失敗率を引いて並べ替える（既定 off では通らない）。
+            base = sorted(refs, key=lambda r: (-(_rank_score(r) - _kind_bias(r, kind)),
+                                               _rank_latency_key(r), r))
     # §3.7 タスク分類カスケード。**層が選ばれていない（off）ときは 1 ミリも並べ替えない**。
     tier = forced_tier() or current_tier()
     return _tier_order(base, tier) if tier in ROUTING_TIERS else base
@@ -1396,7 +1428,8 @@ def _is_model_excluded(ref: str, excluded: set[str]) -> bool:
 
 def select_models(size: int, requested: list[str] | None = None, *,
                   prefer: list[str] | None = None, exclude: list[str] | None = None,
-                  free_only: bool = True, identity_exclude: list[str] | None = None) -> tuple[list[str], dict]:
+                  free_only: bool = True, identity_exclude: list[str] | None = None,
+                  kind: str | None = None) -> tuple[list[str], dict]:
     """参加モデルを決める。明示 > prefer > 品質統計 の順に効かせる（選んだ根拠を返す）。"""
     all_exclude = list(dict.fromkeys(as_str_list(exclude) + env_excluded_models()))
     ex_set = set(all_exclude)
@@ -1458,7 +1491,7 @@ def select_models(size: int, requested: list[str] | None = None, *,
         need = size - len(chosen)
         picked = []
         seen = {_model_identity(ref) for ref in chosen}
-        for candidate in diverse_order(_order_for_selection(ready)):
+        for candidate in diverse_order(_order_for_selection(ready, kind)):
             identity = _model_identity(candidate)
             if identity not in seen:
                 picked.append(candidate)
@@ -3843,7 +3876,13 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
             # 予算を使い切った可能性が高いので、予算を上げて 1 回だけ同じ候補で引き上げる。
             retry_note = ""
             bumped = max_tokens
-            if max_tokens < _EMPTY_RETRY_CAP:
+            # **引き上げ再試行は「length 枯渇（または不明）」のときだけ**（v0.41.0）。
+            # finish_reason が stop / content_filter 等の確定値で本文が空のとき、予算を増やしても
+            # 空のままだった（本番 traces 実測: 失敗の大半がこの型で、再試行 1 回ぶんの待ちと
+            # 枠を無駄にしていた）。枯渇が疑えるとき（truncated / length / 不明）だけ上げる。
+            _finish = as_str(result.get("finish_reason")) if isinstance(result, dict) else ""
+            _length_starved = bool(result.get("truncated")) or _finish in ("", "length")
+            if max_tokens < _EMPTY_RETRY_CAP and _length_starved:
                 bumped = min(max(max_tokens * 3, _EMPTY_TOKEN_FLOOR), _EMPTY_RETRY_CAP)
                 try:
                     retry, retry_wait = _gated_call_once(c_provider, c_model, prompt, system,
@@ -6178,7 +6217,7 @@ def _expand_models(names: list[str]) -> tuple[list[str], bool]:
     return out[:MAX_MODELS_PER_CALL], len(out) > MAX_MODELS_PER_CALL
 
 
-def _select_or_error(args: dict, default_size: int = 3) -> tuple[list[str], dict]:
+def _select_or_error(args: dict, default_size: int = 3, kind: str | None = None) -> tuple[list[str], dict]:
     """`models`（`all` 展開つき）→ `prefer` → 品質統計の順に参加モデルを決める。"""
     requested, cut = _expand_models(as_str_list(args.get("models")))
     size = as_int(args.get("size"), default_size, 1, MAX_SUB_MODELS)
@@ -6186,7 +6225,7 @@ def _select_or_error(args: dict, default_size: int = 3) -> tuple[list[str], dict
         size = max(size, len(requested))     # 明示指定は size で切り落とさない
     refs, info = select_models(size, requested or None,
                                prefer=as_str_list(args.get("prefer")) or None,
-                               exclude=as_str_list(args.get("exclude")) or None)
+                               exclude=as_str_list(args.get("exclude")) or None, kind=kind)
     if cut:
         info.setdefault("notes", []).append(
             f"models は上限 {MAX_MODELS_PER_CALL} 件で切りました（FREEAGENT_MAX_MODELS_PER_CALL）")
@@ -6427,7 +6466,7 @@ def tool_fanout(args: dict) -> dict:
                           "（FREEAGENT_MAX_MODELS_PER_CALL）"] if cut else []}
     else:
         size = as_int(args.get("size"), 2, 1, MAX_SUB_MODELS)
-        refs, info = select_models(size, None)
+        refs, info = select_models(size, None, kind="fanout")
     if not refs:
         return _no_models()
     system = as_str(args.get("system"))
@@ -6575,7 +6614,7 @@ def tool_panel(args: dict) -> dict:
     question = as_str(args.get("question") or args.get("prompt"))
     if not question:
         return {"error": "question は必須です"}
-    refs, info = _select_or_error(args, default_size=3)
+    refs, info = _select_or_error(args, default_size=3, kind="panel")
     if not refs:
         return _no_models()
     results = ask_many(refs, question, system=as_str(args.get("system")) or CONSULT_SYSTEM,
@@ -6716,7 +6755,7 @@ def tool_grounded(args: dict) -> dict:
     # **根拠 0 件・本文なしで早期に返す経路では選抜を走らせない**（提供元へ無駄な一覧要求を出さない）。
     # モデル選抜を知識取得と重ねる案は実測で採らなかった: 一覧がディスクキャッシュ（§3.3）で温まる
     # ため、重ねて縮むのは初回だけの 0.3 秒で、早期返却の契約を壊すほうが損。
-    refs, info = _select_or_error(args, default_size=2)
+    refs, info = _select_or_error(args, default_size=2, kind="grounded")
     if not refs:
         return _no_models()
     prompt = (
@@ -6771,7 +6810,7 @@ def tool_map(args: dict) -> dict:
     model = as_str(args.get("model"))
     selection = {"requested": True, "models": [model]} if model else {}
     if not model:
-        selected, selection = select_models(1)
+        selected, selection = select_models(1, kind="map")
         model = selected[0] if selected else ""
     if not model:
         return _no_models()
@@ -6903,9 +6942,9 @@ def tool_consult(args: dict) -> dict:
         refs = saved_refs if mode == "review" and draft and basis else [m for m in saved_refs if not is_cooling(m)]
         info = {"requested": True, "resumed_from": sid, "models": refs}
         if not refs:
-            refs, info = _select_or_error(args, default_size=3)
+            refs, info = _select_or_error(args, default_size=3, kind="consult")
     else:
-        refs, info = _select_or_error(args, default_size=3)
+        refs, info = _select_or_error(args, default_size=3, kind="consult")
     if not refs:
         return _no_models()
 
@@ -7232,7 +7271,7 @@ def tool_agent(args: dict) -> dict:
     task = as_str(args.get("task") or args.get("prompt"))
     if not task:
         return {"error": "task は必須です"}
-    refs, info = _select_or_error(args, default_size=2)
+    refs, info = _select_or_error(args, default_size=2, kind="agent")
     if not refs:
         return _no_models()
     max_steps = as_int(args.get("max_steps"), 2, 1, 4)
@@ -8328,16 +8367,29 @@ def _admit_key(row: dict) -> str:
     return "|".join([as_str(row.get("source")).strip(), as_str(row.get("thread")).strip(), trigger])
 
 
+_ADMIT_MAX_BYTES = _env_int("FREEAGENT_ADMIT_MAX_BYTES", 5_000_000)
+
+
 def _admit_load(limit: int = ADMIT_LOG_READ_MAX) -> list[dict]:
-    """追記ログを読む（新しい方から `limit` 行）。壊れた行は黙って飛ばす。"""
+    """追記ログを読む（新しい方から `limit` 行）。壊れた行は黙って飛ばす。
+
+    **末尾だけをメモリに載せる**（v0.41.0。旧実装は `readlines()` で全行展開した）。
+    ローテーション（`.1`）があるときは古い側の末尾もつなげて `limit` 行に絞る。
+    """
     path = _admit_log_path()
     if not os.path.exists(path):
         return []
+    lines: list[str] = []
+    rotated = path + ".1"
     try:
+        if os.path.exists(rotated):
+            with open(rotated, encoding="utf-8") as fh:
+                lines.extend(fh.readlines()[-limit:])
         with open(path, encoding="utf-8") as fh:
-            lines = fh.readlines()[-limit:]
+            lines.extend(fh.readlines()[-limit:])
     except OSError:
         return []
+    lines = lines[-limit:]
     rows = []
     for line in lines:
         try:
@@ -8350,12 +8402,21 @@ def _admit_load(limit: int = ADMIT_LOG_READ_MAX) -> list[dict]:
 
 
 def _admit_append(rows: list[dict]) -> None:
-    """追記する（プロセスの外とも直列化する。既存の台帳と同じ型）。"""
+    """追記する（プロセスの外とも直列化する。既存の台帳と同じ型）。
+
+    サイズ上限（`FREEAGENT_ADMIT_MAX_BYTES`・既定 5MB）を超えたら `traces.jsonl` と同じ型で
+    `.1` へ退避する（traces のローテーションと同じく、追記専用ログを無限に育てない）。
+    """
     if not rows:
         return
     path = _admit_log_path()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with _file_lock(path):
+        try:
+            if os.path.getsize(path) > _ADMIT_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
         with open(path, "a", encoding="utf-8") as fh:
             for row in rows:
                 fh.write(_dumps(row) + "\n")
@@ -8620,6 +8681,8 @@ TOOLS: list[dict] = [
                             "description": f"依頼文の配列（最大 {MAX_PROMPTS_PER_CALL} 件。"
                                            f"超過分は切り捨て、件数を `prompts_dropped` で返します）"},
                 "prompt": {"type": "string", "description": "単一の依頼文（prompts の代わり）"},
+                "items": {"type": "array", "items": {"type": "string"},
+                          "description": "prompts の別名"},
                 "models": {"type": "array", "items": {"type": "string"},
                            "description": "明示するモデル（provider/model）。[\"all\"] を渡すと在庫の"
                                           "全 Free（対話モデルのみ）へ展開する（上限は "
@@ -8650,6 +8713,8 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "question": {"type": "string"},
+                "prompt": {"type": "string", "description": "question の別名"},
+                "system": {"type": "string", "description": "各参加モデルへ渡すシステム指示"},
                 "models": {"type": "array", "items": {"type": "string"},
                            "description": "明示するモデル（provider/model）。[\"all\"] を渡すと在庫の"
                                           "全 Free（対話モデルのみ）へ展開する。"
@@ -8690,6 +8755,8 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
+                "q": {"type": "string", "description": "query の別名"},
+                "topic": {"type": "string", "description": "query の別名"},
                 "sources": {"type": "array", "items": {"type": "string"},
                             "description": "既定6ソース: wikipedia / wikidata / arxiv（**英文の語で指定**。日本語クエリは0件） / crossref / openalex / github。追加は明示指定: datacite / openaire / zenodo / ror / doaj / npm / crates / cinii（利用者自身の appid を FREEAGENT_CINII_APPID に設定した場合のみ動く。書誌のみ）/ librariesio（19+ 登録簿の横断検索。利用者自身のキーを FREEAGENT_LIBRARIESIO_KEY に設定した場合のみ動く）/ osv（脆弱性。パッケージ名か CVE-/GHSA- 等のID）/ ietf（RFC・Internet-Draft。RFC番号か1語のタイトル一致）/ inspirehep / oeis / hfhub / hn（Hacker News の投稿・議論。帰属表示）/ swh（Software Heritage のリポジトリ検索）/ ia（Internet Archive のアイテム検索。**query は英語の語**で指定する。日本語クエリは IA 側が拒否する。歴史的な計算機資料・マニュアル・書籍が対象で、summary は目録の注記であり抄録ではない）／qiita（Qiita の日本語技術記事。検索構文 tag:Python user:foo created:>2026-01-01。**未認証は 60 回/時**で別の問いは 1 分待ち、FREEAGENT_QIITA_TOKEN を設定すると 1,000 回/時）／openreview（OpenReview の会議論文。**query は英語の語**で指定する。日本語クエリは 0 件。venue に採択・スポットライト・撤回・Desk Reject が出るので、撤回済みを根拠に使う前に確認できる）／mdn（MDN Web Docs の Web 技術ドキュメント。**帰属表示が必須**（Mozilla contributors, CC-BY-SA 2.5）。lang でロケール指定可、内容は HTML/CSS/JS/Web API に限る）／devdocs（DevDocs の docset 索引。doc で docset slug を指定（例: `python~3.14`）。**索引だけで本文は取得しない**＝`metadata_only`）。／nvd（NIST 脆弱性 DB。**query は英語の語**で指定する。osv が ID・パッケージ名しか受けないのに対し**キーワードで CVE を引ける**。説明文と CVSS が付く。無認証 5 req/30s＝既定 6 秒間隔、FREEAGENT_NVD_API_KEY で 0.6 秒）／terraform（Terraform Registry のモジュール検索。説明は公開者の自己申告）／zbmath（数学の書誌・MSC 分類・レビュー。**抄録は返らない**ので metadata_only が主。英語の語が必須で、規約同意として FREEAGENT_ZBMATH_ACK=1 が必要）。対象は科学とプログラミングまでで医学・生物学は含まない"},
                 "doc": {"type": "string",
@@ -8718,6 +8785,7 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "question": {"type": "string"},
+                "prompt": {"type": "string", "description": "question の別名"},
                 "search_query": {"type": "string",
                                  "description": "根拠を引くときの**検索語**。日本語の質問のまま arXiv / "
                                                 "Crossref / openalex / ia を引くと 0 件になりやすいので、"
@@ -8760,6 +8828,8 @@ TOOLS: list[dict] = [
                 "items": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_MAP_ITEMS,
                           "description": f"処理する要素の配列（最大 {MAX_MAP_ITEMS} 件。"
                                          f"超過分は実行せず、件数を `items_dropped` で返します）"},
+                "prompts": {"type": "array", "items": {"type": "string"},
+                            "description": "items の別名"},
                 "instruction": {"type": "string", "description": "各要素へ適用する指示"},
                 "model": {"type": "string"},
                 "reduce": {"type": "boolean", "description": "true なら全出力を統合する"},
@@ -8910,6 +8980,7 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "task": {"type": "string"},
+                "prompt": {"type": "string", "description": "task の別名"},
                 "models": {"type": "array", "items": {"type": "string"}},
                 "size": {"type": "integer", "description": "サブエージェント数（既定 2）"},
                 "max_steps": {"type": "integer", "description": "1体あたりのツール呼び出し上限（既定 2）"},
@@ -9046,23 +9117,15 @@ def _diag_norm(message) -> str:
     return truncate(text, 120)
 
 
-def _diag_rows(since: float) -> tuple[list[dict], dict]:
-    """traces を読む。壊れた行は数えて飛ばす（全体を失わない）。"""
-    path = trace_path()
-    info = {"path": path, "exists": os.path.exists(path), "lines": 0,
-            "capped": 0, "unreadable": 0, "error": ""}
-    if not info["exists"]:
-        return [], info
+def _diag_read_file(path: str, since: float, info: dict) -> list[dict]:
+    """traces 1 ファイルぶんを読む（壊れた行は数えて飛ばす）。"""
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             raw = [line for line in fh if line.strip()]
     except OSError as exc:
         info["error"] = f"{type(exc).__name__}: {exc}"
-        return [], info
-    info["lines"] = len(raw)
-    if len(raw) > DIAG_MAX_LINES:
-        info["capped"] = len(raw) - DIAG_MAX_LINES
-        raw = raw[-DIAG_MAX_LINES:]
+        return []
+    info["lines"] = info.get("lines", 0) + len(raw)
     rows: list[dict] = []
     for line in raw:
         try:
@@ -9077,6 +9140,30 @@ def _diag_rows(since: float) -> tuple[list[dict], dict]:
         if ts and ts < since:
             continue
         rows.append(row)
+    return rows
+
+
+def _diag_rows(since: float) -> tuple[list[dict], dict]:
+    """traces を読む。壊れた行は数えて飛ばす（全体を失わない）。
+
+    **ローテーション直後も窓を覆う**（v0.41.0）: `traces.jsonl` は 5MB 超で `.1` に退避するが、
+    旧実装は main しか読まず、退避の直後に `freeagent_diagnose(days=7)` の窓が突然空になった。
+    `.1` も読んで（こちらが古い）、main とつなげてから上限で末尾に絞る。
+    """
+    path = trace_path()
+    info = {"path": path, "exists": os.path.exists(path), "lines": 0,
+            "capped": 0, "unreadable": 0, "error": ""}
+    if not info["exists"]:
+        return [], info
+    rows = _diag_read_file(path, since, info)
+    rotated = path + ".1"
+    if os.path.exists(rotated):
+        info["rotated_file"] = rotated
+        old_rows = _diag_read_file(rotated, since, info)
+        rows = old_rows + rows
+    if len(rows) > DIAG_MAX_LINES:
+        info["capped"] = len(rows) - DIAG_MAX_LINES
+        rows = rows[-DIAG_MAX_LINES:]
     return rows, info
 
 
@@ -9346,6 +9433,32 @@ _PARALLEL_TOOLS = {"freeagent_models", "freeagent_ask", "freeagent_fanout", "fre
                    "freeagent_think"}
 
 
+_CJK_HEAD_RE = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
+
+
+def _dense_head(text: str, limit: int = 140) -> str:
+    """**頭 `limit` 字だけ**和文に隣接する ASCII 空白を落とす（遅延カタログの切り詰め対策）。
+
+    Hermes はツール一覧（遅延カタログ）の説明を**先頭 100 字前後で切る**（実測 2026-11-11:
+    `【常用】2 段…` のように空白の直後で切れ、用途と競合名が一覧から読めない）。
+    切れる領域だけ「2 段」→「2段」「Hermes 本体」→「Hermes本体」のように詰めると、
+    同じ文字数で多くの語が見える。`limit` の外は従来どおり（README と同じ表記）。
+    """
+    if len(text) <= limit:
+        head, tail = text, ""
+    else:
+        head, tail = text[:limit], text[limit:]
+    out: list[str] = []
+    for i, ch in enumerate(head):
+        if ch == " ":
+            prev = out[-1] if out else ""
+            nxt = head[i + 1] if i + 1 < len(head) else (tail[:1] or "")
+            if _CJK_HEAD_RE.match(prev or "") or _CJK_HEAD_RE.match(nxt or ""):
+                continue
+        out.append(ch)
+    return "".join(out) + tail
+
+
 def _desc_assemble(base: str, name: str) -> str:
     """description を【使う条件】【使わない条件】【競合より優先】…の順に組み立てる。
 
@@ -9367,7 +9480,16 @@ def _desc_assemble(base: str, name: str) -> str:
     if name in _PARALLEL_TOOLS:
         parts.append(_DESC_PARALLEL)
     parts.append(_DESC_FALLBACK)
-    return "".join(parts)
+    # 頭 140 字を凝縮する（遅延カタログの切り詰めで用途が読めなくなる対策・v0.41.0）。
+    # 圧縮で後ろの語が前に滑るので、**不動点まで繰り返す**（1 回だと、もと 140 字の外にあった
+    # 空白が 140 字以内に滑り込んで残ることがある＝fanout の「panel。」で実測）。
+    out = "".join(parts)
+    for _ in range(3):
+        collapsed = _dense_head(out, 140)
+        if collapsed == out:
+            break
+        out = collapsed
+    return out
 
 
 for _tool in TOOLS:

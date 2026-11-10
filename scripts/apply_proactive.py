@@ -87,6 +87,11 @@ SNIPPET = (
     "**freeagent-bind が無効・不通のときは、存在しないツールを探さず delegate_task / web_search / "
     "web_extract で回答を完遂し、実際に応答した独立ソースの件数を明記する**"
     "（1 件で「複数視点で検討した」と書かない）。"
+    "**freeagent_* は Hermes の遅延カタログに載る（一覧の説明は先頭 100 字ほどで切れて見える）。"
+    "一覧に見えないから使えない、とはしない**: 必要になったら tool_search(\"freeagent …\") で "
+    "mcp__freeagent_bind__freeagent_think / freeagent_panel / freeagent_consult / freeagent_lookup / "
+    "freeagent_grounded を探し、tool_describe で引数を確認してから tool_call する"
+    "（tool_call は配列 arguments に文字列のリスト・真偽は bool で渡す）。"
 )
 
 MARKER = "<!-- freeagent-bind: proactive-usage -->"

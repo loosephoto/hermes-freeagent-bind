@@ -826,6 +826,7 @@ v0.38.0 は診断に `run`（呼び出し単位）を足して **22,463 文字�
 v0.39.0 は第12段階の 3 ソース（nvd / terraform / zbmath）を `sources` の説明に足して **23,110 文字（+647・+2.9%）**（ツール数は 13 のまま）。
 v0.40.1 は `freeagent_lookup` の本文列挙に 7 ソース（openreview / cinii / terraform / nvd / zbmath / mdn / devdocs）を足して **23,227 文字（+117・+0.5%）**（ツール数は 13 のまま）。
 v0.40.3 は監査修正（devdocs の `doc` 配線・ハンドラ引数の schema 追加）で **24,106 文字（+879）**（ツール数は 13 のまま）。
+v0.41.0 は改良（遅延カタログ先頭の凝縮・`FREEAGENT_RANK_KIND_BIAS`（既定 off）・空応答再試行の精緻化・記録のローテーション）で **24,520 文字（+414）**（ツール数は 13 のまま）。
 以下は新しい順の内訳です。
 
 **v0.39.0（第12段階：NVD / Terraform Registry / zbMATH を追加）**: 25 の候補 API とホスト 20 件の
@@ -1943,6 +1944,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |
 | `FREEAGENT_SELECT_STRATEGY` | `quality` | 自動選抜の**並べ方**（`quality` / `catalog` / `least_busy`）。プロバイダ巡回の多様性は全 strategy 共通。`least_busy` は提供元の実行中本数が少ない順 |
 | `FREEAGENT_RANK_LATENCY` / `FREEAGENT_RANK_LATENCY_FULL_S` | 0 / 20.0 | **既定 off**（0 で従来どおり）。0〜1 の重みを入れると、平均所要が `FULL_S` 秒に達したモデルの品質点からその重みぶんを引く（比例・頭打ちあり）。**実測では改善しなかった**（off 24/24・5.38 秒/件 対 on 22/24・6.75 秒/件・n=24）ので既定 off のままを推奨（SPEC §6.25） |
+| `FREEAGENT_RANK_KIND_BIAS` | 0 | `1` で**種別（kind）ごとの品質バイアス**を自動選抜に入れる（同じ kind の空応答・ハード失敗率を選抜順位から引く。他 kind の成績は参照しない）。実測では失敗の大半が空応答で、短答の kind で好成績の思考モデルが長答の kind でも選ばれ続けていた。**既定 off で従来と同一の並び** |
 | `FREEAGENT_REFINE_BAND` | 0.05 | `panel(refine)` の**統合役**を、品質点が先頭からこの差以内の帯の中で**最も速い**モデルにする（0 で品質順の先頭に戻る）。refine 段は panel の壁の 35〜63% を占めるので効く（SPEC §6.26） |
 | `FREEAGENT_ROUTING` | `off` | `auto` で**タスク分類カスケード**（light / long / reason の層で並べ方を変える）。off は従来と同一 |
 | `FREEAGENT_ROUTING_TIER` | 空 | 測定用に層を強制（`light` / `long` / `reason`）。`measure_quality.py` と組み合わせて A/B する |
@@ -1962,8 +1964,8 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_ALLOW_AGENT` | 0 | `freeagent_delegate`（Hermes 本体の起動）を許可 |
 | `FREEAGENT_ARXIV_INTERVAL` | 3.0 | arXiv の最小呼び出し間隔（秒） |
 | `FREEAGENT_CINII_APPID` | 空 | CiNii Research のアプリケーションID（**利用者自身が取得**）。未設定なら cinii は HTTP を出さず案内を返す（SPEC §6.7） |
-| `FREEAGENT_EVIDENCE_ITEM_CHARS` / `_TOTAL_CHARS` | 360 / 3200 | 根拠本文をサブLLMへ注入する 1 件あたり・全体の上限（0 で本文を入れない） |
-| `FREEAGENT_EMPTY_TOKEN_FLOOR` / `_CAP` | 512 / 2048 | 空応答時の予算引き上げ幅 |
+| `FREEAGENT_EVIDENCE_ITEM_CHARS` / `FREEAGENT_EVIDENCE_TOTAL_CHARS` | 360 / 3200 | 根拠本文をサブLLMへ注入する 1 件あたり・全体の上限（0 で本文を入れない） |
+| `FREEAGENT_EMPTY_TOKEN_FLOOR` / `FREEAGENT_EMPTY_TOKEN_CAP` | 512 / 2048 | 空応答時の予算引き上げ幅（**引き上げ再試行は `finish_reason=length`（思考枯渇）か不明のときだけ**行う。stop 等で空だった場合は再試行せず次の候補へ回す） |
 | `FREEAGENT_USER_AGENT` | `hermes-freeagent-bind/0.1 (+…/hermes-freeagent-bind)` | 知識 API に名乗る UA（連絡先入りが望ましい。crates.io は識別可能な UA が必須） |
 | `FREEAGENT_CONNECT_TIMEOUT` / `FREEAGENT_READ_TIMEOUT` | 10.0 / 180.0 | 外部 HTTP の (connect, read) タイムアウト（秒） |
 | `FREEAGENT_KB_TTL` / `FREEAGENT_KB_TIMEOUT` | 1800.0 / 20.0 | 知識取得のキャッシュ TTL・読み取りタイムアウト（秒） |
@@ -1978,6 +1980,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_SESSION_MAX` | 32 | 相談セッションの保持数上限 |
 | `FREEAGENT_STATS_HALFLIFE_DAYS` | 14.0 | 品質統計の減衰半減期（日） |
 | `FREEAGENT_TRACE_MAX_BYTES` | 5000000 | トレースファイルの最大サイズ（バイト） |
+| `FREEAGENT_ADMIT_MAX_BYTES` | 5000000 | 受付ログ（`admission.jsonl`）の最大サイズ（バイト）。超過で `.1` へ退避（traces と同じ型） |
 | `FREEAGENT_DIAG_MAX_LINES` | 20000 | `freeagent_diagnose` が読むトレースの行数上限（末尾から。絞った件数は `notes` に出ます） |
 | `FREEAGENT_TRACE` / `FREEAGENT_STATS` / `FREEAGENT_COOLDOWN` | 1 | トレース・品質統計・クールダウンの記録 |
 | `FREEAGENT_DEBUG_LOG` | 空 | 指定パスへ stdio の送受信を 1 行ずつ追記（クライアント互換の切り分け用） |
