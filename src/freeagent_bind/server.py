@@ -95,7 +95,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.42.0"
+SERVER_VERSION = "0.42.1"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -1583,7 +1583,15 @@ def trace_call(kind: str, ref: str, ok: bool, *, error: str = "", served_by: str
                rate_limited=None, unavailable=None, skipped_cooling=None,
                answer_len: int = 0, answer_sha1: str = "", truncated: bool = False,
                latency_s: float = 0.0, tokens: dict | None = None,
+               finish_reason: str = "", max_tokens: int | None = None, retries: int = 0,
                run: str = "", tool: str = "") -> None:
+    """1 呼び出しを traces に 1 行で残す。
+
+    **`finish_reason` / `max_tokens` / `retries` を残す**（v0.42.1）: 空応答の原因が
+    「思考トークンで予算を使い切った（length）」のか「そもそも stop で本文が空」なのかは
+    記録に無いと後から切り分けられない（実測: v0.42.0 までの traces は 438 件の空応答すべてで
+    tokens が空・finish_reason の列も無かった）。
+    """
     if not TRACE_ENABLED:
         return
     row = {"run": run or current_run(), "tool": tool or current_tool(),
@@ -1593,7 +1601,8 @@ def trace_call(kind: str, ref: str, ok: bool, *, error: str = "", served_by: str
            "unavailable": unavailable, "skipped_cooling": skipped_cooling,
            "answer_len": int(answer_len or 0), "answer_sha1": answer_sha1 or "",
            "truncated": bool(truncated), "latency_s": round(as_float(latency_s, 0.0), 3),
-           "tokens": tokens or {}, "ts": now_ts()}
+           "tokens": tokens or {}, "finish_reason": finish_reason or None,
+           "max_tokens": max_tokens, "retries": int(retries or 0), "ts": now_ts()}
     path = trace_path()
     try:
         with _STATE_LOCK, _file_lock(path):
@@ -1636,7 +1645,10 @@ def observe_call(result: dict, kind: str, text: str = "") -> None:
                answer_len=len(text or ""), answer_sha1=sha1_12(text or ""),
                truncated=bool(result.get("truncated")),
                latency_s=as_float(result.get("latency_s"), 0.0),
-               tokens=result.get("tokens") or {})
+               tokens=result.get("tokens") or {},
+               finish_reason=as_str(result.get("finish_reason")),
+               max_tokens=as_int(result.get("max_tokens"), 0, 0, 10 ** 9) or None,
+               retries=as_int(result.get("retries"), 0, 0, 100))
 
 
 # ---------------------------------------------------------------- §2.4 相談セッション
@@ -3613,6 +3625,7 @@ def _call_once(provider: str, model: str, prompt: str, system: str,
         usage = {}
     return {"text": text, "latency_s": round(latency, 3), "finish_reason": finish,
             "truncated": finish == "length", "redactions": redactions,
+            "max_tokens": max_tokens,
             "tokens": {"prompt": usage.get("prompt_tokens"), "completion": usage.get("completion_tokens")}}
 
 
@@ -3799,7 +3812,10 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
         if isinstance(result, dict):
             # 空応答でも finish_reason と消費 tokens は記録する（length 枯渇とそれ以外を区別する）。
             row.update({"truncated": bool(result.get("truncated")),
-                        "tokens": result.get("tokens") or {}})
+                        "tokens": result.get("tokens") or {},
+                        "finish_reason": as_str(result.get("finish_reason")),
+                        "max_tokens": as_int(result.get("max_tokens"), 0, 0, 10 ** 9) or None,
+                        "retries": as_int(result.get("retries"), 0, 0, 100)})
         observe_call(row, kind, "")
         last_observed_error = message
 
@@ -3923,7 +3939,11 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
                 last_error = (f"空応答（{cand}）。max_tokens={max_tokens}{tried} を思考トークンで"
                               f"使い切った可能性があります{why}。max_tokens を増やすか、"
                               "FREEAGENT_MODEL_EXCLUDE で外してください")
-                note_failure(cand, last_error, result)
+                # 失敗行にも **どの max_tokens で・何回目で** 空だったかを残す（v0.42.1）。
+                _fail_meta = dict(result) if isinstance(result, dict) else {}
+                _fail_meta.update({"max_tokens": bumped,
+                                   "retries": 1 if max_tokens < _EMPTY_RETRY_CAP else 0})
+                note_failure(cand, last_error, _fail_meta)
                 skipped.append(cand)
                 continue
 
@@ -9100,6 +9120,10 @@ TOOLS: list[dict] = [
 
 DIAG_MAX_LINES = _env_int("FREEAGENT_DIAG_MAX_LINES", 20000)
 DIAG_SLOW_MIN_CALLS = 3
+# **本番（ツール経由）とベンチ直呼びを混ぜない**（v0.42.1）。実測: 30 日の窓 1,780 行のうち
+# 1,741 行が `tool` も `run` も持たない（`scripts/measure_quality.py` などの eval/probe）で、
+# 本番は 39 行しかなかった。混ぜると「本番の失敗率」が測定用の連打に引っ張られる。
+DIAG_PROD_MIN = _env_int("FREEAGENT_DIAG_PROD_MIN", 10)
 
 
 def _diag_pct(values: list[float], p: float) -> float | None:
@@ -9250,6 +9274,33 @@ def tool_diagnose(args: dict) -> dict:
     for row in fail_rows:
         key = _row_error_class(row)
         by_class[key] = by_class.get(key, 0) + 1
+    # **チャネル分離**（v0.42.1）: `tool` / `run` を持つ行＝本番（MCP ツール経由）、
+    # 持たない行＝ベンチの直呼び（`scripts/measure_quality.py` 等の eval/probe）。
+    # 実測: 30 日の窓 1,780 行のうち本番は 39 行で、失敗率を混ぜると意味が変わった。
+    def _channel(row: dict) -> str:
+        return "tool" if (as_str(row.get("tool")) or as_str(row.get("run"))) else "bench"
+
+    by_channel: dict[str, dict] = {}
+    for row in rows:
+        slot = by_channel.setdefault(_channel(row), {"calls": 0, "ok": 0, "failed": 0,
+                                                     "by_error_class": {}})
+        slot["calls"] += 1
+        if row.get("ok"):
+            slot["ok"] += 1
+        else:
+            slot["failed"] += 1
+            key = _row_error_class(row)
+            slot["by_error_class"][key] = slot["by_error_class"].get(key, 0) + 1
+    for slot in by_channel.values():
+        slot["ok_rate"] = round(slot["ok"] / slot["calls"], 3) if slot["calls"] else None
+        slot["by_error_class"] = dict(sorted(slot["by_error_class"].items(),
+                                             key=lambda kv: (-kv[1], kv[0])))
+    # `finish_reason` の内訳（v0.42.1 から記録。古い行は数えない）。
+    by_finish: dict[str, int] = {}
+    for row in rows:
+        fr = as_str(row.get("finish_reason"))
+        if fr:
+            by_finish[fr] = by_finish.get(fr, 0) + 1
     by_kind: dict[str, dict] = {}
     for row in rows:
         key = as_str(row.get("kind")) or "unknown"
@@ -9327,7 +9378,34 @@ def tool_diagnose(args: dict) -> dict:
                        "model": as_str(row.get("ref")),
                        "error_class": _row_error_class(row),
                        "error": truncate(as_str(row.get("error")), 200)})
+    # advice の根拠にする行: 本番が `DIAG_PROD_MIN` 件以上あれば本番だけ
+    # （ベンチの連打で「本番の次の一手」が歪まないように）。足りなければ全体。
+    tool_rows = [row for row in rows if _channel(row) == "tool"]
+    advice_channel = "tool" if len(tool_rows) >= DIAG_PROD_MIN else "all"
+    advice_rows = tool_rows if advice_channel == "tool" else rows
+    a_ok = [row for row in advice_rows if row.get("ok")]
+    a_fail = [row for row in advice_rows if not row.get("ok")]
+    a_totals = {"calls": len(advice_rows), "ok": len(a_ok), "failed": len(a_fail),
+                "ok_rate": round(len(a_ok) / len(advice_rows), 3) if advice_rows else None}
+    a_class: dict[str, int] = {}
+    a_ref_fail: dict[str, int] = {}
+    for row in a_fail:
+        key = _row_error_class(row)
+        a_class[key] = a_class.get(key, 0) + 1
+        ref = as_str(row.get("served_by")) or as_str(row.get("ref"))
+        if ref:
+            a_ref_fail[ref] = a_ref_fail.get(ref, 0) + 1
+    advice = _diag_advice(a_totals, a_class, a_ref_fail, a_fail)
+
     notes = []
+    bench_calls = as_int((by_channel.get("bench") or {}).get("calls"), 0, 0, 10 ** 9)
+    if bench_calls:
+        tail = "（次の一手は本番だけを根拠にしています）" if advice_channel == "tool" else ""
+        notes.append(f"ベンチ直呼び（tool / run を持たない行）が {bench_calls} 件あります。"
+                     f"内訳は totals_by_channel で分けています{tail}")
+    length_rows = as_int(by_finish.get("length"), 0, 0, 10 ** 9)
+    if length_rows:
+        notes.append(f"finish_reason=length が {length_rows} 件（思考トークンで予算を使い切った型）")
     if info["capped"]:
         notes.append(f"古い {info['capped']} 行は読みませんでした（FREEAGENT_DIAG_MAX_LINES={DIAG_MAX_LINES}）")
     if info["unreadable"]:
@@ -9336,8 +9414,11 @@ def tool_diagnose(args: dict) -> dict:
         notes.append(f"traces を読めませんでした: {info['error']}")
     if not info["exists"]:
         notes.append("traces がまだありません（FREEAGENT_TRACE=0 で切っている可能性）")
-    if unattributed:
-        notes.append(f"run を持たない行が {unattributed} 件あります（v0.38.0 より前の記録）")
+    unattributed_tool = sum(1 for row in rows
+                            if as_str(row.get("tool")) and not as_str(row.get("run")))
+    if unattributed_tool:
+        notes.append(f"run を持たない本番の行が {unattributed_tool} 件あります"
+                     "（v0.38.0 より前の記録）")
     if kind_filter or model_filter or run_filter:
         notes.append("kind / model / run で絞った結果です（全体は days だけを指定して見る）")
     return {
@@ -9348,6 +9429,9 @@ def tool_diagnose(args: dict) -> dict:
         "totals": totals,
         "by_error_class": dict(sorted(by_class.items(), key=lambda kv: (-kv[1], kv[0]))),
         "by_kind": dict(sorted(by_kind.items())),
+        "totals_by_channel": by_channel,
+        "by_finish_reason": dict(sorted(by_finish.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "advice_channel": advice_channel,
         "runs": run_rows[:limit],
         "runs_total": len(run_rows),
         "unattributed_calls": unattributed,
@@ -9355,7 +9439,7 @@ def tool_diagnose(args: dict) -> dict:
         "latency": latency,
         "slowest_models": slowest[:limit],
         "recent_failures": recent,
-        "advice": _diag_advice(totals, by_class, ref_fail, fail_rows),
+        "advice": advice,
         "trace": info,
         "notes": notes,
         "model_calls": 0,
@@ -9498,9 +9582,8 @@ for _tool in TOOLS:
 
 
 # ================================================================ §8 表示（content）
-# ================================================================ §8 表示（content）
 #
-# 人間向け表示（`content`）は `rendering.py` に切り出した（v0.41.x の分割。references/module-split.md）。
+# 人間向け表示（`content`）は `rendering.py` に切り出した（v0.42.0 の分割。references/module-split.md）。
 # テストが差し替える `render` / `_RENDERERS` はこのファイルに残す（移動先から `S.` で参照される）。
 from . import rendering as _rendering  # noqa: E402
 globals().update(_rendering.EXPORTS)

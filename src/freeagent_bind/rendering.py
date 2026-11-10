@@ -500,6 +500,20 @@ def _render_diagnose(data: dict) -> str:
     classes = data.get("by_error_class") or {}
     if classes:
         lines.append("  失敗の内訳: " + ", ".join(f"{k} {v}" for k, v in classes.items()))
+    chans = data.get("totals_by_channel") or {}
+    if chans:
+        parts = []
+        for name, label in (("tool", "本番（ツール経由）"), ("bench", "ベンチ直呼び")):
+            slot = chans.get(name) or {}
+            n = S.as_int(slot.get("calls"), 0, 0, 10 ** 9)
+            if n:
+                parts.append(f"{label} {S.as_int(slot.get('ok'), 0, 0, 10 ** 9)}/{n}")
+        if parts:
+            lines.append("  チャネル（成功/呼び出し）: " + ", ".join(parts))
+    finish = data.get("by_finish_reason") or {}
+    if finish:
+        lines.append("  finish_reason: "
+                     + ", ".join(f"{k} {v}" for k, v in list(finish.items())[:5]))
     kinds = data.get("by_kind") or {}
     if kinds:
         parts = []

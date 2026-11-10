@@ -2281,6 +2281,23 @@ server.py 側は `globals().update(rendering.EXPORTS)` で旧名の互換を保�
 検証: unittest 1,253 件 OK / smoke_stdio・smoke_http・check_offline・直接実行の initialize /
 tools/list。`tools/list` は **24,520 文字のまま**（ツール定義に触れていない）。
 
+### 6.47 診断の測定精度（v0.42.1）
+
+**記録**（§2.3 `trace_call`）: 1 行に `finish_reason` / `max_tokens` / `retries` を足した。
+実測では v0.42.0 までの traces で**空応答 438 件すべてが `tokens` 空・`finish_reason` 列なし**で、
+「思考トークンで予算を使い切った（`length`）」のか「`stop` で本文が空」なのかを後から
+切り分けられなかった。空応答の失敗行は**引き上げ後の max_tokens** と再試行回数を残す。
+
+**集計**（§6.38 `tool_diagnose`）: `tool` か `run` を持つ行を**本番**、持たない行を**ベンチ直呼び**
+（`scripts/measure_quality.py` などの eval/probe）として `totals_by_channel` に分ける。
+実測: 30 日の窓 1,780 行のうち本番 39 行・ベンチ 1,741 行で、混ぜた失敗率は本番の実力を表さなかった。
+`advice` の根拠は本番が `FREEAGENT_DIAG_PROD_MIN`（既定 10）件以上なら**本番だけ**
+（`advice_channel` にどちらを使ったかを出す）。`by_finish_reason` を別枠で数え、
+`run` 欠落の注記は**本番の行だけ**を数える（ベンチ行はもともと `run` を持たない）。
+
+**検証**: `tests/test_diag_v0421.py` 9 件（列の記録・チャネル分離・advice の根拠切替・
+`finish_reason` 集計・表示）+ 既存 1,253 件。`tools/list` は 24,520 文字のまま。
+
 ## 12. 検証
 
 ```bash
