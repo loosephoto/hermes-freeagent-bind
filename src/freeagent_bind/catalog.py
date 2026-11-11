@@ -31,7 +31,6 @@ _MODELS_INFLIGHT_LOCK = threading.Lock()
 _CATALOG_DISK: dict[str, dict] = {}       # provider -> {"at": float, "rows": [...]}（ディスクのミラー）
 
 
-S._CATALOG_DISK_MTIME: float | None = None
 
 
 _CATALOG_DISK_LOCK = threading.Lock()

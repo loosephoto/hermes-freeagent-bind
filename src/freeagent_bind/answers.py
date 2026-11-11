@@ -536,15 +536,18 @@ def tool_consult(args: dict) -> dict:
         **S._quota_report_after_answers(refs),
         "quota_accounting": quota_accounting,
         "agreement": _consult_agree["value"], "agreement_source": _consult_agree["source"],
+        "consensus_share": _consult_agree["share"],
+        "consensus_clusters": _consult_agree["clusters"],
+        "consensus_note": S.consensus_note(),
         "agreement_votes": _consult_agree["votes"],
         "participants": S.participants_of(refs, last),
         "substitutions": S.substitutions_of(last),
         "agreement_note": S._agreement_note(_consult_agree["source"]),
         "confidence_mean": round(sum(conf) / len(conf), 1) if conf else None,
         "confidence_source": "self_report",
-        "S.confidence_warning": S.confidence_warning(
+        "confidence_warning": S.confidence_warning(
             round(sum(conf) / len(conf), 1) if conf else None, _consult_agree["value"]),
-        "S.confidence_calibration": S.confidence_calibration([r.get("model") for r in round_rows]),
+        "confidence_calibration": S.confidence_calibration([r.get("model") for r in round_rows]),
         "consensus": last,
         "failed": [{"model": row.get("model"), "error": S.truncate(row.get("error") or "", 160)}
                    for row in compliance_failures + rounds[-1]["answers"] if row.get("error")],

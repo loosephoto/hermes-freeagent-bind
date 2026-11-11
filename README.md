@@ -842,6 +842,7 @@ v0.43.1 は永続ストアの残りを切り出した: §2.1 クールダウン�
 v0.44.0 はサブ LLM 呼び出しの層を切り出した: §3.4 提供元ゲートと §3.5 クォータ窓（565 行）→ `quota.py`、§4 の呼び出し本体（秘密の伏せ字・キャッシュ・進捗・合流・予算・741 行）→ `caller.py`、§4.0/§4.1 キャンセルと公平スケジューラ（322 行）→ `parallel.py`。`server.py` は **4,549 行**。`call_model` はテストが直接代入で差し替えるため server.py に残す。ツール定義は不変で **24,520 文字のまま**。
 v0.45.0 はツール実装の本体を切り出した: §6.11 回答の組み立て（grounded / map / consult / agent / delegate・776 行）→ `answers.py`、§6.9/§6.10 `freeagent_think` の実装（計画・改訂・分岐・仮説・検証・781 行）→ `think_tools.py`。`server.py` は **3,006 行**。ツール定義は不変で **24,520 文字のまま**。
 v0.46.0 は §6 の前半（プロンプト・応答の解析・`models`/`ask`/`fanout`/`panel`・MoA の統合・779 行）→ `tools_core.py`、§3 プロバイダの仕様と参照の正規化（190 行）→ `provider_specs.py`。`server.py` は **2,051 行**（v0.40.0 時点の約 12,400 行から 83% 減）。ツール定義は不変で **24,520 文字のまま**。
+v0.47.0 は issue #5 の案3 と #8 の案2 を実装: **多数派シェア** `consensus_share`（最大クラスタ / 参加者数。短答は完全一致、長文は類似度 0.55 以上の単連結クラスタ）を `panel` / `consult` / `grounded` が返し、「確信度の代理」として割れを見られるようにした。`freeagent_models(probe=true)` は各モデルの `budget {asked, effective, completion, chars, respected}` と `probe_budget`（**実効の予算**で比較・逸脱は名指し）を返す。機械分割で混入した `"S.confidence_warning"` のような壊れたキー 4 件も修復し、再発防止のテスト（`test_split_hygiene.py`）を足した。ツール定義は不変で **24,520 文字のまま**。
 以下は新しい順の内訳です。
 
 **v0.39.0（第12段階：NVD / Terraform Registry / zbMATH を追加）**: 25 の候補 API とホスト 20 件の

@@ -95,7 +95,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.46.0"
+SERVER_VERSION = "0.47.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -411,15 +411,67 @@ def answer_shape(text: str) -> str:
     return "exact"
 
 
+_CONSENSUS_LINK = 0.55   # 長文を「同じ答え」とみなす類似度の下限（多数派シェア用）
+
+
+def consensus_share(texts: list[str]) -> dict:
+    """**多数派シェア**（最大クラスタの人数 / 参加者数）を返す（v0.47.0・issue #5 の案3）。
+
+    確信度（自己申告）が正誤と無関係に 100 になる一方、**票の割れ**は実測で正答と単調だった
+    （合意 2/3 以上の問題は 17/17 正解）。確信度の**代理**としてこちらを使う。
+    長文は表層類似度 `_CONSENSUS_LINK` 以上のものを単連結でまとめてクラスタにする。
+    """
+    vals = [t for t in (texts or []) if (t or "").strip()]
+    n = len(vals)
+    if n < 2:
+        return {"share": None, "clusters": n, "source": "none", "n": n}
+    if all(answer_shape(t) == "exact" for t in vals):
+        counts: dict[str, int] = {}
+        for t in vals:
+            key = _norm_short(t).lower()
+            counts[key] = counts.get(key, 0) + 1
+        top = max(counts.values())
+        return {"share": round(top / n, 3), "clusters": len(counts), "source": "exact", "n": n}
+    # 単連結クラスタリング（類似度が閾値以上のものを同じグループに）
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if similarity(vals[i], vals[j]) >= _CONSENSUS_LINK:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+    sizes: dict[int, int] = {}
+    for i in range(n):
+        root = find(i)
+        sizes[root] = sizes.get(root, 0) + 1
+    return {"share": round(max(sizes.values()) / n, 3), "clusters": len(sizes),
+            "source": "similarity", "n": n}
+
+
+def consensus_note() -> str:
+    return ("`consensus_share` は**多数派シェア**（確信度の代理）です。自己申告の `confidence` は"
+            "正誤と無関係に高く出るため、割れていないかをこちらで見てください（正しさの確率ではありません）。")
+
+
 def agreement_detail(texts: list[str]) -> dict:
     """合意度。短答は完全一致、長文は表層類似度（v0.42.2）。
 
     返り値は `{value, source, votes, n}`。`votes` は短答のときだけ中身が入る
-    （表層類似度では「何票が同じ答えか」を言えないため）。
+    （表層類似度では「何票が同じ答えか」を言えないため）。v0.47.0 で多数派シェア
+    （`share` / `clusters`）も返す（issue #5 の案3）。
     """
     vals = [t for t in (texts or []) if (t or "").strip()]
     if len(vals) < 2:
-        return {"value": 0.0, "source": "none", "votes": {}, "n": len(vals)}
+        return {"value": 0.0, "source": "none", "votes": {}, "n": len(vals),
+                "share": None, "clusters": len(vals)}
+    cons = consensus_share(vals)
     if all(answer_shape(t) == "exact" for t in vals):
         counts: dict[str, int] = {}
         for t in vals:
@@ -428,8 +480,9 @@ def agreement_detail(texts: list[str]) -> dict:
         top = max(counts.values())
         return {"value": round(top / len(vals), 3), "source": "exact",
                 "votes": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
-                "n": len(vals)}
-    return {"value": agreement_of(vals), "source": "similarity", "votes": {}, "n": len(vals)}
+                "n": len(vals), "share": cons["share"], "clusters": cons["clusters"]}
+    return {"value": agreement_of(vals), "source": "similarity", "votes": {}, "n": len(vals),
+            "share": cons["share"], "clusters": cons["clusters"]}
 
 
 def _agreement_note(source: str) -> str:

@@ -2571,6 +2571,36 @@ top 名に加える」よう直し、事後修復用に `fix_cross_names.py`（�
 `wall 0.831s / 倍率 0.96`・`render` 正常／`PROVIDER_SPECS` 18 社・`HANDLERS` 13／
 `tools/list` 25,326 文字のまま／`compileall` / `check_integrity`（version=0.46.0）/ smoke 3 種。
 
+### 6.61 多数派シェアと probe の予算遵守（v0.47.0・issue #5 案3 / #8 案2）
+
+**多数派シェア**（#5 の案3）: `confidence` は自己申告で正誤に較正されていない（v0.42.3 で
+`confidence_source="self_report"` と明示済み）。代わりに**票の割れ**を代理に使う。
+`consensus_share(texts)` は最大クラスタの人数 / 参加者数を返す:
+
+- 短答（1 行・24 字以下・句読点なし）は `_norm_short` の**完全一致**で数える（v0.42.2 と同じ規約）。
+- 長文は表層類似度 `_CONSENSUS_LINK=0.55` 以上を**単連結**でまとめてクラスタ化する。
+- 参加者が 2 体未満なら `share=None`（0 と偽らない）。
+
+`agreement_detail` の返り値に `share` / `clusters` を足し、`panel` / `consult` / `grounded` は
+`consensus_share` / `consensus_clusters` / `consensus_note` を返す。**既存の `agreement` は不変**。
+
+**probe の予算遵守**（#8 の案2）: `freeagent_models(probe=true)` の各結果に
+`budget {asked, effective, completion, chars, respected}` を付け、`query.probe_budget` に
+`{checked, not_respected[], note}` を返す。比較対象は**実効の予算**（空応答リトライで
+64→512 に引き上げた後の値）で、v0.42.5 の訂正（逸脱はモデルのせいではない）と整合させた。
+
+**分割の衛生**: 機械分割が文字列リテラルの中まで `S.` 前置し、辞書のキーが
+`"S.confidence_warning"` になっていた（4 件・値を読む側からは黙って欠落）。
+`split_module.py` に「直前が引用符なら前置しない」規則を足し、`tests/test_split_hygiene.py` で
+「文字列内の `S.` 前置」「モジュール直下での自分の名前の `S.` 参照」「EXPORTS の解決」を固定した。
+同じ検査で `catalog.py` / `stores.py` に残っていた `S._*_MTIME: float | None = None` の
+2 行（モジュール直下で server の属性に代入していた）も削除した。
+
+**検証**: unittest **1,317 件 OK**（新規 15 件）／実測: `panel` 3 体が全一致で
+`consensus_share 1.0 / clusters 1`、`freeagent_models(probe=true)` が 2 件試行・1 件生存・
+`probe_budget {checked 1, not_respected []}`／`tools/list` 25,326 文字のまま／
+`compileall` / `check_integrity`（version=0.47.0）/ smoke 3 種。
+
 ## 12. 検証
 
 ```bash

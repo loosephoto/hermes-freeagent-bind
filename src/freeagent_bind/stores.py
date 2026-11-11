@@ -19,7 +19,6 @@ _COOLDOWN: dict[str, dict] = {}
 
 
 
-S._COOLDOWN_MTIME: float | None = None
 
 
 _COOLDOWN_LOCK = threading.Lock()

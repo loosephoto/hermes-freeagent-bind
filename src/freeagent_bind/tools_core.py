@@ -392,7 +392,7 @@ def tool_models(args: dict) -> dict:
         "free_candidates": len(free),
         "non_chat_candidates": sum(row.get("non_chat", 0) for row in status),
         "usable_now": len(usable),
-        "S.default_model": S.default_model(),
+        "default_model": S.default_model(),
         "cooling": {ref: row for ref, row in S.cooling_refs().items()},
         "ranking_enabled": S.RANK_ENABLED,
     }
@@ -477,9 +477,20 @@ def tool_models(args: dict) -> dict:
                 else:
                     # 429（提供元が一時制限）や 5xx。**除外しない**（生きているが今は応えない）。
                     verdict = "error"
+                # 予算遵守の記録（v0.47.0・issue #8 の案2）。**実効の予算**と比べる:
+                # 空応答リトライでサーバが 64→512 へ引き上げた場合、64 と比べると誤検出になる
+                # （v0.42.5 の実測で「モデルが守らない」は 0 件だった）。
+                _tok = res.get("tokens") or {}
+                _eff = res.get("max_tokens") or probe_tokens
+                _comp = S.as_int(_tok.get("completion"), 0, 0, 10 ** 9)
+                budget = {"asked": int(probe_tokens), "effective": int(_eff),
+                          "completion": _comp,
+                          "chars": len((res.get("text") or "").strip()),
+                          "respected": bool(_comp <= int(_eff))}
                 return {"model": row, "verdict": verdict, "served_by": res.get("served_by"),
                         "error": S.truncate(err, 200),
-                        "sample": S.truncate((res.get("text") or "").strip(), 60)}
+                        "sample": S.truncate((res.get("text") or "").strip(), 60),
+                        "budget": budget}
 
             probed = S.run_parallel(shown, check, max_workers=probe_workers, deadline=S.call_budget())
             # 消えたもの（404/410）と権限で拒否されたものだけ一覧から外す。**遅い・一時エラーは残す**
@@ -497,6 +508,16 @@ def tool_models(args: dict) -> dict:
                 "probe_errors": [{"ref": S.make_ref(r["model"]["provider"], r["model"]["id"]),
                                   "verdict": r["verdict"], "error": r["error"]}
                                  for r in probed if r["verdict"] in ("slow", "error")],
+                # 予算遵守（issue #8 の案2）。逸脱が居れば名指しで返す（黙って 0 件にしない）。
+                "probe_budget": {
+                    "checked": sum(1 for r in probed if (r.get("budget") or {}).get("completion")),
+                    "not_respected": [
+                        {"ref": S.make_ref(r["model"]["provider"], r["model"]["id"]),
+                         "asked": r["budget"]["asked"], "effective": r["budget"]["effective"],
+                         "completion": r["budget"]["completion"], "chars": r["budget"]["chars"]}
+                        for r in probed if (r.get("budget") or {}).get("respected") is False],
+                    "note": "実効の予算（リトライで引き上げた後）と completion を比べています。",
+                },
             })
             by_id = {(r["model"]["provider"], r["model"]["id"]): r["verdict"] for r in probed}
             shown = [dict(m, probe=by_id.get((m["provider"], m["id"])) or "alive") for m in kept]
@@ -754,11 +775,13 @@ def tool_panel(args: dict) -> dict:
         "answered": len(good), "independent_sources": len(independent), "failed": len(answers) - len(good),
         "agreement": agree["value"], "agreement_source": agree["source"],
         "agreement_votes": agree["votes"],
+        "consensus_share": agree["share"], "consensus_clusters": agree["clusters"],
+        "consensus_note": S.consensus_note(),
         "participants": S.participants_of(refs, answers),
         "substitutions": S.substitutions_of(answers),
         "confidence_mean": round(sum(conf) / len(conf), 1) if conf else None,
         "confidence_source": "self_report",
-        "S.confidence_warning": S.confidence_warning(
+        "confidence_warning": S.confidence_warning(
             round(sum(conf) / len(conf), 1) if conf else None, agree["value"]),
         "consensus": _consensus_groups(independent),
         "disagreements": [a["model"] for a in good if a.get("question")],
