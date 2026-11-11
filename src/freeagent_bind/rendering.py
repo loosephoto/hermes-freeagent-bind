@@ -141,6 +141,8 @@ def _render_panel(data: dict) -> str:
     if S.as_int(subs.get("count"), 0, 0, 10 ** 9):
         who = ", ".join(f"{row.get('served_by')}×{row.get('n')}" for row in (subs.get("models") or [])[:3])
         lines.append(f"ℹ️ うち {subs.get('count')} 件は別モデルが回答（{who}）")
+    if S.as_str(data.get("confidence_warning")):
+        lines.append(f"⚠️ {data['confidence_warning']}")
     dropped = parts.get("dropped") or []
     if dropped:
         reasons = {}
@@ -538,6 +540,10 @@ def _render_diagnose(data: dict) -> str:
                 parts.append(f"{label} {S.as_int(slot.get('ok'), 0, 0, 10 ** 9)}/{n}")
         if parts:
             lines.append("  チャネル（成功/呼び出し）: " + ", ".join(parts))
+    budget = data.get("budget") or {}
+    for item in (budget.get("models") or [])[:3]:
+        lines.append(f"  ⚠️ {item.get('model')} が max_tokens の {item.get('max_ratio')} 倍まで返しています"
+                     f"（{item.get('n')} 件・予算超過）")
     finish = data.get("by_finish_reason") or {}
     if finish:
         lines.append("  finish_reason: "

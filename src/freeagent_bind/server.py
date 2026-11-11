@@ -95,7 +95,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.42.2"
+SERVER_VERSION = "0.42.3"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -439,6 +439,23 @@ def _agreement_note(source: str) -> str:
     if source == "similarity":
         return "合意度は結論の表層類似度です（長文のため票では数えられません）。正しさの確率ではありません。"
     return "参加者が 2 体未満のため合意度は計算していません。"
+
+
+# 確信度は**モデルの自己申告**で、正誤に対して較正されていない（実測: 20 問 × 4 択で
+# 正解 99.7 / 誤答 100.0、20 問すべて 97.5〜100.0）。順位付けには使わず、
+# 「高い確信度 + 低い合意度」の**矛盾**だけを警告として出す（v0.42.3・issue #5）。
+CONFIDENCE_CALIBRATION_NOTE = ("確信度はモデルの自己申告で、正誤に対して較正されていません"
+                              "（実測: 20 問 × 4 択で正解 99.7 / 誤答 100.0）。")
+
+
+def confidence_warning(conf_mean, agreement) -> str:
+    """確信度が高いのに合意度が低いときの警告（どちらも無いときは空）。"""
+    c = as_float(conf_mean, -1.0)
+    a = as_float(agreement, -1.0)
+    if c >= 90.0 and 0.0 <= a < 0.5:
+        return (f"確信度 {c:g} に対して合意度 {a:g} と割れています。"
+                + CONFIDENCE_CALIBRATION_NOTE + "多数決や討議で確かめてください。")
+    return ""
 
 
 def _drop_reason(error: str) -> str:
@@ -6797,6 +6814,9 @@ def tool_panel(args: dict) -> dict:
         "participants": participants_of(refs, answers),
         "substitutions": substitutions_of(answers),
         "confidence_mean": round(sum(conf) / len(conf), 1) if conf else None,
+        "confidence_source": "self_report",
+        "confidence_warning": confidence_warning(
+            round(sum(conf) / len(conf), 1) if conf else None, agree["value"]),
         "consensus": _consensus_groups(independent),
         "disagreements": [a["model"] for a in good if a.get("question")],
         "open_questions": [{"model": a["model"], "question": a["question"]}
@@ -7356,6 +7376,9 @@ def tool_consult(args: dict) -> dict:
         "substitutions": substitutions_of(last),
         "agreement_note": _agreement_note(_consult_agree["source"]),
         "confidence_mean": round(sum(conf) / len(conf), 1) if conf else None,
+        "confidence_source": "self_report",
+        "confidence_warning": confidence_warning(
+            round(sum(conf) / len(conf), 1) if conf else None, _consult_agree["value"]),
         "consensus": last,
         "failed": [{"model": row.get("model"), "error": truncate(row.get("error") or "", 160)}
                    for row in compliance_failures + rounds[-1]["answers"] if row.get("error")],
@@ -9273,6 +9296,33 @@ DIAG_SLOW_MIN_CALLS = 3
 # 1,741 行が `tool` も `run` も持たない（`scripts/measure_quality.py` などの eval/probe）で、
 # 本番は 39 行しかなかった。混ぜると「本番の失敗率」が測定用の連打に引っ張られる。
 DIAG_PROD_MIN = _env_int("FREEAGENT_DIAG_PROD_MIN", 10)
+# `max_tokens` を守らない提供元/モデルがある（実測: 64 指定で 931 字を返したモデルがあり、
+# 同じ条件 5/5 で逸脱）。記録済みの `max_tokens` と `tokens.completion` の比で検出する。
+_BUDGET_OVER_RATIO = 1.2
+BUDGET_VIOLATION_MIN = 2
+
+
+def _diag_budget(rows: list[dict]) -> dict:
+    """`max_tokens` を大きく超えて返したモデルを数える（v0.42.3・issue #8）。"""
+    over: dict[str, list[float]] = {}
+    checked = 0
+    for row in rows or []:
+        budget = as_int(row.get("max_tokens"), 0, 0, 10 ** 9)
+        used = as_int(((row.get("tokens") or {}).get("completion")), 0, 0, 10 ** 9)
+        if not budget or not used:
+            continue
+        checked += 1
+        ratio = used / budget
+        if ratio > _BUDGET_OVER_RATIO:
+            ref = as_str(row.get("served_by")) or as_str(row.get("ref"))
+            if ref:
+                over.setdefault(ref, []).append(ratio)
+    models = [{"model": m, "n": len(vals), "max_ratio": round(max(vals), 2),
+               "mean_ratio": round(sum(vals) / len(vals), 2)}
+              for m, vals in over.items() if len(vals) >= BUDGET_VIOLATION_MIN]
+    models.sort(key=lambda r: (-r["max_ratio"], r["model"]))
+    return {"checked": checked, "threshold": _BUDGET_OVER_RATIO,
+            "min_rows": BUDGET_VIOLATION_MIN, "models": models[:8]}
 
 
 def _diag_pct(values: list[float], p: float) -> float | None:
@@ -9545,6 +9595,7 @@ def tool_diagnose(args: dict) -> dict:
         if ref:
             a_ref_fail[ref] = a_ref_fail.get(ref, 0) + 1
     advice = _diag_advice(a_totals, a_class, a_ref_fail, a_fail)
+    budget = _diag_budget(rows)
 
     notes = []
     bench_calls = as_int((by_channel.get("bench") or {}).get("calls"), 0, 0, 10 ** 9)
@@ -9552,6 +9603,9 @@ def tool_diagnose(args: dict) -> dict:
         tail = "（次の一手は本番だけを根拠にしています）" if advice_channel == "tool" else ""
         notes.append(f"ベンチ直呼び（tool / run を持たない行）が {bench_calls} 件あります。"
                      f"内訳は totals_by_channel で分けています{tail}")
+    for item in budget["models"]:
+        notes.append(f"{item['model']} が max_tokens の {item['max_ratio']} 倍まで返しています"
+                     f"（{item['n']} 件）。予算での出力長制御が効かない提供元です")
     length_rows = as_int(by_finish.get("length"), 0, 0, 10 ** 9)
     if length_rows:
         notes.append(f"finish_reason=length が {length_rows} 件（思考トークンで予算を使い切った型）")
@@ -9589,6 +9643,7 @@ def tool_diagnose(args: dict) -> dict:
         "slowest_models": slowest[:limit],
         "recent_failures": recent,
         "advice": advice,
+        "budget": budget,
         "trace": info,
         "notes": notes,
         "model_calls": 0,
