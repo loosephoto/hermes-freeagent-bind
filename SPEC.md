@@ -2298,6 +2298,29 @@ tools/list。`tools/list` は **24,520 文字のまま**（ツール定義に触
 **検証**: `tests/test_diag_v0421.py` 9 件（列の記録・チャネル分離・advice の根拠切替・
 `finish_reason` 集計・表示）+ 既存 1,253 件。`tools/list` は 24,520 文字のまま。
 
+### 6.48 合意度・参加者・置換の数え方（v0.42.2）
+
+**合意度**（§1 `agreement_detail`）: 回答の型を見て数え方を変える。**短答**（1 行・正規化後 24 文字
+以下・句読点なし: `C` / `29` / `1/216` / `**1.414**`）は**完全一致**で票を数え、`agreement_source="exact"`
+と `agreement_votes` を返す。**長文**（複数行・句読点あり・24 文字超）は従来の表層類似度で
+`agreement_source="similarity"`（票は返さない）。実測（20 問 × 4 択・71 票）では、旧実装の
+`agreement` は実票の多数派シェアとの**平均絶対差 0.500**、全会一致 7 問でも 0.167〜1.000 だった。
+
+**参加者**（§1 `participants_of`）: `{requested, answered, dropped:[{model, reason}]}` を返す。
+`reason` は `cooling` / `busy` / `empty` / `timeout` / `error` / `not_reached` に分類する。
+content は「回答 3/4 体」と落ちた理由の内訳を出す（黙って減らさない）。
+
+**置換**（§1 `substitutions_of`）: `{count, ratio, models:[{requested, served_by, n}]}`。
+冷却・枠待ちでサーバーが代替へ回ると `served_by` が要求と変わる。実測では 16 モデルの fanout で
+6/16（37.5%）、正答率の測定で 14/40（35%）、直後の冷却中は 6/6（100%）が代替だった
+（冷却が無ければ 1/71 = 1%）。content は「うち N 件は別モデルが回答（solar×2）」を出す。
+
+**`map` の時間**（issue #9）: `wall_s` / `sequential_estimate_s` / `speedup`（`reduce` 時は
+`reduce_s`）を返す。実測: 12 件で 6.3 秒・逐次 24.1 秒（3.8 倍）。
+
+**検証**: `tests/test_metrics_v0422.py` 13 件（短答/長文の判定・票の数え方・落ちた理由の分類・
+置換の集計・content の表示・`map` の時間列）+ 既存 1,262 件。`tools/list` は 24,520 文字のまま。
+
 ## 12. 検証
 
 ```bash

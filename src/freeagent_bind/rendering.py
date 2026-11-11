@@ -111,6 +111,10 @@ def _render_fanout(data: dict) -> str:
     if data.get("quota_report_error"):
         head += f"\n⚠️ クォータ報告失敗: {data['quota_report_error']}"
     head += "".join(f"\n{line}" for line in _dropped_lines(data, "prompts", S.MAX_PROMPTS_PER_CALL))
+    subs = data.get("substitutions") or {}
+    if S.as_int(subs.get("count"), 0, 0, 10 ** 9):
+        who = ", ".join(f"{row.get('served_by')}×{row.get('n')}" for row in (subs.get("models") or [])[:3])
+        head += f"\nℹ️ うち {subs.get('count')} 件は別モデルが回答（{who}）"
     body = ""
     for row in (data.get("results") or [])[:12]:
         text = row.get("answer") or row.get("error") or ""
@@ -125,9 +129,25 @@ def _render_panel(data: dict) -> str:
     """`freeagent_panel` の本文（`content` = 人間向け日本語）。"""
     conf_mean = data.get("confidence_mean")
     conf_note = f"（確信度平均 {conf_mean}）" if isinstance(conf_mean, (int, float)) else ""
-    lines = [f"回答 {data.get('answered')}/{len(data.get('models') or [])} 体"
+    parts = data.get("participants") or {}
+    asked = S.as_int(parts.get("requested"), 0, 0, 10 ** 9) or len(data.get("models") or [])
+    got = S.as_int(parts.get("answered"), 0, 0, 10 ** 9) or S.as_int(data.get("answered"), 0, 0, 10 ** 9)
+    agree_src = S.as_str(data.get("agreement_source"))
+    agree_note = "（完全一致）" if agree_src == "exact" else ("（類似度）" if agree_src == "similarity" else "")
+    lines = [f"回答 {got}/{asked} 体"
              f" / 独立した実モデル {data.get('independent_sources', data.get('answered'))} 体"
-             f" / 合意度 {data.get('agreement')}{conf_note}"]
+             f" / 合意度 {data.get('agreement')}{agree_note}{conf_note}"]
+    subs = data.get("substitutions") or {}
+    if S.as_int(subs.get("count"), 0, 0, 10 ** 9):
+        who = ", ".join(f"{row.get('served_by')}×{row.get('n')}" for row in (subs.get("models") or [])[:3])
+        lines.append(f"ℹ️ うち {subs.get('count')} 件は別モデルが回答（{who}）")
+    dropped = parts.get("dropped") or []
+    if dropped:
+        reasons = {}
+        for row in dropped:
+            reasons[row.get("reason")] = reasons.get(row.get("reason"), 0) + 1
+        detail = ", ".join(f"{k} {v}" for k, v in sorted(reasons.items()))
+        lines.append(f"ℹ️ 応答しなかった {len(dropped)} 体（{detail}）")
     if data.get("slot_waited"):
         lines.append(f"ℹ️ 提供元の枠待ち {data['slot_waited']} 件（429 を踏まずに順番待ちで吸収しました）")
     if data.get("quota_report_error"):
@@ -149,7 +169,10 @@ def _render_panel(data: dict) -> str:
             lines.append(f"⚠️ 統合に失敗: {S.truncate(refined['error'], 120)}")
         elif refined.get("conclusion"):
             lines.append(f"🔗 統合（{refined.get('model')}）: {S.truncate(refined['conclusion'], 220)}")
-    lines.append("ℹ️ 合意度は表層の一致であって正しさの保証ではありません。")
+    if agree_src == "exact":
+        lines.append("ℹ️ 合意度は短答の完全一致（記号・数値・短い語）で数えたもので、正しさの保証ではありません。")
+    else:
+        lines.append("ℹ️ 合意度は表層の一致であって正しさの保証ではありません。")
     return "\n".join(lines)
 
 
@@ -249,6 +272,11 @@ def _render_map(data: dict) -> str:
     """`freeagent_map` の本文（`content` = 人間向け日本語）。"""
     lines = [f"{data.get('count')} 件 / 成功 {data.get('ok')} / 失敗 {data.get('failed')}"
              f"（モデル {data.get('model')}）"]
+    if data.get("wall_s") is not None:
+        speed = data.get("speedup")
+        seq = data.get("sequential_estimate_s")
+        extra = f"（逐次なら {seq}s・{speed} 倍）" if seq and speed else ""
+        lines.append(f"  wall {data.get('wall_s')}s{extra}")
     lines.extend(_dropped_lines(data, "items", S.MAX_MAP_ITEMS))
     for row in (data.get("results") or [])[:10]:
         text = row.get("output") or f"✗ {row.get('error', '')}"

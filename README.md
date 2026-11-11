@@ -829,6 +829,7 @@ v0.40.3 は監査修正（devdocs の `doc` 配線・ハンドラ引数の schem
 v0.41.0 は改良（遅延カタログ先頭の凝縮・`FREEAGENT_RANK_KIND_BIAS`（既定 off）・空応答再試行の精緻化・記録のローテーション）で **24,520 文字（+414）**（ツール数は 13 のまま）。
 v0.42.0 は表示（`_render_*` 本体）を `rendering.py` へ切り出した（**ツール定義に触れない**ので 24,520 文字のまま。切り出し前後で `render` の出力 39 サンプルがバイト一致）。
 v0.42.1 は診断の測定精度（traces に `finish_reason` / `max_tokens` / `retries` を記録し、`freeagent_diagnose` が**本番（ツール経由）とベンチ直呼びを分けて**集計・`FREEAGENT_DIAG_PROD_MIN`（既定 10 件）以上で次の一手を本番だけから決める）。ツール定義は不変なので **24,520 文字のまま**。
+v0.42.2 は数え方の修正（issue #4 / #6 / #7 / #9）: 合意度を**短答は完全一致**で数え（`agreement_source` / `agreement_votes`）、`participants`（要求数・実数・落ちた理由）と `substitutions`（別モデルが答えた件数）を全マルチモデルツールに足し、`map` が `wall_s` / `sequential_estimate_s` / `speedup` を返すようにした。ツール定義は不変で **24,520 文字のまま**。
 以下は新しい順の内訳です。
 
 **v0.39.0（第12段階：NVD / Terraform Registry / zbMATH を追加）**: 25 の候補 API とホスト 20 件の

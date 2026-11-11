@@ -95,7 +95,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.42.1"
+SERVER_VERSION = "0.42.2"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -369,6 +369,128 @@ def agreement_of(texts: list[str]) -> float:
             total += similarity(vals[i], vals[j])
             pairs += 1
     return round(total / pairs, 3) if pairs else 0.0
+
+
+
+# ---- 合意度と参加者の数え方（v0.42.2・issue #4 / #6 / #7） ----------------------
+#
+# 実測: `agreement_of` は結論文字列の**表層類似度**なので、回答が `C` や `29` のような
+# 短い記号・数値だと「全員一致」でも 0.0〜0.3 になり、逆に同じ前置きを共有しただけの
+# 回答は高く出る（20 問 × 4 択で、実票の多数派シェアとの平均絶対差 **0.500**、
+# 全会一致 7 問の agreement は 0.167〜1.000）。短答は**完全一致**で数える。
+_SHORT_ANSWER_MAX = 24
+
+
+def _norm_short(text: str) -> str:
+    """短答の比較キー。確信度の行を落とし、強調・括弧・句読点・空白を除いた先頭行。"""
+    t = text or ""
+    lines = [ln for ln in t.splitlines() if "確信度" not in ln and ln.strip()]
+    t = lines[0].strip() if lines else ""
+    for junk in ("**", "__", "`", "結論:", "結論：", "答え:", "答え："):
+        t = t.replace(junk, "")
+    t = t.strip(" 　#*>-「」『』（）()[]【】")
+    return re.sub(r"[\s、。,.!?！？:：*`\"'「」『』]+", "", t)
+
+
+def answer_shape(text: str) -> str:
+    """回答の型。`exact`（短答）か `similarity`（長文）か。
+
+    短答とみなすのは **1 行だけ**で、正規化後 `_SHORT_ANSWER_MAX` 文字以下、句読点を含まない
+    もの（`C` / `29` / `1/216` / `**1.414**` は短答、`結論: … 。` の 2 行組は長文）。
+    """
+    raw_lines = [ln.strip() for ln in (text or "").splitlines()
+                 if ln.strip() and "確信度" not in ln]
+    if len(raw_lines) != 1:
+        return "similarity"
+    line = raw_lines[0]
+    n = _norm_short(line)
+    if not n or len(n) > _SHORT_ANSWER_MAX:
+        return "similarity"
+    if any(ch in line for ch in "。、，,"):
+        return "similarity"
+    return "exact"
+
+
+def agreement_detail(texts: list[str]) -> dict:
+    """合意度。短答は完全一致、長文は表層類似度（v0.42.2）。
+
+    返り値は `{value, source, votes, n}`。`votes` は短答のときだけ中身が入る
+    （表層類似度では「何票が同じ答えか」を言えないため）。
+    """
+    vals = [t for t in (texts or []) if (t or "").strip()]
+    if len(vals) < 2:
+        return {"value": 0.0, "source": "none", "votes": {}, "n": len(vals)}
+    if all(answer_shape(t) == "exact" for t in vals):
+        counts: dict[str, int] = {}
+        for t in vals:
+            key = _norm_short(t).lower()
+            counts[key] = counts.get(key, 0) + 1
+        top = max(counts.values())
+        return {"value": round(top / len(vals), 3), "source": "exact",
+                "votes": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
+                "n": len(vals)}
+    return {"value": agreement_of(vals), "source": "similarity", "votes": {}, "n": len(vals)}
+
+
+def _agreement_note(source: str) -> str:
+    """合意度の「数え方」を返す（exact と similarity を混同しない）。"""
+    if source == "exact":
+        return "合意度は短答の完全一致（記号・数値・短い語）で数えています。正しさの確率ではありません。"
+    if source == "similarity":
+        return "合意度は結論の表層類似度です（長文のため票では数えられません）。正しさの確率ではありません。"
+    return "参加者が 2 体未満のため合意度は計算していません。"
+
+
+def _drop_reason(error: str) -> str:
+    """落ちた理由の分類（content で「なぜ減ったか」を言えるようにする）。"""
+    t = (error or "").lower()
+    if not t:
+        return "not_reached"
+    if "冷" in t or "cooling" in t:
+        return "cooling"
+    if "429" in t or "同時実行" in t or "使用中" in t or "busy" in t or "枠" in t:
+        return "busy"
+    if "空応答" in t or "no output" in t or "empty" in t:
+        return "empty"
+    if "timeout" in t or "時間切れ" in t or "deadline" in t:
+        return "timeout"
+    return "error"
+
+
+def participants_of(requested: list[str], rows: list[dict]) -> dict:
+    """要求したモデルのうち、実際に答えた数と落ちた理由（issue #6）。"""
+    asked = [m for m in (requested or []) if m]
+    answered = {as_str(r.get("model")) for r in (rows or []) if not r.get("error")}
+    errors: dict[str, str] = {}
+    for r in rows or []:
+        if r.get("error"):
+            errors.setdefault(as_str(r.get("model")), as_str(r.get("error")))
+    dropped = [{"model": m, "reason": _drop_reason(errors.get(m, ""))}
+               for m in asked if m and m not in answered]
+    return {"requested": len(asked), "answered": len(answered), "dropped": dropped}
+
+
+def substitutions_of(rows: list[dict]) -> dict:
+    """要求したモデルと実際に答えたモデルがズレた件数（issue #7）。
+
+    冷却や枠待ちでサーバーが代替へ回ると `served_by` に別モデルが入る。
+    「独立 N 体」を名乗る前にこの数を出す。
+    """
+    per: dict[tuple[str, str], int] = {}
+    total = 0
+    for r in rows or []:
+        if r.get("error"):
+            continue
+        total += 1
+        asked = as_str(r.get("model"))
+        served = as_str(r.get("served_by")) or asked
+        if asked and served and asked != served:
+            per[(asked, served)] = per.get((asked, served), 0) + 1
+    items = [{"requested": a, "served_by": s, "n": n}
+             for (a, s), n in sorted(per.items(), key=lambda kv: (-kv[1], kv[0]))]
+    count = sum(per.values())
+    return {"count": count, "ratio": round(count / total, 3) if total else 0.0,
+            "models": items[:8]}
 
 
 def independent_answers(rows: list[dict]) -> list[dict]:
@@ -6524,6 +6646,8 @@ def tool_fanout(args: dict) -> dict:
         "results": rows, "selection": info, "concurrency": PROVIDER_GATE.report(refs),
         **_quota_report_after_answers(refs),
         "prompts_dropped": prompts_dropped,
+        "participants": participants_of(refs, rows),
+        "substitutions": substitutions_of(rows),
         **_rate_limit_report(results),
     }
 
@@ -6661,13 +6785,17 @@ def tool_panel(args: dict) -> dict:
     good = [a for a in answers if not a.get("error")]
     independent = independent_answers(good)
     conf = [a["confidence"] for a in independent if isinstance(a.get("confidence"), int)]
+    agree = agreement_detail([a["conclusion"] for a in independent])
     # `refine: true` で MoA の集約層（§6.12）。統合役の呼び出しも枠・クォータ・統計を通る。
     refine = _refine_answers(question, answers, refs, args) if as_flag(args.get("refine")) else None
     reported = results + ([refine] if refine and refine.get("calls") else [])
     data = {
         "question": question, "models": refs, "selection": info,
         "answered": len(good), "independent_sources": len(independent), "failed": len(answers) - len(good),
-        "agreement": agreement_of([a["conclusion"] for a in independent]),
+        "agreement": agree["value"], "agreement_source": agree["source"],
+        "agreement_votes": agree["votes"],
+        "participants": participants_of(refs, answers),
+        "substitutions": substitutions_of(answers),
         "confidence_mean": round(sum(conf) / len(conf), 1) if conf else None,
         "consensus": _consensus_groups(independent),
         "disagreements": [a["model"] for a in good if a.get("question")],
@@ -6677,7 +6805,7 @@ def tool_panel(args: dict) -> dict:
         "concurrency": PROVIDER_GATE.report(refs),
         **_quota_report_after_answers(refs),
         **_rate_limit_report(reported),
-        "agreement_note": "合意度は解析済みの結論の表層類似度であり、正しさの確率ではありません。",
+        "agreement_note": _agreement_note(agree["source"]),
     }
     if refine is not None:
         data["refined"] = refine
@@ -6800,6 +6928,7 @@ def tool_grounded(args: dict) -> dict:
                         "truncated": res.get("truncated"), "cot_leak": res.get("cot_leak"),
                         **({"quota_accounting": res["quota_accounting"]} if res.get("quota_accounting") else {})})
     good = [a for a in answers if not a.get("error")]
+    _grounded_agree = agreement_detail([a.get("answer") or "" for a in good])
     return {
         "question": question, "search_query": search_query,
         "citations": citations, "citation_count": len(citations),
@@ -6810,7 +6939,10 @@ def tool_grounded(args: dict) -> dict:
         "models": refs, "selection": info, "answers": answers,
         "concurrency": PROVIDER_GATE.report(refs),
         **_quota_report_after_answers(refs),
-        "agreement": agreement_of([a.get("answer") or "" for a in good]),
+        "agreement": _grounded_agree["value"], "agreement_source": _grounded_agree["source"],
+        "agreement_votes": _grounded_agree["votes"],
+        "participants": participants_of(refs, answers),
+        "substitutions": substitutions_of(answers),
         "answers_with_citations": sum(1 for a in good if a.get("cited_ok")),
         "answered": len(good), "failed": len(answers) - len(good),
         **_rate_limit_report(results),
@@ -6841,9 +6973,12 @@ def tool_map(args: dict) -> dict:
     pairs = list(zip(items, prompts))
     # **予算を渡す**（渡さないと 240 秒の打ち切りが効かず、遅い要素 1 件で 300 秒の
     # クライアント待ちに当たって**取れていた結果まで失われる**。実測: 0.1 秒予算でも完走した）。
+    map_started = now_ts()
     results = run_parallel(pairs, lambda pair: call_model(model, pair[1], max_tokens=max_tokens, kind="map"),
                            max_workers=MAX_WORKERS, deadline=call_budget(), fair_keys=prompts,
                            fair_providers=[split_ref(model)[0]] * len(pairs))
+    wall = round(now_ts() - map_started, 3)
+    sequential = round(sum(as_float(res.get("latency_s"), 0.0) for res in results), 3)
     rows = []
     for item, res in zip(items, results):
         row = {"item": truncate(item, 200),
@@ -6857,7 +6992,11 @@ def tool_map(args: dict) -> dict:
     ok = sum(1 for r in rows if not r["error"])
     coalesced_calls = sum(1 for r in rows if r.get("coalesced"))
     data = {"model": model, "count": len(rows), "ok": ok, "failed": len(rows) - ok, "results": rows,
-            "items_dropped": items_dropped, "coalesced_calls": coalesced_calls, "selection": selection}
+            "items_dropped": items_dropped, "coalesced_calls": coalesced_calls, "selection": selection,
+            # 所要時間は **fanout と同じ形**で返す（v0.42.2・issue #9）。サーバーが返さないと
+            # 「並列が速い」ことを content でも言えない（実測: 12 件で 6.3s / 逐次 24.1s・3.8 倍）。
+            "wall_s": wall, "sequential_estimate_s": sequential,
+            "speedup": round(sequential / wall, 2) if wall > 0 and sequential else None}
     if as_flag(args.get("reduce")) and budget_expired():
         # 後段の統合は 1 回ぶんの推論を足す。予算切れで始めると 300 秒の待ちに当たるだけ。
         data["reduce_error"] = ("呼び出しの予算を使い切ったため reduce を実行しませんでした"
@@ -6867,9 +7006,11 @@ def tool_map(args: dict) -> dict:
         if joined.strip():
             reduce_prompt = (f"次の {len(rows)} 件の出力を統合してください。"
                             f"重複をまとめ、対立点は残し、出典番号や行番号を落とさない。\n\n{truncate(joined, 12000)}")
+            reduce_started = now_ts()
             red = call_model(as_str(args.get("reduce_model")) or model, reduce_prompt,
                              max_tokens=as_int(args.get("reduce_max_tokens"), 900, 16, 4000),
                              kind="map_reduce")
+            data["reduce_s"] = round(now_ts() - reduce_started, 3)
             data["reduced"] = red.get("text") or ""
             if red.get("quota_accounting"):
                 data["reduce_quota_accounting"] = red["quota_accounting"]
@@ -7198,6 +7339,7 @@ def tool_consult(args: dict) -> dict:
     quota_accounting = [{"round": r.get("round"), "kind": r.get("kind"), "model": a.get("model"),
                          "warning": a["quota_accounting"]}
                         for r in rounds for a in r.get("answers", []) if a.get("quota_accounting")]
+    _consult_agree = agreement_detail([row.get("conclusion") or "" for row in last])
     return {
         "session_id": sid,
         "mode": mode,
@@ -7208,8 +7350,11 @@ def tool_consult(args: dict) -> dict:
         "concurrency": PROVIDER_GATE.report(refs),
         **_quota_report_after_answers(refs),
         "quota_accounting": quota_accounting,
-        "agreement": agreement_of([row.get("conclusion") or "" for row in last]),
-        "agreement_note": "表層合意度。正しさの確率ではありません。",
+        "agreement": _consult_agree["value"], "agreement_source": _consult_agree["source"],
+        "agreement_votes": _consult_agree["votes"],
+        "participants": participants_of(refs, last),
+        "substitutions": substitutions_of(last),
+        "agreement_note": _agreement_note(_consult_agree["source"]),
         "confidence_mean": round(sum(conf) / len(conf), 1) if conf else None,
         "consensus": last,
         "failed": [{"model": row.get("model"), "error": truncate(row.get("error") or "", 160)}
@@ -7390,12 +7535,16 @@ def tool_agent(args: dict) -> dict:
             if key not in seen:
                 seen.add(key)
                 citations.append(cite)
+    _agent_agree = agreement_detail([r.get("answer") or "" for r in good])
     return {
         "task": truncate(task, 300), "models": refs, "selection": info,
         "agents": results, "answered": len(good), "failed": len(results) - len(good),
         "tool_calls": sum(len(r.get("trace") or []) for r in results),
         "citations": citations, "citation_count": len(citations),
-        "agreement": agreement_of([r.get("answer") or "" for r in good]),
+        "agreement": _agent_agree["value"], "agreement_source": _agent_agree["source"],
+        "agreement_votes": _agent_agree["votes"],
+        "participants": participants_of(refs, results),
+        "substitutions": substitutions_of(results),
         "answers_with_citations": sum(1 for r in good if r.get("cited_ok")),
         "unsupported_citations": sorted({n for r in good
                                         for n in (r.get("unsupported_citations") or [])}),
