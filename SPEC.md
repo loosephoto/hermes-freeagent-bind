@@ -2444,6 +2444,25 @@ content は「回答 3/4 体」と落ちた理由の内訳を出す（黙って�
 Wikipedia の実検索が通る（`International Space Station`・2 件・0.8 秒・`render` 正常）／
 `compileall` / `check_integrity`（version=0.42.8）/ smoke 3 種。
 
+### 6.55 モデル一覧の切り出し（v0.42.9）
+
+§3.3（一覧の取得・並列・締め切り・プロセス間キャッシュ）と §3.2（チャット向け選別・既定モデル）の
+**454 行 / 32 名前**を `catalog.py` へ移した。`server.py` は 8,265 → **7,821 行**。
+
+**`--keep` を使った初めての例**: `_CATALOG_DISK_MTIME` は
+`tests/test_catalog_cache.py` が**直接代入**（`S._CATALOG_DISK_MTIME = ...`）で差し替えるため
+server.py に残し、移動先からは `S._CATALOG_DISK_MTIME` で読む。定義そのもの（
+`_CATALOG_DISK_MTIME: float | None = None`）も server.py に置く。
+
+**切り出し器の不具合 1 件（実測で踏んだ）**: `global _CATALOG_DISK_MTIME` の行が
+`global S._CATALOG_DISK_MTIME` に化けて SyntaxError。`global` / `nonlocal` 行は前置しない、
+という規則を足した。さらに keep 名の処理順を「`global` から名前を落とす → `S.` 前置」に直した
+（逆順だと名前が `S.X` になって `global` 行と一致しない）。
+
+**検証**: unittest 1,302 件 OK（移動前と同一）／`all_models()` 1,233 件・`default_model()` が
+`nous/meituan/longcat-2.5:free`／`tools/list` 25,326 文字のまま／`compileall` /
+`check_integrity`（version=0.42.9）/ smoke 3 種。
+
 ## 12. 検証
 
 ```bash

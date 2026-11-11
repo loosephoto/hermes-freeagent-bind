@@ -836,6 +836,7 @@ v0.42.5 は `FREEAGENT_RANK_BUDGET` の判断（実測 traces 2,288 行で超過
 v0.42.6 は確信度の較正: `consult(debate_depth=deep)` で**討論により立場を変えた**割合を確信度の帯（90-100 / 70-89 / 50-69 / 0-49）ごとに `confidence_calibration.json` へ貯め、`confidence_calibration` として返す（真の正誤ではないので**代理ラベル**と明記）。ツール定義は不変で **24,520 文字のまま**。
 v0.42.7 は `server.py` の分割の続き: 決定論ツールの `admit`（約 400 行）を `admission.py` へ、`diagnose`（約 380 行）を `diagnostics.py` へ切り出した（`server.py` は **9,569 行**）。`TOOLS` / `HANDLERS` と、テストが直接代入する `_ADMIT_MAX_BYTES` は server.py に残す。ツール定義は不変で **24,520 文字のまま**。
 v0.42.8 は知識バックエンドを `knowledge.py` へ切り出した（§5 の **1,311 行 / 72 名前**・`server.py` は **8,265 行**）。§5.99 のソース登録（`sources` の読み込みと `SOURCES` の拡張）はserver.py に残し、移動先からは `S.` 経由で呼ぶ。ツール定義は不変で **24,520 文字のまま**。
+v0.42.9 は §3.2/§3.3（モデル一覧の取得・プロセス間キャッシュ・チャット向け選別・既定モデルの解決）**454 行 / 32 名前**を `catalog.py` へ切り出した（`server.py` は **7,821 行**）。テストが直接代入する `_CATALOG_DISK_MTIME` は server.py に残す。ツール定義は不変で **24,520 文字のまま**。
 以下は新しい順の内訳です。
 
 **v0.39.0（第12段階：NVD / Terraform Registry / zbMATH を追加）**: 25 の候補 API とホスト 20 件の
