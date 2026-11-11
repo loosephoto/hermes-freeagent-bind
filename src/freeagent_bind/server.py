@@ -95,7 +95,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.42.4"
+SERVER_VERSION = "0.42.5"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -9342,7 +9342,14 @@ BUDGET_VIOLATION_MIN = 2
 
 
 def _is_over_budget(result: dict) -> bool:
-    """この 1 回が `max_tokens` を大きく超えて返したか（v0.42.4・issue #8）。"""
+    """この 1 回が `max_tokens` を大きく超えて返したか（v0.42.4・issue #8）。
+
+    **比べるのは「実効の予算」**（空応答リトライで 64 → 512 に引き上げた後の値）。
+    実測: traces 2,288 行で `max_tokens >= 512` の行が 63 行あり、それらは引き上げ後の値。
+    実効予算で比べると超過は 0 件で、実験2の「64 指定で 931 字」は**サーバー自身の引き上げ**が
+    原因だった（モデルが予算を無視したわけではない）。`FREEAGENT_RANK_BUDGET` を既定 off に
+    しているのは、この実測で降格の根拠がまだ無いため。
+    """
     if not isinstance(result, dict):
         return False
     budget = as_int(result.get("max_tokens"), 0, 0, 10 ** 9)
@@ -9657,6 +9664,9 @@ def tool_diagnose(args: dict) -> dict:
         tail = "（次の一手は本番だけを根拠にしています）" if advice_channel == "tool" else ""
         notes.append(f"ベンチ直呼び（tool / run を持たない行）が {bench_calls} 件あります。"
                      f"内訳は totals_by_channel で分けています{tail}")
+    if budget["checked"] and not budget["models"]:
+        notes.append(f"max_tokens の比較は実効の予算（空応答の引き上げ後）で行いました"
+                     f"（{budget['checked']} 行を検査・超過 0 件）")
     for item in budget["models"]:
         notes.append(f"{item['model']} が max_tokens の {item['max_ratio']} 倍まで返しています"
                      f"（{item['n']} 件）。予算での出力長制御が効かない提供元です")
