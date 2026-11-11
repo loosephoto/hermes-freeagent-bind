@@ -2399,6 +2399,29 @@ content は「回答 3/4 体」と落ちた理由の内訳を出す（黙って�
 参照フィルタ・代理ラベルの明記・警告の閾値）。実機でも deep 討論 1 回で
 `50-69: 1/1 flipped`・`0-49: 1/1 flipped` が記録されることを確認。
 
+### 6.53 決定論ツールの切り出し（v0.42.7）
+
+`server.py` の §7 から 2 ブロックを機械的に切り出した（`references/module-split.md` の型）:
+
+| 移動先 | 内容 | 行数 |
+|---|---|---|
+| `admission.py` | `admit`（定数・`_admit_*`・`tool_admit`・`_render_admit`） | 約 400 |
+| `diagnostics.py` | `diagnose`（`DIAG_*` / `_diag_*` / `_is_over_budget` / `tool_diagnose`） | 約 380 |
+
+**server.py に残したもの**: `TOOLS`（481 行）、`HANDLERS`、記述の組み立て（`_dense_head` /
+`_desc_assemble`）、`_ADMIT_MAX_BYTES`。前 2 つはテストが `patch.object(S, ...)` で差し替え、
+最後の 1 つは**直接代入**（`S._ADMIT_MAX_BYTES = 10`）で強制ローテーションを起こすため、
+移動先に置くと差し替えが届かない（実測: 最初の切り出しで
+`test_rotation_moves_the_log_and_reads_both` が落ちた）。
+
+**参照の向き**: 移動先は `from . import server as S` して `S.<name>` で呼ぶ。切り出し時に
+「テストが差し替える名前（`patch.object` / `patch.dict` / `setattr` / **直接代入**）」を cross 集合に
+強制加入させ、ローカル定義があっても `S.` 前置にする。標準ライブラリ名は除外する
+（`patch.object(S, "os", ...)` を拾って `S.os.path` に化けた実測があるため）。
+
+**検証**: unittest 1,302 件 OK（切り出し前と同一）／`tools/list` は 25,326 文字のまま／
+`compileall` ／`check_integrity`（version=0.42.7）／smoke 3 種。`server.py` は 10,336 → **9,569 行**。
+
 ## 12. 検証
 
 ```bash
