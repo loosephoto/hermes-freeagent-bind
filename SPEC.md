@@ -2554,6 +2554,23 @@ top 名に加える」よう直し、事後修復用に `fix_cross_names.py`（�
 （`render` 142 文字）、`freeagent_grounded` が answers 2 件・citations 12 件・`render` 1,730 文字を
 返す／`tools/list` 25,326 文字のまま／`compileall` / `check_integrity`（version=0.45.0）/ smoke 3 種。
 
+### 6.60 ツール実装の前半とプロバイダ仕様の切り出し（v0.46.0）
+
+**969 行**を 2 モジュールへ移した。`server.py` は 3,006 → **2,051 行**。
+
+| 移動先 | 内容 | 行数 |
+|---|---|---|
+| `tools_core.py` | §6 前半（`CONSULT_SYSTEM` ほかのプロンプト・`parse_labeled` / `parse_review` / `parse_verdict` の解析・`tool_models` / `tool_ask` / `tool_fanout` / `tool_panel`・§6.12 MoA の統合） | 779 |
+| `provider_specs.py` | §3 プロバイダの仕様（18 社）とモデル参照の正規化 | 190 |
+
+`provider_specs` の `_CATALOG_DISK_MTIME` はテストが直接代入で差し替えるので server.py に残した
+（`--keep`）。
+
+**検証**: unittest 1,302 件 OK／実呼び出しで `freeagent_panel` が 2 体回答・
+`participants {requested 2, answered 2, dropped []}`、`freeagent_fanout` が 1 件成功・
+`wall 0.831s / 倍率 0.96`・`render` 正常／`PROVIDER_SPECS` 18 社・`HANDLERS` 13／
+`tools/list` 25,326 文字のまま／`compileall` / `check_integrity`（version=0.46.0）/ smoke 3 種。
+
 ## 12. 検証
 
 ```bash

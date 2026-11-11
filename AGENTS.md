@@ -6,7 +6,8 @@ Hermes Agent の **Free モデルをサブ LLM として並列に走らせる** 
 `rendering.py`・v0.42.0 / `admission.py`・`diagnostics.py`・v0.42.7 / `knowledge.py`・v0.42.8 / `catalog.py`・v0.42.9 / `stats.py`・`routing.py`・`thoughts.py`・v0.43.0 /
 `stores.py`・`sessions.py`・v0.43.1 /
 `quota.py`・`caller.py`・`parallel.py`・v0.44.0 /
-`answers.py`・`think_tools.py`・v0.45.0。
+`answers.py`・`think_tools.py`・v0.45.0 /
+`tools_core.py`・`provider_specs.py`・v0.46.0。
 テストが差し替える `render` / `_RENDERERS` / `_ADMIT_MAX_BYTES` と `TOOLS` / `HANDLERS` は
 server.py に残す。切り出しは `scripts/split_module.py`（skill 側）で機械的に行う））。メイン LLM の知識補助として
 **arXiv / Crossref / OpenAlex / Wikipedia / Wikidata / GitHub** を既定で引き、**DataCite / OpenAIRE / Zenodo /
