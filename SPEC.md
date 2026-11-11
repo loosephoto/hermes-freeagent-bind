@@ -2487,6 +2487,25 @@ top 名に加える」よう直し、事後修復用に `fix_cross_names.py`（�
 （wikipedia・arxiv 各 2 件・`render` 正常）／`model_quality` が 0.94 を返す／`compileall` /
 `check_integrity`（version=0.43.0）/ smoke 3 種。
 
+### 6.57 クールダウン・認証・トレース・セッションの切り出し（v0.43.1）
+
+§2 の残り 4 ブロック（**539 行**）を 2 モジュールへ移した。`server.py` は 6,641 → **6,128 行**。
+
+| 移動先 | 内容 | 行数 | keep |
+|---|---|---|---|
+| `stores.py` | §2.1 クールダウン（`note_cooldown` / `is_cooling` / `_parse_retry_after`）と §2.5 認証の記憶 | 281 | `_COOLDOWN_LOADED` / `_COOLDOWN_MTIME` / `_AUTH_LOADED` |
+| `sessions.py` | §2.3.1 呼び出し ID・`trace_call`・§2.4 相談セッション | 258 | `_SESSIONS_LOADED` |
+
+**新しい落とし穴（実測で 15 件が落ちた）**: `ast` の `node.lineno` は Python 3.8+ では
+**`def` 行**を指す（デコレータ行ではない）。旧版の切り出し器は `node.lineno` から切り出していたため、
+`@contextlib.contextmanager` が落ちて `run_scope` が素の generator になり、
+「context manager ではない」で 15 件が ERROR/FAIL した。→ `min(lineno, *decorator_lineno)` から
+切り出すよう修正。あわせて `fa_deco_audit.py`（git 履歴の親 server.py と突き合わせて
+デコレータ欠落を検出）を用意し、**過去に切り出した 14 モジュールも総点検**して欠落 0 件を確認した。
+
+**検証**: unittest 1,302 件 OK／`with S.run_scope(...)` が動く（`current_run` / `current_tool`）／
+`tools/list` 25,326 文字のまま／`compileall` / `check_integrity`（version=0.43.1）/ smoke 3 種。
+
 ## 12. 検証
 
 ```bash
