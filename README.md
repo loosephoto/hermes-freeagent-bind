@@ -831,6 +831,7 @@ v0.42.0 は表示（`_render_*` 本体）を `rendering.py` へ切り出した�
 v0.42.1 は診断の測定精度（traces に `finish_reason` / `max_tokens` / `retries` を記録し、`freeagent_diagnose` が**本番（ツール経由）とベンチ直呼びを分けて**集計・`FREEAGENT_DIAG_PROD_MIN`（既定 10 件）以上で次の一手を本番だけから決める）。ツール定義は不変なので **24,520 文字のまま**。
 v0.42.2 は数え方の修正（issue #4 / #6 / #7 / #9）: 合意度を**短答は完全一致**で数え（`agreement_source` / `agreement_votes`）、`participants`（要求数・実数・落ちた理由）と `substitutions`（別モデルが答えた件数）を全マルチモデルツールに足し、`map` が `wall_s` / `sequential_estimate_s` / `speedup` を返すようにした。ツール定義は不変で **24,520 文字のまま**。
 v0.42.3 は `diagnose` が **`budget.models`（`max_tokens` を 1.2 倍超で返したモデル）**を検出し、確信度を**自己申告**として扱って「確信度 90 以上 + 合意度 0.5 未満」の矛盾だけを警告する（`confidence_source` / `confidence_warning`）。ツール定義は不変で **24,520 文字のまま**。
+v0.42.4 は予算超過を**統計と選抜**に繋いだ: `model_stats` の kind 行に `over_budget` を記録し、`FREEAGENT_RANK_BUDGET=1` で降格（既定 off は従来と同一の並び）。`diagnose` の空応答の助言が超過モデルを名指しする。ツール定義は不変で **24,520 文字のまま**。
 以下は新しい順の内訳です。
 
 **v0.39.0（第12段階：NVD / Terraform Registry / zbMATH を追加）**: 25 の候補 API とホスト 20 件の
@@ -1948,6 +1949,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_RANK` | 1 | 品質統計による並べ替えを使う |
 | `FREEAGENT_SELECT_STRATEGY` | `quality` | 自動選抜の**並べ方**（`quality` / `catalog` / `least_busy`）。プロバイダ巡回の多様性は全 strategy 共通。`least_busy` は提供元の実行中本数が少ない順 |
 | `FREEAGENT_RANK_LATENCY` / `FREEAGENT_RANK_LATENCY_FULL_S` | 0 / 20.0 | **既定 off**（0 で従来どおり）。0〜1 の重みを入れると、平均所要が `FULL_S` 秒に達したモデルの品質点からその重みぶんを引く（比例・頭打ちあり）。**実測では改善しなかった**（off 24/24・5.38 秒/件 対 on 22/24・6.75 秒/件・n=24）ので既定 off のままを推奨（SPEC §6.25） |
+| `FREEAGENT_RANK_BUDGET` | 0 | `1` で**`max_tokens` を超えて返すモデル**を選抜から降格する（観測のうち超過した割合を品質点から引く・上限 0.20・2 件未満は効かせない）。実測では 64 指定で 931 字を返すモデルがあり、予算での出力長制御が効かなかった。**既定 off で従来と同一の並び** |
 | `FREEAGENT_RANK_KIND_BIAS` | 0 | `1` で**種別（kind）ごとの品質バイアス**を自動選抜に入れる（同じ kind の空応答・ハード失敗率を選抜順位から引く。他 kind の成績は参照しない）。実測では失敗の大半が空応答で、短答の kind で好成績の思考モデルが長答の kind でも選ばれ続けていた。**既定 off で従来と同一の並び** |
 | `FREEAGENT_REFINE_BAND` | 0.05 | `panel(refine)` の**統合役**を、品質点が先頭からこの差以内の帯の中で**最も速い**モデルにする（0 で品質順の先頭に戻る）。refine 段は panel の壁の 35〜63% を占めるので効く（SPEC §6.26） |
 | `FREEAGENT_ROUTING` | `off` | `auto` で**タスク分類カスケード**（light / long / reason の層で並べ方を変える）。off は従来と同一 |

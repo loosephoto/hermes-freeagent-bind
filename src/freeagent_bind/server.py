@@ -95,7 +95,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.42.3"
+SERVER_VERSION = "0.42.4"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -960,7 +960,10 @@ _STATS_HALFLIFE_DAYS = max(0.5, _env_float("FREEAGENT_STATS_HALFLIFE_DAYS", 14.0
 STATS_MAX_REFS = 400
 STATS_STALE_DAYS = 60.0
 
-_KIND_KEYS = ("n", "ok", "leak", "trunc", "empty")
+# `over_budget` は「max_tokens を大きく超えて返した」回数（v0.42.4・issue #8）。
+# 予算での出力長制御が効かない提供元があり（実測: 64 指定で 931 字・同じ条件 5/5 で逸脱）、
+# 選抜で降格したいが、既定の並びは**静かに変えない**（`FREEAGENT_RANK_BUDGET` で on）。
+_KIND_KEYS = ("n", "ok", "leak", "trunc", "empty", "over_budget")
 
 
 def stats_path() -> str:
@@ -1045,7 +1048,7 @@ def _ensure_stats_loaded() -> None:
 
 def _stats_apply(models: dict, ref: str, kind: str, *, now: float, error: str = "",
                  leak: bool = False, trunc: bool = False, empty: bool = False,
-                 lat_ms: float = 0.0) -> dict:
+                 over_budget: bool = False, lat_ms: float = 0.0) -> dict:
     """1 件の観測を `models` に足す（読み直した**最新の写し**に対して行う）。"""
     entry = models.setdefault(ref, {"kinds": {}, "updated_at": now})
     if not isinstance(entry.get("kinds"), dict):
@@ -1066,6 +1069,9 @@ def _stats_apply(models: dict, ref: str, kind: str, *, now: float, error: str = 
             row["empty"] = as_float(row.get("empty"), 0.0) + 1.0
         else:
             row["ok"] = as_float(row.get("ok"), 0.0) + 1.0
+    if over_budget:
+        # 成功・失敗とは独立に数える（空応答でも成功でも、予算を超えた事実は残す）
+        row["over_budget"] = as_float(row.get("over_budget"), 0.0) + 1.0
     if lat_ms:
         row["lat_ms"] = as_float(row.get("lat_ms"), 0.0) + lat_ms
     return models
@@ -1144,7 +1150,8 @@ def is_env_failure(err: str) -> bool:
 
 
 def note_observation(ref: str, kind: str, *, error: str = "", leak: bool = False,
-                     trunc: bool = False, empty: bool = False, lat_ms: float = 0.0) -> None:
+                     trunc: bool = False, empty: bool = False, over_budget: bool = False,
+                     lat_ms: float = 0.0) -> None:
     """1 回の呼び出し結果を記録する（ok は「エラーが無く、空でもなく、切断もされていない」）。"""
     global _STATS_LOADED, _STATS_MTIME
     if not STATS_ENABLED:
@@ -1158,7 +1165,8 @@ def note_observation(ref: str, kind: str, *, error: str = "", leak: bool = False
     # そこへ 1 件だけ足す。
     with _file_lock(path):
         models = _stats_apply(_stats_read(path), ref, kind, now=now, error=error,
-                              leak=leak, trunc=trunc, empty=empty, lat_ms=lat_ms)
+                              leak=leak, trunc=trunc, empty=empty, over_budget=over_budget,
+                              lat_ms=lat_ms)
         models = _stats_prune(models, now)
         _atomic_write(path, _dumps({"version": 1, "models": models}))
         with _STATS_LOCK:
@@ -1313,6 +1321,34 @@ def _kind_bias(ref: str, kind: str) -> float:
     return round(min(_KIND_BIAS_CAP, 0.3 * soft / n + 0.5 * hard / n), 4)
 
 
+# 予算超過の降格（既定 off・v0.42.4）。on にすると、観測のうち `over_budget` の割合だけ
+# 品質点から引く（上限 0.20）。**2 件未満は効かせない**（1 回の偶然で順位を動かさない）。
+RANK_BUDGET = _env_on("FREEAGENT_RANK_BUDGET", False)
+_RANK_BUDGET_CAP = 0.20
+_RANK_BUDGET_MIN_CALLS = 2
+
+
+def _budget_penalty(ref: str) -> float:
+    """`max_tokens` を超えて返した割合ぶんのペナルティ（0〜`_RANK_BUDGET_CAP`）。"""
+    if not RANK_BUDGET:
+        return 0.0
+    _ensure_stats_loaded()
+    kinds = (_STATS["models"].get(ref) or {}).get("kinds") or {}
+    total = 0.0
+    over = 0.0
+    for row in kinds.values():
+        if not isinstance(row, dict):
+            continue
+        n = as_float(row.get("n"), 0.0)
+        if n <= 0:
+            continue
+        total += n
+        over += as_float(row.get("over_budget"), 0.0)
+    if total < _RANK_BUDGET_MIN_CALLS or over <= 0:
+        return 0.0
+    return round(min(_RANK_BUDGET_CAP, over / total), 4)
+
+
 RANK_LATENCY_W = max(0.0, min(1.0, _env_float("FREEAGENT_RANK_LATENCY", 0.0)))
 RANK_LATENCY_FULL_S = max(1.0, _env_float("FREEAGENT_RANK_LATENCY_FULL_S", 20.0))
 
@@ -1339,7 +1375,8 @@ def rank_models(refs: list[str]) -> list[str]:
     """
     if not RANK_ENABLED:
         return list(refs)
-    return sorted(refs, key=lambda r: (-(_rank_score(r) - _latency_penalty(r)),
+    return sorted(refs, key=lambda r: (-(_rank_score(r) - _latency_penalty(r)
+                                         - _budget_penalty(r)),
                                        _rank_latency_key(r), r))
 
 
@@ -1775,6 +1812,7 @@ def observe_call(result: dict, kind: str, text: str = "") -> None:
                      leak=bool(result.get("cot_leak")),
                      trunc=bool(result.get("truncated")),
                      empty=not (text or "").strip() and not error,
+                     over_budget=_is_over_budget(result),
                      lat_ms=as_float(result.get("latency_s"), 0.0) * 1000.0)
     trace_call(kind, ref, not error, error=error,
                served_by=as_str(result.get("served_by")) or ref,
@@ -4091,6 +4129,7 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
         out = {"ref": ref, "served_by": cand, "model": c_model, "provider": c_provider,
                "text": text, "latency_s": result["latency_s"],
                "truncated": result["truncated"], "tokens": result["tokens"],
+               "max_tokens": result.get("max_tokens"),
                "redactions": result.get("redactions", 0),
                "cot_leak": _cot_leak(text), "kind": kind,
                "gate_wait_s": round(gate_wait, 3) if gate_wait else None,
@@ -9302,6 +9341,15 @@ _BUDGET_OVER_RATIO = 1.2
 BUDGET_VIOLATION_MIN = 2
 
 
+def _is_over_budget(result: dict) -> bool:
+    """この 1 回が `max_tokens` を大きく超えて返したか（v0.42.4・issue #8）。"""
+    if not isinstance(result, dict):
+        return False
+    budget = as_int(result.get("max_tokens"), 0, 0, 10 ** 9)
+    used = as_int(((result.get("tokens") or {}).get("completion")), 0, 0, 10 ** 9)
+    return bool(budget and used and used > budget * _BUDGET_OVER_RATIO)
+
+
 def _diag_budget(rows: list[dict]) -> dict:
     """`max_tokens` を大きく超えて返したモデルを数える（v0.42.3・issue #8）。"""
     over: dict[str, list[float]] = {}
@@ -9596,6 +9644,12 @@ def tool_diagnose(args: dict) -> dict:
             a_ref_fail[ref] = a_ref_fail.get(ref, 0) + 1
     advice = _diag_advice(a_totals, a_class, a_ref_fail, a_fail)
     budget = _diag_budget(rows)
+    if budget["models"] and advice.get("kind") == "empty_output":
+        top = budget["models"][0]
+        advice["advice"] += (f" さらに {top['model']} が max_tokens の {top['max_ratio']} 倍まで返しており"
+                            "（予算での出力長制御が効かない提供元）、FREEAGENT_RANK_BUDGET=1 で選抜から"
+                            "降格できます。")
+        advice.setdefault("check", []).append("FREEAGENT_RANK_BUDGET")
 
     notes = []
     bench_calls = as_int((by_channel.get("bench") or {}).get("calls"), 0, 0, 10 ** 9)
