@@ -833,6 +833,7 @@ v0.42.2 は数え方の修正（issue #4 / #6 / #7 / #9）: 合意度を**短答
 v0.42.3 は `diagnose` が **`budget.models`（`max_tokens` を 1.2 倍超で返したモデル）**を検出し、確信度を**自己申告**として扱って「確信度 90 以上 + 合意度 0.5 未満」の矛盾だけを警告する（`confidence_source` / `confidence_warning`）。ツール定義は不変で **24,520 文字のまま**。
 v0.42.4 は予算超過を**統計と選抜**に繋いだ: `model_stats` の kind 行に `over_budget` を記録し、`FREEAGENT_RANK_BUDGET=1` で降格（既定 off は従来と同一の並び）。`diagnose` の空応答の助言が超過モデルを名指しする。ツール定義は不変で **24,520 文字のまま**。
 v0.42.5 は `FREEAGENT_RANK_BUDGET` の判断（実測 traces 2,288 行で超過 **0 件**）と、「モデルが max_tokens を守らない」という前提の**訂正**（実際はサーバー自身の空応答リトライが予算を 64 → 512 に上げていた）。`diagnose` の注記に「実効予算で比較した・0 件」を出す。ツール定義は不変で **24,520 文字のまま**。
+v0.42.6 は確信度の較正: `consult(debate_depth=deep)` で**討論により立場を変えた**割合を確信度の帯（90-100 / 70-89 / 50-69 / 0-49）ごとに `confidence_calibration.json` へ貯め、`confidence_calibration` として返す（真の正誤ではないので**代理ラベル**と明記）。ツール定義は不変で **24,520 文字のまま**。
 以下は新しい順の内訳です。
 
 **v0.39.0（第12段階：NVD / Terraform Registry / zbMATH を追加）**: 25 の候補 API とホスト 20 件の

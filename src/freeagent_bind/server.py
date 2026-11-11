@@ -95,7 +95,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.42.5"
+SERVER_VERSION = "0.42.6"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -457,6 +457,98 @@ def confidence_warning(conf_mean, agreement) -> str:
                 + CONFIDENCE_CALIBRATION_NOTE + "多数決や討議で確かめてください。")
     return ""
 
+
+
+# ---- 確信度の較正（v0.42.6・issue #5 の続き） -------------------------------------
+#
+# 確信度は自己申告で、正誤に対して較正されていない（実測: 正解 99.7 / 誤答 100.0）。
+# 真の正誤ラベルは無いので、**討論で立場を変えた**ことを誤答の代理ラベルに使う
+# （変えた＝直前の答えを自分で取り下げた、とみなす）。代理ラベルなので**割合だけ**を出し、
+# 「誤答率」とは書かない（SPEC §6.52）。
+CALIB_FILE = "confidence_calibration.json"
+_CALIB_BUCKETS = ((89, "90-100"), (69, "70-89"), (49, "50-69"), (-1, "0-49"))
+
+
+def confidence_bucket(conf) -> str:
+    """確信度（0〜100）を帯に落とす。数値でなければ `"unknown"`。"""
+    if not isinstance(conf, (int, float)):
+        return "unknown"
+    for floor, name in _CALIB_BUCKETS:
+        if conf > floor:
+            return name
+    return "0-49"
+
+
+def calib_path() -> str:
+    return os.path.join(state_dir(), CALIB_FILE)
+
+
+def _calib_read() -> dict:
+    try:
+        with open(calib_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {"version": 1, "models": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("models"), dict):
+        return {"version": 1, "models": {}}
+    return data
+
+
+def note_confidence(ref: str, conf, flipped: bool) -> None:
+    """1 件の確信度と「立場を変えたか」を記録する（読んで足してから原子置換）。"""
+    if not ref or not isinstance(conf, (int, float)):
+        return
+    path = calib_path()
+    bucket = confidence_bucket(conf)
+    try:
+        with _file_lock(path):
+            data = _calib_read()
+            slot = data["models"].setdefault(ref, {"buckets": {}})
+            row = slot["buckets"].setdefault(bucket, {"n": 0, "flipped": 0})
+            row["n"] = as_int(row.get("n"), 0, 0, 10 ** 9) + 1
+            if flipped:
+                row["flipped"] = as_int(row.get("flipped"), 0, 0, 10 ** 9) + 1
+            slot["updated_at"] = now_ts()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            _atomic_write(path, _dumps(data))
+    except OSError:
+        pass
+
+
+def confidence_calibration(refs: list[str] | None = None) -> dict:
+    """帯ごとの「立場を変えた割合」を返す（`refs` を渡すとその範囲だけ）。"""
+    data = _calib_read()
+    wanted = {r for r in (refs or []) if r}
+    buckets: dict[str, dict] = {}
+    for ref, slot in (data.get("models") or {}).items():
+        if wanted and ref not in wanted:
+            continue
+        for bucket, row in ((slot or {}).get("buckets") or {}).items():
+            n = as_int((row or {}).get("n"), 0, 0, 10 ** 9)
+            if not n:
+                continue
+            flipped = as_int((row or {}).get("flipped"), 0, 0, 10 ** 9)
+            agg = buckets.setdefault(bucket, {"n": 0, "flipped": 0})
+            agg["n"] += n
+            agg["flipped"] += flipped
+    out = {}
+    for bucket, agg in sorted(buckets.items(), key=lambda kv: -kv[1]["n"]):
+        out[bucket] = {"n": agg["n"], "flipped": agg["flipped"],
+                       "flip_rate": round(agg["flipped"] / agg["n"], 3) if agg["n"] else None}
+    return {"buckets": out,
+            "note": ("「立場を変えた」を誤答の代理ラベルにした割合です（真の正誤ではありません）。"
+                     "討論を実行した `consult(debate_depth=deep)` の分だけが貯まります。")}
+
+
+def _calibration_warning(calib: dict) -> str:
+    """高確信度の帯で覆る割合が高いときの警告（閾値未満なら空）。"""
+    hb = ((calib or {}).get("buckets") or {}).get("90-100") or {}
+    n = as_int(hb.get("n"), 0, 0, 10 ** 9)
+    rate = hb.get("flip_rate")
+    if n >= 5 and isinstance(rate, (int, float)) and rate >= 0.3:
+        return (f"確信度 90-100 の帯でも {rate:.0%} が討論で立場を変えています"
+                f"（n={n}）。確信度は自己申告で、正誤の確率ではありません。")
+    return ""
 
 def _drop_reason(error: str) -> str:
     """落ちた理由の分類（content で「なぜ減ったか」を言えるようにする）。"""
@@ -7272,6 +7364,7 @@ def tool_consult(args: dict) -> dict:
                    "answers": round_rows})
 
     debate_summary = None
+    _conf_by_model: dict = {}
     do_debate = (depth == "deep") and not budget_expired()
     if depth == "deep" and not do_debate:
         dropped_rows = [_dropped_result(call_budget(), "未実行") for _ in refs]
@@ -7288,6 +7381,8 @@ def tool_consult(args: dict) -> dict:
         rebuttal = ask_many(refs, rebuttal_prompt, system=DEBATE_SYSTEM,
                             max_tokens=max_tokens, kind="debate",
                             avoid=as_str_list(args.get("exclude")) or None)
+        _conf_by_model = {r["model"]: r.get("confidence") for r in round_rows
+                          if isinstance(r.get("confidence"), int)}
         debate_rows = []
         for ref, res in zip(refs, rebuttal):
             if res.get("error"):
@@ -7332,6 +7427,12 @@ def tool_consult(args: dict) -> dict:
                 (row.get("unresolved") or "").lower().rstrip(" .。!?！？;；").strip() not in _NO_ANSWER
                 and bool(row.get("unresolved")) for row in debate_rows if not row.get("error")),
         }
+        # 確信度の較正（v0.42.6）: **討論で立場を変えた**を誤答の代理ラベルとして数える。
+        # 真の正誤ラベルではないので割合だけを出す（SPEC §6.52）。
+        for part in debate_summary["participants"]:
+            conf = _conf_by_model.get(part.get("model"))
+            if isinstance(conf, int):
+                note_confidence(part["model"], conf, flipped=bool(part.get("changed")))
 
     if do_debate:
         debate_by_model = {row.get("model"): row for row in debate_rows}
@@ -7418,6 +7519,7 @@ def tool_consult(args: dict) -> dict:
         "confidence_source": "self_report",
         "confidence_warning": confidence_warning(
             round(sum(conf) / len(conf), 1) if conf else None, _consult_agree["value"]),
+        "confidence_calibration": confidence_calibration([r.get("model") for r in round_rows]),
         "consensus": last,
         "failed": [{"model": row.get("model"), "error": truncate(row.get("error") or "", 160)}
                    for row in compliance_failures + rounds[-1]["answers"] if row.get("error")],
