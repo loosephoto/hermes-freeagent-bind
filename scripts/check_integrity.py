@@ -77,7 +77,15 @@ def main() -> int:
             check(banned not in text, f"content に指示文「{banned}」が混ざっています")
 
     # 7. HTTP タイムアウトの指定
-    src = inspect.getsource(S)
+    # **分割後のモジュールも連結して読む**（v0.43.x で HTTP まわりを server.py から出したため、
+    # server.py だけ見ると「(connect, read) が無い」と誤判定する・実測 1 件）。
+    parts = [inspect.getsource(S)]
+    pkg_dir = os.path.dirname(os.path.abspath(S.__file__))
+    for name in sorted(os.listdir(pkg_dir)):
+        if name.endswith(".py") and name != "server.py":
+            with open(os.path.join(pkg_dir, name), encoding="utf-8") as fh:
+                parts.append(fh.read())
+    src = "\n".join(parts)
     check("timeout=" in src, "外部 HTTP に timeout が指定されていません")
     check(re.search(r"\(\s*\d+(\.\d+)?\s*,\s*\d+(\.\d+)?\s*\)", src) is not None,
           "外部 HTTP に (connect, read) 形式のタイムアウトが見当たりません")

@@ -2506,6 +2506,37 @@ top 名に加える」よう直し、事後修復用に `fix_cross_names.py`（�
 **検証**: unittest 1,302 件 OK／`with S.run_scope(...)` が動く（`current_run` / `current_tool`）／
 `tools/list` 25,326 文字のまま／`compileall` / `check_integrity`（version=0.43.1）/ smoke 3 種。
 
+### 6.58 サブ LLM 呼び出し層の切り出し（v0.44.0）
+
+`server.py` から **1,628 行**を 3 モジュールへ移した。`server.py` は 6,128 → **4,549 行**。
+
+| 移動先 | 内容 | 行数 |
+|---|---|---|
+| `quota.py` | §3.4 提供元別ゲート（`_ProviderGate` / `provider_slot_cap`）と §3.5 クォータ窓（予約・精算・報告） | 565 |
+| `caller.py` | §4 の呼び出し本体（`scrub_secrets` / `_call_once` / `_call_model_uncached` / 進捗 / 合流 / `Deadline`） | 741 |
+| `parallel.py` | §4.0 要求単位のキャンセルと §4.1 公平な共有スケジューラ（`run_parallel` / `ask_many` / `ask_map`） | 322 |
+
+`call_model` はテストが**直接代入**で差し替えるので server.py に残す（`--keep call_model`）。
+
+**切り出し器の不具合 3 件（実測）**:
+1. **keep 名を「定義行だけ消す」実装では足りない** — `def call_model(` の行が `S.` 前置されて
+   `def S.call_model(` で SyntaxError。keep 名は**ノードごと移動しない**ようにした。
+2. **keep 名の初期化式が移動先の関数を呼ぶ** — `_QUOTA_LIMITS = _parse_quota_limits(...)` が
+   `NameError`。keep の定義は `globals().update(EXPORTS)` の**後**に置く。
+3. **標準ライブラリ名でもテストが差し替えるなら `S.` 前置が要る** — `patch.object(S, "time", ...)` を
+   効かせるため `time` を前置する必要がある一方、`patch.dict(S.os.environ, ...)` を拾うと
+   `S.os.path` に化ける。差し替えの種類（`patch.object`/`setattr`/直接代入 = hard、
+   `patch.dict` = soft）を分け、**hard は標準ライブラリ名でも前置 / soft は除外**にした
+   （実測: これで Deadline 系 10 件が直った）。
+4. **モジュール直下の行では自分の名前を `S.` にしない** — 読み込み順で `AttributeError`。
+
+**`check_integrity.py` の修正**: `inspect.getsource(S)` だけを見ていたため、HTTP の
+`(connect, read)` タイムアウトが分割先へ移ると「見当たりません」で落ちた（実測 1 件）。
+パッケージ内の全モジュールを連結して検査するようにした。
+
+**検証**: unittest 1,302 件 OK／実呼び出し（`freeagent_ask` が `2` を返し tokens 17/2）／
+`tools/list` 25,326 文字のまま／`compileall` / `check_integrity`（version=0.44.0）/ smoke 3 種。
+
 ## 12. 検証
 
 ```bash
