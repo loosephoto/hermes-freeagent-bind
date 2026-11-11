@@ -2537,6 +2537,23 @@ top 名に加える」よう直し、事後修復用に `fix_cross_names.py`（�
 **検証**: unittest 1,302 件 OK／実呼び出し（`freeagent_ask` が `2` を返し tokens 17/2）／
 `tools/list` 25,326 文字のまま／`compileall` / `check_integrity`（version=0.44.0）/ smoke 3 種。
 
+### 6.59 ツール実装本体の切り出し（v0.45.0）
+
+`server.py` から **1,557 行**を 2 モジュールへ移した。`server.py` は 4,549 → **3,006 行**。
+
+| 移動先 | 内容 | 行数 |
+|---|---|---|
+| `answers.py` | §6.11 `tool_grounded` / `tool_map` / `tool_consult` / `tool_agent` / `tool_delegate` と引用の認定（`_cited_numbers` / `_evidence_block`） | 776 |
+| `think_tools.py` | §6.9/§6.10 `tool_think` の実装（`_thought_apply_ops` / `_plan_merge` / 検証・閲覧・代替案） | 781 |
+
+`HANDLERS` は server.py に残したまま、13 ツールすべての実体が `EXPORTS` 経由で解決される
+（`handlers=13` を実測）。移動先の相互参照（`answers.py` が `think_tools.py` を、逆も）は
+`S.` 属性参照で行うため、循環 import にならない。
+
+**検証**: unittest 1,302 件 OK／実呼び出しで `freeagent_think` が `session_id` を返し
+（`render` 142 文字）、`freeagent_grounded` が answers 2 件・citations 12 件・`render` 1,730 文字を
+返す／`tools/list` 25,326 文字のまま／`compileall` / `check_integrity`（version=0.45.0）/ smoke 3 種。
+
 ## 12. 検証
 
 ```bash

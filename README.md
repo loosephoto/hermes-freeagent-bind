@@ -840,6 +840,7 @@ v0.42.9 は §3.2/§3.3（モデル一覧の取得・プロセス間キャッシ
 v0.43.0 は永続ストアを 3 モジュールに切り出した: §2.2 品質統計と順位付け（454 行）→ `stats.py`、§3.6/§3.7 選抜ストラテジとタスク分類（304 行）→ `routing.py`、§2.6/§2.7 思考台帳（458 行）→ `thoughts.py`。合計 **1,216 行**を移し、`server.py` は **6,641 行**。テストが直接代入する `_STATS` / `_STATS_LOADED` / `_STATS_MTIME` / `RANK_BUDGET` / `_THOUGHTS_LOADED` は server.py に残す。ツール定義は不変で **24,520 文字のまま**。
 v0.43.1 は永続ストアの残りを切り出した: §2.1 クールダウンと §2.5 プロバイダ認証の記憶（281 行）→ `stores.py`、§2.3.1 呼び出し ID・トレースと §2.4 相談セッション（258 行）→ `sessions.py`。`server.py` は **6,128 行**（`_COOLDOWN_LOADED` / `_COOLDOWN_MTIME` / `_AUTH_LOADED` / `_SESSIONS_LOADED` は server.py に残す）。ツール定義は不変で **24,520 文字のまま**。
 v0.44.0 はサブ LLM 呼び出しの層を切り出した: §3.4 提供元ゲートと §3.5 クォータ窓（565 行）→ `quota.py`、§4 の呼び出し本体（秘密の伏せ字・キャッシュ・進捗・合流・予算・741 行）→ `caller.py`、§4.0/§4.1 キャンセルと公平スケジューラ（322 行）→ `parallel.py`。`server.py` は **4,549 行**。`call_model` はテストが直接代入で差し替えるため server.py に残す。ツール定義は不変で **24,520 文字のまま**。
+v0.45.0 はツール実装の本体を切り出した: §6.11 回答の組み立て（grounded / map / consult / agent / delegate・776 行）→ `answers.py`、§6.9/§6.10 `freeagent_think` の実装（計画・改訂・分岐・仮説・検証・781 行）→ `think_tools.py`。`server.py` は **3,006 行**。ツール定義は不変で **24,520 文字のまま**。
 以下は新しい順の内訳です。
 
 **v0.39.0（第12段階：NVD / Terraform Registry / zbMATH を追加）**: 25 の候補 API とホスト 20 件の
