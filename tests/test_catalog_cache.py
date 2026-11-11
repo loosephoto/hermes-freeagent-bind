@@ -147,43 +147,53 @@ class TestCatalogDiskCache(_CacheCase):
 
 class TestCatalogParallelDeadline(_CacheCase):
     def test_slow_provider_does_not_serialise_the_others(self):
-        """1 ホストが固まっても、他プロバイダの結果で先に進める（並列 + 締め切り）。"""
+        """1 ホストが固まっても、他プロバイダの結果で先に進める（並列 + 締め切り）。
+
+        **プロバイダ名はテストごとに固有**にする: 遅い呼び出しのスレッドは締め切り後も
+        1.5 秒走り続け、終わると `_MODELS_CACHE` へ書き込む。前のテストと同じ名前だと、
+        その残骸が次のテストの setUp（キャッシュ消去）の後に書き込まれて
+        `_models_memory` が None でなくなり、実測で CI の windows/3.11 だけ落ちた。
+        """
+        fastp, slowp = "fastp-dl", "slowp-dl"
+
         def http(path, provider=None, timeout=None):
-            if provider == "slowp":
+            if provider == slowp:
                 time.sleep(1.5)
             return {"data": _rows(provider)}
 
-        with self._specs("fastp", "slowp"), \
+        with self._specs(fastp, slowp), \
              mock.patch.object(S, "provider_http", http), \
              mock.patch.object(S, "_CATALOG_DEADLINE_S", 0.3):
             start = time.monotonic()
-            S._catalog_prefetch(["fastp", "slowp"])
+            S._catalog_prefetch([fastp, slowp])
             elapsed = time.monotonic() - start
-            fast = S._models_memory("fastp")
-            slow = S._models_memory("slowp")
+            fast = S._models_memory(fastp)
+            slow = S._models_memory(slowp)
         self.assertLess(elapsed, 1.0, f"締め切りで打ち切る（実測 {elapsed:.2f}s）")
         self.assertEqual(len(fast), 2)
         self.assertIsNone(slow, "間に合っていないものは鮮度なしとして扱う")
 
     def test_deadline_miss_is_filled_with_the_previous_value(self):
         """締め切り超過は**失敗ではない**ので、前回の成功値で埋める（空にしない）。"""
+        fastp, slowp = "fastp-miss", "slowp-miss"      # 名前はテスト固有（上の注意書きと同じ理由）
+
         def http(path, provider=None, timeout=None):
-            if provider == "slowp":
+            if provider == slowp:
                 time.sleep(1.5)
             return {"data": _rows(provider, 3)}
 
-        with self._specs("fastp", "slowp"):
-            self._store_stale("slowp", _rows("slowp", 2))     # 前回の成功値
+        with self._specs(fastp, slowp):
+            self._store_stale(slowp, _rows(slowp, 2))     # 前回の成功値
             with mock.patch.object(S, "provider_http", http), \
-                 mock.patch.object(S, "PROVIDER_ORDER", ["fastp", "slowp"]), \
+                 mock.patch.object(S, "PROVIDER_ORDER", [fastp, slowp]), \
                  mock.patch.object(S, "_CATALOG_DEADLINE_S", 0.3):
                 start = time.monotonic()
                 rows = S.all_models()
                 elapsed = time.monotonic() - start
         ids = [r["id"] for r in rows]
         self.assertLess(elapsed, 1.0, f"直列なら 1.5 秒以上かかる（実測 {elapsed:.2f}s）")
-        self.assertIn("fastp-model-0", ids)
-        self.assertIn("slowp-model-1", ids, "締め切りを超えた分は前回の成功値で埋まる")
+        self.assertIn("fastp-miss-model-0", ids)
+        self.assertIn("slowp-miss-model-1", ids, "締め切りを超えた分は前回の成功値で埋まる")
 
     def test_failure_is_not_filled_with_the_previous_value(self):
         """取得の**失敗**は前回値で隠さない（規約 8: 失敗を content / error で出す）。"""
