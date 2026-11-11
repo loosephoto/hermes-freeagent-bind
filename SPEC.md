@@ -2422,6 +2422,28 @@ content は「回答 3/4 体」と落ちた理由の内訳を出す（黙って�
 **検証**: unittest 1,302 件 OK（切り出し前と同一）／`tools/list` は 25,326 文字のまま／
 `compileall` ／`check_integrity`（version=0.42.7）／smoke 3 種。`server.py` は 10,336 → **9,569 行**。
 
+### 6.54 知識バックエンドの切り出し（v0.42.8）
+
+§5（知識バックエンド・1,311 行 / トップレベル 72 名前）を `knowledge.py` へ移した。
+`server.py` は 9,569 → **8,265 行**。
+
+**境界の引き方**: §5.99「ソース実装の読み込み」
+（`from . import sources as _kb_sources` / `globals().update(_kb_sources.EXPORTS)` /
+`KB_BACKENDS.update(...)` / `SOURCES = tuple(...)`）は **server.py に残した**。ここは
+`server.kb_wikipedia` 等の互換名を作る場所で、移動先に置くと互換名が移動先の名前空間にしか
+入らない（テストは `patch.object(server, "kb_wikipedia")` で差し替えるため届かなくなる）。
+`KB_BACKENDS` の dict は同一オブジェクトを共有するので `patch.dict` は移動後も効く。
+
+**切り出し器の不具合 2 件（実測で踏んだ）**:
+1. `def kb_http(...)` のように**force 対象の名前を定義している行**まで `S.` 前置してしまい
+   `def S.kb_http(` で SyntaxError。→ 直前が `def` / `class` なら前置しない。
+2. `_KA_POOL_MAX = _env_int(...)` の**左辺**を前置して `S._KA_POOL_MAX = ...` に化け、
+   `EXPORTS` 参照時に NameError。→ 行頭が名前 + `=` / `:` なら前置しない。
+
+**検証**: unittest 1,302 件 OK（移動前と同一）／`tools/list` 25,326 文字のまま／
+Wikipedia の実検索が通る（`International Space Station`・2 件・0.8 秒・`render` 正常）／
+`compileall` / `check_integrity`（version=0.42.8）/ smoke 3 種。
+
 ## 12. 検証
 
 ```bash

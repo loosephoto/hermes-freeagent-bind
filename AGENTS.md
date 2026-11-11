@@ -3,8 +3,9 @@
 Hermes Agent の **Free モデルをサブ LLM として並列に走らせる** MCP サーバー（Python 3.11+ / 実行時依存ゼロ /
 モジュラーモノリス＝本体 1 ファイル＋`sources/`・`providers/` パッケージ＋分割モジュール
 （`transport_http.py` / `resources.py` / `harness.py` / `jsonutil.py`・v0.40.0 /
-`rendering.py`・v0.42.0 / `admission.py`・`diagnostics.py`・v0.42.7。テストが差し替える
-`render` / `_RENDERERS` / `_ADMIT_MAX_BYTES` と `TOOLS` / `HANDLERS` は server.py に残す））。メイン LLM の知識補助として
+`rendering.py`・v0.42.0 / `admission.py`・`diagnostics.py`・v0.42.7 / `knowledge.py`・v0.42.8。
+テストが差し替える `render` / `_RENDERERS` / `_ADMIT_MAX_BYTES` と `TOOLS` / `HANDLERS` は
+server.py に残す。切り出しは `scripts/split_module.py`（skill 側）で機械的に行う））。メイン LLM の知識補助として
 **arXiv / Crossref / OpenAlex / Wikipedia / Wikidata / GitHub** を既定で引き、**DataCite / OpenAIRE / Zenodo /
 ROR / DOAJ / npm / crates / CiNii / OSV / IETF / INSPIRE-HEP / OEIS / HF Hub / Hacker News / Software Heritage /
 Libraries.io / Internet Archive / Qiita / OpenReview / MDN / DevDocs / NVD / Terraform Registry / zbMATH** は
