@@ -578,13 +578,13 @@ def _arxiv_throttle() -> None:
 
 KB_BACKENDS = {
     # wikipedia だけ「言語の自動判定」を使う（opts が空なら kb_wikipedia 側が問いから決める）。
-    "wikipedia": lambda q, limit, opts: kb_wikipedia(q, lang=opts.get("lang") or "", limit=limit),
-    "wikidata": lambda q, limit, opts: kb_wikidata(q, lang=opts.get("lang") or "ja", limit=limit),
-    "arxiv": lambda q, limit, opts: kb_arxiv(q, limit=limit),
-    "crossref": lambda q, limit, opts: kb_crossref(q, limit=limit,
+    "wikipedia": lambda q, limit, opts: S.kb_wikipedia(q, lang=opts.get("lang") or "", limit=limit),
+    "wikidata": lambda q, limit, opts: S.kb_wikidata(q, lang=opts.get("lang") or "ja", limit=limit),
+    "arxiv": lambda q, limit, opts: S.kb_arxiv(q, limit=limit),
+    "crossref": lambda q, limit, opts: S.kb_crossref(q, limit=limit,
                                                  need_evidence=opts.get("need_evidence") is True),
-    "openalex": lambda q, limit, opts: kb_openalex(q, limit=limit),
-    "github": lambda q, limit, opts: kb_github(q, kind=opts.get("kind") or "repo", limit=limit),
+    "openalex": lambda q, limit, opts: S.kb_openalex(q, limit=limit),
+    "github": lambda q, limit, opts: S.kb_github(q, kind=opts.get("kind") or "repo", limit=limit),
 }
 
 

@@ -837,6 +837,7 @@ v0.42.6 は確信度の較正: `consult(debate_depth=deep)` で**討論により
 v0.42.7 は `server.py` の分割の続き: 決定論ツールの `admit`（約 400 行）を `admission.py` へ、`diagnose`（約 380 行）を `diagnostics.py` へ切り出した（`server.py` は **9,569 行**）。`TOOLS` / `HANDLERS` と、テストが直接代入する `_ADMIT_MAX_BYTES` は server.py に残す。ツール定義は不変で **24,520 文字のまま**。
 v0.42.8 は知識バックエンドを `knowledge.py` へ切り出した（§5 の **1,311 行 / 72 名前**・`server.py` は **8,265 行**）。§5.99 のソース登録（`sources` の読み込みと `SOURCES` の拡張）はserver.py に残し、移動先からは `S.` 経由で呼ぶ。ツール定義は不変で **24,520 文字のまま**。
 v0.42.9 は §3.2/§3.3（モデル一覧の取得・プロセス間キャッシュ・チャット向け選別・既定モデルの解決）**454 行 / 32 名前**を `catalog.py` へ切り出した（`server.py` は **7,821 行**）。テストが直接代入する `_CATALOG_DISK_MTIME` は server.py に残す。ツール定義は不変で **24,520 文字のまま**。
+v0.43.0 は永続ストアを 3 モジュールに切り出した: §2.2 品質統計と順位付け（454 行）→ `stats.py`、§3.6/§3.7 選抜ストラテジとタスク分類（304 行）→ `routing.py`、§2.6/§2.7 思考台帳（458 行）→ `thoughts.py`。合計 **1,216 行**を移し、`server.py` は **6,641 行**。テストが直接代入する `_STATS` / `_STATS_LOADED` / `_STATS_MTIME` / `RANK_BUDGET` / `_THOUGHTS_LOADED` は server.py に残す。ツール定義は不変で **24,520 文字のまま**。
 以下は新しい順の内訳です。
 
 **v0.39.0（第12段階：NVD / Terraform Registry / zbMATH を追加）**: 25 の候補 API とホスト 20 件の

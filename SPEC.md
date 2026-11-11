@@ -2463,6 +2463,30 @@ server.py に残し、移動先からは `S._CATALOG_DISK_MTIME` で読む。定
 `nous/meituan/longcat-2.5:free`／`tools/list` 25,326 文字のまま／`compileall` /
 `check_integrity`（version=0.42.9）/ smoke 3 種。
 
+### 6.56 永続ストアの切り出し（v0.43.0）
+
+`server.py` の §2（永続ストア）と §3.6/§3.7（選抜・分類）から 3 ブロックを移した。合計 **1,216 行**、
+`server.py` は 7,821 → **6,641 行**。
+
+| 移動先 | 内容 | 行数 | keep（server.py に残す） |
+|---|---|---|---|
+| `stats.py` | §2.2 品質統計・減衰・順位付け（`rank_models` / `diverse_order` ほか） | 454 | `_STATS` / `_STATS_LOADED` / `_STATS_MTIME` / `RANK_BUDGET` |
+| `routing.py` | §3.6 選抜ストラテジ・§3.7 タスク分類カスケード（`select_models` ほか） | 304 | なし |
+| `thoughts.py` | §2.6/§2.7 思考台帳（改訂・分岐・仮説） | 458 | `_THOUGHTS_LOADED` |
+
+**新しい落とし穴（実測で 1 回落ちた）**: 先に `stats.py` を切り出すと、server.py 側では
+`diverse_order` などが `globals().update(stats.EXPORTS)` でしか存在しない＝**AST の top-level 名に
+見えない**。その状態で次の区画を切り出すと cross 集合に入らず裸参照のまま残り、
+`select_models` が `NameError: diverse_order` で落ちる（20 件が同時に ERROR）。
+→ `split_module.py` を「既存の `globals().update(_<mod>.EXPORTS)` の先を読み、`EXPORTS` のキーも
+top 名に加える」よう直し、事後修復用に `fix_cross_names.py`（裸参照を `S.` に直す）を用意した。
+同じ検査で `knowledge.py` の `kb_arxiv` 等 6 名も裸参照と判明したので、あわせて `S.` 参照にした
+（`patch.object(server, "kb_arxiv")` が移動後も効くようになる）。
+
+**検証**: unittest 1,302 件 OK／`tools/list` 25,326 文字のまま／実検索 2 ソース
+（wikipedia・arxiv 各 2 件・`render` 正常）／`model_quality` が 0.94 を返す／`compileall` /
+`check_integrity`（version=0.43.0）/ smoke 3 種。
+
 ## 12. 検証
 
 ```bash
