@@ -328,8 +328,9 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     **python のプロセスだけ**。(d) VBS で `On Error Resume Next` の下に `If <失敗しうる式> Then` を
     書かない（評価に失敗しても本体が走る。値を変数へ入れてから比べる）。(e) サーバーが開いている
     ログへ VBS から追記しない（失敗して黙って消える。見張りの記録は `*-watchdog.log`）。
-    (f) launcher は Hermes のセッションから起動されたとき、レジストリに無い `FREEAGENT_*` /
-    `HERMES_*` / `TERMINAL_*` / `TMPDIR` を落とす（ログオン起動と同じ環境にする）。
+    (f) launcher は Hermes が起動した親から来たとき（レジストリに無い `HERMES_*` があるとき）、
+    レジストリに無い `FREEAGENT_*` / `HERMES_*` / `TERMINAL_*` / `TMPDIR` と env ファイルの定義名を
+    落とす（ログオン起動と同じ環境にする。判定を特定の名前の列挙にしない）。
     (g) 生成した VBS を走らせるテストに、実行形式でない `python.exe` を起動させない
     （窓なしの親では 1 件ごとに 20 秒待たされる）。プロキシの worker は実機の Startup を
     復元しにいくので、テストでは実行せず関数だけを取り出して走らせる。

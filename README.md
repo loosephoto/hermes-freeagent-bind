@@ -1260,9 +1260,9 @@ API キーに加えて、契約プランやデータの扱いを確認したこ�
   対話セッションや KANBAN ワーカーの端末から worker を起動すると、常駐プロセスは親の環境を引き継ぎます
   （実測: ログオン起動は `.env` から 48 個読むのに、セッションからの再起動では 25 個＝残りは親の環境に既にありました）。
   「すでに環境にある値は上書きしない」規則のため、そのセッションが一時的に設定した `FREEAGENT_STATE_DIR` などが
-  常駐に居座ります。launcher は**セッションの印（`HERMES_SESSION_ID` / `HERMES_UI_SESSION_ID` / `HERMES_KANBAN_TASK`）が
-  あるときだけ**、レジストリ（ユーザー／システムの環境変数）に無い `FREEAGENT_*` / `HERMES_*` / `TERMINAL_*` / `TMPDIR` を
-  落としてからファイルを読みます。落とした名前はログに `[env] dropped N session-inherited vars: …` と出ます（値は出ません）。
+  常駐に居座ります。launcher は**Hermes が起動した親から来たとき（レジストリに無い `HERMES_*` が環境にあるとき）だけ**、
+  レジストリ（ユーザー／システムの環境変数）に無い `FREEAGENT_*` / `HERMES_*` / `TERMINAL_*` / `TMPDIR` と、
+  env ファイルが定義している名前を落としてからファイルを読みます（＝親の値ではなくファイルの値で起動します）。落とした名前はログに `[env] dropped N session-inherited vars: …` と出ます（値は出ません）。
   Windows の「環境変数」設定に登録した値と、`FREEAGENT_ENV_FILE` / `HERMES_PROXY_LOG` / `HERMES_PROXY_FORCE_START` は残ります。
   意図して持ち込みたいときは `FREEAGENT_KEEP_SESSION_ENV=1` を付けて起動します。
 - **値の後ろにインラインコメントを書かないでください**（`KEY=1  # 説明` は値に混ざり、

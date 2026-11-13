@@ -2621,7 +2621,7 @@ top 名に加える」よう直し、事後修復用に `fix_cross_names.py`（�
 | 見張りタスクの電源設定 | `schtasks /create /sc minute` で登録したタスクは `DisallowStartIfOnBatteries` / `StopIfGoingOnBatteries` が True | XML 定義で登録（`render_task_xml`）。両方 false・`StartWhenAvailable` true・`Repetition` に `Duration` なし・`UserId` を書かない |
 | 応答なしを検知しない | 生存確認は `Win32_Process` の有無だけ。待受を受け付けない模擬プロセスは「起動済み」のまま | 毎ティック `WinHttp` で待受ポートを 1 回叩き、`UNRESPONSIVE_STRIKES`（2）回続けて答えなければ WMI の `Terminate` → 起動 |
 | 接続確認がログを汚す | 素の `WinHttp` GET は、サーバーに 1 回につき 1 件の `ConnectionResetError` のトレースバックを書かせる（keep-alive の接続を黙って閉じるため） | 確認は `Connection: close` つき（0 件）。サーバーも `handle_error` で切断系 3 種をトレースバックにしない |
-| セッション由来の環境変数 | ログオン起動は `.env` から 48 個読むのに、Hermes セッションからの再起動は 25 個（残りは親の環境に既にあった） | launcher が、セッションの印があるときだけ、レジストリに無い `FREEAGENT_*` / `HERMES_*` / `TERMINAL_*` / `TMPDIR` を落とす |
+| セッション由来の環境変数 | ログオン起動は `.env` から 48 個読むのに、Hermes セッションからの再起動は 25 個（残りは親の環境に既にあった） | launcher が、Hermes の起動した親から来たときだけ、レジストリに無い `FREEAGENT_*` / `HERMES_*` / `TERMINAL_*` / `TMPDIR` と env ファイルの定義名を落とす（再起動後は 48 個・ログオン起動と同じ集合） |
 
 **応答なしの検知の規則**（worker VBS・freeagent / proxy 共通）:
 
@@ -2654,10 +2654,13 @@ top 名に加える」よう直し、事後修復用に `fix_cross_names.py`（�
   追記はできない（`OpenTextFile` が「書き込みできません」で失敗する）。見張りの記録は別ファイル
   （`freeagent-watchdog.log` / `proxy-watchdog.log`）に書く。
 
-**セッション由来の環境変数**: 落とすのは、(a) セッションの印（`HERMES_SESSION_ID` /
-`HERMES_UI_SESSION_ID` / `HERMES_KANBAN_TASK`）があり、(b) 名前が `FREEAGENT_` / `HERMES_` /
-`TERMINAL_` で始まるか `TMPDIR` で、(c) `HKCU\Environment` と `HKLM\…\Session Manager\Environment` の
-どちらにも無いもの。Windows の設定に登録した値・利用者が素のシェルで設定して起動した値・launcher への
+**セッション由来の環境変数**: 落とすのは、(a) Hermes が起動した親から来ていて（＝レジストリに無い
+`HERMES_*` が環境に 1 つでもある。ログオン起動の環境には `HERMES_*` が無い）、(b) 名前が `FREEAGENT_` /
+`HERMES_` / `TERMINAL_` で始まるか、`TMPDIR` か、launcher が読む env ファイルの定義名で、
+(c) `HKCU\Environment` と `HKLM\…\Session Manager\Environment` のどちらにも無いもの。
+(a) を特定の名前の列挙にしない: 対話端末には `HERMES_SESSION_ID` があるが、コード実行の子プロセスには
+無く `HERMES_RPC_TOKEN` などだけがあった（実測。列挙だと後者を素通しする）。(b) に env ファイルの定義名を
+入れるのは、接頭辞だけだと `.env` の 48 個のうち 15 個が親の値のまま残ったため（実測）。Windows の設定に登録した値・利用者が素のシェルで設定して起動した値・launcher への
 指示（`FREEAGENT_ENV_FILE` / `FREEAGENT_KEEP_SESSION_ENV` / `HERMES_PROXY_LOG` /
 `HERMES_PROXY_FORCE_START`）は残す。`run_server.pyw` は**ファイルを読む前に** `os.environ` から落とし
 （落とした名前は `.env` / `freeagent.env` の値で埋まる）、`run_proxy.pyw` は子へ渡す環境だけを直す。
@@ -2666,7 +2669,7 @@ top 名に加える」よう直し、事後修復用に `fix_cross_names.py`（�
 **触れていないもの**: Linux（`systemd --user`）/ macOS（`launchd`）の配線は Python の選定順だけを
 揃えた。応答なしの検知とセッション環境の除去は Windows の worker / launcher だけにある。
 
-**検証**: unittest **1,352 件 OK**（新規 23 件・`tests/test_resident_v0490.py`。Windows では生成した
+**検証**: unittest **1,354 件 OK**（新規 25 件・`tests/test_resident_v0490.py`。Windows では生成した
 worker VBS を `cscript` で実際に走らせ、健全なサーバーを落とさない・1 回目は記録だけ・2 回目で終了、
 を確かめる）／実機: 一時タスクを XML で登録して電源 2 項目が False・実行結果 0x0 を確認して削除／
 `tools/list` は変更なし／`compileall` / `check_integrity`（version=0.49.0）/ smoke 3 種。

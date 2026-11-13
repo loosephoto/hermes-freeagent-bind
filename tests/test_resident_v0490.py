@@ -227,20 +227,21 @@ class WatchdogTaskCase(_Base):
 
         class _Done:
             returncode = 0
-            stdout = "ok"
-            stderr = ""
+            stdout = b"ok"
+            stderr = b""
 
         def fake_run(cmd, **kwargs):
             xml_path = cmd[cmd.index("/xml") + 1]
             with open(xml_path, "rb") as fh:
                 raw = fh.read()
-            calls.append((cmd, xml_path, raw))
+            calls.append((cmd, xml_path, raw, kwargs))
             return _Done()
 
         with mock.patch.object(self.m.subprocess, "run", side_effect=fake_run):
             message = self.m._register_schtask(r"C:\x\Hermes_Freeagent.vbs", "T_Watchdog", 5)
         self.assertEqual(len(calls), 1)
-        cmd, xml_path, raw = calls[0]
+        cmd, xml_path, raw, kwargs = calls[0]
+        self.assertFalse(kwargs.get("text"), "text=True は PYTHONUTF8=1 の下で cp932 の出力を復号できず落ちる")
         self.assertEqual(cmd[:4], ["schtasks", "/create", "/tn", "T_Watchdog"])
         self.assertIn("/f", cmd)
         self.assertNotIn("/sc", cmd, "簡易登録（/sc minute）は電源の既定値が付く")
@@ -254,8 +255,9 @@ class WatchdogTaskCase(_Base):
 
         class _Failed:
             returncode = 1
-            stdout = ""
-            stderr = "ERROR: access denied"
+            stdout = b""
+            # schtasks はコンソールのコードページで書く（日本語 Windows は cp932）。UTF-8 では復号できない。
+            stderr = "エラー: access denied".encode("cp932")
 
         def fake_run(cmd, **kwargs):
             seen.append(cmd[cmd.index("/xml") + 1])
@@ -264,7 +266,12 @@ class WatchdogTaskCase(_Base):
         with mock.patch.object(self.m.subprocess, "run", side_effect=fake_run):
             message = self.m._register_schtask("w.vbs", "T", 5)
         self.assertIn("task failed (1)", message)
-        self.assertIn("access denied", message)
+        self.assertIn("access denied", message, "失敗理由が消えている")
+        self.assertEqual(self.m._decode_console(b""), "")
+        self.assertEqual(self.m._decode_console(None), "")
+        self.assertEqual(self.m._decode_console("already text"), "already text")
+        self.assertIn("access denied", self.m._decode_console(b"\x90\xac\x8c\xf7 access denied"),
+                      "UTF-8 として不正なバイト列でも例外にしない")
         self.assertFalse(os.path.exists(seen[0]))
 
 
@@ -402,7 +409,7 @@ class UnresponsiveDetectionCase(_Base):
 class SessionEnvCase(_Base):
     def _helper(self, source: str) -> dict:
         tree = ast.parse(source)
-        wanted = {"SESSION_MARKERS", "SESSION_PREFIXES", "SESSION_EXACT", "SESSION_KEEP"}
+        wanted = {"SESSION_MARKER_PREFIX", "SESSION_PREFIXES", "SESSION_EXACT", "SESSION_KEEP"}
         nodes = []
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name in ("_drop_session_env", "_persistent_env_names"):
@@ -447,16 +454,54 @@ class SessionEnvCase(_Base):
         keep = dict(session, FREEAGENT_KEEP_SESSION_ENV="1")
         self.assertEqual(drop(keep, set()), [], "意図的な持ち込みは opt-out で残せる")
         self.assertIn("FREEAGENT_STATE_DIR", keep)
+        # launcher への指示だけ・レジストリに登録した HERMES_* だけでは「Hermes から起動された」としない。
+        forced = {"HERMES_PROXY_FORCE_START": "1", "FREEAGENT_STATE_DIR": "x"}
+        self.assertEqual(drop(dict(forced), set()), [])
+        registered = {"HERMES_HOME": r"D:\hermes", "FREEAGENT_STATE_DIR": "x"}
+        self.assertEqual(drop(dict(registered), {"HERMES_HOME"}), [])
+
+    def test_any_unregistered_hermes_variable_marks_a_hermes_parent(self):
+        """名前を並べる判定は漏れる（実測: コード実行の子には HERMES_SESSION_ID が無かった）。"""
+        ns = self._helper(self.m.render_launcher(self._cfg()))
+        kernel_shape = {"HERMES_RPC_TOKEN": "secret", "HERMES_KERNEL_SENTINEL": "1",
+                        "TERMINAL_TIMEOUT": "180", "FREEAGENT_STATE_DIR": "x", "PATH": "p"}
+        dropped = ns["_drop_session_env"](kernel_shape, set())
+        self.assertEqual(dropped, ["FREEAGENT_STATE_DIR", "HERMES_KERNEL_SENTINEL", "HERMES_RPC_TOKEN",
+                                   "TERMINAL_TIMEOUT"])
+        self.assertEqual(kernel_shape, {"PATH": "p"})
 
     def test_server_launcher_drops_before_loading_env_files(self):
         """落とすのが後だと、`実環境 > ファイル` の規則で .env の値が入らないまま起動する。"""
         source = self.m.render_launcher(self._cfg())
         compile(source, "run_server.pyw", "exec")
         self.assertNotIn("__SESSION_ENV_HELPER__", source)
-        drop_at = source.index("_dropped = _drop_session_env(os.environ, _persistent_env_names())")
+        drop_at = source.index("_dropped = _drop_session_env(os.environ, _persistent_env_names(), _file_keys)")
         load_at = source.index("for _env_path in ENV_FILES:")
         self.assertLess(drop_at, load_at)
         self.assertIn("[env] dropped %d session-inherited vars", source)
+
+    def test_names_defined_by_the_env_files_take_the_file_value_in_a_session(self):
+        """接頭辞の外の名前も、env ファイルが定義していれば親の値を捨てる（実測: 15 個が残っていた）。"""
+        source = self.m.render_launcher(self._cfg())
+        ns = self._helper(source)
+        tree = ast.parse(source)
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_env_file_keys")
+        scope = {"os": os}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<launcher>", "exec"), scope)
+        path = os.path.join(self.tmp, "keys.env")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("# c\nexport BROWSER_SESSION_TIMEOUT=300\nWEB_TOOLS_DEBUG=false\nEMPTY=\nnot a pair\n")
+        keys = scope["_env_file_keys"](path)
+        self.assertEqual(keys, ["BROWSER_SESSION_TIMEOUT", "WEB_TOOLS_DEBUG", "EMPTY"])
+        self.assertEqual(scope["_env_file_keys"](os.path.join(self.tmp, "missing.env")), [])
+        environ = dict(self._environ(), BROWSER_SESSION_TIMEOUT="from-session", WEB_TOOLS_DEBUG="true")
+        dropped = ns["_drop_session_env"](environ, {"WEB_TOOLS_DEBUG"}, keys)
+        self.assertIn("BROWSER_SESSION_TIMEOUT", dropped)
+        self.assertNotIn("WEB_TOOLS_DEBUG", dropped, "レジストリに登録した値は残す")
+        self.assertNotIn("PATH", dropped)
+        # セッションの外では、ファイルが定義する名前でも実環境が勝つ（従来の規則）。
+        plain = {"BROWSER_SESSION_TIMEOUT": "user-set", "PATH": "p"}
+        self.assertEqual(ns["_drop_session_env"](plain, set(), keys), [])
 
     def test_proxy_launcher_cleans_the_child_environment_only(self):
         source = self.m.render_proxy_launcher(self._cfg())

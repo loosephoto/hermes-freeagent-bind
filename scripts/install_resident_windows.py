@@ -48,8 +48,9 @@ worker が毎ティックで行うこと（v0.49.0）:
 - **応答なしの検知**。プロセスが居ても待受ポートが HTTP に答えないティックが `UNRESPONSIVE_STRIKES` 回
   続いたら、そのプロセスを WMI で終了して起動し直す（1 回だけなら起動直後の可能性があるので待つ）。
   見張りの記録は `logs\\<名前>-watchdog.log`（サーバーが掴んでいるログには VBS から追記できない・実測）。
-- launcher は **Hermes のセッションから起動されたとき**、そのセッション由来の環境変数
-  （レジストリに無い `FREEAGENT_*` / `HERMES_*` / `TERMINAL_*` / `TMPDIR`）を落としてから起動する。
+- launcher は **Hermes が起動した親から来たとき**（レジストリに無い `HERMES_*` があるとき）、その親に由来する
+  環境変数（レジストリに無い `FREEAGENT_*` / `HERMES_*` / `TERMINAL_*` / `TMPDIR` と env ファイルの定義名）を
+  落としてから起動する。
 """
 from __future__ import annotations
 
@@ -307,9 +308,12 @@ _PY_SESSION_ENV = r"""
 # 環境変数を引き継ぐ（実測: ログオン起動は .env から 48 個読むのに、セッションからの再起動は 25 個
 # ＝残りは親の環境に既にあった）。`実環境 > ファイル` の規則のせいで、そのセッションが一時的に
 # export した `FREEAGENT_STATE_DIR`（scratch を指す）などが常駐に居座る。
-# ログオン起動と同じ環境にするため、**セッションの印があるときだけ**、レジストリ（ユーザー／
+# ログオン起動と同じ環境にするため、**Hermes が起動した親から来たときだけ**、レジストリ（ユーザー／
 # システムの環境変数）に無い `FREEAGENT_*` / `HERMES_*` / `TERMINAL_*` / `TMPDIR` を落とす。
-SESSION_MARKERS = ("HERMES_SESSION_ID", "HERMES_UI_SESSION_ID", "HERMES_KANBAN_TASK")
+# 判定は「レジストリに無い `HERMES_*` が 1 つでもある」。ログオン起動（Startup・タスクスケジューラ）の
+# 環境には `HERMES_*` が無い。特定の名前を並べる方式は漏れる（実測: 対話端末には HERMES_SESSION_ID が
+# あるが、コード実行の子プロセスには無く HERMES_RPC_TOKEN などだけがあった）。
+SESSION_MARKER_PREFIX = "HERMES_"
 SESSION_PREFIXES = ("FREEAGENT_", "HERMES_", "TERMINAL_")
 SESSION_EXACT = ("TMPDIR",)
 # launcher 自身への指示は残す（テスト・別プロファイル・意図的な持ち込み）。
@@ -343,18 +347,30 @@ def _persistent_env_names():
     return names if found else None
 
 
-def _drop_session_env(environ, persistent):
+def _drop_session_env(environ, persistent, also=()):
     # セッション由来の変数を `environ` から落とし、落とした名前（昇順）を返す。値は返さない。
+    # `also` は接頭辞に依らず落とす名前（launcher が読む env ファイルの定義名。セッションの値ではなく
+    # ファイルの値で起動するため。渡さないと、接頭辞の外の名前だけ親の値のまま残る）。
+    also_upper = {str(name).upper() for name in also}
     if (environ.get("FREEAGENT_KEEP_SESSION_ENV") or "").strip().lower() in ("1", "true", "yes", "on"):
         return []
-    if persistent is None or not any(environ.get(name) for name in SESSION_MARKERS):
+    if persistent is None:
+        return []
+    managed = False
+    for name in environ:
+        upper = name.upper()
+        if (upper.startswith(SESSION_MARKER_PREFIX) and upper not in SESSION_KEEP
+                and upper not in persistent and environ.get(name)):
+            managed = True
+            break
+    if not managed:
         return []
     dropped = []
     for name in list(environ):
         upper = name.upper()
         if upper in SESSION_KEEP or upper in persistent:
             continue
-        if upper in SESSION_EXACT or upper.startswith(SESSION_PREFIXES):
+        if upper in SESSION_EXACT or upper in also_upper or upper.startswith(SESSION_PREFIXES):
             environ.pop(name, None)
             dropped.append(name)
     return sorted(dropped)
@@ -463,8 +479,32 @@ def _load_env_file(path):
     return names
 
 
+def _env_file_keys(path):
+    # env ファイルが定義する名前だけを返す（値は読まない）。
+    keys = []
+    if not path or not os.path.isfile(path):
+        return keys
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.lower().startswith("export "):
+                    line = line[7:].lstrip()
+                key, sep, _value = line.partition("=")
+                if sep and key.strip():
+                    keys.append(key.strip())
+    except OSError:
+        pass
+    return keys
+
+
 # ファイルを読む**前に**落とす（落とした名前は、このあと .env / freeagent.env の値で埋まる）。
-_dropped = _drop_session_env(os.environ, _persistent_env_names())
+# env ファイルが定義する名前も対象にする: セッションから起動されたときは、親の値ではなくファイルの値で
+# 起動する（実測: 接頭辞だけだと 48 個のうち 15 個が親の値のまま残った）。
+_file_keys = [key for _env_path in ENV_FILES for key in _env_file_keys(_env_path)]
+_dropped = _drop_session_env(os.environ, _persistent_env_names(), _file_keys)
 if _dropped:
     print("[env] dropped %d session-inherited vars: %s" % (len(_dropped), ", ".join(_dropped)))
 _loaded = []
@@ -1269,6 +1309,20 @@ def render_task_xml(worker_path: str, interval_minutes: int, start: str = "") ->
 """ % (interval, _xml_escape(start), _xml_escape('"%s"' % worker_path))
 
 
+def _decode_console(raw) -> str:
+    """コンソール向けプログラム（schtasks）の出力を復号する。OEM → ANSI → UTF-8 の順に試す。"""
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    for encoding in ("oem", "mbcs", "utf-8"):
+        try:
+            return raw.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
 def _register_schtask(worker_path: str, task_name: str, interval_minutes: int) -> str:
     """指定した worker VBS の見張りタスクを XML 定義で登録する（冪等・電源に依らず動く）。"""
     xml = render_task_xml(worker_path, interval_minutes)
@@ -1281,7 +1335,10 @@ def _register_schtask(worker_path: str, task_name: str, interval_minutes: int) -
         cmd = ["schtasks", "/create", "/tn", task_name, "/xml", xml_path, "/f"]
         nw = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=nw)
+            # バイト列で受けて自分で復号する。`text=True` は PYTHONUTF8=1 の下で schtasks の出力
+            # （コンソールのコードページ。日本語 Windows は cp932）を UTF-8 として読み、読み取り
+            # スレッドが UnicodeDecodeError で落ちて失敗理由が消える（実測）。
+            proc = subprocess.run(cmd, capture_output=True, creationflags=nw)
         except OSError as exc:
             return "task failed: %s" % exc
     finally:
@@ -1290,7 +1347,8 @@ def _register_schtask(worker_path: str, task_name: str, interval_minutes: int) -
         except OSError:
             pass
     if proc.returncode != 0:
-        return "task failed (%d): %s" % (proc.returncode, (proc.stderr or proc.stdout or "").strip())
+        detail = _decode_console(proc.stderr) or _decode_console(proc.stdout)
+        return "task failed (%d): %s" % (proc.returncode, detail.strip())
     return "task registered: %s (every %d min, runs on battery too)" % (task_name, max(1, int(interval_minutes)))
 
 
