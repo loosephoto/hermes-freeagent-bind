@@ -43,6 +43,37 @@ jobs:
       - name: Unit tests (offline)
         run: python -m unittest discover -s tests -v
 
+      # Issue #10: 生成した Linux systemd --user ユニットを実物の systemd-analyze で検査する。
+      # 陽性対照（WorkingDirectory="..." が拒否されること）と、空白・% 入りパスの両方を確かめる。
+      - name: Verify generated Linux systemd user units
+        if: runner.os == 'Linux'
+        run: |
+          if command -v systemd-analyze >/dev/null 2>&1; then
+            rt_dir="$(mktemp -d)"
+            chmod 0700 "$rt_dir"
+            work_root="$(mktemp -d)"
+            bad_unit="$work_root/bad-quoted.service"
+            printf '[Service]\nType=simple\nWorkingDirectory="/tmp"\nExecStart="%s" "-c" "pass"\n' "$(command -v python)" > "$bad_unit"
+            if XDG_RUNTIME_DIR="$rt_dir" SYSTEMD_COLORS=0 systemd-analyze --user verify "$bad_unit" >/dev/null 2>&1; then
+              echo "positive control failed: quoted WorkingDirectory was accepted"
+              exit 1
+            fi
+            base_dir="$work_root/alice smith/job%2F1"
+            mkdir -p "$base_dir/hermes-freeagent-bind/src/freeagent_bind"
+            cp src/freeagent_bind/server.py "$base_dir/hermes-freeagent-bind/src/freeagent_bind/server.py"
+            python scripts/install_resident.py \
+              --platform linux \
+              --hermes-home "$base_dir/.hermes" \
+              --repo "$base_dir/hermes-freeagent-bind" \
+              --unit-dir "$base_dir/units" \
+              --python "$(command -v python)" \
+              --write --force
+            XDG_RUNTIME_DIR="$rt_dir" SYSTEMD_COLORS=0 systemd-analyze --user verify \
+              "$base_dir/units/hermes-freeagent-bind.service" \
+              "$base_dir/units/hermes-proxy.service"
+            rm -rf "$rt_dir" "$work_root"
+          fi
+
       - name: stdio smoke (real JSON-RPC path)
         run: python scripts/smoke_stdio.py
 

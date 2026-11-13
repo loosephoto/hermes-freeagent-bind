@@ -530,9 +530,33 @@ if __name__ == "__main__":
 
 
 def _systemd_quote(value: str) -> str:
-    """systemd unit ファイルの引数・環境変数用にダブルクォートで囲む。"""
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    """systemd unit ファイルの引数・環境変数（`ExecStart=` / `Environment=`）用にダブルクォートで囲む。
+
+    `%` は systemd が specifier（`%h` 等）として先に展開するため、`%%` でリテラル化する。
+    """
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace("%", "%%")
+        .replace('"', '\\"')
+    )
     return '"%s"' % escaped
+
+
+def _systemd_path(value: str) -> str:
+    r"""systemd unit ファイルのパス設定（`WorkingDirectory=` 等）用にエスケープする。
+
+    `WorkingDirectory=` は二重引用符を解釈しない（`WorkingDirectory="/home/..."` は
+    先頭が `"` の相対パスと見なされ、`WorkingDirectory= path is not absolute` の
+    `bad-setting` で起動が拒否される・実測 Issue #10）。引用符は付けず、空白や制御文字は
+    C 形式（`\x20` 等）、`%` は specifier 展開防止のため `%%` に逃がす。
+    """
+    return (
+        value.replace("\\", "\\\\")
+        .replace("%", "%%")
+        .replace(" ", "\\x20")
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+    )
 
 
 def _exec_args_for(cfg: dict, launcher_path: str, marker: str) -> list[str]:
@@ -570,7 +594,7 @@ WantedBy=default.target
 """ % (
         cfg["host"],
         cfg["port"],
-        _systemd_quote(cfg["repo"]),
+        _systemd_path(cfg["repo"]),
         env_home,
         env_path,
         exec_start,
@@ -605,7 +629,7 @@ RestartSec=5
 WantedBy=default.target
 """ % (
         proxy_port,
-        _systemd_quote(cfg["hermes_home"]),
+        _systemd_path(cfg["hermes_home"]),
         env_home,
         env_path,
         exec_start,
@@ -741,8 +765,13 @@ def build_config(hermes_home: str, repo: str, host: str, port: int,
         cfg["platform"] = "windows"
         return cfg
 
+    if _host_matches_target(target):
+        hermes_home = os.path.abspath(os.path.expanduser(hermes_home))
+        repo = os.path.abspath(os.path.expanduser(repo))
+        if startup_dir:
+            startup_dir = os.path.abspath(os.path.expanduser(startup_dir))
     paths = service_paths(hermes_home, platform_name=target, unit_dir=startup_dir)
-    found_py, _ = discover_python(hermes_home, platform_name=target)
+    found_py, _ = ("", "") if python else discover_python(hermes_home, platform_name=target)
     return {
         "platform": target,
         "hermes_home": hermes_home,

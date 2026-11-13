@@ -227,6 +227,8 @@ python scripts/install_resident.py --write --force --task    # サービス登�
 
 - **Linux（SSH・ヘッドレス運用）**: ログアウトや SSH 切断後も常駐を維持するには `loginctl enable-linger "$USER"` を有効化してください（未有効の場合は `--task` 実行時に案内が出ます）。WSL では `/etc/wsl.conf` の `[boot] systemd=true` が必要です。
 - **macOS**: `LaunchAgents`（`gui/$(id -u)` ドメイン）として GUI ログインセッション単位で起動します。`PATH` には `/opt/homebrew/bin` と `/usr/local/bin` が含まれます。
+- **Nous Portal 未認証時の `hermes-proxy` の見え方**: `run_proxy.py` は未認証時に `[launcher] skipped: Nous Portal not authenticated` を 1 行だけ記録して待機するため、`127.0.0.1:8645` は LISTEN せず `freeagent_models` では `nous` だけ `到達不可: Connection refused` と表示されます（異常ではなく待機状態です。`openrouter` / `nvidia` など他のプロバイダはそのまま使えます）。後から `hermes auth add nous` を実行すると自動的に待受を開始します。
+- **設定切替後の Hermes 側への反映**: `apply_freeagent_http.sh` を実行しても、**すでに起動している Hermes プロセスは起動時の stdio 子プロセスを保持します**（自動ホットリロードはありません）。デスクトップは `Settings → Tools/MCP` の Reload、メッセージングは `/reload-mcp`（または Hermes の再起動）で常駐 HTTP へ切り替わります。
 
 ## 💬 会話での頼み方
 

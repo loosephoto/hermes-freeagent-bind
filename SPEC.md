@@ -2045,7 +2045,7 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   プロセス生成まわりの契約（Python の選定順・見張りタスクの電源設定・応答なしの検知・セッション由来の
   環境変数）は §6.62。検証: `tests/test_resident_v0490.py`。
 - **Linux / macOS を含む全 OS 共通の常駐化は `scripts/install_resident.py` が担う**（`--platform auto|windows|linux|macos`。`auto` は `sys.platform` の `win32` / `linux*` / `darwin` で判別し、Windows は `install_resident_windows.py` と同一契約に委譲）。
-  Linux は `systemd --user`（`~/.config/systemd/user/hermes-freeagent-bind.service` / `hermes-proxy.service`・`Type=simple`・`Restart=on-failure`・`systemctl --user enable --now`、`/run/systemd/system` とユーザー D-Bus 到達確認＋`linger` 未有効時の案内つき）、macOS は `launchd` LaunchAgent（`~/Library/LaunchAgents/ai.hermes.freeagent-bind.plist` / `ai.hermes.proxy.plist`・`plistlib` 生成・`KeepAlive={"SuccessfulExit": False}`・`launchctl bootstrap gui/<uid>` + `kickstart -k`）へ配線する。
+  Linux は `systemd --user`（`~/.config/systemd/user/hermes-freeagent-bind.service` / `hermes-proxy.service`・`Type=simple`・`Restart=on-failure`・`systemctl --user enable --now`、`/run/systemd/system` とユーザー D-Bus 到達確認＋`linger` 未有効時の案内つき。`WorkingDirectory=` は引用符を解釈しないため `_systemd_path()` で `\x20` / `%%` へ逃がし引用符を付けない・§6.63）、macOS は `launchd` LaunchAgent（`~/Library/LaunchAgents/ai.hermes.freeagent-bind.plist` / `ai.hermes.proxy.plist`・`plistlib` 生成・`KeepAlive={"SuccessfulExit": False}`・`launchctl bootstrap gui/<uid>` + `kickstart -k`）へ配線する。
   POSIX ランチャ `run_server.py` は `~/.hermes/.env` と `freeagent.env` を読んで `<hermes-home>/logs/freeagent-autostart.log` に追記しつつ同一プロセスで待ち受ける。`run_proxy.py` は Nous Portal 未認証時にログ 1 行のみ出してポーリング待機（`FREEAGENT_PROXY_AUTH_POLL_S`、既定 60 秒）し、認証後に `os.execvpe` で同一 PID のまま `hermes proxy start` に置換する（クラッシュ再起動ループを防ぎつつログイン後の自動復帰を保つ）。検証: `tests/test_resident_posix.py`。
 - **目印（ハーネス判別）の点検も HTTP に対応する**: `scripts/apply_proactive.py --check` は
   `x-freeagent-harness` ヘッダを env と同じ目印として読み、HTTP なら不足時にヘッダを足すコマンドを出す
@@ -2673,6 +2673,20 @@ top 名に加える」よう直し、事後修復用に `fix_cross_names.py`（�
 worker VBS を `cscript` で実際に走らせ、健全なサーバーを落とさない・1 回目は記録だけ・2 回目で終了、
 を確かめる）／実機: 一時タスクを XML で登録して電源 2 項目が False・実行結果 0x0 を確認して削除／
 `tools/list` は変更なし／`compileall` / `check_integrity`（version=0.49.0）/ smoke 3 種。
+
+### 6.63 Linux 常駐ユニットの `WorkingDirectory` 修正（v0.49.1・issue #10）
+
+実機（LMDE 7 / systemd 257）で `scripts/install_resident.py --write --force --task` を通した検証により、生成された `hermes-freeagent-bind.service` と `hermes-proxy.service` が両方とも `bad-setting` で起動を拒否される不具合（issue #10）が判明した。
+
+| 点 | 実測 | 対処 |
+|---|---|---|
+| `WorkingDirectory=` の二重引用符 | `WorkingDirectory="/home/..."` に対し `systemd-analyze --user verify` が `WorkingDirectory= path is not absolute`（`bad-setting`）を返し、空白の有無に依らず起動しない | 引数・環境変数用の `_systemd_quote()` と分離し、パス設定専用の `_systemd_path()` を新設（引用符を付けず、空白を `\x20`、`%` を `%%` へ逃がす）。ホスト一致時は相対パス・`~` も絶対パスへ正規化する |
+| 既存テストの誤期待値 | `tests/test_resident_posix.py` が `WorkingDirectory="/home/alice smith/..."`（バグそのもの）を期待値にしていた | `WorkingDirectory=/home/alice\x20smith/...` と引用符非混入へ更新。Linux 環境では実物の `systemd-analyze --user verify` で陽性対照（引用符つきが拒否されること）と生成 2 ユニットの通過を検査し、`.github/workflows/ci.yml` の Linux ジョブと `scripts/check_integrity.py`（全 OS）にも同じ検査を入れた |
+| `pip install -e .`・`PYTHONPATH=src` 無しでの単体テスト | `AGENTS.md` の手順どおり `python -m unittest discover -s tests` を素で走らせると、子プロセスを起動する 3 ファイル 6 件が `ModuleNotFoundError` で落ちた | `sys.path` 未設定のテスト 17 本に `src` 追加を入れ、子プロセスを起動する 3 本の `env` にも `PYTHONPATH` を引き継ぐよう揃えた |
+
+あわせて実機運用で確認された 2 点（Nous Portal 未認証時は `run_proxy.py` が待機して `8645` を開かず `nous` のみ `Connection refused` に見えること、`apply_freeagent_http.sh` 実行後は既存 Hermes プロセスで MCP の Reload または再起動が要ること）を `README.md` に明記した。
+
+**検証**: unittest **1,356 件 OK**（`PYTHONPATH` 無しでも全件通過）／`check_integrity`（version=0.49.1・Linux ユニット引用符検査つき）／`compileall` / `smoke_stdio` / `smoke_http` / `check_offline` / `apply_proactive --check`／CI Linux ランナーでの実 `systemd-analyze --user verify`。
 
 ## 12. 検証
 

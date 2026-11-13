@@ -8,6 +8,10 @@ import sys
 import unittest
 from unittest import mock
 
+import os as _fa_os, sys as _fa_sys
+_FA_SRC = _fa_os.path.join(_fa_os.path.dirname(_fa_os.path.dirname(_fa_os.path.abspath(__file__))), 'src')
+if _FA_SRC not in _fa_sys.path:
+    _fa_sys.path.insert(0, _FA_SRC)
 from freeagent_bind import server as S
 
 
@@ -174,6 +178,7 @@ class StorageSafety(unittest.TestCase):
         S._QUOTA_LIMITS["nous"] = {"tpm": 15}
         self.assertIsNone(S.quota_reserve("nous", 9, "parent"))
         env = os.environ.copy()
+        env["PYTHONPATH"] = _FA_SRC + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         env["FREEAGENT_QUOTA_LIMITS"] = "nous:tpm=15"
         child = subprocess.run([sys.executable, "-c",
             "from freeagent_bind import server as S; print('blocked' if S.quota_reserve('nous',9,'child') else 'admitted')"],

@@ -10,6 +10,10 @@ import tempfile
 import unittest
 from unittest import mock
 
+import os as _fa_os, sys as _fa_sys
+_FA_SRC = _fa_os.path.join(_fa_os.path.dirname(_fa_os.path.dirname(_fa_os.path.abspath(__file__))), 'src')
+if _FA_SRC not in _fa_sys.path:
+    _fa_sys.path.insert(0, _FA_SRC)
 from freeagent_bind import server as S
 
 
@@ -28,6 +32,11 @@ class ThoughtDiskAuthorityTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
+    def _child_env(self):
+        env = os.environ.copy()
+        env['PYTHONPATH'] = _FA_SRC + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
+        return env
+
     def rows(self):
         return json.loads(self.path.read_text(encoding='utf-8'))['chains']
 
@@ -38,7 +47,7 @@ class ThoughtDiskAuthorityTest(unittest.TestCase):
         self.assertIsNotNone(S.thought_get(sid))
         child = subprocess.run([sys.executable, '-c',
             'import sys; from freeagent_bind import server as S; S.thought_drop(sys.argv[1])', sid],
-            env=os.environ.copy(), capture_output=True, text=True, timeout=30)
+            env=self._child_env(), capture_output=True, text=True, timeout=30)
         self.assertEqual(0, child.returncode, child.stderr)
         self.assertNotIn(sid, self.rows())
         result = S.thought_merge(sid, {'text': 'fresh'}, assign_number=True,
@@ -72,7 +81,7 @@ class ThoughtDiskAuthorityTest(unittest.TestCase):
                     self.assertTrue(started.wait(10))
                     child = subprocess.run([sys.executable, '-c',
                         'import sys; from freeagent_bind import server as S; S.thought_drop(sys.argv[1])', sid],
-                        env=os.environ.copy(), capture_output=True, text=True, timeout=30)
+                        env=self._child_env(), capture_output=True, text=True, timeout=30)
                     self.assertEqual(0, child.returncode, child.stderr)
                 finally:
                     release.set()
@@ -84,7 +93,7 @@ class ThoughtDiskAuthorityTest(unittest.TestCase):
         sid = S.thought_merge('', {'text': 'old'}, assign_number=True, card='card')['session_id']
         child = subprocess.run([sys.executable, '-c',
             'import sys; from freeagent_bind import server as S; S.thought_drop(sys.argv[1])', sid],
-            env=os.environ.copy(), capture_output=True, text=True, timeout=30)
+            env=self._child_env(), capture_output=True, text=True, timeout=30)
         self.assertEqual(0, child.returncode, child.stderr)
         with mock.patch.object(S, '_file_mtime', return_value=S._THOUGHTS_MTIME):
             self.assertIsNone(S.thought_get(sid))

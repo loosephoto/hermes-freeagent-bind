@@ -5,6 +5,10 @@ import tempfile
 import unittest
 from unittest import mock
 
+import os as _fa_os, sys as _fa_sys
+_FA_SRC = _fa_os.path.join(_fa_os.path.dirname(_fa_os.path.dirname(_fa_os.path.abspath(__file__))), 'src')
+if _FA_SRC not in _fa_sys.path:
+    _fa_sys.path.insert(0, _FA_SRC)
 from freeagent_bind import server as S
 
 

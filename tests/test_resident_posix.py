@@ -11,6 +11,7 @@ import os
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -118,20 +119,113 @@ class ResidentPosixCase(unittest.TestCase):
         self.assertIn("Restart=on-failure", unit)
         self.assertIn("RestartSec=5", unit)
         self.assertIn("WantedBy=default.target", unit)
-        self.assertIn('WorkingDirectory="/home/alice smith/hermes-freeagent-bind"', unit)
+        # Issue #10: systemd の WorkingDirectory= は引用符を解釈せず bad-setting になるため、
+        # 引用符を付けず C 形式（空白 -> \x20）で逃がす。
+        self.assertIn(r"WorkingDirectory=/home/alice\x20smith/hermes-freeagent-bind" + "\n", unit)
+        self.assertNotIn('WorkingDirectory="', unit)
+        self.assertNotIn("WorkingDirectory='", unit)
         self.assertIn('"/opt/python 3.14/bin/python3"', unit)
         self.assertIn('"/home/alice smith/.hermes/freeagent-service/run_server.py"', unit)
         self.assertIn('"freeagent-resident-8790"', unit)
 
         proxy_unit = self.m.render_linux_proxy_unit(cfg)
+        self.assertIn(r"WorkingDirectory=/home/alice\x20smith/.hermes" + "\n", proxy_unit)
+        self.assertNotIn('WorkingDirectory="', proxy_unit)
+        self.assertNotIn("WorkingDirectory='", proxy_unit)
         self.assertIn('"/home/alice smith/.hermes/proxy-service/run_proxy.py"', proxy_unit)
         self.assertIn('"hermes-proxy-8645"', proxy_unit)
+
+        # 空白の無い通常パス・% を含むパスでも WorkingDirectory= に引用符が付かないこと
+        plain_cfg = self.m.build_config(
+            "/home/oresama/.hermes", "/home/oresama/hermes-freeagent-bind",
+            "127.0.0.1", 8790, python="/usr/bin/python3",
+            startup_dir="/home/oresama/.config/systemd/user", platform_name="linux",
+        )
+        self.assertIn("WorkingDirectory=/home/oresama/hermes-freeagent-bind\n",
+                      self.m.render_linux_unit(plain_cfg))
+        self.assertIn("WorkingDirectory=/home/oresama/.hermes\n",
+                      self.m.render_linux_proxy_unit(plain_cfg))
+        self.assertEqual(self.m._systemd_path("/var/lib/job%2F1/a b"),
+                         r"/var/lib/job%%2F1/a\x20b")
+        self.assertEqual(self.m._systemd_quote("/opt/job%2F1/py"),
+                         '"/opt/job%%2F1/py"')
 
         apply_sh = self.m.render_posix_apply(cfg)
         revert_sh = self.m.render_posix_revert(cfg)
         self.assertIn("systemctl --user start hermes-freeagent-bind.service", apply_sh)
         self.assertIn("systemctl --user disable --now hermes-freeagent-bind.service", revert_sh)
         self.assertIn("headers.x-freeagent-harness hermes", apply_sh)
+
+    def test_linux_build_config_normalizes_relative_paths_on_matching_host(self):
+        with mock.patch.object(self.m, "_host_matches_target", return_value=False):
+            cross = self.m.build_config(
+                "/home/alice/.hermes", "/home/alice/repo", "127.0.0.1", 8790,
+                python="/usr/bin/python3", startup_dir="/home/alice/units", platform_name="linux",
+            )
+        self.assertEqual(cross["repo"], "/home/alice/repo")
+        with mock.patch.object(self.m, "_host_matches_target", return_value=True), \
+             mock.patch.object(self.m, "_interpreter_ok", return_value=True):
+            matched = self.m.build_config(
+                ".", ".", "127.0.0.1", 8790,
+                python=self.posix_py, startup_dir=".", platform_name="linux",
+            )
+        self.assertTrue(os.path.isabs(matched["repo"]), matched["repo"])
+        self.assertTrue(os.path.isabs(matched["hermes_home"]), matched["hermes_home"])
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and bool(shutil.which("systemd-analyze")),
+        "Linux + systemd-analyze が要る",
+    )
+    def test_linux_systemd_analyze_verify_accepts_generated_units(self):
+        """実物の `systemd-analyze --user verify` で Issue #10 の再現と修正の両方向を検証する。"""
+        rt_dir = os.path.join(self.tmp, "xdg-run")
+        os.makedirs(rt_dir, mode=0o700, exist_ok=True)
+        os.chmod(rt_dir, 0o700)
+        env = dict(os.environ, SYSTEMD_COLORS="0", XDG_RUNTIME_DIR=rt_dir)
+
+        # 陽性対照: 二重引用符つき WorkingDirectory= は systemd-analyze が拒否すること
+        bad_unit = os.path.join(self.tmp, "bad-quoted.service")
+        with open(bad_unit, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(
+                "[Service]\nType=simple\n"
+                'WorkingDirectory="/tmp"\n'
+                f'ExecStart="{sys.executable}" "-c" "pass"\n'
+            )
+        bad_proc = subprocess.run(
+            ["systemd-analyze", "--user", "verify", bad_unit],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        self.assertNotEqual(bad_proc.returncode, 0, "引用符つき WorkingDirectory が通ってしまった")
+
+        # 本検査: 空白と % を含む実在パスで生成した 2 ユニットが verify を exit 0 で通ること
+        base = os.path.join(self.tmp, "alice smith", "job%2F1")
+        sp_home = os.path.join(base, ".hermes")
+        sp_repo = os.path.join(base, "hermes-freeagent-bind")
+        sp_units = os.path.join(base, "units")
+        os.makedirs(os.path.join(sp_repo, "src", "freeagent_bind"), exist_ok=True)
+        with open(os.path.join(sp_repo, "src", "freeagent_bind", "server.py"),
+                  "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("# stub\n")
+
+        rc = self.m.main([
+            "--platform", "linux",
+            "--hermes-home", sp_home,
+            "--repo", sp_repo,
+            "--unit-dir", sp_units,
+            "--python", sys.executable,
+            "--write", "--force",
+        ])
+        self.assertEqual(rc, 0)
+        unit_main = os.path.join(sp_units, self.m.LINUX_UNIT_NAME)
+        unit_proxy = os.path.join(sp_units, self.m.LINUX_PROXY_UNIT_NAME)
+        ok_proc = subprocess.run(
+            ["systemd-analyze", "--user", "verify", unit_main, unit_proxy],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        detail = (ok_proc.stdout + ok_proc.stderr).strip()
+        self.assertEqual(ok_proc.returncode, 0, f"systemd-analyze verify failed: {detail}")
+        self.assertNotIn("bad-setting", detail)
+        self.assertNotIn("not absolute", detail)
 
     # --- 4. macOS launchd LaunchAgents plist 生成 ----------------------
 

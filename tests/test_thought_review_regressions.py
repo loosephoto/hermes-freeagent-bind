@@ -10,6 +10,10 @@ import threading
 import unittest
 from unittest import mock
 
+import os as _fa_os, sys as _fa_sys
+_FA_SRC = _fa_os.path.join(_fa_os.path.dirname(_fa_os.path.dirname(_fa_os.path.abspath(__file__))), 'src')
+if _FA_SRC not in _fa_sys.path:
+    _fa_sys.path.insert(0, _FA_SRC)
 from freeagent_bind import server as S
 
 
@@ -26,6 +30,11 @@ class ThoughtReviewRegressions(unittest.TestCase):
                       mock.patch.object(S, '_THOUGHTS_LOADED', False)):
             patch.start()
             self.addCleanup(patch.stop)
+
+    def _child_env(self):
+        env = os.environ.copy()
+        env['PYTHONPATH'] = _FA_SRC + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
+        return env
 
     def rows(self):
         return json.loads(self.path.read_text(encoding='utf-8'))['chains']
@@ -76,7 +85,7 @@ class ThoughtReviewRegressions(unittest.TestCase):
                 child = subprocess.run([sys.executable, '-c',
                     "from freeagent_bind import server as S; "
                     "print(S.thought_merge('', {'text': 'external'}, assign_number=True, card='card')['session_id'])"],
-                    env=os.environ.copy(), capture_output=True, text=True, timeout=30)
+                    env=self._child_env(), capture_output=True, text=True, timeout=30)
                 self.assertEqual(0, child.returncode, child.stderr)
                 child_sid.append(child.stdout.strip())
                 raise
@@ -93,7 +102,7 @@ class ThoughtReviewRegressions(unittest.TestCase):
         script = ("import sys; from freeagent_bind import server as S; "
                   "S.now_ts=lambda:10000.0; print('visible' if S.thought_get(sys.argv[1]) else 'expired')")
         def child_read():
-            child = subprocess.run([sys.executable, '-c', script, sid], env=os.environ.copy(),
+            child = subprocess.run([sys.executable, '-c', script, sid], env=self._child_env(),
                                    capture_output=True, text=True, timeout=30)
             self.assertEqual(0, child.returncode, child.stderr)
             return child.stdout.strip()

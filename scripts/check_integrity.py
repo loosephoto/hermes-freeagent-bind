@@ -9,10 +9,12 @@ CI と手元の両方で同じ判定にするため、テストスイートと�
   5. pyproject.toml と SERVER_VERSION が一致する
   6. content に LLM 向け指示文が混ざっていない（人間が読むチャネル）
   7. 外部 HTTP に (connect, read) タイムアウトが指定されている
+  8. Linux 常駐ユニットの WorkingDirectory= が引用符で囲まれていない（Issue #10）
 """
 from __future__ import annotations
 
 import ast
+import importlib.util
 import inspect
 import os
 import re
@@ -96,6 +98,37 @@ def main() -> int:
                   any(alias.name in {"webbrowser", "tkinter"} for alias in node.names)
                   for node in ast.walk(tree)),
           "GUI を開く import が含まれています（stdio サーバーで開いてはいけません）")
+
+    # 8. Linux systemd --user ユニットの WorkingDirectory= 検査（Issue #10: 引用符があると bad-setting）
+    ir_path = os.path.join(ROOT, "scripts", "install_resident.py")
+    ir_spec = importlib.util.spec_from_file_location("_check_install_resident", ir_path)
+    check(ir_spec is not None and ir_spec.loader is not None, "install_resident.py を読み込めません")
+    if ir_spec is not None and ir_spec.loader is not None:
+        ir_mod = importlib.util.module_from_spec(ir_spec)
+        ir_spec.loader.exec_module(ir_mod)
+        for sample_home, sample_repo in (
+            ("/home/oresama/.hermes", "/home/oresama/hermes-freeagent-bind"),
+            ("/home/alice smith/job%2F1/.hermes", "/home/alice smith/job%2F1/hermes-freeagent-bind"),
+        ):
+            cfg_linux = ir_mod.build_config(
+                sample_home, sample_repo, "127.0.0.1", 8790,
+                python="/usr/bin/python3", startup_dir="/tmp/fa-check-units",
+                platform_name="linux",
+            )
+            for unit_label, rendered in (
+                ("hermes-freeagent-bind.service", ir_mod.render_linux_unit(cfg_linux)),
+                ("hermes-proxy.service", ir_mod.render_linux_proxy_unit(cfg_linux)),
+            ):
+                wd_lines = [ln for ln in rendered.splitlines() if ln.startswith("WorkingDirectory=")]
+                check(len(wd_lines) == 1, f"{unit_label}: WorkingDirectory= 行が 1 本ではありません ({wd_lines})")
+                for wd in wd_lines:
+                    val = wd.partition("=")[2]
+                    check(not val.startswith(('"', "'")),
+                          f"{unit_label}: WorkingDirectory= が引用符で始まっています（systemd bad-setting）: {wd}")
+                    check(val.startswith("/"),
+                          f"{unit_label}: WorkingDirectory= が絶対パスではありません: {wd}")
+                    check(" " not in val,
+                          f"{unit_label}: WorkingDirectory= に未エスケープの空白があります: {wd}")
 
     if FAILURES:
         print("整合性チェック失敗:")

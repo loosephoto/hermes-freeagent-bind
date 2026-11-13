@@ -35,7 +35,7 @@ Libraries.io / Internet Archive / Qiita / OpenReview / MDN / DevDocs / NVD / Ter
 hermes proxy start            # 推論バックエンド（Free モデル）
 python -m compileall -q src/freeagent_bind
 python scripts/check_integrity.py
-python -m unittest discover -s tests
+PYTHONPATH=src python -m unittest discover -s tests
 python scripts/smoke_stdio.py
 ```
 
@@ -47,7 +47,7 @@ python scripts/smoke_stdio.py
 ```bash
 python -m compileall -q src/freeagent_bind   # 構文
 python scripts/check_integrity.py            # TOOLS/HANDLERS の一致・スキーマ・版・content の規約
-python -m unittest discover -s tests         # オフライン回帰（件数は実行結果を参照・ネットワーク不要）
+PYTHONPATH=src python -m unittest discover -s tests   # オフライン回帰（件数は実行結果を参照・ネットワーク不要）
 python scripts/smoke_stdio.py                # 実クライアント経路（initialize/tools/list/tools/call）
 python scripts/smoke_http.py                 # HTTP 経路（1 プロセス共有。通知 202・batch・セッション・SSE）
 python scripts/probe_knowledge_stdio.py      # 新規知識ソースの実API・stdio（ネットワークあり）
@@ -334,6 +334,9 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     (g) 生成した VBS を走らせるテストに、実行形式でない `python.exe` を起動させない
     （窓なしの親では 1 件ごとに 20 秒待たされる）。プロキシの worker は実機の Startup を
     復元しにいくので、テストでは実行せず関数だけを取り出して走らせる。
+    (h) Linux（`systemd --user`）のユニットで `WorkingDirectory=` は二重引用符を解釈しない（引用符を付けると
+    `bad-setting` で起動不能になる・SPEC §6.63）。引数・環境変数用の `_systemd_quote` と分け、パス設定には
+    引用符を付けず `\x20` / `%%` へ逃がす `_systemd_path` を使う。
 
 44. **知識取得の読み取りは壁時計でも打ち切る**（§5.8）。`urlopen(timeout=…)` の上限は
     「ソケット 1 回の待ち」の上限であって**リクエスト全体の壁時計制限ではない**。1 バイトずつ
