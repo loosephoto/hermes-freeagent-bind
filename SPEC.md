@@ -2698,6 +2698,47 @@ Linux（LMDE 7 / systemd 257）実機での動作報告から、README の説明
 | アプリ再起動では切り替わらない | デスクトップだけ入れ替えても `hermes-gateway.service` は古い PID のまま・stdio 子プロセスが残る（`harness.source=env`・8790 への ESTAB 0） | 接続を持つのは gateway。切替は (a) `Settings → Tools/MCP → Reload`、(b) `systemctl --user restart hermes-gateway.service`、(c) OS 再起動のいずれか。確認は ESTAB 本数・`Transport: HTTP`・`harness.source=header`（README「Linux / macOS で常駐させる」） |
 | `nous` の見え方 | `hermes-proxy` 未認証時は 8645 が LISTEN せず `nous` だけ `Connection refused`（v0.49.1 で記載済み） | 変更なし |
 
+### 6.65 既定モデルの鮮度（v0.50.0・issue #12）
+
+Free の在庫は提供元の申告であり、廃止・未有効・アカウント単位の提供終了が混ざる。実測（LMDE 7・
+常駐 HTTP）では Free 候補 71 件のうち probe を通すと 63〜64 件になり、`model` 省略の `ask` が
+既定（`nvidia/01-ai/yi-large`）で `HTTP 404: Not found for account …` に落ちた。同じ失敗が 3 回続くと
+クライアント（Hermes）が MCP サーバーを約 43 秒停止するため、**在庫の鮮度は既定の可用性の問題**になる。
+
+**観測に時刻を持たせる**（`stats.py`）: kind 行に `last_at` / `last_ok_at` / `last_alive_at` /
+`last_gone_at` / `last_rate_limited_at` と `gone_reason` を足す。**減衰の対象にしない**（`_decay` は
+`_KIND_KEYS` だけを掛ける。時刻を割り引くと意味が壊れる）。`last_alive_at` は「エラー無く応答した」
+（空応答を含む）時刻で、`last_ok_at` は成功の時刻。空応答（`no_output`）は**存在の証拠**として扱い、
+廃止の記録を打ち消すが成功には数えない。
+
+| 判定 | 規則 | 既定の扱い |
+|---|---|---|
+| `gone` | `last_gone_at` が `max(last_ok_at, last_alive_at)` より新しく、`FREEAGENT_GONE_TTL_H`（既定 24 時間）以内 | 自動選抜と既定から外す。在庫には残す（`gone_models` に理由・経過・再確認までの秒数） |
+| `rate_limited` | 429・クォータ・クールダウン | 在庫に残す。既定の選抜では後回し（既存のクールダウンと同じ） |
+| `no_output` | 空応答（`finish_reason=length` 等） | 廃止としない。生存確認では `slow`（残す） |
+| 明示指定 | `model` / `models` に書かれた ref | 廃止でも試す（復活の確認）。`selection.notes` に「直近 404/410」を出す |
+
+- **TTL を置く理由**: NVIDIA の「アカウントで提供終了」のような提供元都合の廃止は復活しうる。
+  永久に除外すると、戻ったモデルを二度と選ばない。
+- **在庫と使用可を分ける**: `freeagent_models` は `free_candidates`（在庫）・`usable_now`
+  （クールダウンと廃止を除く）・`gone`（件数）・`gone_models`（`ref` / `reason` / `age_s` /
+  `retry_in_s`）を返し、各行に `gone` と `freshness`（`last_ok_at` / `last_gone_at` / `probed_at` /
+  `last_ok_age_s` など。記録が無い項目は省略）を付ける。行は既定で伏せ、`include_gone=true` で含める
+  （件数は `query.gone_hidden`）。**隠すのではなく理由付きで残す**（規約 8）。
+- **`404` の分類**: `HTTP 404` / `410` と、HTTP 状態を伴わない `not found`（5xx・auth 判定の後）は
+  `gone`。OpenRouter の `404 page not found`（HTML 本文でモデル情報を含まない）も同じ扱いで、
+  **モデル ID の誤入力と区別しない**（どちらも「その ref では呼べない」）。区別が必要なのは
+  401/403（`auth`）と 429（`rate_limited`）で、これらは `gone` にしない。
+- **生存確認の予算**: `probe_max_tokens` の既定を 16 → **64**（上限 512）へ上げる。16 では思考モデルが
+  本文 0 で終わり、利用者には「死んでいる」ように見える（空応答は `slow` として残す扱いは変えない）。
+- **`diagnose` の助言**: 失敗の 30% 以上が `gone` のときは `kind=gone` を返し、
+  「直近 404/410 は既定から自動で外れる（24 時間で再確認）・ref を固定しているなら
+  `FREEAGENT_MODEL_EXCLUDE` で外す」ことを案内する。
+
+**検証**: `tests/test_freshness_v0500.py`（18 件。`_stats_apply` の時刻・TTL・成功/空応答による解除・
+`rate_limited`/`timeout` が gone にならないこと・`select_models` の除外と明示指定の維持・
+`default_model` の回避・`tool_models` の 3 段の数と `include_gone`・probe の判定・予算の既定）。
+
 ## 12. 検証
 
 ```bash

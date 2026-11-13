@@ -381,7 +381,30 @@ def tool_models(args: dict) -> dict:
     """
     status = S.provider_status()
     free = S.free_model_refs(chat_only=True)          # サブLLM に使える Free だけ（§3.2）
-    usable = [ref for ref in free if not S.is_cooling(ref)]
+    # **在庫と「いま使える」を分ける**（v0.50.0・issue #12）。直近 404/410 で廃止と判定したモデルは
+    # 一覧には残す（理由つき）が、`usable_now` と自動選抜からは外す。既定の鮮度は
+    # `FREEAGENT_GONE_TTL_H`（既定 24 時間）で、期限が切れたら再確認に戻る。
+    gone = S.gone_refs()
+    include_gone = S.as_flag(args.get("include_gone"))
+    usable = [ref for ref in free if not S.is_cooling(ref) and ref not in gone]
+
+    def _fresh_row(row: dict) -> dict:
+        ref = S.make_ref(row["provider"], row["id"])
+        info = gone.get(ref) or S.model_freshness(ref)
+        item = {
+            "ref": ref,
+            "provider": row["provider"],
+            "id": row["id"],
+            "free": bool(row.get("free")),
+            "free_via": row.get("free_via") or [],
+            "context_length": row.get("context_length"),
+            "usable": S.provider_ready(row["provider"]),
+            "probe": row.get("probe"),
+            "gone": bool(info.get("gone")),
+        }
+        if info:
+            item["freshness"] = info
+        return item
     query = S.as_str(args.get("query")) or S.as_str(args.get("q"))
     provider_filter = S.as_str(args.get("provider"))
     limit = S.as_int(args.get("limit"), 40, 1, 200)
@@ -392,6 +415,13 @@ def tool_models(args: dict) -> dict:
         "free_candidates": len(free),
         "non_chat_candidates": sum(row.get("non_chat", 0) for row in status),
         "usable_now": len(usable),
+        # 在庫・使用可・廃止の 3 段（差が説明できない数字を出さない）。`gone_models` は理由つきで返す。
+        "gone": len(gone),
+        "gone_models": [{"ref": ref, "age_s": info.get("gone_age_s"),
+                         "reason": info.get("gone_reason") or "",
+                         "retry_in_s": info.get("gone_expires_in_s")}
+                        for ref, info in list(gone.items())[:20]],
+        "include_gone": include_gone,
         "default_model": S.default_model(),
         "cooling": {ref: row for ref, row in S.cooling_refs().items()},
         "ranking_enabled": S.RANK_ENABLED,
@@ -430,13 +460,22 @@ def tool_models(args: dict) -> dict:
             "probed": False,
         }
         shown = matched[:limit]
+        if not include_gone:
+            # 廃止は**隠さずに数える**（`gone_models` に理由が出る）。行だけ既定で伏せる。
+            hidden = [r for r in shown if S.make_ref(r["provider"], r["id"]) in gone]
+            if hidden:
+                shown = [r for r in shown if S.make_ref(r["provider"], r["id"]) not in gone]
+                data["query"]["gone_hidden"] = len(hidden)
         if args.get("probe") and shown:
             # 一覧は実態と乖離する（実測: NVIDIA の一覧 82 件の大半が 410 EOL、HF は権限で 403）。
             # 実際に 1 回だけ呼んで**呼べるものだけ**を残す。件数は絞る（呼び出しは課金・レートに触れる）。
             probe_limit = S.as_int(args.get("probe_limit"), min(len(shown), 12), 1, 40)
             shown = [r for r in shown if r.get("free")][:probe_limit]
             probe_prompt = S.as_str(args.get("probe_prompt")) or "1+1=? 数字1つだけ。"
-            probe_tokens = S.as_int(args.get("probe_max_tokens"), 16, 1, 64)
+            # 既定を 16 から 64 へ上げる（v0.50.0・issue #12）。思考モデルは 16 トークンだと
+            # 本文 0 で終わり、「廃止」ではなく `slow`（空応答）と判定されるが、利用者には
+            # 「死んでいる」ように見える。空応答は `call_model` 側で床まで引き上げて再試行もする。
+            probe_tokens = S.as_int(args.get("probe_max_tokens"), 64, 1, 512)
             probe_timeout = S._env_float("FREEAGENT_PROBE_TIMEOUT", 25.0)
             probe_workers = max(1, min(8, S._env_int("FREEAGENT_PROBE_WORKERS", 8),
                                        len(shown))) if shown else 1
@@ -521,16 +560,7 @@ def tool_models(args: dict) -> dict:
             })
             by_id = {(r["model"]["provider"], r["model"]["id"]): r["verdict"] for r in probed}
             shown = [dict(m, probe=by_id.get((m["provider"], m["id"])) or "alive") for m in kept]
-        data["models"] = [{
-            "ref": S.make_ref(r["provider"], r["id"]),
-            "provider": r["provider"],
-            "id": r["id"],
-            "free": bool(r.get("free")),
-            "free_via": r.get("free_via") or [],
-            "context_length": r.get("context_length"),
-            "usable": S.provider_ready(r["provider"]),
-            "probe": r.get("probe"),
-        } for r in shown]
+        data["models"] = [_fresh_row(r) for r in shown]
     if args.get("stats"):
         data["stats"] = [
             {"model": ref, "status": S.model_status(ref), "quality": S.model_quality(ref),
@@ -541,16 +571,8 @@ def tool_models(args: dict) -> dict:
     # `free_models`（サブLLMに使える Free 全体）は**常に両方**を返す。片方だけだと
     # 利用側がモードで別のキーを読む羽目になる（実測: 引数なし → free_models のみ /
     # query 付き → models のみ）。
-    data["models"] = [{
-        "ref": S.make_ref(r["provider"], r["id"]),
-        "provider": r["provider"],
-        "id": r["id"],
-        "free": bool(r.get("free")),
-        "free_via": r.get("free_via") or [],
-        "context_length": r.get("context_length"),
-        "usable": S.provider_ready(r["provider"]),
-        "probe": r.get("probe"),
-    } for r in shown]
+    data["models"] = [_fresh_row(r) for r in shown]
+    # `free_models` は**在庫**（廃止を含む）。使えるかどうかは `usable_now` / 各 `ref` の `gone` を見る。
     data["free_models"] = free
     return data
 

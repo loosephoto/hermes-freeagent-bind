@@ -38,10 +38,19 @@ def stats_path() -> str:
     return os.environ.get("FREEAGENT_STATS_PATH") or os.path.join(S.state_dir(), "model_stats.json")
 
 
+# 鮮度（v0.50.0・issue #12）。**減衰の対象にしない**（`_decay` は `_KIND_KEYS` だけを掛ける）。
+# 「最後にいつ答えたか」「最後にいつ 404/410 だったか」を持ち、既定モデルの選抜から
+# 廃止済みを外すのに使う。件数の減衰とは別物（時刻を割り引くと意味が壊れる）。
+_FRESH_KEYS = ("last_at", "last_ok_at", "last_alive_at", "last_gone_at", "last_rate_limited_at")
+
+
 def _empty_kind() -> dict:
     row = {k: 0.0 for k in _KIND_KEYS}
     row["err"] = {}
     row["lat_ms"] = 0.0
+    for key in _FRESH_KEYS:
+        row[key] = 0.0
+    row["gone_reason"] = ""
     return row
 
 
@@ -124,11 +133,25 @@ def _stats_apply(models: dict, ref: str, kind: str, *, now: float, error: str = 
     _decay_model(entry, now)
     row = entry["kinds"].setdefault(kind, _empty_kind())
     row["n"] = S.as_float(row.get("n"), 0.0) + 1.0
+    row["last_at"] = now
     if error:
         cls = classify_error(error)
         err = row.setdefault("err", {})
         err[cls] = S.as_float(err.get(cls), 0.0) + 1.0
+        if cls == "gone":
+            # **廃止の証拠を残す**（既定の選抜から外す判断に使う・v0.50.0）。
+            row["last_gone_at"] = now
+            row["gone_reason"] = S.truncate(error, 160)
+        elif cls == "rate_limited":
+            row["last_rate_limited_at"] = now
+        elif cls == "no_output":
+            # 応答は返っている（本文 0）＝**そのモデルは存在する**。廃止の判定は打ち消すが、
+            # 成功としては数えない（`last_ok_at` は上げない）。
+            row["last_alive_at"] = now
     else:
+        # 応答が返った＝そのモデルは存在する。
+        row["last_ok_at"] = now
+        row["last_alive_at"] = now
         if leak:
             row["leak"] = S.as_float(row.get("leak"), 0.0) + 1.0
         elif trunc:
@@ -156,6 +179,74 @@ def _stats_save() -> bool:
             models = _stats_prune(copy.deepcopy(S._STATS["models"]), now)
         payload = {"version": 1, "models": models}
         return S._atomic_write(path, S._dumps(payload))
+
+
+GONE_TTL_S = max(0.0, S._env_float("FREEAGENT_GONE_TTL_H", 24.0) * 3600.0)
+
+
+def _kind_rows(ref: str) -> dict:
+    _ensure_stats_loaded()
+    entry = S._STATS["models"].get(ref)
+    kinds = entry.get("kinds") if isinstance(entry, dict) else None
+    return kinds if isinstance(kinds, dict) else {}
+
+
+def model_freshness(ref: str) -> dict:
+    """`ref` の鮮度（最後に答えた時刻・最後に廃止だった時刻・その理由）を返す。
+
+    直近の `gone`（404/410）が**最後の応答より新しく**、かつ `FREEAGENT_GONE_TTL_H`（既定 24 時間）
+    以内なら `gone: true`。TTL を過ぎたら再確認に戻す（NVIDIA の「アカウントで提供終了」のような
+    提供元都合の廃止は復活しうるので、永久に除外しない）。値が無ければ空の辞書。
+    """
+    last_ok = last_alive = last_gone = last_limited = last_probe = 0.0
+    reason = ""
+    for kind_name, row in _kind_rows(ref).items():
+        if not isinstance(row, dict):
+            continue
+        last_ok = max(last_ok, S.as_float(row.get("last_ok_at"), 0.0))
+        last_alive = max(last_alive, S.as_float(row.get("last_alive_at"), 0.0))
+        gone_at = S.as_float(row.get("last_gone_at"), 0.0)
+        if gone_at > last_gone:
+            last_gone = gone_at
+            reason = S.as_str(row.get("gone_reason"))
+        last_limited = max(last_limited, S.as_float(row.get("last_rate_limited_at"), 0.0))
+        if kind_name == "probe":
+            last_probe = max(last_probe, S.as_float(row.get("last_at"), 0.0))
+    if not any((last_ok, last_gone, last_limited, last_probe)):
+        return {}
+    now = S.now_ts()
+    # 「最後に応答があった時刻」より新しい廃止だけを gone とする（空応答でも復活は拾う）。
+    gone = bool(last_gone) and last_gone > max(last_ok, last_alive) and (now - last_gone) <= GONE_TTL_S
+    out: dict = {"gone": gone}
+    if last_ok:
+        out["last_ok_at"] = round(last_ok, 3)
+        out["last_ok_age_s"] = round(max(0.0, now - last_ok), 1)
+    if last_gone:
+        out["last_gone_at"] = round(last_gone, 3)
+        out["gone_age_s"] = round(max(0.0, now - last_gone), 1)
+        out["gone_reason"] = S.truncate(reason, 160)
+        out["gone_expires_in_s"] = round(max(0.0, GONE_TTL_S - (now - last_gone)), 1)
+    if last_limited:
+        out["last_rate_limited_at"] = round(last_limited, 3)
+    if last_probe:
+        out["probed_at"] = round(last_probe, 3)
+    return out
+
+
+def is_gone(ref: str) -> bool:
+    """`ref` が直近の 404/410 で廃止と判定されているか（TTL 内・明示指定は妨げない）。"""
+    return bool(model_freshness(ref).get("gone"))
+
+
+def gone_refs() -> dict[str, dict]:
+    """いま廃止と判定されている ref → 鮮度辞書（選抜の除外と一覧の可視化に使う）。"""
+    _ensure_stats_loaded()
+    out: dict[str, dict] = {}
+    for ref in list(S._STATS["models"]):
+        info = model_freshness(ref)
+        if info.get("gone"):
+            out[ref] = info
+    return out
 
 
 def classify_error(err: str) -> str:
@@ -464,6 +555,11 @@ def diverse_order(refs: list[str]) -> list[str]:
 
 
 EXPORTS = {
+    "GONE_TTL_S": GONE_TTL_S,
+    "_FRESH_KEYS": _FRESH_KEYS,
+    "model_freshness": model_freshness,
+    "is_gone": is_gone,
+    "gone_refs": gone_refs,
     "_STATS_LOCK": _STATS_LOCK,
     "_STATS_HALFLIFE_DAYS": _STATS_HALFLIFE_DAYS,
     "STATS_MAX_REFS": STATS_MAX_REFS,

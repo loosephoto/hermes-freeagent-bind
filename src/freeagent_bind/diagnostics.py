@@ -152,6 +152,14 @@ def _diag_advice(totals: dict, by_class: dict, ref_fail: dict, fails: list[dict]
                           "FREEAGENT_QUOTA_LIMITS の宣言値が実際の枠より小さいか、1 つの提供元に寄りすぎています"
                           "（宣言が無ければ何も制限していないので、この分類は提供元側の 429 です）。"
                           "size を減らすか、PROVIDER_ORDER で別の提供元を先に並べてください。"}
+    if share.get("gone", 0.0) >= 0.3:
+        ranked_gone = [r for r, _ in sorted(ref_fail.items(), key=lambda kv: (-kv[1], kv[0]))]
+        worst = ", ".join(ranked_gone[:3]) or "特定できず"
+        return {"kind": "gone", "check": ["FREEAGENT_GONE_TTL_H"],
+                "advice": f"失敗 {failed} 件のうち {by_class['gone']} 件が廃止（404/410）です。"
+                          "直近 404/410 のモデルは既定の選抜から自動で外れます（24 時間で再確認に戻る）。"
+                          f"呼び出しで ref を固定しているなら、それを FREEAGENT_MODEL_EXCLUDE で外すか "
+                          f"`freeagent_models(probe=true)` で生きている ref を選び直してください（上位: {worst}）。"}
     if share.get("no_output", 0.0) >= 0.3:
         ranked_fail = [r for r, _ in sorted(ref_fail.items(), key=lambda kv: (-kv[1], kv[0]))]
         worst = ", ".join(ranked_fail[:3]) or "特定できず"

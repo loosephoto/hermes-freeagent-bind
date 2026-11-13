@@ -95,7 +95,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.49.2"
+SERVER_VERSION = "0.50.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -1101,6 +1101,9 @@ TOOLS: list[dict] = [
             "返る `ref` は他ツールの `models` 引数にそのまま渡せる（HF は `:提供元` を付けて経路を固定できる）。"
             "`Free候補` は**サブLLM に使えるモデルだけ**（埋め込み・分類器・画像/音声生成は自動選抜から外す。"
             "件数は `non_chat_candidates`）。"
+            "**`free_candidates` は在庫・`usable_now` はクールダウンと直近 404/410 を除いた数**で、"
+            "差は `gone`（`gone_models` に理由と再確認までの秒数）と `cooling` で説明できる。"
+            "各 `ref` の `freshness` に `last_ok_at` / `last_gone_at` / `probed_at` を返す（無い場合は省略）。"
             "【使わない条件】通常は不要（panel/consult 等が自動で選ぶ）。"
             "**個別の ref を並べる代わりに、他ツールの `models` へ `[\"all\"]` を渡せる**"
             "（在庫の全 Free・対話モデルのみが対象）。"
@@ -1121,7 +1124,10 @@ TOOLS: list[dict] = [
                                          "（一覧は廃止・未有効を含むため。呼び出しが発生する）"},
                 "probe_limit": {"type": "integer", "description": "生存確認する件数（既定 12・最大 40）"},
                 "probe_prompt": {"type": "string", "description": "生存確認に使う短い問い"},
-                "probe_max_tokens": {"type": "integer", "description": "生存確認の上限トークン（既定 16）"},
+                "probe_max_tokens": {"type": "integer", "description": "生存確認の上限トークン（既定 64・最大 512）"},
+                "include_gone": {"type": "boolean",
+                                 "description": "直近 404/410 で廃止と判定したモデルを行にも含める"
+                                                "（既定は伏せる。理由は `gone_models` に常に出る）"},
                 "stats": {"type": "boolean", "description": "品質統計（形式適合・CoT混入・切断の観測）を含める"},
             },
         },

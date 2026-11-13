@@ -242,6 +242,11 @@ def select_models(size: int, requested: list[str] | None = None, *,
         cooling_requested = [r for r in chosen if S.is_cooling(r)]
         if cooling_requested:
             notes.append(f"指定モデルがクールダウン中（再試行で回復します）: {', '.join(cooling_requested[:3])}")
+        # 明示指定は**廃止でも試す**（利用者が復活を確かめたいことがある）。ただし黙って 404 を返さない。
+        gone_requested = [r for r in chosen if S.is_gone(r)]
+        if gone_requested:
+            notes.append("指定モデルが直近 404/410（廃止の記録あり・指定なので試します）: "
+                         + ", ".join(gone_requested[:3]))
     if prefer:
         add(prefer)
     if len(chosen) < size:
@@ -263,6 +268,14 @@ def select_models(size: int, requested: list[str] | None = None, *,
             pool = [r for r in pool if r.split("/", 1)[0] not in blocked]
             notes.append("認証で失敗中のため自動選抜から除外: " + ", ".join(sorted(blocked))
                          + "（明示指定すれば試します。キー/権限を直せば数分で戻ります）")
+        # **直近 404/410（gone）は自動選抜から外す**（v0.50.0・issue #12）。廃止済みが既定に選ばれると
+        # `model` 省略の ask が 404 で落ち、同じ失敗が続くとクライアント側がサーバーを一時停止する。
+        # 在庫（一覧）からは消さない（`freeagent_models` が理由つきで返す）。
+        gone = S.gone_refs()
+        if gone:
+            pool = [r for r in pool if r not in gone]
+            notes.append("直近 404/410（gone）のため自動選抜から除外: %d 件"
+                         "（freeagent_models が理由を返します。明示指定すれば試します）" % len(gone))
         ready = [r for r in pool if r not in cooling]
         waiting = [r for r in pool if r in cooling]
         need = size - len(chosen)

@@ -342,7 +342,11 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     勧める理由は性能ではなく**推論が成立するか**。MCP 接続を持つのは gateway プロセスなので、切替の反映は
     `Settings → Tools/MCP → Reload` / `systemctl --user restart hermes-gateway.service` / OS 再起動のいずれか
     （アプリの再起動だけでは切り替わらない・SPEC §6.64）。
-
+    (j) 既定モデルは**直近の廃止（404/410）を避ける**（v0.50.0・issue #12）。廃止は観測の時刻
+    （`last_gone_at` > `max(last_ok_at, last_alive_at)`・TTL は `FREEAGENT_GONE_TTL_H` 既定 24 時間）で
+    判定し、自動選抜と既定から外す。**在庫からは消さない**（`freeagent_models` が `gone_models` と
+    各行の `freshness` で理由つきに返す）。429・空応答を廃止と混ぜない（空応答は「応答があった」証拠）。
+    明示指定は試す。SPEC §6.65。
 44. **知識取得の読み取りは壁時計でも打ち切る**（§5.8）。`urlopen(timeout=…)` の上限は
     「ソケット 1 回の待ち」の上限であって**リクエスト全体の壁時計制限ではない**。1 バイトずつ
     drip する提供元では読みが終わるまで何分も待つ（実測: ローカル drip サーバで 98.0 秒 =

@@ -421,7 +421,8 @@ def default_model(free_only: bool = True) -> str:
         chosen = []
     if chosen:
         return chosen[0]
-    refs = S.free_model_refs(free_only=free_only, chat_only=True)
+    # 選抜が空に落ちたときの保険でも**廃止（直近 404/410）は返さない**（v0.50.0・issue #12）。
+    refs = [r for r in S.free_model_refs(free_only=free_only, chat_only=True) if not S.is_gone(r)]
     return refs[0] if refs else ""
 
 
