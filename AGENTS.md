@@ -337,6 +337,11 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     (h) Linux（`systemd --user`）のユニットで `WorkingDirectory=` は二重引用符を解釈しない（引用符を付けると
     `bad-setting` で起動不能になる・SPEC §6.63）。引数・環境変数用の `_systemd_quote` と分け、パス設定には
     引用符を付けず `\x20` / `%%` へ逃がす `_systemd_path` を使う。
+    (i) **stdio では `.env` のキーが子プロセスに届かない**（Hermes は安全な環境変数と設定の `env:` だけを渡す）。
+    その状態の `freeagent_models` は「キー未設定 → 検索のみ」で Free 0 件＝推論できない（実測）。常駐 HTTP を
+    勧める理由は性能ではなく**推論が成立するか**。MCP 接続を持つのは gateway プロセスなので、切替の反映は
+    `Settings → Tools/MCP → Reload` / `systemctl --user restart hermes-gateway.service` / OS 再起動のいずれか
+    （アプリの再起動だけでは切り替わらない・SPEC §6.64）。
 
 44. **知識取得の読み取りは壁時計でも打ち切る**（§5.8）。`urlopen(timeout=…)` の上限は
     「ソケット 1 回の待ち」の上限であって**リクエスト全体の壁時計制限ではない**。1 バイトずつ

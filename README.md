@@ -228,7 +228,7 @@ python scripts/install_resident.py --write --force --task    # サービス登�
 - **Linux（SSH・ヘッドレス運用）**: ログアウトや SSH 切断後も常駐を維持するには `loginctl enable-linger "$USER"` を有効化してください（未有効の場合は `--task` 実行時に案内が出ます）。WSL では `/etc/wsl.conf` の `[boot] systemd=true` が必要です。
 - **macOS**: `LaunchAgents`（`gui/$(id -u)` ドメイン）として GUI ログインセッション単位で起動します。`PATH` には `/opt/homebrew/bin` と `/usr/local/bin` が含まれます。
 - **Nous Portal 未認証時の `hermes-proxy` の見え方**: `run_proxy.py` は未認証時に `[launcher] skipped: Nous Portal not authenticated` を 1 行だけ記録して待機するため、`127.0.0.1:8645` は LISTEN せず `freeagent_models` では `nous` だけ `到達不可: Connection refused` と表示されます（異常ではなく待機状態です。`openrouter` / `nvidia` など他のプロバイダはそのまま使えます）。後から `hermes auth add nous` を実行すると自動的に待受を開始します。
-- **設定切替後の Hermes 側への反映**: `apply_freeagent_http.sh` を実行しても、**すでに起動している Hermes プロセスは起動時の stdio 子プロセスを保持します**（自動ホットリロードはありません）。デスクトップは `Settings → Tools/MCP` の Reload、メッセージングは `/reload-mcp`（または Hermes の再起動）で常駐 HTTP へ切り替わります。
+- **設定切替後の Hermes 側への反映**: `apply_freeagent_http.sh` を実行しても、**すでに起動している Hermes プロセスは起動時の stdio 子プロセスを保持します**（自動ホットリロードはありません）。MCP 接続を持っているのは `hermes-gateway.service` のプロセスなので、**デスクトップアプリの再起動だけでは切り替わりません**（実測: アプリを入れ替えても gateway は古い PID のまま生き続け、stdio の子プロセスが残り、ライブ呼び出しの `harness.source` は `env` のまま）。切り替えるには、(a) デスクトップの `Settings → Tools/MCP` → **Reload**（プロセス再起動なしで config を読み直す）、(b) `systemctl --user restart hermes-gateway.service`、(c) OS 再起動、のいずれかが必要です。確認は `ss -tnp | grep ':8790'` に **ESTAB** が出るか（stdio なら 0 本）、`hermes mcp test freeagent-bind` が `Transport: HTTP` を返すか、ライブ呼び出しの `harness.source` が `header` になるかで行います。
 
 ## 💬 会話での頼み方
 
@@ -1243,6 +1243,8 @@ API キーに加えて、契約プランやデータの扱いを確認したこ�
 **stdio（既定）では、このサーバーは `.env` を自動で読みません。** Hermes の MCP `env` へ渡してください。
 最近の Hermes は [環境変数参照](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference#environment-variable-references)
 を解決できるので、キーを Hermes のアクティブプロファイルの秘密情報として保存済みなら、値を重複保存せず参照を設定できます。
+
+> **実測（Linux / Hermes v0.23.1）**: stdio で繋いだ場合、Hermes は MCP の子プロセスへ安全な環境変数と設定の `env:` だけを渡します。`~/.hermes/.env` にキーがあっても**子プロセスには届きません**。その状態の `freeagent_models` は全プロバイダが「キー未設定 → 検索のみ」、Free 候補 **0 件**になり、一覧は出るが**推論はできません**。同じ日に常駐 HTTP へ切り替えると同じ呼び出しが 4 プロバイダ有効・Free 71 件を返しました。**常駐 HTTP を勧める理由は速さではなく「推論が成立するか」**です。
 
 #### 常駐 HTTP のとき（MCP `env` は届きません）
 

@@ -2688,6 +2688,16 @@ worker VBS を `cscript` で実際に走らせ、健全なサーバーを落と�
 
 **検証**: unittest **1,356 件 OK**（`PYTHONPATH` 無しでも全件通過）／`check_integrity`（version=0.49.1・Linux ユニット引用符検査つき）／`compileall` / `smoke_stdio` / `smoke_http` / `check_offline` / `apply_proactive --check`／CI Linux ランナーでの実 `systemd-analyze --user verify`。
 
+### 6.64 常駐 HTTP と stdio の差・切替の反映（v0.49.2・issue #11）
+
+Linux（LMDE 7 / systemd 257）実機での動作報告から、README の説明を 2 点補った（実装の変更はない）。
+
+| 観測 | 実測 | 文書へ入れたこと |
+|---|---|---|
+| stdio では推論できない | stdio 接続時の `freeagent_models` は全プロバイダが「キー未設定 → 検索のみ」・Free 候補 0 件。常駐 HTTP では同じ呼び出しが 4 プロバイダ有効・Free 71 件 | Hermes は stdio MCP の子プロセスへ安全な環境変数と設定の `env:` だけを渡すため `.env` のキーは届かない。常駐 HTTP を勧める理由は性能ではなく**推論が成立するか**（README「キーの渡し方」） |
+| アプリ再起動では切り替わらない | デスクトップだけ入れ替えても `hermes-gateway.service` は古い PID のまま・stdio 子プロセスが残る（`harness.source=env`・8790 への ESTAB 0） | 接続を持つのは gateway。切替は (a) `Settings → Tools/MCP → Reload`、(b) `systemctl --user restart hermes-gateway.service`、(c) OS 再起動のいずれか。確認は ESTAB 本数・`Transport: HTTP`・`harness.source=header`（README「Linux / macOS で常駐させる」） |
+| `nous` の見え方 | `hermes-proxy` 未認証時は 8645 が LISTEN せず `nous` だけ `Connection refused`（v0.49.1 で記載済み） | 変更なし |
+
 ## 12. 検証
 
 ```bash
