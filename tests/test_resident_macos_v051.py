@@ -213,21 +213,23 @@ class ResidentMacosCase(unittest.TestCase):
     def test_generated_units_carry_their_own_path(self):
         # POSIX パスで組む（実際に Linux / macOS へ置く形。Windows ホストではクロス生成になる）
         def posix_cfg(platform_name: str):
+            # ホストに依らず同じ PATH にする（Linux / macOS のランナーでも同じ判定）
             return self.m.build_config(
                 "/home/alice/.hermes", "/home/alice/hermes-freeagent-bind", "127.0.0.1", 8790,
                 python="/usr/bin/python3", startup_dir="/home/alice/units",
-                platform_name=platform_name,
+                platform_name=platform_name, assume_host=False,
             )
 
         linux_cfg = posix_cfg("linux")
         linux_unit = self.m.render_linux_unit(linux_cfg)
         self.assertNotIn("/opt/homebrew", linux_unit, "Linux ユニットに macOS の PATH が入っている")
         self.assertIn("PATH=%s" % linux_cfg["path"], linux_unit)
+        self.assertIn("/home/alice/.local/bin", linux_cfg["path"])
 
         mac_cfg = self.m.build_config(
             "/Users/alice/.hermes", "/Users/alice/hermes-freeagent-bind", "127.0.0.1", 8790,
             python="/opt/homebrew/bin/python3", startup_dir="/Users/alice/Library/LaunchAgents",
-            platform_name="macos",
+            platform_name="macos", assume_host=False,
         )
         plist = plistlib.loads(self.m.render_macos_plist(mac_cfg).encode("utf-8"))
         self.assertEqual(plist["EnvironmentVariables"]["PATH"], mac_cfg["path"])
@@ -269,6 +271,7 @@ class ResidentMacosCase(unittest.TestCase):
         hermes = os.path.join(bin_dir, "hermes")
         with open(hermes, "w", encoding="ascii", newline="\n") as fh:
             fh.write("#!/bin/sh\n")
+        os.chmod(hermes, 0o755)  # POSIX は X_OK が実行ビットを見る（Windows では実質存在チェック）
         ns["REPO"] = os.path.join(self.tmp, "no-hermes-agent")
         ns["HOME"] = os.path.join(self.tmp, "no-bin")
         with mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}, clear=False):

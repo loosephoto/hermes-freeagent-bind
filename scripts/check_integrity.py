@@ -115,7 +115,7 @@ def main() -> int:
             cfg_linux = ir_mod.build_config(
                 sample_home, sample_repo, "127.0.0.1", 8790,
                 python="/usr/bin/python3", startup_dir="/tmp/fa-check-units",
-                platform_name="linux",
+                platform_name="linux", assume_host=False,
             )
             for unit_label, rendered in (
                 ("hermes-freeagent-bind.service", ir_mod.render_linux_unit(cfg_linux)),
@@ -146,7 +146,7 @@ def main() -> int:
                 sample_home, sample_repo, "127.0.0.1", 8790,
                 python="/opt/homebrew/bin/python3",
                 startup_dir="/Users/alice/Library/LaunchAgents",
-                platform_name="macos",
+                platform_name="macos", assume_host=False,
             )
             for plist_label, rendered in (
                 ("ai.hermes.freeagent-bind.plist", ir_mod.render_macos_plist(cfg_mac)),
@@ -183,16 +183,27 @@ def main() -> int:
         cfg_lin = ir_mod.build_config(
             "/home/alice/.hermes", "/home/alice/hermes-freeagent-bind", "127.0.0.1", 8790,
             python="/usr/bin/python3", startup_dir="/home/alice/.config/systemd/user",
-            platform_name="linux",
+            platform_name="linux", assume_host=False,
         )
+        sample_home_pref = str(cfg_lin.get("hermes_home") or "").rstrip("/")
         for unit_label2, rendered2 in (
             ("hermes-freeagent-bind.service", ir_mod.render_linux_unit(cfg_lin)),
             ("hermes-proxy.service", ir_mod.render_linux_proxy_unit(cfg_lin)),
         ):
-            check("/opt/homebrew" not in rendered2,
-                  f"{unit_label2}: Linux ユニットの PATH に macOS の /opt/homebrew が入っています")
-            check("/home/alice/.local/bin" in rendered2,
-                  f"{unit_label2}: PATH に ~/.local/bin がありません（hermes CLI を見つけられません）")
+            # サンプルは `assume_host=False` で組むので、ホストに依らず同じ PATH になる（CI の Linux /
+            # macOS でも Windows でも同じ判定）。値そのものをメッセージに出す。
+            path_line = next((ln for ln in rendered2.splitlines()
+                              if ln.startswith("Environment=") and "PATH=" in ln), "")
+            path_value = path_line.split("PATH=", 1)[1].rstrip('"').replace("\\\\", "\\")
+            entries2 = [e for e in path_value.split(":") if e]
+            check(not any("/opt/homebrew" in e for e in entries2),
+                  f"{unit_label2}: Linux ユニットの PATH に macOS の /opt/homebrew が入っています: {path_value}")
+            check("/home/alice/.local/bin" in entries2,
+                  f"{unit_label2}: PATH に ~/.local/bin がありません（hermes CLI を見つけられません）: {path_value}")
+            check("/usr/local/bin" in entries2,
+                  f"{unit_label2}: PATH に /usr/local/bin がありません: {path_value}")
+            check(sample_home_pref + "/bin" in path_value,
+                  f"{unit_label2}: PATH に <hermes-home>/bin がありません: {path_value}")
 
     if FAILURES:
         print("整合性チェック失敗:")

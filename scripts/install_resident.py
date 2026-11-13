@@ -812,8 +812,13 @@ def build_config(hermes_home: str, repo: str, host: str, port: int,
                  python: str = "", pythonw: str = "", startup_dir: str = "",
                  proxy_port: int = DEFAULT_PROXY_PORT,
                  with_proxy: bool = True,
-                 platform_name: str = "auto") -> dict:
-    """生成に必要な値一式を組み立てる（`startup_dir` は全 OS 共通のユニット出力先上書きとして扱う）。"""
+                 platform_name: str = "auto",
+                 assume_host: bool | None = None) -> dict:
+    """生成に必要な値一式を組み立てる（`startup_dir` は全 OS 共通のユニット出力先上書きとして扱う）。
+
+    `assume_host` は「ホストと対象 OS が一致している」と見なすかの上書き。既定（None）は実機判定で、
+    検査スクリプトが**ホストに依らず同じ結果**を得たいときに `False`（クロス生成として扱う）を渡す。
+    """
     target = detect_platform(platform_name)
     if target == "windows":
         cfg = _WIN.build_config(
@@ -824,7 +829,7 @@ def build_config(hermes_home: str, repo: str, host: str, port: int,
         cfg["platform"] = "windows"
         return cfg
 
-    host_match = _host_matches_target(target)
+    host_match = _host_matches_target(target) if assume_host is None else bool(assume_host)
     if host_match:
         hermes_home = os.path.abspath(os.path.expanduser(hermes_home))
         repo = os.path.abspath(os.path.expanduser(repo))
