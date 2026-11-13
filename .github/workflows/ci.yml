@@ -142,3 +142,89 @@ jobs:
               sys.exit(1)
           print("UTF-8 OK")
           PY
+
+  # macOS（launchd）常駐配線の実機検査（v0.51.0・SPEC §6.66）。
+  # この経路は ubuntu / windows のランナーでは 1 行も実行されないため、plist を実物の `plutil` と
+  # `launchctl` に通す（Linux 側の `systemd-analyze --user verify` と対になる検査）。
+  macos-resident:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 既定の出力先（~/Library/LaunchAgents）へ生成する。launchctl は
+      # 「ユーザー所有・group/world 書き込み不可」の plist しか受け付けないため、実運用と同じ場所に置く。
+      - name: Generate launchd agents
+        run: |
+          python scripts/install_resident.py --platform macos \
+            --hermes-home "$RUNNER_TEMP/fa-home" --repo "$GITHUB_WORKSPACE" \
+            --python "$(command -v python3)" --write --force
+          ls -l "$HOME/Library/LaunchAgents"
+
+      # plistlib の round-trip は Python 内の話。launchd が受理する形かは plutil で見る。
+      - name: plutil -lint both agents
+        run: |
+          plutil -lint "$HOME/Library/LaunchAgents/ai.hermes.freeagent-bind.plist"
+          plutil -lint "$HOME/Library/LaunchAgents/ai.hermes.proxy.plist"
+
+      # launchd は exec の前に StandardOutPath / StandardErrorPath / WorkingDirectory / 実行ファイルを開く。
+      # どれか欠けると `last exit status = 78` で黙って終わる（bootstrap の rc は 0 のまま）ので、
+      # 生成直後に同じ検査を通す。
+      - name: Pre-flight what launchd checks before exec
+        run: |
+          python - <<'PY'
+          import os, plistlib, sys
+          unit_dir = os.path.expanduser("~/Library/LaunchAgents")
+          bad = []
+          names = ("ai.hermes.freeagent-bind.plist", "ai.hermes.proxy.plist")
+          for name in names:
+              with open(os.path.join(unit_dir, name), "rb") as fh:
+                  plist = plistlib.load(fh)
+              for key in ("StandardOutPath", "StandardErrorPath"):
+                  parent = os.path.dirname(plist[key])
+                  if not os.path.isdir(parent):
+                      bad.append("%s: %s の親ディレクトリが無い: %s" % (name, key, parent))
+              wd = plist.get("WorkingDirectory") or ""
+              if not os.path.isdir(wd):
+                  bad.append("%s: WorkingDirectory が無い: %s" % (name, wd))
+              prog = plist["ProgramArguments"][0]
+              if not os.path.isabs(prog):
+                  bad.append("%s: ProgramArguments[0] が絶対パスではない: %s" % (name, prog))
+              if prog != "/usr/bin/env" and not os.path.exists(prog):
+                  bad.append("%s: 実行ファイルが無い: %s" % (name, prog))
+          print("\n".join(bad) or "pre-flight OK")
+          sys.exit(1 if bad else 0)
+          PY
+
+      # 実物の launchd へ登録し、`launchctl print` の state / last exit status で稼働を判定する
+      # （これが無いと、起動していないエージェントを「登録成功」と報告してしまう）。
+      - name: Bootstrap with real launchctl and verify state
+        run: |
+          if ! launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
+            echo "::warning::gui/$(id -u) ドメインに到達できないランナーのため launchd 登録は省略"
+            exit 0
+          fi
+          python - <<'PY'
+          import importlib.util, os, shutil
+          spec = importlib.util.spec_from_file_location("ir", "scripts/install_resident.py")
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          cfg = mod.build_config(
+              os.path.join(os.environ["RUNNER_TEMP"], "fa-home"), os.getcwd(),
+              "127.0.0.1", 8790, python=shutil.which("python3") or "",
+              startup_dir=os.path.expanduser("~/Library/LaunchAgents"),
+              platform_name="macos",
+          )
+          lines = mod.register_macos_agents(cfg)
+          print("\n".join(lines))
+          if any(line.startswith("service failed") for line in lines):
+              raise SystemExit(1)
+          PY
+          launchctl print "gui/$(id -u)/ai.hermes.freeagent-bind" | grep -E 'state =|last exit status' || true
+      - name: Bootout the agents
+        if: always()
+        run: |
+          launchctl bootout "gui/$(id -u)/ai.hermes.freeagent-bind" 2>/dev/null || true
+          launchctl bootout "gui/$(id -u)/ai.hermes.proxy" 2>/dev/null || true

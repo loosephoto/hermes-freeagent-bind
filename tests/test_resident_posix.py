@@ -323,12 +323,18 @@ class ResidentPosixCase(unittest.TestCase):
 
         exec_calls = []
         chdir_calls = []
+        clock = {"t": 0.0}
+
+        def fake_sleep(secs):
+            # _wait_or_stop は 0.25 秒刻みで sleep する。実時計だとテストが実時間で回るため偽時計を進める。
+            clock["t"] += float(secs or 0)
 
         def fake_execvpe(file, args, env):
             exec_calls.append((file, list(args), dict(env)))
 
         # 1) 未認証のまま max_polls=1 -> skipped ログは 1 行だけ書かれ、execvpe は呼ばれない
-        with mock.patch.object(ns["time"], "sleep", return_value=None), \
+        with mock.patch.object(ns["time"], "sleep", side_effect=fake_sleep), \
+             mock.patch.object(ns["time"], "monotonic", side_effect=lambda: clock["t"]), \
              mock.patch.object(ns["os"], "execvpe", side_effect=fake_execvpe), \
              mock.patch.object(ns["os"], "dup2", return_value=None), \
              mock.patch.object(ns["os"], "chdir", side_effect=chdir_calls.append), \
@@ -343,10 +349,12 @@ class ResidentPosixCase(unittest.TestCase):
 
         # 2) 待機中に auth.json が書かれたら、次のチェックで自動復帰して execvpe する
         def write_auth_on_sleep(_secs):
+            clock["t"] += float(_secs or 0)
             with open(auth_path, "w", encoding="utf-8") as fh:
                 json.dump({"providers": {"nous": {"agent_key": "sk-test"}}}, fh)
 
         with mock.patch.object(ns["time"], "sleep", side_effect=write_auth_on_sleep), \
+             mock.patch.object(ns["time"], "monotonic", side_effect=lambda: clock["t"]), \
              mock.patch.object(ns["os"], "execvpe", side_effect=fake_execvpe), \
              mock.patch.object(ns["os"], "dup2", return_value=None), \
              mock.patch.object(ns["os"], "chdir", side_effect=chdir_calls.append), \
@@ -464,7 +472,8 @@ class ResidentPosixCase(unittest.TestCase):
             calls.append(list(cmd))
             # 初回 bootout が exit 3（未ロード）でも続行できること
             rc = 3 if cmd[1] == "bootout" else 0
-            return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
+            out = "\tstate = running\n" if cmd[1] == "print" else ""
+            return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
 
         with mock.patch.object(self.m.shutil, "which", return_value="/bin/launchctl"), \
              mock.patch.object(self.m, "_posix_uid", return_value=501), \
@@ -478,9 +487,13 @@ class ResidentPosixCase(unittest.TestCase):
                 "service bootstrapped: ai.hermes.proxy (gui/501)",
             ],
         )
-        self.assertEqual(calls[0], ["launchctl", "bootout", "gui/501/ai.hermes.freeagent-bind"])
-        self.assertEqual(calls[1], ["launchctl", "bootstrap", "gui/501", cfg["paths"]["unit"]])
-        self.assertEqual(calls[2], ["launchctl", "kickstart", "-k", "gui/501/ai.hermes.freeagent-bind"])
+        # 到達確認（print gui/<uid>）が先に走り、各ラベルは bootout -> bootstrap -> kickstart -k -> print
+        self.assertEqual(calls[0], ["launchctl", "print", "gui/501"])
+        lifecycle = [c for c in calls if c[1] != "print"]
+        self.assertEqual(lifecycle[0], ["launchctl", "bootout", "gui/501/ai.hermes.freeagent-bind"])
+        self.assertEqual(lifecycle[1], ["launchctl", "bootstrap", "gui/501", cfg["paths"]["unit"]])
+        self.assertEqual(lifecycle[2], ["launchctl", "kickstart", "-k", "gui/501/ai.hermes.freeagent-bind"])
+        self.assertIn(["launchctl", "print", "gui/501/ai.hermes.freeagent-bind"], calls)
 
     def test_register_services_skips_when_cross_generating(self):
         cfg = self.m.build_config(

@@ -2045,8 +2045,8 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   プロセス生成まわりの契約（Python の選定順・見張りタスクの電源設定・応答なしの検知・セッション由来の
   環境変数）は §6.62。検証: `tests/test_resident_v0490.py`。
 - **Linux / macOS を含む全 OS 共通の常駐化は `scripts/install_resident.py` が担う**（`--platform auto|windows|linux|macos`。`auto` は `sys.platform` の `win32` / `linux*` / `darwin` で判別し、Windows は `install_resident_windows.py` と同一契約に委譲）。
-  Linux は `systemd --user`（`~/.config/systemd/user/hermes-freeagent-bind.service` / `hermes-proxy.service`・`Type=simple`・`Restart=on-failure`・`systemctl --user enable --now`、`/run/systemd/system` とユーザー D-Bus 到達確認＋`linger` 未有効時の案内つき。`WorkingDirectory=` は引用符を解釈しないため `_systemd_path()` で `\x20` / `%%` へ逃がし引用符を付けない・§6.63）、macOS は `launchd` LaunchAgent（`~/Library/LaunchAgents/ai.hermes.freeagent-bind.plist` / `ai.hermes.proxy.plist`・`plistlib` 生成・`KeepAlive={"SuccessfulExit": False}`・`launchctl bootstrap gui/<uid>` + `kickstart -k`）へ配線する。
-  POSIX ランチャ `run_server.py` は `~/.hermes/.env` と `freeagent.env` を読んで `<hermes-home>/logs/freeagent-autostart.log` に追記しつつ同一プロセスで待ち受ける。`run_proxy.py` は Nous Portal 未認証時にログ 1 行のみ出してポーリング待機（`FREEAGENT_PROXY_AUTH_POLL_S`、既定 60 秒）し、認証後に `os.execvpe` で同一 PID のまま `hermes proxy start` に置換する（クラッシュ再起動ループを防ぎつつログイン後の自動復帰を保つ）。検証: `tests/test_resident_posix.py`。
+  Linux は `systemd --user`（`~/.config/systemd/user/hermes-freeagent-bind.service` / `hermes-proxy.service`・`Type=simple`・`Restart=on-failure`・`systemctl --user enable --now`、`/run/systemd/system` とユーザー D-Bus 到達確認＋`linger` 未有効時の案内つき。`WorkingDirectory=` は引用符を解釈しないため `_systemd_path()` で `\x20` / `%%` へ逃がし引用符を付けない・§6.63）、macOS は `launchd` LaunchAgent（`~/Library/LaunchAgents/ai.hermes.freeagent-bind.plist` / `ai.hermes.proxy.plist`・`plistlib` 生成・`KeepAlive={"SuccessfulExit": False}`・`launchctl bootstrap gui/<uid>` + `kickstart -k`）へ配線する。macOS は `bootstrap` の rc を成功と見なさず、`gui/<uid>` ドメインへの到達（`launchctl print gui/<uid>`）と登録後の `state` / `last exit status`（78 は起動前の失敗）で判定する。`PATH` は OS 別（`platform_path()`。Linux は `/usr/local/bin` 起点・macOS は `/opt/homebrew/bin` 起点で、どちらも `<home>/.local/bin` と `<home>/bin` を先頭に置く）。§6.66。
+  `--write` は常駐機構が**起動前に開く**ディレクトリ（`<hermes-home>/logs`。launchd は `StandardOutPath` の親を作らない）を先に作り、生成直後に同じ検査を通す（通らなければ `--task` を実行しない）。POSIX ランチャ `run_server.py` は `~/.hermes/.env` と `freeagent.env` を読んで `<hermes-home>/logs/freeagent-autostart.log` に追記しつつ同一プロセスで待ち受ける。`run_proxy.py` は Nous Portal 未認証時にログ 1 行のみ出してポーリング待機（`FREEAGENT_PROXY_AUTH_POLL_S`、既定 60 秒）し、認証後に `os.execvpe` で同一 PID のまま `hermes proxy start` に置換する（クラッシュ再起動ループを防ぎつつログイン後の自動復帰を保つ）。検証: `tests/test_resident_posix.py`。
 - **目印（ハーネス判別）の点検も HTTP に対応する**: `scripts/apply_proactive.py --check` は
   `x-freeagent-harness` ヘッダを env と同じ目印として読み、HTTP なら不足時にヘッダを足すコマンドを出す
   （ヘッダを読まないと常駐運用の実機で「未設定」と誤警告した）。
@@ -2738,6 +2738,27 @@ Free の在庫は提供元の申告であり、廃止・未有効・アカウン
 **検証**: `tests/test_freshness_v0500.py`（18 件。`_stats_apply` の時刻・TTL・成功/空応答による解除・
 `rate_limited`/`timeout` が gone にならないこと・`select_models` の除外と明示指定の維持・
 `default_model` の回避・`tool_models` の 3 段の数と `include_gone`・probe の判定・予算の既定）。
+
+### 6.66 macOS（launchd）常駐配線の起動前検査（v0.51.0）
+
+macOS の配線は Linux（`systemd --user`・§6.63 で実機検証済み）を元に写したため、**Linux では
+表面化しない前提**が抜けていた。どれも「登録は成功したように見えて起動していない」形で出る。
+
+| 点 | 実測・根拠 | 対処 |
+|---|---|---|
+| ログの親ディレクトリが無い | launchd は `StandardOutPath` / `StandardErrorPath` を **exec の前**に開き、中間ディレクトリは作らない（ファイルだけ作る）。`<hermes-home>/logs` を作るのは launcher 自身＝exec の後なので、初回はジョブが `last exit status = 78` で黙って終わる（`bootstrap` の rc は 0 のまま）。Windows の VBS は自分で `logs` を作っていた（`install_resident_windows.py` の `CreateFolder`） | `ensure_runtime_dirs()` が `--write` 時に `<hermes-home>/logs` を作る。`verify_generated()` が生成直後に「起動前に開くパス」を検査し、通らなければ `--task` を実行せず exit 1 |
+| 登録結果を鵜呑みにしていた | `launchctl bootstrap` の rc 0 は「ジョブを登録できた」だけ。Linux 側は `systemctl --user show-environment` で到達を確かめていたのに、macOS は `which("launchctl")` と UID だけ見ていた | 登録後に `launchctl print gui/<uid>/<label>` を最大 3 回読み、`state` と `last exit status` で判定（78 は失敗として報告）。`detect_macos_service_ready()` も `launchctl print gui/<uid>` で GUI ドメインへ届くか確かめ、SSH / 非 GUI では「GUI ログインセッションで実行してください」を返す |
+| `PATH` が macOS の実態と違う | Linux ユニットにも `MACOS_DEFAULT_PATH`（`/opt/homebrew/bin` 起点）を流用していた（実測: 生成した Linux ユニットが `Environment="PATH=/opt/homebrew/bin:…"`）。逆に macOS 側は `$HOME` 配下が 1 つも無く、`hermes` CLI の現実的な置き場（uv tool / pipx の `~/.local/bin`）が入っていない。`run_proxy.py` は `~/.hermes/hermes-agent` が無いと `which("hermes")` へ、それも無いと `python -m hermes_cli.main` へ落ちる（同梱 python に `hermes_cli` が無ければ 5 秒ごとの失敗再起動） | `platform_path()` を新設して OS 別に組み立てる。`run_proxy.py` は plist / unit の PATH に依存せず `<hermes-home>/bin` / `~/.local/bin` / `~/bin` を自分で探す |
+| 停止が待機時間ぶん遅れる | `run_proxy.py` の未認証待機は `time.sleep()`。Python 3.5 以降はシグナルハンドラが例外を投げない限り**残り時間を寝続ける**（PEP 475）ため、SIGTERM 後も最大 `FREEAGENT_PROXY_AUTH_POLL_S`（既定 60 秒）待つ。`launchctl bootout` → `bootstrap` を続けて撃つ再登録では、旧プロセスが 8645 を掴んだまま新プロセスが bind に失敗する | `_wait_or_stop()`（0.25 秒刻みで `_STOP` を見る）へ置換 |
+| macOS の経路が CI で一度も走っていない | CI の matrix は `ubuntu-latest` / `windows-latest` のみ。`check_integrity.py` の常駐検査も Linux ユニットだけだった | `macos-resident` ジョブを追加（`plutil -lint`・launchd の起動前検査・実 `launchctl bootstrap` と `launchctl print` による稼働確認・後始末）。`check_integrity.py` に macOS plist の形（ログの親・絶対パス・`KeepAlive`・`PATH`）と「Linux ユニットに `/opt/homebrew` を入れない」検査を追加 |
+
+**触れていないもの**: 「起動しているが応答しない」検知（Windows の worker は待受ポートを HTTP で叩く・§6.62）。
+launchd / systemd はプロセスの終了しか見ないため、ハングは再起動されない。
+
+**検証**: unittest **24 件 OK**（`tests/test_resident_macos_v051.py` 11 件 + `tests/test_resident_posix.py` 13 件・
+1 skip は Windows に `systemd-analyze` が無いため）／`scripts/check_integrity.py`（macOS plist・PATH の検査つき）／
+生成物の preflight（修正前の生成物が FAIL・修正後が PASS・実測は本節の表）／`plutil -lint` と実 `launchctl` は
+CI の `macos-resident` ジョブ。**手元に macOS が無いため、実機の launchd での起動確認は CI の結果で判断する**。
 
 ## 12. 検証
 

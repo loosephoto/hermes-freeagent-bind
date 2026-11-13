@@ -347,6 +347,14 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     判定し、自動選抜と既定から外す。**在庫からは消さない**（`freeagent_models` が `gone_models` と
     各行の `freshness` で理由つきに返す）。429・空応答を廃止と混ぜない（空応答は「応答があった」証拠）。
     明示指定は試す。SPEC §6.65。
+    (k) **macOS（`launchd`）は起動前の検査を自分で通す**（v0.51.0・SPEC §6.66）。launchd は
+    `StandardOutPath` / `StandardErrorPath` を exec の**前**に開き、中間ディレクトリは作らない。`--write` は
+    `<hermes-home>/logs` を作り、`verify_generated()` が通らなければ `--task` を実行しない（無いと
+    `last exit status = 78` で無言停止し、`bootstrap` の rc は 0 のまま）。`launchctl bootstrap` の rc を
+    成功と見なさず、`launchctl print gui/<uid>/<label>` の `state` / `last exit status` で判定する。`PATH` は
+    `platform_path()` で OS 別に組み立てる（macOS の `/opt/homebrew/bin` を Linux ユニットへ流用しない・
+    `~/.local/bin` を落とさない）。`run_proxy.py` の待機は `time.sleep` ではなく `_wait_or_stop`（PEP 475 で
+    sleep は再開されるため、SIGTERM 後の停止が待機時間ぶん遅れ、再登録時にポートが競合する）。
 44. **知識取得の読み取りは壁時計でも打ち切る**（§5.8）。`urlopen(timeout=…)` の上限は
     「ソケット 1 回の待ち」の上限であって**リクエスト全体の壁時計制限ではない**。1 バイトずつ
     drip する提供元では読みが終わるまで何分も待つ（実測: ローカル drip サーバで 98.0 秒 =

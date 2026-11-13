@@ -10,6 +10,8 @@ CI と手元の両方で同じ判定にするため、テストスイートと�
   6. content に LLM 向け指示文が混ざっていない（人間が読むチャネル）
   7. 外部 HTTP に (connect, read) タイムアウトが指定されている
   8. Linux 常駐ユニットの WorkingDirectory= が引用符で囲まれていない（Issue #10）
+  9. macOS launchd plist の起動前検査（ログの親ディレクトリ・絶対パス・KeepAlive）
+ 10. PATH が OS 別（macOS の定数を Linux ユニットへ流用していない）
 """
 from __future__ import annotations
 
@@ -129,6 +131,68 @@ def main() -> int:
                           f"{unit_label}: WorkingDirectory= が絶対パスではありません: {wd}")
                     check(" " not in val,
                           f"{unit_label}: WorkingDirectory= に未エスケープの空白があります: {wd}")
+
+        # 9. macOS launchd plist（v0.51.0・SPEC §6.66）。launchd は `StandardOutPath` /
+        #    `StandardErrorPath` を exec の**前**に開き、中間ディレクトリは作らない。親が無いと
+        #    ジョブは起動せず `last exit status = 78` で黙って終わる（`bootstrap` の rc は 0 のまま）。
+        #    ここでは macOS 実機なしで確かめられる形（パスの組み立て・KeepAlive の意味）を固定する。
+        import plistlib as _plistlib
+
+        for sample_home, sample_repo in (
+            ("/Users/alice/.hermes", "/Users/alice/hermes-freeagent-bind"),
+            ("/Users/alice smith/job%2F1/.hermes", "/Users/alice smith/job%2F1/hermes-freeagent-bind"),
+        ):
+            cfg_mac = ir_mod.build_config(
+                sample_home, sample_repo, "127.0.0.1", 8790,
+                python="/opt/homebrew/bin/python3",
+                startup_dir="/Users/alice/Library/LaunchAgents",
+                platform_name="macos",
+            )
+            for plist_label, rendered in (
+                ("ai.hermes.freeagent-bind.plist", ir_mod.render_macos_plist(cfg_mac)),
+                ("ai.hermes.proxy.plist", ir_mod.render_macos_proxy_plist(cfg_mac)),
+            ):
+                try:
+                    plist = _plistlib.loads(rendered.encode("utf-8"))
+                except Exception as exc:  # noqa: BLE001 - 解析できないこと自体を失敗にしたい
+                    check(False, f"{plist_label}: plist を解析できません: {exc}")
+                    continue
+                log_path = str(plist.get("StandardOutPath") or "")
+                check(os.path.dirname(log_path) == sample_home + "/logs",
+                      f"{plist_label}: StandardOutPath が <hermes-home>/logs の下にありません: {log_path}")
+                check(plist.get("StandardErrorPath") == log_path,
+                      f"{plist_label}: StandardErrorPath が StandardOutPath と一致しません")
+                check(str(plist.get("WorkingDirectory") or "").startswith("/"),
+                      f"{plist_label}: WorkingDirectory が絶対パスではありません: {plist.get('WorkingDirectory')}")
+                check(plist.get("KeepAlive") == {"SuccessfulExit": False},
+                      f"{plist_label}: KeepAlive が SuccessfulExit=False ではありません"
+                      "（Restart=on-failure と同義でなくなっています）")
+                check(plist.get("RunAtLoad") is True, f"{plist_label}: RunAtLoad がありません")
+                prog = (plist.get("ProgramArguments") or [""])[0]
+                check(str(prog).startswith("/"),
+                      f"{plist_label}: ProgramArguments[0] が絶対パスではありません: {prog}")
+                path_env = str((plist.get("EnvironmentVariables") or {}).get("PATH") or "")
+                check("/opt/homebrew/bin" in path_env,
+                      f"{plist_label}: PATH に /opt/homebrew/bin がありません: {path_env}")
+                account_home = sample_home.rsplit("/", 1)[0]
+                check(account_home + "/.local/bin" in path_env,
+                      f"{plist_label}: PATH に ~/.local/bin がありません"
+                      f"（hermes CLI を見つけられません）: {path_env}")
+
+        # 10. PATH は OS 別（macOS の `/opt/homebrew/bin` を Linux ユニットへ流用しない）
+        cfg_lin = ir_mod.build_config(
+            "/home/alice/.hermes", "/home/alice/hermes-freeagent-bind", "127.0.0.1", 8790,
+            python="/usr/bin/python3", startup_dir="/home/alice/.config/systemd/user",
+            platform_name="linux",
+        )
+        for unit_label2, rendered2 in (
+            ("hermes-freeagent-bind.service", ir_mod.render_linux_unit(cfg_lin)),
+            ("hermes-proxy.service", ir_mod.render_linux_proxy_unit(cfg_lin)),
+        ):
+            check("/opt/homebrew" not in rendered2,
+                  f"{unit_label2}: Linux ユニットの PATH に macOS の /opt/homebrew が入っています")
+            check("/home/alice/.local/bin" in rendered2,
+                  f"{unit_label2}: PATH に ~/.local/bin がありません（hermes CLI を見つけられません）")
 
     if FAILURES:
         print("整合性チェック失敗:")
