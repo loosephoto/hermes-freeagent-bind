@@ -101,7 +101,7 @@ def _resource_providers() -> str:
         f"# 推論プロバイダ（{len(S.PROVIDER_ORDER)} 社）",
         "",
         "`未設定` は鍵または確認フラグが足りない状態（**値はここに出さない**）。",
-        "キーの置き場所は stdio なら MCP の `env`、常駐 HTTP なら `%LOCALAPPDATA%\\hermes\\.env`。",
+        "キーの置き場所は stdio なら MCP の `env`、常駐 HTTP なら `%LOCALAPPDATA%\\hermes\\.env`（Linux / macOS は `~/.hermes/.env`）。",
         "",
         _md_table(["provider", "状態", "key_env", "足りないもの", "free_kind"], rows),
     ])

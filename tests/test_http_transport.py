@@ -333,6 +333,33 @@ class TestHttpDispatchSharing(unittest.TestCase):
         self.assertGreaterEqual(S._http_sessions_prune(), 1)
         self.assertIsNone(S._http_session_get(sid))
 
+    def test_duplicate_bind_fails_and_reuse_address_follows_os(self):
+        from unittest import mock
+        from freeagent_bind import transport_http as TH
+
+        s1 = S._http_build_server({"host": "127.0.0.1", "port": 0, "path": "/mcp"})
+        try:
+            port = int(s1.server_address[1])
+            with self.assertRaises(OSError):
+                s2 = S._http_build_server({"host": "127.0.0.1", "port": port, "path": "/mcp"})
+                s2.server_close()
+        finally:
+            s1.server_close()
+
+        with mock.patch.object(TH.os, "name", "nt"):
+            srv_nt = S._http_build_server({"host": "127.0.0.1", "port": 0, "path": "/mcp"})
+            try:
+                self.assertFalse(srv_nt.allow_reuse_address)
+            finally:
+                srv_nt.server_close()
+
+        with mock.patch.object(TH.os, "name", "posix"):
+            srv_posix = S._http_build_server({"host": "127.0.0.1", "port": 0, "path": "/mcp"})
+            try:
+                self.assertTrue(srv_posix.allow_reuse_address)
+            finally:
+                srv_posix.server_close()
+
 
 class _NoPool:
     """`_dispatch_message` は tools/call 以外では pool を使わない（未使用でも渡せる形にする）。"""

@@ -279,7 +279,7 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     response` で切る）。通知には 202 を返し、**要求に 202 を返さない**。`initialize` の応答に
     `mcp-session-id` を付け、未知のセッションは 404。メソッド表は §9 の `_replies_for` に集約し、
     stdio と HTTP で分岐を作らない。**二重起動は失敗させる**（Windows の `SO_REUSEADDR` は同一ポートへの
-    二重バインドを許すので `allow_reuse_address = False`）。HTTP では env の目印が渡らないため、ハーネス判別は
+    二重バインドを許すので Windows では `allow_reuse_address = False`、POSIX は再起動直後の `TIME_WAIT` を避けるため `True`）。HTTP では env の目印が渡らないため、ハーネス判別は
     `x-freeagent-harness` ヘッダを env より優先する。`http.server` / `argparse` は遅延 import（stdio の起動を
     重くしない）。検証は `python scripts/smoke_http.py` と `tests/test_http_transport.py`。
 

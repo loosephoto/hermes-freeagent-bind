@@ -2014,8 +2014,9 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   警告は最初のツール結果にも載るので実害はない。
 - **進捗（`notifications/progress`）も同じ待ち行列へ回す**（§4.6）。ただし送るのは要求が
   `_meta.progressToken` を付けたときだけ。stdio 側は `write_line` で 1 行を書く（`WRITE_LOCK` の内側）。
-- **二重起動は失敗させる**: `ThreadingHTTPServer` の `allow_reuse_address` を `False` にする
-  （Windows の `SO_REUSEADDR` は同一ポートへの二重バインドを許し、状態が 2 つに割れたまま気づけない）。
+- **二重起動は失敗させる**: Windows では `ThreadingHTTPServer` の `allow_reuse_address` を `False` にする
+  （Windows の `SO_REUSEADDR` は同一ポートへの二重バインドを許し、状態が 2 つに割れたまま気づけない。
+  一方 Linux / macOS の POSIX ソケットは `SO_REUSEADDR` でも生きた LISTEN への二重バインドを拒否し、`False` だと常駐再起動直後の `TIME_WAIT` で失敗するため `os.name != "nt"` とする）。
 - **ハーネス目印はヘッダでも受ける**（`x-freeagent-harness`。HTTP では子プロセスの env が渡らないため）。
   ヘッダ > env の優先で、`detect_harness(params, env, marker)` の `marker` がヘッダ由来（`source: "header"`）。
 - 実装は標準ライブラリのみ（`http.server`）。stdio の起動を重くしないため `http.server` と `argparse` は
@@ -2041,6 +2042,9 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   また MSDN 仕様により両フラグ併用時は `CREATE_NO_WINDOW` が無視される）。さらに `auth.json` の
   `providers.nous` に有効な資格情報が無い（未ログイン・トークン失効）ときは起動自体をスキップし、
   5 分おきの再起動ループとログ肥大化を防ぐ。検証: `tests/test_resident_installer.py`。
+- **Linux / macOS を含む全 OS 共通の常駐化は `scripts/install_resident.py` が担う**（`--platform auto|windows|linux|macos`。`auto` は `sys.platform` の `win32` / `linux*` / `darwin` で判別し、Windows は `install_resident_windows.py` と同一契約に委譲）。
+  Linux は `systemd --user`（`~/.config/systemd/user/hermes-freeagent-bind.service` / `hermes-proxy.service`・`Type=simple`・`Restart=on-failure`・`systemctl --user enable --now`、`/run/systemd/system` とユーザー D-Bus 到達確認＋`linger` 未有効時の案内つき）、macOS は `launchd` LaunchAgent（`~/Library/LaunchAgents/ai.hermes.freeagent-bind.plist` / `ai.hermes.proxy.plist`・`plistlib` 生成・`KeepAlive={"SuccessfulExit": False}`・`launchctl bootstrap gui/<uid>` + `kickstart -k`）へ配線する。
+  POSIX ランチャ `run_server.py` は `~/.hermes/.env` と `freeagent.env` を読んで `<hermes-home>/logs/freeagent-autostart.log` に追記しつつ同一プロセスで待ち受ける。`run_proxy.py` は Nous Portal 未認証時にログ 1 行のみ出してポーリング待機（`FREEAGENT_PROXY_AUTH_POLL_S`、既定 60 秒）し、認証後に `os.execvpe` で同一 PID のまま `hermes proxy start` に置換する（クラッシュ再起動ループを防ぎつつログイン後の自動復帰を保つ）。検証: `tests/test_resident_posix.py`。
 - **目印（ハーネス判別）の点検も HTTP に対応する**: `scripts/apply_proactive.py --check` は
   `x-freeagent-harness` ヘッダを env と同じ目印として読み、HTTP なら不足時にヘッダを足すコマンドを出す
   （ヘッダを読まないと常駐運用の実機で「未設定」と誤警告した）。

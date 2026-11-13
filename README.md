@@ -203,6 +203,27 @@ python scripts/install_resident_windows.py --write --force --task    # 5 分ご�
   `server.py … --port <port>` の**両方**に当てます（片方だけだと、起動方式を変えた直後に二重起動します）。
 - 既定のポートは 8790 です（`--port` で変更できます。Hermes 側の `url` も同じ値にしてください）。
 
+#### Linux / macOS で常駐させる（`systemd --user` / `launchd`）
+
+Linux と macOS では、全 OS 共通の `scripts/install_resident.py` が `sys.platform` を自動判別して常駐配線を生成・登録します（Windows でも同じコマンドが使え、`install_resident_windows.py` と同じ生成物を出力します）。既定の `--hermes-home` は `~/.hermes` です。
+
+```bash
+python scripts/install_resident.py                          # 自動判別して表示のみ（1 バイトも書きません）
+python scripts/install_resident.py --write --force           # 生成（ランチャ / ユニット定義 / 切替スクリプト）
+python scripts/install_resident.py --write --force --task    # サービス登録・即時起動（systemctl --user / launchctl）
+```
+
+| 生成物 | 役割 |
+|---|---|
+| `~/.hermes/freeagent-service/run_server.py` | `~/.hermes/.env` と `freeagent.env` を読み、`~/.hermes/logs/freeagent-autostart.log` へ追記しつつ同一プロセスで HTTP サーバーを起動 |
+| `~/.config/systemd/user/hermes-freeagent-bind.service`（Linux）<br>`~/Library/LaunchAgents/ai.hermes.freeagent-bind.plist`（macOS） | 自動起動・異常終了時の自動復旧（Linux: `Restart=on-failure` / macOS: `KeepAlive.SuccessfulExit=false`） |
+| `~/.hermes/freeagent-service/apply_freeagent_http.sh` / `revert_freeagent_stdio.sh` | `hermes config` の HTTP 切替と stdio への戻し |
+| `~/.hermes/proxy-service/run_proxy.py` | Nous Portal プロキシ（`127.0.0.1:8645`）を起動（`--no-proxy` で省略可能）。未認証時は 1 行だけ記録して待機し、認証後に `os.execvpe` で同一 PID のまま自動起動 |
+| `~/.config/systemd/user/hermes-proxy.service`（Linux）<br>`~/Library/LaunchAgents/ai.hermes.proxy.plist`（macOS） | プロキシ用ユニット定義 |
+
+- **Linux（SSH・ヘッドレス運用）**: ログアウトや SSH 切断後も常駐を維持するには `loginctl enable-linger "$USER"` を有効化してください（未有効の場合は `--task` 実行時に案内が出ます）。WSL では `/etc/wsl.conf` の `[boot] systemd=true` が必要です。
+- **macOS**: `LaunchAgents`（`gui/$(id -u)` ドメイン）として GUI ログインセッション単位で起動します。`PATH` には `/opt/homebrew/bin` と `/usr/local/bin` が含まれます。
+
 ## 💬 会話での頼み方
 
 引数を覚える必要はありません。最初は用途を普通の言葉で頼み、選ばれなければツール名を添えてください。
@@ -1037,12 +1058,12 @@ HTTP の待受までは 463ms（4 回のうち初回を除く中央値）でし�
 
 ### 📝 どこに書くか（Hermes Agent の `.env`）
 
-**キーは Hermes Agent の `.env` に書きます。** Windows では `%LOCALAPPDATA%\hermes\.env`、
+**キーは Hermes Agent の `.env` に書きます。** Windows では `%LOCALAPPDATA%\hermes\.env`、Linux / macOS では `~/.hermes/.env` に
 1 行 1 つ `KEY=VALUE` の書式です。
 
 | 使い方 | キーの置き場所 |
 |---|---|
-| **常駐 HTTP**（`install_resident_windows.py` で配線した場合・推奨） | 上記の `.env`。launcher（`run_server.pyw`）が起動時に読みます。常駐サーバー固有の確認フラグだけを `%LOCALAPPDATA%\hermes\freeagent-service\freeagent.env` に分けても構いません（同じ書式） |
+| **常駐 HTTP**（`install_resident.py` / `install_resident_windows.py` で配線した場合・推奨） | 上記の `.env`。launcher（`run_server.pyw` / `run_server.py`）が起動時に読みます。常駐サーバー固有の確認フラグだけを `<hermes-home>/freeagent-service/freeagent.env` に分けても構いません（同じ書式） |
 | **stdio**（既定） | Hermes の MCP `env`（`hermes config set mcp_servers.freeagent-bind.env.<変数名> …`）。**この場合はサーバーが `.env` を自動で読みません** |
 
 - 反映には**常駐サーバーの再起動**が要ります（見張りタスクは生存確認だけで、動いている
@@ -1219,14 +1240,14 @@ API キーに加えて、契約プランやデータの扱いを確認したこ�
 
 #### 常駐 HTTP のとき（MCP `env` は届きません）
 
-常駐 HTTP（上の「Windows で常駐させる」）では、サーバーは**ログオン時に起動される別プロセス**
-なので MCP `env` は届きません。launcher（`run_server.pyw`）が起動時に次の 2 つを読みます
+常駐 HTTP（上の「Windows で常駐させる」「Linux / macOS で常駐させる」）では、サーバーは**別プロセス**
+なので MCP `env` は届きません。launcher（`run_server.pyw` / `run_server.py`）が起動時に次の 2 つを読みます
 （**すでに環境にある値は上書きしません**。値はログに出ず、名前だけが出ます）。
 
 | ファイル | 何を書くか |
 |---|---|
-| `%LOCALAPPDATA%\hermes\.env` | Hermes が使っているキー（`OPENROUTER_API_KEY` / `NVIDIA_API_KEY` / `HF_TOKEN` / `GEMINI_API_KEY` / `OLLAMA_API_KEY` / `GLM_API_KEY` / `GH_TOKEN`、追加プロバイダなら `CEREBRAS_API_KEY` / `SAMBANOVA_API_KEY` / `NOVITA_API_KEY` / `SILICONFLOW_API_KEY` / `LONGCAT_API_KEY` / `OPENCODE_ZEN_API_KEY` など） |
-| `%LOCALAPPDATA%\hermes\freeagent-service\freeagent.env` | 常駐サーバー固有の確認フラグ（`FREEAGENT_*`）。`install_resident_windows.py --write` が**無いときだけ**作ります |
+| `%LOCALAPPDATA%\hermes\.env`（Linux / macOS は `~/.hermes/.env`） | Hermes が使っているキー（`OPENROUTER_API_KEY` / `NVIDIA_API_KEY` / `HF_TOKEN` / `GEMINI_API_KEY` / `OLLAMA_API_KEY` / `GLM_API_KEY` / `GH_TOKEN`、追加プロバイダなら `CEREBRAS_API_KEY` / `SAMBANOVA_API_KEY` / `NOVITA_API_KEY` / `SILICONFLOW_API_KEY` / `LONGCAT_API_KEY` / `OPENCODE_ZEN_API_KEY` など） |
+| `%LOCALAPPDATA%\hermes\freeagent-service\freeagent.env`（Linux / macOS は `~/.hermes/freeagent-service/freeagent.env`） | 常駐サーバー固有の確認フラグ（`FREEAGENT_*`）。`install_resident.py --write`（または `install_resident_windows.py --write`）が**無いときだけ**作ります |
 
 - 反映には**常駐サーバーの再起動**が要ります（見張りタスクは生存確認だけで、動いている
   プロセスの環境は読み直しません）。
@@ -1930,7 +1951,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 
 | 変数 | 既定 | 意味 |
 |---|---|---|
-| `FREEAGENT_STATE_DIR` | `%LOCALAPPDATA%\hermes-freeagent-bind` | 蓄積ストア（統計・クールダウン・相談セッション）。**一時領域に置かない** |
+| `FREEAGENT_STATE_DIR` | Windows: `%LOCALAPPDATA%\hermes-freeagent-bind`<br>Linux / macOS: `$XDG_STATE_HOME/hermes-freeagent-bind`（既定 `~/.local/state/hermes-freeagent-bind`） | 蓄積ストア（統計・クールダウン・相談セッション）。**一時領域に置かない** |
 | `FREEAGENT_DEFAULT_MODEL` | 空（自動選抜） | 既定モデル（`provider/model`） |
 | `FREEAGENT_MODEL_EXCLUDE` | 空 | 自動選抜・フォールバック・統合役から常に外すモデル（カンマ区切り。例: `nous/poolside/laguna-xs-2.1:free`。`:free` 無しの基底名でも一致） |
 | `FREEAGENT_MAX_WORKERS` | 8 | 並列処理 1 回のワーカー上限（1〜32）。プロセス全体の上限ではない。**429 の抑止は提供元の枠が担う** |

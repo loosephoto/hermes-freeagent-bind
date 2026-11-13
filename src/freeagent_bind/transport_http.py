@@ -462,9 +462,10 @@ def _http_build_server(config: dict):
     import http.server
 
     class _Server(http.server.ThreadingHTTPServer):
-        # Windows の SO_REUSEADDR は「同じポートへの二重バインド」を許す。共有が目的なので、
-        # 二重起動は黙って通さず必ず失敗させる（状態が 2 つに割れると気づけない）。
-        allow_reuse_address = False
+        # Windows の SO_REUSEADDR は「同じポートへの二重バインド」を許すため False にする。
+        # POSIX（Linux / macOS）では SO_REUSEADDR でも生きた LISTEN への二重起動は失敗し、
+        # False だと常駐サービスの再起動直後に TIME_WAIT でバインドできなくなる。
+        allow_reuse_address = (os.name != "nt")
         daemon_threads = True
 
     return _Server((_http_host(config), _http_port(config)), _http_make_handler(config))
