@@ -35,15 +35,32 @@ python scripts/install_resident_windows.py --write --force # 上書き
 python scripts/install_resident_windows.py --write --force --task   # 見張りタスクも登録
 ```
 
-`--task` は `schtasks /create /sc minute /mo <間隔> /tr "wscript.exe <worker>" /f` を実行する。
+`--task` は見張りタスクを **XML 定義**で登録する（`schtasks /create /tn <名前> /xml <一時ファイル> /f`）。
+`/sc minute` の簡易登録は「バッテリー駆動では開始しない／バッテリーに切り替わったら停止する」が
+既定で有効になり、ノート PC では見張りが止まる（実測: 簡易登録のタスクは両方 True）。XML では
+両方 false・`StartWhenAvailable` true・繰り返しは無期限で登録する。
 間隔を空けたくない場合（ログオン時だけ起動すれば十分）は付けない。
+
+worker が毎ティックで行うこと（v0.49.0）:
+
+- **Python の選定は版番号順**（数字の並びを桁揃えして比べる）。素の文字列比較は `python-3.14.10` より
+  `python-3.14.9` を上に置く（実測）。標準ライブラリの無い残骸フォルダは選ばない。
+- **応答なしの検知**。プロセスが居ても待受ポートが HTTP に答えないティックが `UNRESPONSIVE_STRIKES` 回
+  続いたら、そのプロセスを WMI で終了して起動し直す（1 回だけなら起動直後の可能性があるので待つ）。
+  見張りの記録は `logs\\<名前>-watchdog.log`（サーバーが掴んでいるログには VBS から追記できない・実測）。
+- launcher は **Hermes のセッションから起動されたとき**、そのセッション由来の環境変数
+  （レジストリに無い `FREEAGENT_*` / `HERMES_*` / `TERMINAL_*` / `TMPDIR`）を落としてから起動する。
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
+import re
 import subprocess
 import sys
+import tempfile
+from xml.sax.saxutils import escape as _xml_escape
 
 # 日本語 Windows のコンソール（cp932/cp1252）でも出力を落とさない。
 for _stream in (sys.stdout, sys.stderr):
@@ -56,6 +73,9 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8790
 DEFAULT_PROXY_PORT = 8645
+# `hermes proxy start` が `--port` 無しで待ち受けるポート。worker はこれ以外のときだけ `--port` を渡し、
+# `--port` の無いコマンドラインをこのポートのプロキシとして扱う。
+HERMES_PROXY_DEFAULT_PORT = 8645
 DEFAULT_TASK_NAME = "Hermes_Freeagent_Watchdog"
 DEFAULT_PROXY_TASK_NAME = "Hermes_Proxy_Watchdog"
 DEFAULT_INTERVAL_MINUTES = 5
@@ -66,6 +86,11 @@ ENV_NAME = "freeagent.env"
 WORKER_NAME = "Hermes_Freeagent.vbs"
 PROXY_SERVICE_DIR_NAME = "proxy-service"
 PROXY_LOG_NAME = "proxy-service.log"
+WATCHDOG_LOG_NAME = "freeagent-watchdog.log"
+PROXY_WATCHDOG_LOG_NAME = "proxy-watchdog.log"
+# 待受ポートが答えないティックがこの回数続いたら、プロセスを終了して起動し直す。
+# 1 回で落とさないのは、起動直後（まだ bind していない数秒）に見張りが当たることがあるため。
+UNRESPONSIVE_STRIKES = 2
 PROXY_LAUNCHER_NAME = "run_proxy.pyw"
 PROXY_WORKER_NAME = "Hermes_Proxy.vbs"
 PROXY_TEMPLATE_NAME = "Hermes_Proxy_Launcher.vbs"
@@ -100,6 +125,16 @@ def _interpreter_ok(exe: str) -> bool:
     即死した。`os.path.isfile` だけの判定はこれを通してしまい、**目印の無い pythonw 起動で無言の即死**になる
     （起動ログには `starting` だけが残り、サーバーは LISTENING しない）。だから実行して確かめる。
     """
+    if os.name == "nt":
+        # 実行形式でないファイルを起動しない。PE でない `python.exe`（空ファイルや壊れた残骸）を
+        # コンソールの無い親から起動すると、Windows が 16 ビット扱いで待たされ、1 件ごとに
+        # timeout（20 秒）まで戻らない（実測: テキストの stub 1 個で 20 秒・窓なしの親で再現）。
+        try:
+            with open(exe, "rb") as fh:
+                if fh.read(2) != b"MZ":
+                    return False
+        except OSError:
+            return False
     try:
         nw = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         proc = subprocess.run([exe, "-c", "import sys;print(sys.version_info[0])"],
@@ -111,12 +146,35 @@ def _interpreter_ok(exe: str) -> bool:
     return proc.returncode == 0 and out[:1].isdigit()
 
 
+def _python_dir_key(name: str) -> list:
+    """`python-*` フォルダ名を**版番号順**に並べるためのキー（数字の並びを数値として比べる）。
+
+    素の文字列比較は `python-3.14.10` より `python-3.14.9` を上に置く（`"1" < "9"`）。更新で
+    3.14.10 が入っても古い 3.14.9 を選び続け、古いフォルダが壊れた時点で `pythonw` の無言即死になる
+    （実測: `sorted(reverse=True)` も VBS の `StrComp` も 3.14.9 を選んだ）。worker VBS の `NatKey` と
+    同じ規則（数字の並び → 数値、それ以外 → 小文字）にしてあり、生成器と worker の選ぶ版が食い違わない。
+    """
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", name)]
+
+
+def probe_host(host: str) -> str:
+    """応答確認で叩くホスト。`0.0.0.0` / `::` の待受はループバックへ、IPv6 は角括弧つきにする。"""
+    host = (host or "").strip()
+    if host in ("", "0.0.0.0", "*"):
+        return "127.0.0.1"
+    if host in ("::", "[::]"):
+        return "[::1]"
+    if ":" in host and not host.startswith("["):
+        return "[%s]" % host
+    return host
+
+
 def discover_python(hermes_home: str) -> tuple[str, str]:
     """`<hermes-home>\\tools\\python-*` から `(python.exe, pythonw.exe)` を探す。
 
     フォルダ名はインストールごとに変わる（版＋ビルド番号。例 `python-3.14.7+<build>-win32-x64`）ので、
     **名前を書かずに `tools` を列挙する**。選び方は 2 段:
-      1. **新しい版から**見る（`sorted(..., reverse=True)`。旧実装は昇順で最古の残骸を選んでいた）
+      1. **新しい版から**見る（`_python_dir_key` の版番号順。文字列順だと 3.14.10 < 3.14.9 になる）
       2. `_interpreter_ok()` で**起動できることを確かめる**（stdlib が欠けた残骸を飛ばす）
     見つからなければ空文字を返す（生成側で明示指定を促す）。
     """
@@ -126,13 +184,181 @@ def discover_python(hermes_home: str) -> tuple[str, str]:
     candidates = sorted(
         (name for name in os.listdir(tools)
          if name.startswith("python-") and os.path.isdir(os.path.join(tools, name))),
-        reverse=True)
+        key=_python_dir_key, reverse=True)
     for name in candidates:
         exe = os.path.join(tools, name, "python.exe")
         exe_w = os.path.join(tools, name, "pythonw.exe")
         if os.path.isfile(exe) and _interpreter_ok(exe):
             return exe, (exe_w if os.path.isfile(exe_w) else "")
     return "", ""
+
+
+# --- worker VBS / launcher が共有する部品（v0.49.0） -------------------------------
+
+# 版番号順のキーと、標準ライブラリの有無（どちらも子プロセスを作らない）。
+_VBS_PYTHON_PICK = r"""
+' Natural-order key: every digit run is zero-padded, so "3.14.10" sorts above "3.14.9"
+' (a plain text compare picked 3.14.9 - measured).
+Function NatKey(s)
+  Dim i, ch, num, out
+  out = ""
+  num = ""
+  For i = 1 To Len(s)
+    ch = Mid(s, i, 1)
+    If ch >= "0" And ch <= "9" Then
+      num = num & ch
+    Else
+      If num <> "" Then
+        out = out & Right(String(20, "0") & num, 20)
+        num = ""
+      End If
+      out = out & LCase(ch)
+    End If
+  Next
+  If num <> "" Then out = out & Right(String(20, "0") & num, 20)
+  NatKey = out
+End Function
+
+' A python-* folder without its standard library starts and dies at once (measured: a
+' leftover python-3.14.7 kept python.exe but lost Lib). File-system check only: running
+' the interpreter from here would allocate a console.
+Function HasStdlib(folder)
+  Dim z
+  HasStdlib = False
+  If fso.FileExists(folder.Path & "\Lib\os.py") Then
+    HasStdlib = True
+    Exit Function
+  End If
+  For Each z In folder.Files
+    If LCase(Left(z.Name, 6)) = "python" And LCase(Right(z.Name, 4)) = ".zip" Then HasStdlib = True
+  Next
+End Function
+"""
+
+# 応答確認・見張りログ・連続回数の記録（どれもコンソールを作らない）。
+_VBS_WATCHDOG = r"""
+' 1 = the port answered HTTP (any status), 0 = no answer, -1 = the probe is unavailable.
+' "Connection: close" matters: without it the server logged one ConnectionResetError
+' traceback per probe (measured: 1 per probe without the header, 0 with it).
+Function ProbePort(url)
+  Dim rq
+  ProbePort = -1
+  On Error Resume Next
+  Set rq = CreateObject("WinHttp.WinHttpRequest.5.1")
+  If Err.Number <> 0 Then
+    Err.Clear
+    Exit Function
+  End If
+  rq.SetTimeouts 2000, 2000, 5000, 10000
+  rq.Open "GET", url, False
+  rq.SetRequestHeader "Connection", "close"
+  rq.Send
+  If Err.Number = 0 Then
+    ProbePort = 1
+  Else
+    ProbePort = 0
+  End If
+  Err.Clear
+End Function
+
+' The watchdog writes to its own file: the server keeps its log open, and a second
+' writer from Windows Script Host fails with "permission denied" (measured).
+Sub AppendLog(path, msg)
+  Dim h
+  On Error Resume Next
+  Set h = fso.OpenTextFile(path, 8, True)
+  h.WriteLine "[" & Now & "] " & msg
+  h.Close
+  Err.Clear
+End Sub
+
+Function ReadStrikes(path)
+  Dim h, v
+  ReadStrikes = 0
+  On Error Resume Next
+  If fso.FileExists(path) Then
+    Set h = fso.OpenTextFile(path, 1, False)
+    v = Trim(h.ReadLine)
+    h.Close
+    If IsNumeric(v) Then ReadStrikes = CLng(v)
+  End If
+  Err.Clear
+End Function
+
+Sub WriteStrikes(path, n)
+  Dim h
+  On Error Resume Next
+  Set h = fso.OpenTextFile(path, 2, True)
+  h.WriteLine CStr(n)
+  h.Close
+  Err.Clear
+End Sub
+
+Sub ClearStrikes(path)
+  On Error Resume Next
+  If fso.FileExists(path) Then fso.DeleteFile path, True
+  Err.Clear
+End Sub
+"""
+
+# launcher（pythonw から走る Python）が共有する、セッション由来の環境変数の除去。
+_PY_SESSION_ENV = r"""
+# Hermes のセッション（対話・KANBAN ワーカー・cron）から常駐を起動し直すと、そのセッションの
+# 環境変数を引き継ぐ（実測: ログオン起動は .env から 48 個読むのに、セッションからの再起動は 25 個
+# ＝残りは親の環境に既にあった）。`実環境 > ファイル` の規則のせいで、そのセッションが一時的に
+# export した `FREEAGENT_STATE_DIR`（scratch を指す）などが常駐に居座る。
+# ログオン起動と同じ環境にするため、**セッションの印があるときだけ**、レジストリ（ユーザー／
+# システムの環境変数）に無い `FREEAGENT_*` / `HERMES_*` / `TERMINAL_*` / `TMPDIR` を落とす。
+SESSION_MARKERS = ("HERMES_SESSION_ID", "HERMES_UI_SESSION_ID", "HERMES_KANBAN_TASK")
+SESSION_PREFIXES = ("FREEAGENT_", "HERMES_", "TERMINAL_")
+SESSION_EXACT = ("TMPDIR",)
+# launcher 自身への指示は残す（テスト・別プロファイル・意図的な持ち込み）。
+SESSION_KEEP = ("FREEAGENT_ENV_FILE", "FREEAGENT_KEEP_SESSION_ENV",
+                "HERMES_PROXY_LOG", "HERMES_PROXY_FORCE_START")
+
+
+def _persistent_env_names():
+    # レジストリに登録された環境変数名（大文字）。読めなければ None（＝何も落とさない）。
+    try:
+        import winreg
+    except ImportError:
+        return None
+    names = set()
+    found = False
+    for root, sub in ((winreg.HKEY_CURRENT_USER, "Environment"),
+                      (winreg.HKEY_LOCAL_MACHINE,
+                       r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")):
+        try:
+            with winreg.OpenKey(root, sub) as key:
+                found = True
+                index = 0
+                while True:
+                    try:
+                        names.add(winreg.EnumValue(key, index)[0].upper())
+                    except OSError:
+                        break
+                    index += 1
+        except OSError:
+            continue
+    return names if found else None
+
+
+def _drop_session_env(environ, persistent):
+    # セッション由来の変数を `environ` から落とし、落とした名前（昇順）を返す。値は返さない。
+    if (environ.get("FREEAGENT_KEEP_SESSION_ENV") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return []
+    if persistent is None or not any(environ.get(name) for name in SESSION_MARKERS):
+        return []
+    dropped = []
+    for name in list(environ):
+        upper = name.upper()
+        if upper in SESSION_KEEP or upper in persistent:
+            continue
+        if upper in SESSION_EXACT or upper.startswith(SESSION_PREFIXES):
+            environ.pop(name, None)
+            dropped.append(name)
+    return sorted(dropped)
+"""
 
 
 def service_paths(hermes_home: str, startup_dir: str = "") -> dict:
@@ -151,6 +377,7 @@ def service_paths(hermes_home: str, startup_dir: str = "") -> dict:
         "launcher": os.path.join(service, LAUNCHER_NAME),
         "worker": os.path.join(service, WORKER_NAME),
         "log": os.path.join(hermes_home, "logs", LOG_NAME),
+        "watchdog_log": os.path.join(hermes_home, "logs", WATCHDOG_LOG_NAME),
         "service_env": os.path.join(service, ENV_NAME),
         "apply": os.path.join(service, "apply_freeagent_http.sh"),
         "revert": os.path.join(service, "revert_freeagent_stdio.sh"),
@@ -161,6 +388,7 @@ def service_paths(hermes_home: str, startup_dir: str = "") -> dict:
         "proxy_startup_template": os.path.join(proxy_service, PROXY_TEMPLATE_NAME),
         "proxy_startup": os.path.join(startup_root, PROXY_WORKER_NAME),
         "proxy_log": os.path.join(hermes_home, "logs", PROXY_LOG_NAME),
+        "proxy_watchdog_log": os.path.join(hermes_home, "logs", PROXY_WATCHDOG_LOG_NAME),
     }
 
 
@@ -196,6 +424,8 @@ os.makedirs(os.path.dirname(LOG), exist_ok=True)
 _stream = open(LOG, "a", encoding="utf-8", errors="replace", buffering=1)
 sys.stdout = _stream
 sys.stderr = _stream
+
+__SESSION_ENV_HELPER__
 
 def _load_env_file(path):
     """KEY=VALUE を os.environ へ入れる（**既にある値を上書きしない**）。
@@ -233,6 +463,10 @@ def _load_env_file(path):
     return names
 
 
+# ファイルを読む**前に**落とす（落とした名前は、このあと .env / freeagent.env の値で埋まる）。
+_dropped = _drop_session_env(os.environ, _persistent_env_names())
+if _dropped:
+    print("[env] dropped %d session-inherited vars: %s" % (len(_dropped), ", ".join(_dropped)))
 _loaded = []
 for _env_path in ENV_FILES:
     _loaded.extend(_load_env_file(_env_path))
@@ -243,12 +477,13 @@ runpy.run_path(os.path.join(REPO, "src", "freeagent_bind", "server.py"), run_nam
 '''.replace("__HERMES_HOME__", cfg["hermes_home"]).replace("__REPO__", cfg["repo"]).replace(
         "__LOG_NAME__", LOG_NAME).replace("__PORT__", str(cfg["port"])).replace(
         "__HOST__", cfg["host"]).replace("__MARKER__", cfg["marker"]).replace(
-        "__SERVICE_DIR__", SERVICE_DIR_NAME).replace("__ENV_NAME__", ENV_NAME).lstrip("\n")
+        "__SERVICE_DIR__", SERVICE_DIR_NAME).replace("__ENV_NAME__", ENV_NAME).replace(
+        "__SESSION_ENV_HELPER__", _PY_SESSION_ENV.strip("\n")).lstrip("\n")
 
 
 def render_worker(cfg: dict) -> str:
-    """worker VBS。生存確認は WMI、起動は pythonw、ログはファイル追記（すべて窓を作らない）。"""
-    return '''
+    """worker VBS。生存確認は WMI、応答確認は WinHttp、起動は pythonw、ログはファイル追記（すべて窓を作らない）。"""
+    return r"""
 ' Hermes Agent - freeagent-bind resident MCP server over HTTP (StreamableHTTP)
 ' Serves the freeagent-bind MCP server on __HOST__:__PORT__ so every Hermes process
 ' (gateway, interactive sessions, KANBAN workers) shares ONE server process.
@@ -259,86 +494,116 @@ def render_worker(cfg: dict) -> str:
 ' `sh.Run "cmd /c ..."` allocate a console; Windows 11 hands that console to Windows
 ' Terminal and shows a black window for a moment (measured: one per 5-minute
 ' watchdog tick, even with a hidden window style). So:
-'   - liveness = a WMI query of Win32_Process CommandLine (no child process),
-'     with a WinHttp connection probe only if WMI is unavailable;
-'   - the start line is appended with Scripting.FileSystemObject (no "cmd /c echo");
+'   - liveness = a WMI query of Win32_Process (python processes only, matched by
+'     CommandLine; no child process), with a WinHttp probe only if WMI is unavailable;
+'   - responsiveness = a WinHttp GET with "Connection: close". A process that exists
+'     but does not answer on __STRIKES__ ticks in a row is terminated through WMI and restarted;
+'   - log lines are appended with Scripting.FileSystemObject (no "cmd /c echo");
 '   - the server itself is started with pythonw.exe (GUI subsystem: no console).
 ' ASCII only: Windows Script Host reads a .vbs without a UTF-16 BOM as ANSI.
 Option Explicit
-Dim sh, fso, hermesHome, repo, logDir, logFile, running, py, pyw, bestName, tools, f
-Dim http, lf, ts, svc, procs, p, cl, wmiOk
+Dim sh, fso, hermesHome, repo, logDir, logFile, watchLog, running, py, pyw, bestName, bestKey, tools, f
+Dim lf, ts, svc, procs, p, cl, nm, hit, key, wmiOk, probeUrl, strikeFile, strikes, killed
 
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
-hermesHome = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\hermes"
+hermesHome = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\hermes"
 repo = "__REPO__"
-logDir = hermesHome & "\\logs"
-logFile = logDir & "\\__LOG_NAME__"
+logDir = hermesHome & "\logs"
+logFile = logDir & "\__LOG_NAME__"
+watchLog = logDir & "\__WATCHDOG_LOG_NAME__"
+probeUrl = "http://__PROBE_HOST__:__PORT__/"
+strikeFile = fso.GetParentFolderName(WScript.ScriptFullName) & "\unresponsive-__PORT__.count"
 ts = Now
 
-If Not fso.FileExists(repo & "\\src\\freeagent_bind\\server.py") Then WScript.Quit 0
+If Not fso.FileExists(repo & "\src\freeagent_bind\server.py") Then WScript.Quit 0
 If Not fso.FolderExists(logDir) Then fso.CreateFolder(logDir)
 
-' Liveness: WMI on the server's own command line. Pure COM - no child process and no
-' stray connection (an HTTP probe made the server log ConnectionResetError every tick).
+' Liveness: WMI on the server's own command line. Pure COM - no child process.
+' Each value is assigned before it is tested: under "On Error Resume Next" a failing
+' If-condition runs the If-body (measured), which would mark a dead server as running.
 running = False
 wmiOk = False
 On Error Resume Next
-Set svc = GetObject("winmgmts:\\\\.\\root\\cimv2")
+Set svc = GetObject("winmgmts:\\.\root\cimv2")
 If Err.Number = 0 And IsObject(svc) Then
-  Set procs = svc.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process")
+  Set procs = svc.ExecQuery("SELECT ProcessId, Name, CommandLine FROM Win32_Process")
   If Err.Number = 0 And IsObject(procs) Then
     wmiOk = True
     For Each p In procs
+      nm = ""
+      cl = Null
+      nm = p.Name
       cl = p.CommandLine
-      If Not IsNull(cl) Then
-        If InStr(cl, "__MARKER__") > 0 Then running = True
-        If InStr(cl, "freeagent_bind") > 0 And InStr(cl, "server.py") > 0 And InStr(cl, "--port __PORT__") > 0 Then running = True
-      End If
+      hit = False
+      If Not IsNull(cl) Then hit = IsServer(nm, cl)
+      If hit = True Then running = True
     Next
   End If
   Err.Clear
 End If
-If running Then WScript.Quit 0
-
-' WMI unavailable -> connection probe with WinHttp (still no console window).
-If Not wmiOk Then
-  Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
-  If Err.Number = 0 And IsObject(http) Then
-    http.SetTimeouts 1000, 1000, 1000, 2000
-    http.Open "GET", "http://__HOST__:__PORT__/", False
-    http.Send
-    If Err.Number = 0 Then running = True
-    Err.Clear
-  End If
-  If running Then WScript.Quit 0
-End If
 On Error GoTo 0
+
+If Not wmiOk Then
+  ' WMI unavailable -> the port itself is the only evidence (still no console window).
+  If ProbePort(probeUrl) = 1 Then WScript.Quit 0
+ElseIf running Then
+  ' The process exists. Make sure it also answers; a hung server is otherwise never
+  ' restarted, because the liveness check above only looks at the process list.
+  If ProbePort(probeUrl) <> 0 Then
+    ClearStrikes strikeFile
+    WScript.Quit 0
+  End If
+  strikes = ReadStrikes(strikeFile) + 1
+  If strikes < __STRIKES__ Then
+    WriteStrikes strikeFile, strikes
+    AppendLog watchLog, "server process is alive but port __PORT__ did not answer (" & strikes & "/__STRIKES__); it is restarted if the next tick fails too"
+    WScript.Quit 0
+  End If
+  killed = KillServers()
+  AppendLog watchLog, "port __PORT__ did not answer on __STRIKES__ ticks in a row; terminated " & killed & " process(es)"
+  ' Nothing was terminated (WMI failed, or only a legacy-shaped process exists): do not
+  ' start a second server. The strike count is kept, so the next tick tries again.
+  If killed = 0 Then WScript.Quit 0
+  ClearStrikes strikeFile
+  WScript.Sleep 2000
+End If
 
 ' The bundled python lives in a folder whose name changes per install (version plus
 ' build number), so enumerate the tools folder instead of hardcoding a path.
 py = ""
 pyw = ""
 bestName = ""
-tools = hermesHome & "\\tools"
+bestKey = ""
+tools = hermesHome & "\tools"
 If fso.FolderExists(tools) Then
   For Each f In fso.GetFolder(tools).SubFolders
     If Left(f.Name, 7) = "python-" Then
-      ' Pick the NEWEST python-* folder (greatest name). Enumerating in folder order
-      ' selected the oldest one; a stale install (python-3.14.7 without its stdlib)
-      ' then died silently: pythonw has no console and the log showed only "starting".
-      ' We cannot verify the interpreter here (WshShell.Exec would spawn a console),
-      ' so choose by name instead.
-      If fso.FileExists(f.Path & "\\python.exe") And StrComp(f.Name, bestName, vbTextCompare) > 0 Then
-        bestName = f.Name
-        py = f.Path & "\\python.exe"
-        pyw = f.Path & "\\pythonw.exe"
+      ' Pick the NEWEST usable python-* folder by VERSION ORDER (NatKey), skipping
+      ' folders that lost their standard library. Folder order selected the oldest
+      ' one and a text compare ranks 3.14.9 above 3.14.10; either way a stale install
+      ' dies silently: pythonw has no console and the log shows only "starting".
+      If fso.FileExists(f.Path & "\python.exe") And HasStdlib(f) Then
+        key = NatKey(f.Name)
+        If StrComp(key, bestKey, vbBinaryCompare) > 0 Then
+          bestKey = key
+          bestName = f.Name
+          py = f.Path & "\python.exe"
+          pyw = ""
+          If fso.FileExists(f.Path & "\pythonw.exe") Then pyw = f.Path & "\pythonw.exe"
+        End If
       End If
     End If
   Next
 End If
-If py = "" Then WScript.Quit 0
+If py = "" Then
+  AppendLog watchLog, "no usable python-* folder under " & tools & "; the server was not started"
+  WScript.Quit 0
+End If
+
+' A strike left by an earlier server must not count against the one started now.
+ClearStrikes strikeFile
 
 ' Log the start with a plain file append ("cmd /c echo" would spawn a console too).
 On Error Resume Next
@@ -350,14 +615,52 @@ On Error GoTo 0
 ' Launch console-free. Fall back to python.exe (hidden) only if pythonw is missing.
 sh.CurrentDirectory = repo
 If pyw <> "" Then
-  sh.Run """" & pyw & """ """ & hermesHome & "\\__SERVICE_DIR__\\__LAUNCHER_NAME__"" __MARKER__", 0, False
+  sh.Run "" & Chr(34) & pyw & Chr(34) & " " & Chr(34) & hermesHome & "\__SERVICE_DIR__\__LAUNCHER_NAME__" & Chr(34) & " __MARKER__", 0, False
 Else
-  sh.Run """" & py & """ src\\freeagent_bind\\server.py --transport http --host __HOST__ --port __PORT__", 0, False
+  sh.Run "" & Chr(34) & py & Chr(34) & " src\freeagent_bind\server.py --transport http --host __HOST__ --port __PORT__", 0, False
 End If
-'''.replace("__HERMES_HOME__", cfg["hermes_home"]).replace("__REPO__", cfg["repo"]).replace(
-        "__LOG_NAME__", LOG_NAME).replace("__SERVICE_DIR__", SERVICE_DIR_NAME).replace(
+
+' --- helpers ---------------------------------------------------------------
+
+' True for the resident server only. The name test keeps a shell whose own command
+' line merely mentions the marker (a search, an editor) from counting as the server.
+Function IsServer(name, cmdLine)
+  IsServer = False
+  If LCase(Left(name, 6)) <> "python" Then Exit Function
+  If InStr(cmdLine, "__MARKER__") > 0 Then IsServer = True
+  If InStr(cmdLine, "freeagent_bind") > 0 And InStr(cmdLine, "server.py") > 0 And InStr(cmdLine, "--port __PORT__") > 0 Then IsServer = True
+End Function
+
+Function KillServers()
+  Dim q, x, c, n, count
+  count = 0
+  On Error Resume Next
+  Set q = svc.ExecQuery("SELECT ProcessId, Name, CommandLine FROM Win32_Process")
+  For Each x In q
+    n = ""
+    c = Null
+    n = x.Name
+    c = x.CommandLine
+    hit = False
+    If Not IsNull(c) Then hit = IsServer(n, c)
+    If hit = True Then
+      AppendLog watchLog, "terminating unresponsive server pid=" & x.ProcessId
+      x.Terminate
+      count = count + 1
+    End If
+  Next
+  Err.Clear
+  KillServers = count
+End Function
+__VBS_PYTHON_PICK____VBS_WATCHDOG__""".replace("__HERMES_HOME__", cfg["hermes_home"]).replace("__REPO__", cfg["repo"]).replace(
+        "__LOG_NAME__", LOG_NAME).replace("__WATCHDOG_LOG_NAME__", WATCHDOG_LOG_NAME).replace(
+        "__SERVICE_DIR__", SERVICE_DIR_NAME).replace(
         "__LAUNCHER_NAME__", LAUNCHER_NAME).replace("__PORT__", str(cfg["port"])).replace(
-        "__HOST__", cfg["host"]).replace("__MARKER__", cfg["marker"]).lstrip("\n")
+        "__PROBE_HOST__", probe_host(cfg["host"])).replace(
+        "__HOST__", cfg["host"]).replace("__MARKER__", cfg["marker"]).replace(
+        "__STRIKES__", str(UNRESPONSIVE_STRIKES)).replace(
+        "__VBS_PYTHON_PICK__", _VBS_PYTHON_PICK).replace(
+        "__VBS_WATCHDOG__", _VBS_WATCHDOG).lstrip("\n")
 
 
 def render_startup(cfg: dict) -> str:
@@ -431,6 +734,9 @@ MARKER_PREFIX = "hermes-proxy-"
 # 0x00000008（コンソール剥奪フラグ）は絶対に入れない（子孫の git.exe / python.exe が黒窓を開くため）。
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NO_WINDOW = 0x08000000
+
+
+__SESSION_ENV_HELPER__
 
 
 def _console_python():
@@ -519,6 +825,9 @@ def main():
     args = ["-m", "hermes_cli.main", "proxy", "start"] + extra
 
     env = dict(os.environ)
+    # Hermes のセッションから起動し直されたときは、そのセッション由来の変数を子へ渡さない
+    # （ログオン起動と同じ環境にする。落とすのは子の環境だけで、launcher 自身は触らない）。
+    dropped = _drop_session_env(env, _persistent_env_names())
     env.setdefault("HERMES_HOME", HOME)
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
@@ -536,6 +845,8 @@ def main():
             creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
         )
+        if dropped:
+            log.write("[launcher] dropped %d session-inherited vars: %s\\n" % (len(dropped), ", ".join(dropped)))
         log.write("[launcher] started pid=%d args=%s\\n" % (child.pid, " ".join(args)))
     return 0
 
@@ -543,28 +854,32 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 '''.replace("__HERMES_HOME__", cfg["hermes_home"]).replace(
-        "__PROXY_LOG_NAME__", PROXY_LOG_NAME).lstrip("\n")
+        "__PROXY_LOG_NAME__", PROXY_LOG_NAME).replace(
+        "__SESSION_ENV_HELPER__", _PY_SESSION_ENV.strip("\n")).lstrip("\n")
 
 
 def render_proxy_worker(cfg: dict) -> str:
-    """プロキシ用 worker VBS（WMI 生存確認・WinHttp フォールバック・pythonw 起動・ASCII のみ）。"""
+    """プロキシ用 worker VBS（WMI 生存確認・WinHttp 応答確認・pythonw 起動・ASCII のみ）。"""
     proxy_port = str(cfg.get("proxy_port", DEFAULT_PROXY_PORT))
-    return r'''
+    return r"""
 ' Hermes Agent - local OpenAI-compatible proxy autostart
 ' Serves Nous Portal credentials on 127.0.0.1:__PROXY_PORT__ for local MCP servers
 ' (e.g. freeagent-bind's sub-LLM tools). Skips when the proxy is already up.
 '
 ' NO CONSOLE PROCESS IS EVER SPAWNED HERE:
 '   - liveness = a WMI query of Win32_Process CommandLine (no child process at all),
-'     with a WinHttp connection probe only if WMI is unavailable;
+'     with a WinHttp probe only if WMI is unavailable;
+'   - responsiveness = a WinHttp GET with "Connection: close". A proxy process that
+'     exists but does not answer on __STRIKES__ ticks in a row is terminated through WMI and restarted;
 '   - the server is started by run_proxy.pyw (via pythonw.exe), which launches
 '     "python.exe -m hermes_cli.main proxy start" with CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 '     (never DETACHED_PROCESS, so all grandchild git/python processes inherit the hidden console)
 '     and skips launch when Nous Portal is not authenticated.
 ' ASCII only: Windows Script Host reads a .vbs without a UTF-16 BOM as ANSI.
 Option Explicit
-Dim sh, fso, home, launcher, logDir, running, http, svc, procs, p, cl, wmiOk
-Dim tools, f, pyw, bestName, port, startupDir, startupLauncher, templateLauncher
+Dim sh, fso, home, launcher, logDir, watchLog, running, svc, procs, p, cl, nm, hit, wmiOk
+Dim tools, f, pyw, bestName, bestKey, key, port, startupDir, startupLauncher, templateLauncher
+Dim probeUrl, strikeFile, strikes, killed
 
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -572,9 +887,12 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 home = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\hermes"
 launcher = home & "\__PROXY_SERVICE_DIR__\__PROXY_LAUNCHER_NAME__"
 logDir = home & "\logs"
+watchLog = logDir & "\__PROXY_WATCHDOG_LOG_NAME__"
 
 port = "__PROXY_PORT__"
 If WScript.Arguments.Count > 0 Then port = WScript.Arguments(0)
+probeUrl = "http://127.0.0.1:" & port & "/"
+strikeFile = fso.GetParentFolderName(WScript.ScriptFullName) & "\unresponsive-" & port & ".count"
 
 If Not fso.FileExists(launcher) Then WScript.Quit 0
 If Not fso.FolderExists(logDir) Then fso.CreateFolder(logDir)
@@ -589,76 +907,147 @@ If Not fso.FileExists(startupLauncher) Then
 End If
 On Error GoTo 0
 
-' Liveness: WMI on the proxy's own command line. Pure COM - no child process and no
-' stray connection (an HTTP probe makes the server log ConnectionResetError).
+' Liveness: WMI on the proxy's own command line. Pure COM - no child process.
+' Each value is assigned before it is tested: under "On Error Resume Next" a failing
+' If-condition runs the If-body (measured), which would mark a dead proxy as running.
 running = False
 wmiOk = False
 On Error Resume Next
 Set svc = GetObject("winmgmts:\\.\root\cimv2")
 If Err.Number = 0 And IsObject(svc) Then
-  Set procs = svc.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process")
+  Set procs = svc.ExecQuery("SELECT ProcessId, Name, CommandLine FROM Win32_Process")
   If Err.Number = 0 And IsObject(procs) Then
     wmiOk = True
     For Each p In procs
+      nm = ""
+      cl = Null
+      nm = p.Name
       cl = p.CommandLine
-      If Not IsNull(cl) Then
-        If InStr(cl, "-m hermes_cli.main proxy start") > 0 Then
-          If InStr(cl, " --port " & port) > 0 Or port = "__PROXY_PORT__" Then running = True
-        End If
-        ' Legacy shape (started by the old cmd.exe launcher): the cmd.exe parent carries
-        ' hermes.cmd + "proxy start". Accept it so a transition never starts a second one.
-        If InStr(cl, "hermes.cmd") > 0 And InStr(cl, "proxy start") > 0 Then running = True
-      End If
+      hit = False
+      If Not IsNull(cl) Then hit = IsProxy(nm, cl)
+      If hit = True Then running = True
+      ' Legacy shape (started by the old launcher): the shell parent carries
+      ' hermes.cmd + "proxy start". Accept it so a transition never starts a second one.
+      hit = False
+      If Not IsNull(cl) Then hit = (InStr(cl, "hermes.cmd") > 0 And InStr(cl, "proxy start") > 0)
+      If hit = True Then running = True
     Next
   End If
   Err.Clear
 End If
-If running Then WScript.Quit 0
-
-' WMI unavailable -> connection probe with WinHttp (still no console window).
-If Not wmiOk Then
-  Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
-  If Err.Number = 0 And IsObject(http) Then
-    http.SetTimeouts 1000, 1000, 1000, 2000
-    http.Open "GET", "http://127.0.0.1:" & port & "/", False
-    http.Send
-    If Err.Number = 0 Then running = True
-    Err.Clear
-  End If
-  If running Then WScript.Quit 0
-End If
 On Error GoTo 0
 
+If Not wmiOk Then
+  ' WMI unavailable -> the port itself is the only evidence (still no console window).
+  If ProbePort(probeUrl) = 1 Then WScript.Quit 0
+ElseIf running Then
+  ' The process exists. Make sure it also answers; a hung proxy is otherwise never
+  ' restarted, because the liveness check above only looks at the process list.
+  If ProbePort(probeUrl) <> 0 Then
+    ClearStrikes strikeFile
+    WScript.Quit 0
+  End If
+  strikes = ReadStrikes(strikeFile) + 1
+  If strikes < __STRIKES__ Then
+    WriteStrikes strikeFile, strikes
+    AppendLog watchLog, "proxy process is alive but port " & port & " did not answer (" & strikes & "/__STRIKES__); it is restarted if the next tick fails too"
+    WScript.Quit 0
+  End If
+  killed = KillProxies()
+  AppendLog watchLog, "port " & port & " did not answer on __STRIKES__ ticks in a row; terminated " & killed & " process(es)"
+  ' Nothing was terminated (WMI failed, or only a legacy-shaped process exists): do not
+  ' start a second proxy. The strike count is kept, so the next tick tries again.
+  If killed = 0 Then WScript.Quit 0
+  ClearStrikes strikeFile
+  WScript.Sleep 2000
+End If
+
 ' pythonw.exe lives in a folder whose name changes per install (version + build),
-' so enumerate the tools folder instead of hardcoding a path.
+' so enumerate the tools folder instead of hardcoding a path. Version order (NatKey),
+' skipping folders without a standard library - see the helpers below.
 pyw = ""
 bestName = ""
+bestKey = ""
 tools = home & "\tools"
 If fso.FolderExists(tools) Then
   For Each f In fso.GetFolder(tools).SubFolders
     If Left(f.Name, 7) = "python-" Then
-      If fso.FileExists(f.Path & "\pythonw.exe") And StrComp(f.Name, bestName, vbTextCompare) > 0 Then
-        bestName = f.Name
-        pyw = f.Path & "\pythonw.exe"
+      If fso.FileExists(f.Path & "\pythonw.exe") And HasStdlib(f) Then
+        key = NatKey(f.Name)
+        If StrComp(key, bestKey, vbBinaryCompare) > 0 Then
+          bestKey = key
+          bestName = f.Name
+          pyw = f.Path & "\pythonw.exe"
+        End If
       End If
     End If
   Next
 End If
-If pyw = "" Then WScript.Quit 0
+If pyw = "" Then
+  AppendLog watchLog, "no usable python-* folder under " & tools & "; the proxy was not started"
+  WScript.Quit 0
+End If
+
+' A strike left by an earlier proxy must not count against the one started now.
+ClearStrikes strikeFile
 
 ' Console-free launch: pythonw (GUI subsystem) runs the thin launcher, which starts
 ' the CLI with CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, so no window is ever shown.
 sh.CurrentDirectory = home
-If port = "__PROXY_PORT__" Then
-  sh.Run """" & pyw & """ """ & launcher & """ hermes-proxy-" & port, 0, False
+If port = "__HERMES_DEFAULT_PORT__" Then
+  sh.Run "" & Chr(34) & pyw & Chr(34) & " " & Chr(34) & launcher & Chr(34) & " hermes-proxy-" & port, 0, False
 Else
-  sh.Run """" & pyw & """ """ & launcher & """ --port " & port & " hermes-proxy-" & port, 0, False
+  sh.Run "" & Chr(34) & pyw & Chr(34) & " " & Chr(34) & launcher & Chr(34) & " --port " & port & " hermes-proxy-" & port, 0, False
 End If
-'''.replace("__PROXY_SERVICE_DIR__", PROXY_SERVICE_DIR_NAME).replace(
+
+' --- helpers ---------------------------------------------------------------
+
+' True for the proxy's own python process ("-m hermes_cli.main proxy start") ON THIS
+' PORT: "--port N" must name it, and a command line without --port is the Hermes
+' default (__HERMES_DEFAULT_PORT__). A proxy on another port is neither "already running" nor ours to stop.
+Function IsProxy(name, cmdLine)
+  IsProxy = False
+  If LCase(Left(name, 6)) <> "python" Then Exit Function
+  If InStr(cmdLine, "-m hermes_cli.main proxy start") > 0 Then
+    If InStr(cmdLine, " --port ") > 0 Then
+      If InStr(cmdLine & " ", " --port " & port & " ") > 0 Then IsProxy = True
+    ElseIf port = "__HERMES_DEFAULT_PORT__" Then
+      IsProxy = True
+    End If
+  End If
+End Function
+
+Function KillProxies()
+  Dim q, x, c, n, count
+  count = 0
+  On Error Resume Next
+  Set q = svc.ExecQuery("SELECT ProcessId, Name, CommandLine FROM Win32_Process")
+  For Each x In q
+    n = ""
+    c = Null
+    n = x.Name
+    c = x.CommandLine
+    hit = False
+    If Not IsNull(c) Then hit = IsProxy(n, c)
+    If hit = True Then
+      AppendLog watchLog, "terminating unresponsive proxy pid=" & x.ProcessId
+      x.Terminate
+      count = count + 1
+    End If
+  Next
+  Err.Clear
+  KillProxies = count
+End Function
+__VBS_PYTHON_PICK____VBS_WATCHDOG__""".replace("__PROXY_SERVICE_DIR__", PROXY_SERVICE_DIR_NAME).replace(
         "__PROXY_LAUNCHER_NAME__", PROXY_LAUNCHER_NAME).replace(
         "__PROXY_WORKER_NAME__", PROXY_WORKER_NAME).replace(
         "__PROXY_TEMPLATE_NAME__", PROXY_TEMPLATE_NAME).replace(
-        "__PROXY_PORT__", proxy_port).lstrip("\n")
+        "__PROXY_WATCHDOG_LOG_NAME__", PROXY_WATCHDOG_LOG_NAME).replace(
+        "__PROXY_PORT__", proxy_port).replace(
+        "__HERMES_DEFAULT_PORT__", str(HERMES_PROXY_DEFAULT_PORT)).replace(
+        "__STRIKES__", str(UNRESPONSIVE_STRIKES)).replace(
+        "__VBS_PYTHON_PICK__", _VBS_PYTHON_PICK).replace(
+        "__VBS_WATCHDOG__", _VBS_WATCHDOG).lstrip("\n")
 
 
 def render_proxy_startup(cfg: dict) -> str:
@@ -815,16 +1204,94 @@ def write_plan(plan: list[tuple[str, str]], force: bool = False) -> list[str]:
     return written
 
 
+def render_task_xml(worker_path: str, interval_minutes: int, start: str = "") -> str:
+    """見張りタスクの XML 定義（`schtasks /create /xml` へ渡す）。
+
+    `schtasks /create /sc minute` の簡易登録は電源まわりが既定値になる（実測: `DisallowStartIfOnBatteries`
+    と `StopIfGoingOnBatteries` が True）。ノート PC をバッテリーで使っている間は見張りが開始されず、
+    落ちた常駐が戻らない。XML で明示する:
+
+    - `DisallowStartIfOnBatteries` / `StopIfGoingOnBatteries` = false（電源に依らず見張る）
+    - `StartWhenAvailable` = true（スリープで逃したティックを復帰後に実行する）
+    - `Repetition` に `Duration` を書かない（無期限に繰り返す）
+    - `MultipleInstancesPolicy` = IgnoreNew（前のティックが残っていたら重ねない）
+    - `LogonType` = InteractiveToken・`UserId` なし（登録した利用者の対話セッションで動く。パスワード不要）
+    """
+    interval = max(1, int(interval_minutes))
+    start = start or datetime.datetime.now().replace(microsecond=0).isoformat()
+    return """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>hermes-freeagent-bind watchdog: runs the worker script, which starts the server only when it is down or unresponsive.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT%dM</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>%s</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>wscript.exe</Command>
+      <Arguments>%s</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+""" % (interval, _xml_escape(start), _xml_escape('"%s"' % worker_path))
+
+
 def _register_schtask(worker_path: str, task_name: str, interval_minutes: int) -> str:
-    """指定した worker VBS の見張りタスクを登録する（冪等）。"""
-    tr = 'wscript.exe "%s"' % worker_path
-    cmd = ["schtasks", "/create", "/tn", task_name, "/sc", "minute",
-           "/mo", str(interval_minutes), "/tr", tr, "/f"]
-    nw = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=nw)
+    """指定した worker VBS の見張りタスクを XML 定義で登録する（冪等・電源に依らず動く）。"""
+    xml = render_task_xml(worker_path, interval_minutes)
+    fd, xml_path = tempfile.mkstemp(prefix="freeagent-task-", suffix=".xml")
+    os.close(fd)
+    try:
+        # schtasks は UTF-16（BOM つき）の定義を読む。
+        with open(xml_path, "w", encoding="utf-16", newline="\r\n") as fh:
+            fh.write(xml)
+        cmd = ["schtasks", "/create", "/tn", task_name, "/xml", xml_path, "/f"]
+        nw = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=nw)
+        except OSError as exc:
+            return "task failed: %s" % exc
+    finally:
+        try:
+            os.remove(xml_path)
+        except OSError:
+            pass
     if proc.returncode != 0:
-        return "task failed (%d): %s" % (proc.returncode, (proc.stderr or proc.stdout).strip())
-    return "task registered: %s (every %d min)" % (task_name, interval_minutes)
+        return "task failed (%d): %s" % (proc.returncode, (proc.stderr or proc.stdout or "").strip())
+    return "task registered: %s (every %d min, runs on battery too)" % (task_name, max(1, int(interval_minutes)))
 
 
 def register_task(cfg: dict, task_name: str, interval_minutes: int) -> str:

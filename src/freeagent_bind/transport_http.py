@@ -468,6 +468,20 @@ def _http_build_server(config: dict):
         allow_reuse_address = (os.name != "nt")
         daemon_threads = True
 
+        def handle_error(self, request, client_address):
+            """クライアント側の切断は異常ではないので、トレースバックを stderr へ出さない。
+
+            keep-alive の接続を相手が黙って閉じると、次の要求を待つ `readline` が
+            `ConnectionResetError` を投げ、既定の `handle_error` がトレースバックを書く
+            （実測: 見張りの接続確認 1 回につき 1 件・常駐ログの Traceback 55 件が全部これ）。
+            それ以外の例外は握り潰さず既定の出力に任せる。
+            """
+            exc = sys.exc_info()[1]
+            if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+                S._debug("http", f"client disconnected: {type(exc).__name__}")
+                return
+            super().handle_error(request, client_address)
+
     return _Server((_http_host(config), _http_port(config)), _http_make_handler(config))
 
 

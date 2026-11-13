@@ -214,6 +214,7 @@ def discover_python(hermes_home: str, platform_name: str | None = None) -> tuple
         candidates = sorted(
             (name for name in os.listdir(tools)
              if name.startswith("python-") and os.path.isdir(os.path.join(tools, name))),
+            key=_WIN._python_dir_key,   # 版番号順（文字列順だと 3.14.10 < 3.14.9 になる）
             reverse=True,
         )
         rel_bins = (

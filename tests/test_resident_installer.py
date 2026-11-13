@@ -115,13 +115,19 @@ class InstallerCase(unittest.TestCase):
         for line in vbs.splitlines():
             if line.strip().startswith("Dim "):
                 dims += line.split("Dim ", 1)[1]
-        for name in ("bestName", "py", "pyw", "tools"):
+        for name in ("bestName", "bestKey", "key", "py", "pyw", "tools", "watchLog", "probeUrl",
+                     "strikeFile", "strikes", "killed", "nm", "hit"):
             self.assertIn(name, dims, f"{name} が Dim に無い（Option Explicit で即死する）")
 
     def test_worker_picks_the_newest_python(self):
-        """最古の python-*（stdlib 欠落の残骸）を掴むと pythonw が無言で即死する。"""
+        """最古の python-*（stdlib 欠落の残骸）を掴むと pythonw が無言で即死する。
+
+        比べるのは版番号順のキー（`NatKey`）。フォルダ名の文字列比較は 3.14.10 より 3.14.9 を
+        上に置く（実測・`tests/test_resident_v0490.py` が実行して確かめる）。
+        """
         vbs = self.m.render_worker(self.cfg)
-        self.assertIn("StrComp(f.Name, bestName", vbs)
+        self.assertIn("StrComp(key, bestKey, vbBinaryCompare)", vbs)
+        self.assertIn("key = NatKey(f.Name)", vbs)
         self.assertIn('bestName = ""', vbs)
 
     def test_worker_never_spawns_a_console(self):
@@ -138,7 +144,7 @@ class InstallerCase(unittest.TestCase):
     def test_worker_recognises_current_and_legacy_command_lines(self):
         vbs = self.m.render_worker(self.cfg)
         self.assertIn(self.m.marker_for(8790), vbs, "pythonw + run_server.pyw のプロセスに当たること")
-        self.assertIn('InStr(cl, "--port 8790")', vbs, "旧来の server.py 起動にも当たること")
+        self.assertIn('InStr(cmdLine, "--port 8790")', vbs, "旧来の server.py 起動にも当たること")
         other = self.m.build_config(self.home, self.repo, "127.0.0.1", 8801,
                                     startup_dir=self.startup_dir)
         self.assertIn(self.m.marker_for(8801), self.m.render_worker(other))
@@ -367,7 +373,9 @@ class InstallerCase(unittest.TestCase):
         for line in vbs.splitlines():
             if line.strip().startswith("Dim "):
                 dims += line.split("Dim ", 1)[1]
-        for name in ("bestName", "pyw", "tools", "port", "startupLauncher", "templateLauncher"):
+        for name in ("bestName", "bestKey", "key", "pyw", "tools", "port", "startupLauncher",
+                     "templateLauncher", "watchLog", "probeUrl", "strikeFile", "strikes", "killed",
+                     "nm", "hit"):
             self.assertIn(name, dims, f"{name} が Dim に無い（Option Explicit で即死する）")
         code = _code_lines(vbs)
         for forbidden in ("netstat", ".Exec(", "cmd /c", "cmd.exe", "wscript.exe "):
@@ -376,7 +384,7 @@ class InstallerCase(unittest.TestCase):
         self.assertIn("-m hermes_cli.main proxy start", code)
         self.assertIn("hermes.cmd", code, "旧来の起動形態も判定して二重起動を防ぐこと")
         self.assertIn("pythonw.exe", code)
-        self.assertIn("StrComp(f.Name, bestName", code)
+        self.assertIn("StrComp(key, bestKey, vbBinaryCompare)", code)
 
     def test_proxy_launcher_uses_create_no_window_and_forbids_detached_process(self):
         """`DETACHED_PROCESS (0x00000008)` を使うと孫の python.exe / git.exe が 4 個の黒窓を開く（実測）。"""

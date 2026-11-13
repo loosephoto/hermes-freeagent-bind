@@ -198,7 +198,11 @@ python scripts/install_resident_windows.py --write --force --task    # 5 分ご�
   Windows 11（既定のターミナルが Windows Terminal）では**数分おきに黒いウィンドウが一瞬出ます**
   （実測: 5 分周期の見張りで毎回 1 個。ウィンドウを隠す指定でも表示されました）。
 - **プロキシ（`run_proxy.pyw`）は `CREATE_NO_WINDOW (0x08000000) | CREATE_NEW_PROCESS_GROUP (0x00000200)` で起動し、`DETACHED_PROCESS (0x00000008)` は使いません**。`DETACHED_PROCESS` で起動された `python.exe` は「コンソール無し」になるため、`hermes_cli.main` の起動処理が呼ぶコンソール孫プロセス（`Scripts\python.exe` × 2、`cmd\git.exe` × 2）がそれぞれ新しくコンソールを割り当て、Windows 11 で 1 回の起動につき 4 個の黒い画面が表示されます（実測）。`CREATE_NO_WINDOW` なら親 `python.exe` の非表示コンソール（`conhost.exe 0x4`）を孫プロセスが継承するため黒い画面は 0 個になります。さらに `auth.json` に Nous Portal の有効な資格情報が無い（未ログイン・トークン失効）ときは起動前にスキップし、5 分おきの無駄な再起動ループを防ぎます。
-- 見張りは `schtasks` の 5 分間隔（`Hermes_Freeagent_Watchdog` / `Hermes_Proxy_Watchdog`）で、**生きていれば何もしない**冪等な設計です。落ちていたときだけ起動します。
+- 見張りは `schtasks` の 5 分間隔（`Hermes_Freeagent_Watchdog` / `Hermes_Proxy_Watchdog`）で、**生きて応答していれば何もしない**冪等な設計です。落ちていたときと、応答しなくなったときだけ起動します。
+- **見張りタスクは XML 定義で登録します**（`schtasks /create /xml`）。`/sc minute` の簡易登録は「バッテリー駆動では開始しない／バッテリーに切り替わったら停止する」が既定で有効になり、ノート PC では見張りが止まります（実測: 簡易登録のタスクは両方 True）。XML では両方 false・`StartWhenAvailable` true・繰り返しは無期限です。既に簡易登録したタスクは `--write --force --task` をもう一度実行すると置き換わります。
+- **応答しないサーバーも戻します**。プロセスの有無だけを見る判定は、固まったサーバーを「起動済み」と数え続けます。worker は毎ティック、待受ポートへ `WinHttp` で 1 回だけ接続し（`Connection: close` つき。無いとサーバーが接続確認のたびに `ConnectionResetError` を記録します・実測 1 回につき 1 件）、**2 ティック続けて答えなければ**そのプロセスを WMI で終了して起動し直します。1 回で落とさないのは、起動直後の数秒に見張りが当たることがあるためです。経過は `logs\freeagent-watchdog.log` / `logs\proxy-watchdog.log` に残ります（サーバーが開いているログには VBS から追記できません・実測）。連続回数は `freeagent-service\unresponsive-<port>.count` に持ち、答えた時点で消えます。
+- **Python は版番号順で選びます**。`tools\python-*` を文字列順で比べると `python-3.14.10` より `python-3.14.9` が上に来ます（実測: 生成器も worker もこの順で 3.14.9 を選びました）。数字の並びを数値として比べ、標準ライブラリ（`Lib\os.py`）の無い残骸フォルダと、実行形式でない `python.exe` は選びません。
+- **対象は python のプロセスだけ**です。目印の文字列を自分のコマンドラインに含むだけのシェル（検索や編集）は、起動済みの判定にも終了の対象にもなりません。プロキシは `--port` の一致で見分け、`--port` の無いコマンドラインは Hermes 既定の 8645 として扱います（別ポートのプロキシを巻き込みません）。
 - 二重起動の判定は、launcher が付ける目印 `freeagent-resident-<port>` と、旧来の
   `server.py … --port <port>` の**両方**に当てます（片方だけだと、起動方式を変えた直後に二重起動します）。
 - 既定のポートは 8790 です（`--port` で変更できます。Hermes 側の `url` も同じ値にしてください）。
@@ -1252,6 +1256,15 @@ API キーに加えて、契約プランやデータの扱いを確認したこ�
 - 反映には**常駐サーバーの再起動**が要ります（見張りタスクは生存確認だけで、動いている
   プロセスの環境は読み直しません）。
 - 読み込むファイルを差し替えたいときは `FREEAGENT_ENV_FILE` を設定します。
+- **Hermes のセッションから起動し直しても、そのセッションの環境変数は持ち込みません**（Windows の launcher）。
+  対話セッションや KANBAN ワーカーの端末から worker を起動すると、常駐プロセスは親の環境を引き継ぎます
+  （実測: ログオン起動は `.env` から 48 個読むのに、セッションからの再起動では 25 個＝残りは親の環境に既にありました）。
+  「すでに環境にある値は上書きしない」規則のため、そのセッションが一時的に設定した `FREEAGENT_STATE_DIR` などが
+  常駐に居座ります。launcher は**セッションの印（`HERMES_SESSION_ID` / `HERMES_UI_SESSION_ID` / `HERMES_KANBAN_TASK`）が
+  あるときだけ**、レジストリ（ユーザー／システムの環境変数）に無い `FREEAGENT_*` / `HERMES_*` / `TERMINAL_*` / `TMPDIR` を
+  落としてからファイルを読みます。落とした名前はログに `[env] dropped N session-inherited vars: …` と出ます（値は出ません）。
+  Windows の「環境変数」設定に登録した値と、`FREEAGENT_ENV_FILE` / `HERMES_PROXY_LOG` / `HERMES_PROXY_FORCE_START` は残ります。
+  意図して持ち込みたいときは `FREEAGENT_KEEP_SESSION_ENV=1` を付けて起動します。
 - **値の後ろにインラインコメントを書かないでください**（`KEY=1  # 説明` は値に混ざり、
   確認フラグが有効になりません。launcher はコメントを落としますが、他の読み手では落ちません）。
   説明は行を分けて書きます。

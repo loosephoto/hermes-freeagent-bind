@@ -2042,6 +2042,8 @@ README は利用開始・結果の読み方・障害時の対処を先に置き�
   また MSDN 仕様により両フラグ併用時は `CREATE_NO_WINDOW` が無視される）。さらに `auth.json` の
   `providers.nous` に有効な資格情報が無い（未ログイン・トークン失効）ときは起動自体をスキップし、
   5 分おきの再起動ループとログ肥大化を防ぐ。検証: `tests/test_resident_installer.py`。
+  プロセス生成まわりの契約（Python の選定順・見張りタスクの電源設定・応答なしの検知・セッション由来の
+  環境変数）は §6.62。検証: `tests/test_resident_v0490.py`。
 - **Linux / macOS を含む全 OS 共通の常駐化は `scripts/install_resident.py` が担う**（`--platform auto|windows|linux|macos`。`auto` は `sys.platform` の `win32` / `linux*` / `darwin` で判別し、Windows は `install_resident_windows.py` と同一契約に委譲）。
   Linux は `systemd --user`（`~/.config/systemd/user/hermes-freeagent-bind.service` / `hermes-proxy.service`・`Type=simple`・`Restart=on-failure`・`systemctl --user enable --now`、`/run/systemd/system` とユーザー D-Bus 到達確認＋`linger` 未有効時の案内つき）、macOS は `launchd` LaunchAgent（`~/Library/LaunchAgents/ai.hermes.freeagent-bind.plist` / `ai.hermes.proxy.plist`・`plistlib` 生成・`KeepAlive={"SuccessfulExit": False}`・`launchctl bootstrap gui/<uid>` + `kickstart -k`）へ配線する。
   POSIX ランチャ `run_server.py` は `~/.hermes/.env` と `freeagent.env` を読んで `<hermes-home>/logs/freeagent-autostart.log` に追記しつつ同一プロセスで待ち受ける。`run_proxy.py` は Nous Portal 未認証時にログ 1 行のみ出してポーリング待機（`FREEAGENT_PROXY_AUTH_POLL_S`、既定 60 秒）し、認証後に `os.execvpe` で同一 PID のまま `hermes proxy start` に置換する（クラッシュ再起動ループを防ぎつつログイン後の自動復帰を保つ）。検証: `tests/test_resident_posix.py`。
@@ -2604,6 +2606,70 @@ top 名に加える」よう直し、事後修復用に `fix_cross_names.py`（�
 `consensus_share 1.0 / clusters 1`、`freeagent_models(probe=true)` が 2 件試行・1 件生存・
 `probe_budget {checked 1, not_respected []}`／`tools/list` 25,326 文字のまま／
 `compileall` / `check_integrity`（version=0.47.0）/ smoke 3 種。
+
+### 6.62 常駐プロセス生成の硬化（v0.49.0）
+
+常駐配線（Windows）のプロセス生成を監査して見つかった点を塞いだ。稼働中のプロセスに異常は無く
+（8790 / 8645 とも 1 プロセスずつ・配備 9 ファイルは生成器の出力とバイト一致）、どれも**次に条件が
+揃ったときに無言で壊れる**種類である。
+
+| 点 | 実測 | 対処 |
+|---|---|---|
+| Python の選定が文字列順 | `python-3.14.7` / `3.14.9` / `3.14.10` を与えると、生成器の `sorted(reverse=True)` も worker VBS の `StrComp` も **3.14.9** を選ぶ | 版番号順（数字の並びを数値で比べる）。生成器は `_python_dir_key`、worker は `NatKey`（桁揃え）で**同じ規則** |
+| 残骸フォルダ | `tools\python-3.14.7` は `python.exe` が残り標準ライブラリが無い（起動すると rc=1） | worker は `Lib\os.py`（または `python*.zip`）の無いフォルダを選ばない。コンソールを作れないので実行はせず、ファイルの有無で見る |
+| 実行形式でない `python.exe` | テキスト 4 バイトの `python.exe` を窓なしの親から起動すると timeout（20 秒）まで戻らない。常駐テスト 26 件が **97.3 秒 → 1.9 秒** | `_interpreter_ok` は Windows で先頭 2 バイト（`MZ`）を見て、PE でなければ起動しない |
+| 見張りタスクの電源設定 | `schtasks /create /sc minute` で登録したタスクは `DisallowStartIfOnBatteries` / `StopIfGoingOnBatteries` が True | XML 定義で登録（`render_task_xml`）。両方 false・`StartWhenAvailable` true・`Repetition` に `Duration` なし・`UserId` を書かない |
+| 応答なしを検知しない | 生存確認は `Win32_Process` の有無だけ。待受を受け付けない模擬プロセスは「起動済み」のまま | 毎ティック `WinHttp` で待受ポートを 1 回叩き、`UNRESPONSIVE_STRIKES`（2）回続けて答えなければ WMI の `Terminate` → 起動 |
+| 接続確認がログを汚す | 素の `WinHttp` GET は、サーバーに 1 回につき 1 件の `ConnectionResetError` のトレースバックを書かせる（keep-alive の接続を黙って閉じるため） | 確認は `Connection: close` つき（0 件）。サーバーも `handle_error` で切断系 3 種をトレースバックにしない |
+| セッション由来の環境変数 | ログオン起動は `.env` から 48 個読むのに、Hermes セッションからの再起動は 25 個（残りは親の環境に既にあった） | launcher が、セッションの印があるときだけ、レジストリに無い `FREEAGENT_*` / `HERMES_*` / `TERMINAL_*` / `TMPDIR` を落とす |
+
+**応答なしの検知の規則**（worker VBS・freeagent / proxy 共通）:
+
+1. WMI で自分のサーバー（**python のプロセスで**、コマンドラインが目印か旧来の形に一致）を探す。
+   無ければ起動する（従来どおり）。名前を python に限るのは、目印を自分のコマンドラインに含むだけの
+   シェルを「起動済み」「終了対象」に数えないため。
+2. 居れば待受ポートへ `GET /` を 1 回送る。**HTTP の応答があれば状態コードに依らず生存**（404 でよい。
+   認証やパスに依存させない）。確認の道具（`WinHttp`）が作れないときは生存として扱う（確認できないことを
+   理由に落とさない）。
+3. 答えなければ連続回数を `unresponsive-<port>.count` に 1 足し、2 未満ならそのまま終わる。起動直後
+   （まだ bind していない数秒）に見張りが当たることがあるので、1 回では落とさない。
+4. 2 回目で、1 と同じ条件のプロセスを `Terminate` し、2 秒待って起動へ進む。終了させたものが 0 件
+   （WMI の失敗・旧来の形だけが居る）なら起動しない（二重起動を作らない）。連続回数は残すので、
+   次のティックでもう一度終了を試みる。
+5. 答えたティックと、新しく起動するティックで連続回数を消す（前のサーバーの記録を次に持ち越さない）。
+
+タイムアウトは名前解決 2 秒・接続 2 秒・送信 5 秒・受信 10 秒（固まった相手で 1 ティックあたり約 12 秒）。
+待受が `0.0.0.0` / `::` のときはループバックを叩く（`probe_host`。`0.0.0.0` へは接続できず、健全な
+サーバーを応答なしと誤判定する）。プロキシは `--port <port>` の一致で見分け、`--port` の無い
+コマンドラインは Hermes 既定の 8645 とみなす（従来は設定ポートに依らず全プロキシに一致していた。
+終了の対象にもなるので、別ポートのプロキシを巻き込まないよう絞った。worker が `--port` を渡す条件も
+「8645 以外」に揃えた）。
+
+**VBS の落とし穴 2 つ**（どちらも実測。生成物の文面に理由を残してある）:
+
+- `On Error Resume Next` の下で `If <失敗する式> Then …` を書くと、**条件の評価に失敗しても本体が走る**。
+  生存確認でこれを踏むと、死んだサーバーを「起動済み」と数える。値を先に変数へ入れてから比べる
+  （`hit = False` → `hit = IsServer(nm, cl)` → `If hit = True Then`）。
+- サーバーが開いているログ（`freeagent-autostart.log` / `proxy-service.log`）へ、Windows Script Host から
+  追記はできない（`OpenTextFile` が「書き込みできません」で失敗する）。見張りの記録は別ファイル
+  （`freeagent-watchdog.log` / `proxy-watchdog.log`）に書く。
+
+**セッション由来の環境変数**: 落とすのは、(a) セッションの印（`HERMES_SESSION_ID` /
+`HERMES_UI_SESSION_ID` / `HERMES_KANBAN_TASK`）があり、(b) 名前が `FREEAGENT_` / `HERMES_` /
+`TERMINAL_` で始まるか `TMPDIR` で、(c) `HKCU\Environment` と `HKLM\…\Session Manager\Environment` の
+どちらにも無いもの。Windows の設定に登録した値・利用者が素のシェルで設定して起動した値・launcher への
+指示（`FREEAGENT_ENV_FILE` / `FREEAGENT_KEEP_SESSION_ENV` / `HERMES_PROXY_LOG` /
+`HERMES_PROXY_FORCE_START`）は残す。`run_server.pyw` は**ファイルを読む前に** `os.environ` から落とし
+（落とした名前は `.env` / `freeagent.env` の値で埋まる）、`run_proxy.pyw` は子へ渡す環境だけを直す。
+レジストリが読めないときは何も落とさない。`FREEAGENT_KEEP_SESSION_ENV=1` で無効にできる。
+
+**触れていないもの**: Linux（`systemd --user`）/ macOS（`launchd`）の配線は Python の選定順だけを
+揃えた。応答なしの検知とセッション環境の除去は Windows の worker / launcher だけにある。
+
+**検証**: unittest **1,352 件 OK**（新規 23 件・`tests/test_resident_v0490.py`。Windows では生成した
+worker VBS を `cscript` で実際に走らせ、健全なサーバーを落とさない・1 回目は記録だけ・2 回目で終了、
+を確かめる）／実機: 一時タスクを XML で登録して電源 2 項目が False・実行結果 0x0 を確認して削除／
+`tools/list` は変更なし／`compileall` / `check_integrity`（version=0.49.0）/ smoke 3 種。
 
 ## 12. 検証
 
