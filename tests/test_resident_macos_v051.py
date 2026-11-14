@@ -52,6 +52,7 @@ class ResidentMacosCase(unittest.TestCase):
         self.python = os.path.join(self.tmp, "python3")
         with open(self.python, "w", encoding="ascii", newline="\n") as fh:
             fh.write("#!/bin/sh\n")
+        os.chmod(self.python, 0o755)  # 実行ビットが無いと systemd-analyze verify が正しく弾く（v0.52.0）
 
     def _cfg(self, platform_name: str = "macos"):
         return self.m.build_config(

@@ -46,6 +46,7 @@ class ResidentPosixCase(unittest.TestCase):
         self.posix_py = os.path.join(py_dir, "python3")
         with open(self.posix_py, "w", encoding="ascii", newline="\n") as fh:
             fh.write("#!/bin/sh\n")
+        os.chmod(self.posix_py, 0o755)  # 実行ビットが無いと systemd-analyze verify が正しく弾く（v0.52.0）
 
     # --- 1. 機種・OS 判別と既定パス ------------------------------------
 
