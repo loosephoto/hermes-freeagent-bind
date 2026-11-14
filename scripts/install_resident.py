@@ -24,6 +24,7 @@ python scripts/install_resident.py                        # 自動判別して�
 python scripts/install_resident.py --dry-run              # 書き込むパスだけ表示
 python scripts/install_resident.py --write --force        # 配線を生成
 python scripts/install_resident.py --write --force --task # サービス登録・起動（schtasks / systemctl / launchctl）も実行
+python scripts/install_resident.py --write --force --task --restart  # Linux: 登録後に systemctl --user restart（稼働中プロセスへの反映）
 ```
 """
 from __future__ import annotations
@@ -31,6 +32,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 import argparse
+import calendar
 import importlib.util
 import os
 import plistlib
@@ -85,6 +87,12 @@ LINUX_DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sb
 MACOS_DEFAULT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # ユーザー領域の bin（launchd / systemd はログインシェルの PATH を引き継がない・SPEC §6.66）。
 USER_BIN_DIRS = (".local/bin", "bin", ".hermes/bin")
+
+# run_proxy.py が未認証時に 1 行だけ出すログ（`proxy_waiting_note()` が同じ文字列を照合する。
+# テンプレートへは repr で埋め込むので、**ここを変えると生成物も変わる**。issue #13・E）。
+PROXY_SKIP_LOG_MSG = (
+    "[launcher] skipped: Nous Portal not authenticated"
+    " (run `hermes auth add nous` to enable proxy)")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -550,7 +558,7 @@ def main(argv=None, max_polls=None):
     polls = 0
     if not force_start and provider == "nous":
         while not _nous_authenticated():
-            skip_msg = "[launcher] skipped: Nous Portal not authenticated (run `hermes auth add nous` to enable proxy)"
+            skip_msg = __PROXY_SKIP_MSG_REPR__
             if _last_log_line(LOG) != skip_msg:
                 _append_log(skip_msg)
             if _STOP or (max_polls is not None and polls >= max_polls):
@@ -585,6 +593,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 '''.replace("__HERMES_HOME_REPR__", repr(cfg["hermes_home"])).replace(
         "__PROXY_LOG_NAME_REPR__", repr(PROXY_LOG_NAME)).replace(
+        "__PROXY_SKIP_MSG_REPR__", repr(PROXY_SKIP_LOG_MSG)).replace(
         "__PROXY_PORT__", str(proxy_port))
 
 
@@ -964,6 +973,11 @@ def verify_generated(cfg: dict) -> list[str]:
         problems.append(
             "python3 が見つかりません（ユニット / plist は /usr/bin/env python3 に落ち、起動に失敗します）: "
             "--python で明示してください")
+    if not problems and target == "linux":
+        # 基本検査を通ったときだけ unit の静的妥当性を見る（issue #13・C）。
+        # 基本検査で落ちているときは、stub 環境（実行形式でない python 等）のノイズを
+        # verify に二重報告させない。
+        problems.extend(_systemd_analyze_problems(cfg))
     return problems
 
 
@@ -1015,9 +1029,162 @@ def _linux_linger_enabled(linger_dir: str = "/var/lib/systemd/linger",
     return bool(user) and os.path.exists(os.path.join(linger_dir, user))
 
 
+def proxy_waiting_note(cfg: dict) -> str | None:
+    """proxy が「active だが未認証で待機中」のときの note を返す（issue #13・E）。
+
+    `run_proxy.py` は Nous 未認証でも失敗終了せず待機するため、systemd 上は `active (running)` に
+    見えて 8645 を listen していない（監視や「proxy 稼働」前提の判断を誤らせる）。
+    ログの末尾が未認証スキップの 1 行と一致するときだけ案内する（実行時の状態なので
+    **unit やサーバー側の返り値には入れない**。ここは登録時の読み取り）。
+    """
+    if not cfg.get("with_proxy", True):
+        return None
+    log = (cfg.get("paths") or {}).get("proxy_log") or ""
+    if not log or not os.path.isfile(log):
+        return None
+    try:
+        with open(log, encoding="utf-8", errors="replace") as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        return None
+    if not lines or lines[-1] != PROXY_SKIP_LOG_MSG:
+        return None
+    return (
+        "note: %s は待機中です（Nous Portal 未認証のためポート %d を listen していません。"
+        "`hermes auth add nous` 後に同一 PID で自動起動します）"
+        % (os.path.basename(cfg["paths"]["proxy_unit"]), cfg.get("proxy_port", DEFAULT_PROXY_PORT))
+    )
+
+
+def _parse_systemd_timestamp(raw: str) -> float | None:
+    """`ExecMainStartTimestamp`（例: `Tue 2026-11-14 08:26:53 UTC`）を epoch 秒へ。失敗は None。
+
+    systemd は既定で**ローカル時刻＋TZ 略号**を出す。`UTC` / `GMT` は確実に判定できるので
+    `timegm` で epoch 化し、それ以外の略号（JST など）は落として**ローカル時刻**として読む
+    （unit の mtime と同じローカル基準。値は「警告を出すか」の閾値比較にしか使わず、
+    パースに失敗したら黙って警告を出さない＝誤報しない）。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    utc = False
+    for marker in (" UTC", " GMT"):
+        if text.endswith(marker):
+            utc = True
+            text = text[: -len(marker)].strip()
+            break
+    if not utc:
+        # それ以外の TZ 略号（JST 等）は落としてローカル時刻として読む（誤報しない方へ倒す）。
+        parts = text.rsplit(" ", 1)
+        if len(parts) == 2 and parts[1].isupper() and 2 <= len(parts[1]) <= 5 and parts[1].isalpha():
+            text = parts[0].strip()
+    st = None
+    for fmt in ("%a %Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            st = time.strptime(text, fmt)
+            break
+        except ValueError:
+            continue
+    if st is None:
+        return None
+    return calendar.timegm(st) if utc else time.mktime(st)
+
+
+def _linux_running_stale_notes(cfg: dict, run_env: Mapping[str, str]) -> list[str]:
+    """unit より古いプロセスが稼働中なら note を返す（issue #13・B）。
+
+    `enable --now` は稼働中の unit を再起動しないため、`--write --force --task` が成功しても
+    **古い launcher / 古い src/ を掴んだプロセスが残り**、systemd 上は active のまま
+    「成功に見えて未反映」の状態が無言で続く（実測: ExecMainStartTimestamp が 08:17:44 のまま）。
+    unit の mtime が稼働プロセスの起動時刻より新しいときだけ 1 行出す（パース不能・非 active・
+    PID 0 は警告しない）。
+    """
+    nw = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    units = [cfg["paths"]["unit"]]
+    if cfg.get("with_proxy", True):
+        units.append(cfg["paths"]["proxy_unit"])
+    notes: list[str] = []
+    for unit_path in units:
+        unit = os.path.basename(unit_path)
+        try:
+            mtime = os.stat(unit_path).st_mtime
+        except OSError:
+            continue
+        try:
+            proc = subprocess.run(
+                ["systemctl", "--user", "show", unit,
+                 "--property=ActiveState", "--property=MainPID",
+                 "--property=ExecMainStartTimestamp"],
+                capture_output=True, text=True, timeout=10, env=run_env, creationflags=nw,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode != 0:
+            continue
+        props: dict[str, str] = {}
+        for line in (proc.stdout or "").splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                props[key.strip()] = value.strip()
+        if props.get("ActiveState") != "active" or (props.get("MainPID") or "0").lstrip() in ("", "0"):
+            continue
+        started = _parse_systemd_timestamp(props.get("ExecMainStartTimestamp") or "")
+        if started is None or started >= mtime - 2.0:
+            continue
+        notes.append(
+            "note: %s は生成より前のプロセスが稼働中です（--task は稼働中プロセスを再起動しません。"
+            "systemctl --user restart %s で反映してください）" % (unit, unit)
+        )
+    return notes
+
+
+def _systemd_analyze_problems(cfg: dict) -> list[str]:
+    """`systemd-analyze --user verify` を生成直後に通す（issue #13・C）。
+
+    生成時の自己検査（verify_generated）はファイル存在・パスまでで、unit の**静的妥当性**は
+    手動の `systemd-analyze verify` に頼っていた。既存の「壊れた定義は登録しない」方針に揃え、
+    ツールが有るときだけ検査して失敗を problems に積む。systemd の無い環境では従来どおりスキップ
+    （クロス生成は `verify_generated()` が最初に [] を返すのでここには来ない）。
+    """
+    if shutil.which("systemd-analyze") is None:
+        return []
+    paths = cfg.get("paths") or {}
+    units = [p for p in (paths.get("unit"), paths.get("proxy_unit") if cfg.get("with_proxy", True) else None)
+             if p and os.path.isfile(p)]
+    if not units:
+        return []
+    environ = dict(os.environ)
+    uid = _posix_uid()
+    if uid is not None and not environ.get("XDG_RUNTIME_DIR"):
+        runtime_dir = "/run/user/%d" % uid
+        if os.path.isdir(runtime_dir):
+            environ["XDG_RUNTIME_DIR"] = runtime_dir
+    nw = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        proc = subprocess.run(
+            ["systemd-analyze", "--user", "verify", *units],
+            capture_output=True, text=True, timeout=60, env=environ, creationflags=nw,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode == 0:
+        return []
+    # 環境ノイズ（ユーザーバスへ接続できない等）は unit の欠陥ではないので捨てる。
+    skip_markers = ("Failed to connect to bus", "Transport endpoint is not connected",
+                    "Connection refused", "Failed to start")
+    problems = []
+    for line in ((proc.stdout or "") + (proc.stderr or "")).splitlines():
+        text = line.strip()
+        if not text or any(marker in text for marker in skip_markers):
+            continue
+        problems.append("systemd-analyze verify が失敗しました: %s" % text)
+    return problems[:5]
+
+
 def register_linux_units(cfg: dict, systemd_dir: str = "/run/systemd/system",
-                         linger_dir: str = "/var/lib/systemd/linger") -> list[str]:
-    """`systemctl --user daemon-reload` と `enable --now` を実行する。"""
+                         linger_dir: str = "/var/lib/systemd/linger",
+                         restart: bool = False) -> list[str]:
+    """`systemctl --user daemon-reload` と `enable --now` を実行する（`restart` は登録後に再起動）。"""
     ok, reason, run_env = detect_linux_service_ready(systemd_dir=systemd_dir)
     if not ok:
         return ["service failed: %s" % reason]
@@ -1044,6 +1211,27 @@ def register_linux_units(cfg: dict, systemd_dir: str = "/run/systemd/system",
             results.append("service failed (%s -> %d): %s" % (unit, proc.returncode, detail))
         else:
             results.append("service enabled: %s (systemd --user)" % unit)
+    if restart:
+        # `enable --now` は稼働中の unit を再起動しない（issue #13・B）。opt-in で再起動して反映する。
+        for unit in units:
+            proc = subprocess.run(
+                ["systemctl", "--user", "restart", unit],
+                capture_output=True, text=True, timeout=20, env=run_env, creationflags=nw,
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                results.append("service failed (restart %s -> %d): %s" % (unit, proc.returncode, detail))
+            else:
+                results.append("service restarted: %s" % unit)
+    else:
+        results.append(
+            "note: --task は稼働中のプロセスを再起動しません（生成物の反映は --restart か"
+            " systemctl --user restart <unit> で行ってください）"
+        )
+    results.extend(_linux_running_stale_notes(cfg, run_env))
+    wait_note = proxy_waiting_note(cfg)
+    if wait_note:
+        results.append(wait_note)
     if not _linux_linger_enabled(linger_dir=linger_dir):
         results.append(
             "note: loginctl enable-linger $USER is not enabled; user services stop after logout/SSH disconnect"
@@ -1174,8 +1362,9 @@ def register_macos_agents(cfg: dict) -> list[str]:
 
 def register_services(cfg: dict, task_name: str = _WIN.DEFAULT_TASK_NAME,
                       proxy_task_name: str = _WIN.DEFAULT_PROXY_TASK_NAME,
-                      interval_minutes: int = DEFAULT_INTERVAL_MINUTES) -> list[str]:
-    """プラットフォーム別の常駐登録を実行する。"""
+                      interval_minutes: int = DEFAULT_INTERVAL_MINUTES,
+                      restart: bool = False) -> list[str]:
+    """プラットフォーム別の常駐登録を実行する（`restart` は Linux 登録後の再起動）。"""
     target = cfg.get("platform") or "windows"
     if not _host_matches_target(target):
         return [
@@ -1186,11 +1375,18 @@ def register_services(cfg: dict, task_name: str = _WIN.DEFAULT_TASK_NAME,
         out = [_WIN.register_task(cfg, task_name, interval_minutes)]
         if cfg.get("with_proxy", True):
             out.append(_WIN.register_proxy_task(cfg, proxy_task_name, interval_minutes))
+        if restart:
+            out.append("note: --restart は Linux（systemd --user）専用です"
+                       "（Windows は見張りタスクが待ち受けの応答を見て再起動します・§6.62）")
         return out
     if target == "linux":
-        return register_linux_units(cfg)
+        return register_linux_units(cfg, restart=restart)
     if target == "macos":
-        return register_macos_agents(cfg)
+        out = register_macos_agents(cfg)
+        if restart:
+            out.append("note: --restart は Linux（systemd --user）専用です"
+                       "（macOS は kickstart -k が登録のたびに再起動します）")
+        return out
     raise ValueError("unknown platform: %r" % target)
 
 
@@ -1224,6 +1420,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--task", "--enable", dest="task", action="store_true",
         help="常駐サービスの登録・起動も行う（Windows: schtasks / Linux: systemctl --user / macOS: launchctl）",
+    )
+    parser.add_argument(
+        "--restart", action="store_true",
+        help="Linux で登録後に systemctl --user restart を実行する（--task は稼働中プロセスを再起動しないため・issue #13）",
     )
     parser.add_argument(
         "--unit-dir", "--startup-dir", dest="unit_dir",
@@ -1307,6 +1507,7 @@ def main(argv: list[str] | None = None) -> int:
                 task_name=args.task_name,
                 proxy_task_name=args.proxy_task_name,
                 interval_minutes=args.interval_minutes,
+                restart=args.restart,
             )
             for line in lines:
                 print(line)

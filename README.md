@@ -215,7 +215,11 @@ Linux と macOS では、全 OS 共通の `scripts/install_resident.py` が `sys
 python scripts/install_resident.py                          # 自動判別して表示のみ（1 バイトも書きません）
 python scripts/install_resident.py --write --force           # 生成（ランチャ / ユニット定義 / 切替スクリプト）
 python scripts/install_resident.py --write --force --task    # サービス登録・即時起動（systemctl --user / launchctl）
+python scripts/install_resident.py --write --force --task --restart  # Linux: 登録後に systemctl --user restart（下記「反映」参照）
+python scripts/verify_resident.py                            # 実 MCP 疎通の確認（initialize / tools/list / tools/call）
 ```
+
+- **`--task` は稼働中のプロセスを再起動しません**: `systemctl --user enable --now` は稼働中の unit を再起動しないため、`--write --force --task` が成功しても**古い launcher / 古い `src/` を掴んだプロセスが残ります**（systemd 上は active のまま「成功に見えて未反映」）。生成物を反映するときは `--restart` を付けるか、後から `systemctl --user restart hermes-freeagent-bind.service hermes-proxy.service` を実行してください（macOS は `kickstart -k` が登録のたびに再起動、Windows は見張りタスクが待ち受けの応答を見て再起動します）。`--task` は unit の生成時刻が稼働プロセスの起動時刻より新しいとき、その旨を 1 行警告します。生成直後の自己検査には `systemd-analyze --user verify`（Linux・ツールがあるとき）が含まれ、壊れた unit 定義は `--task` の前に exit 1 で止まります。
 
 | 生成物 | 役割 |
 |---|---|
@@ -227,7 +231,8 @@ python scripts/install_resident.py --write --force --task    # サービス登�
 
 - **Linux（SSH・ヘッドレス運用）**: ログアウトや SSH 切断後も常駐を維持するには `loginctl enable-linger "$USER"` を有効化してください（未有効の場合は `--task` 実行時に案内が出ます）。WSL では `/etc/wsl.conf` の `[boot] systemd=true` が必要です。
 - **macOS**: `LaunchAgents`（`gui/$(id -u)` ドメイン）として GUI ログインセッション単位で起動します。`PATH` には `/opt/homebrew/bin`・`/usr/local/bin`・`~/.local/bin`（uv tool / pipx の `hermes`）が入ります。**生成時に `<hermes-home>/logs` を作ります** — launchd は `StandardOutPath` の親ディレクトリを作らないため、無いとジョブが `last exit status = 78` で黙って終わるからです。`--task` は `launchctl print` の `state` / `last exit status` まで見て成否を出し、GUI セッションの無い所（SSH など）では「GUI ログインセッションで実行してください」を返します。
-- **Nous Portal 未認証時の `hermes-proxy` の見え方**: `run_proxy.py` は未認証時に `[launcher] skipped: Nous Portal not authenticated` を 1 行だけ記録して待機するため、`127.0.0.1:8645` は LISTEN せず `freeagent_models` では `nous` だけ `到達不可: Connection refused` と表示されます（異常ではなく待機状態です。`openrouter` / `nvidia` など他のプロバイダはそのまま使えます）。後から `hermes auth add nous` を実行すると自動的に待受を開始します。
+- **Nous Portal 未認証時の `hermes-proxy` の見え方**: `run_proxy.py` は未認証時に `[launcher] skipped: Nous Portal not authenticated` を 1 行だけ記録して待機するため、`127.0.0.1:8645` は LISTEN せず `freeagent_models` では `nous` だけ `到達不可: Connection refused` と表示されます（異常ではなく待機状態です。`openrouter` / `nvidia` など他のプロバイダはそのまま使えます）。後から `hermes auth add nous` を実行すると自動的に待受を開始します。`--task` の実行時にログの末尾がこの待機 1 行と一致していれば「待機中」の note を出します。
+- **再起動直後の初回呼び出しは失敗することがあります**: 常駐サーバーを再起動すると Hermes 側 MCP クライアントの transport session が失効し、次の 1 回が `The MCP transport session … expired … outcome is UNKNOWN` になることがあります（読み取り専用の `freeagent_models` でも発生・**再送で成功**します）。切り替えの直後だけの既知の挙動で、続けて失敗するようなら `python scripts/verify_resident.py` で常駐プロセス側の疎通を先に確かめてください。
 - **設定切替後の Hermes 側への反映**: `apply_freeagent_http.sh` を実行しても、**すでに起動している Hermes プロセスは起動時の stdio 子プロセスを保持します**（自動ホットリロードはありません）。MCP 接続を持っているのは `hermes-gateway.service` のプロセスなので、**デスクトップアプリの再起動だけでは切り替わりません**（実測: アプリを入れ替えても gateway は古い PID のまま生き続け、stdio の子プロセスが残り、ライブ呼び出しの `harness.source` は `env` のまま）。切り替えるには、(a) デスクトップの `Settings → Tools/MCP` → **Reload**（プロセス再起動なしで config を読み直す）、(b) `systemctl --user restart hermes-gateway.service`、(c) OS 再起動、のいずれかが必要です。確認は `ss -tnp | grep ':8790'` に **ESTAB** が出るか（stdio なら 0 本）、`hermes mcp test freeagent-bind` が `Transport: HTTP` を返すか、ライブ呼び出しの `harness.source` が `header` になるかで行います。
 
 ## 💬 会話での頼み方

@@ -355,6 +355,13 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     `platform_path()` で OS 別に組み立てる（macOS の `/opt/homebrew/bin` を Linux ユニットへ流用しない・
     `~/.local/bin` を落とさない）。`run_proxy.py` の待機は `time.sleep` ではなく `_wait_or_stop`（PEP 475 で
     sleep は再開されるため、SIGTERM 後の停止が待機時間ぶん遅れ、再登録時にポートが競合する）。
+    (l) **Linux の `--task` は稼働中プロセスを再起動しない**（v0.52.0・SPEC §6.67）。
+    `enable --now` は稼働中の unit を再起動しないため、`--write --force --task` が成功しても
+    古い launcher を掴んだプロセスが残る（「成功に見えて未反映」）。反映は `--restart`
+    （Linux 専用。macOS は kickstart -k、Windows は見張りタスクが再起動を担う）。
+    生成直後の `verify_generated()` は `systemd-analyze --user verify` を**基本検査を通ったとき
+    だけ**通す（stub 環境での二重報告とバス接続ノイズを避ける）。proxy の「未認証待機」は
+    ログ末尾のスキップ 1 行との一致で判定して note に出す（新しい状態ファイルは作らない）。
 44. **知識取得の読み取りは壁時計でも打ち切る**（§5.8）。`urlopen(timeout=…)` の上限は
     「ソケット 1 回の待ち」の上限であって**リクエスト全体の壁時計制限ではない**。1 バイトずつ
     drip する提供元では読みが終わるまで何分も待つ（実測: ローカル drip サーバで 98.0 秒 =

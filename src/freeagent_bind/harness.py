@@ -118,18 +118,38 @@ def harness_on_initialize(params, marker=None) -> dict:
     `marker` は HTTP のヘッダ（`HARNESS_MARKER_HEADER`）由来の目印。HTTP では 1 プロセスを複数
     クライアントが共有するので、この判定はプロセス内で最後に initialize したクライアントのものになる
     （警告は 1 プロセス 1 回・最初のツール結果の注記も 1 回だけ、という従来の性質は変わらない）。
+    **上書きの発生は stderr に 1 行出す**（issue #13・D）。別クライアントが 1 回 initialize するだけで
+    Hermes 側の表示が「Hermes Agent 以外」の警告に変わる（サーバー再起動でのみ復帰する）のは
+    運用上分かりにくいため、誰が上書きしたかをログに残す（セッション単位の判定は行わない。
+    `announced` / `notified` の「1 プロセス 1 回」契約と `_HARNESS` の単一判定のままである）。
     """
     info = detect_harness(params, marker=marker)
     announce = False
+    overwrite = None
     with _HARNESS_LOCK:
         # **鍵の欠落で落ちない**: 状態はテストや再初期化で消えることがある（実測: フルスイートで
         # `KeyError: 'announced'` になり、initialize が例外になった）。既定値を置いてから読む。
         S._HARNESS.setdefault("announced", False)
         S._HARNESS.setdefault("notified", False)
         S._HARNESS.setdefault("log_level", "info")
+        prev = S._HARNESS.get("info")
         S._HARNESS["info"] = info
+        if (prev is not None
+                and (prev.get("kind"), prev.get("client"), prev.get("marker"))
+                != (info.get("kind"), info.get("client"), info.get("marker"))):
+            overwrite = prev
         if not S._HARNESS["announced"] and info["kind"] != "hermes" and harness_warn_enabled():
             S._HARNESS["announced"] = announce = True
+    if overwrite is not None:
+        try:
+            old = "%s (%s)" % (overwrite.get("client") or "（無名）", overwrite.get("kind"))
+            new = "%s (%s)" % (info.get("client") or "（無名）", info.get("kind"))
+            sys.stderr.write(
+                f"[freeagent-bind] ハーネス判定を上書き: {old} → {new}"
+                "（HTTP は 1 プロセス共有のため、最後に initialize したクライアントの判定が全体に反映されます）\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
     if announce:
         try:
             sys.stderr.write(f"[freeagent-bind] {harness_message(info)}\n")

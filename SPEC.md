@@ -2760,6 +2760,34 @@ launchd / systemd はプロセスの終了しか見ないため、ハングは�
 生成物の preflight（修正前の生成物が FAIL・修正後が PASS・実測は本節の表）／`plutil -lint` と実 `launchctl` は
 CI の `macos-resident` ジョブ。**手元に macOS が無いため、実機の launchd での起動確認は CI の結果で判断する**。
 
+### 6.67 Linux 常駐配線の再生成・反映の検証（v0.52.0・issue #13）
+
+Issue #13（LMDE 7 / systemd `--user` 実機での v0.51.0 再生成・通し検証レポート）の改善案 B〜F に対応する。
+A（旧 Linux ユニットの `PATH` が macOS 固定）は v0.51.0 で `platform_path()` 修正済みであり、回帰は
+`check_integrity.py`（Linux ユニットの `PATH` に `/opt/homebrew` を含まない・`~/.local/bin` と
+`/usr/local/bin` を含む・`<hermes-home>/bin` を含む）が固定済み。
+
+| 点 | 実測・根拠（issue #13） | 対処 |
+|---|---|---|
+| **B**: `--task` は稼働中プロセスへ反映しない | `enable --now` は稼働中の unit を再起動しない。`--write --force --task` が成功しても古い launcher / 古い `src/` を掴んだプロセスが残る（実測: `ExecMainStartTimestamp` は 08:17:44 のまま、手動 restart 後に 08:26:53 へ更新。systemd 上は active のまま「成功に見えて未反映」が無言で続く） | `--restart` を追加（`daemon-reload` → `enable --now` → `systemctl --user restart`。macOS は `kickstart -k` が毎回再起動、Windows は見張りタスクが待ち受け応答を見て再起動するため **Linux 専用**で、他 OS ではその旨の note を出す）。`--task` 出力に「稼働中プロセスは再起動しない」の note。加えて unit の mtime が稼働プロセスの `ExecMainStartTimestamp` より新しいとき 1 行警告（`_linux_running_stale_notes()`。非 active・PID 0・パース不能は警告しない＝誤報しない） |
+| **C**: 生成時の自己検査が unit の静的妥当性を見ない | `verify_generated()` はファイル存在・ログ親ディレクトリ・python 絶対パスまで。`systemd-analyze --user verify` は tests / `check_integrity.py` / CI の側でしか走らない（今回は手動で回した） | `verify_generated()` が `shutil.which("systemd-analyze")` があるとき `--user verify` を実行し、失敗を problems に積む（既存の「壊れた定義は登録しない」方針と整合）。**基本検査を通ったときだけ**実行する（stub python 等で基本検査が落ちている環境での二重報告を避ける）。バス接続系の環境ノイズ行は捨て、systemd の無い環境は従来どおりスキップ |
+| **D**: ハーネス判定が「最後の initialize」勝ち | HTTP は 1 プロセス共有。検証クライアント（`resident-verify`）の initialize 後に Hermes 経由の呼び出しが `kind=other` になり、結果先頭に「Hermes Agent 以外」の誤警告（サーバー再起動で復帰） | **上書きの発生を stderr に 1 行出す**（誰が誰へ上書きしたか。§8.6）。セッション単位の判定は**行わない**（`announced` / `notified` の「1 プロセス 1 回」契約と `_HARNESS` の単一判定を維持。実害は小さく、ログで説明可能にするのが今回の範囲） |
+| **E**: proxy が未認証で active かつ 8645 未待受 | `run_proxy.py` は失敗終了せず待機するため systemd 上は健全に見え、`nous` だけ `Connection refused`（監視や「proxy 稼働」前提の判断を誤らせる） | `register_linux_units()` が proxy ログの末尾が未認証スキップ 1 行（`PROXY_SKIP_LOG_MSG`・生成物と同一の定数）と一致するとき「待機中」の note を返す（`hermes auth add nous` 後に同一 PID で自動起動する旨）。**見送り**: `freeagent_models` の nous 行への反映（サーバーから proxy の待機状態は分からない・新しい状態ファイルは作らない） |
+| **F**: 再起動直後の初回呼び出しが outcome UNKNOWN | 再起動で Hermes 側 MCP クライアントの transport session が失効。再送で成功（読み取り専用の `freeagent_models` でも発生） | README / SPEC に既知の挙動として明記。検証スクリプト（`scripts/verify_resident.py`）は失効を想定して `tools/call` を**1 回だけ再送**する。実装（クライアント側の自動再送）は見送り（主体は Hermes 側クライアント） |
+
+**検証スクリプト**（issue #13 の「スクリプトは共有資産」提案）: `scripts/verify_resident.py`。素の
+`urllib` で initialize → notifications/initialized → tools/list → tools/call を 1 往復ずつ（依存ゼロ）。
+この initialize はハーネス判定を `resident-verify` に上書きする（D の stderr 1 行で見える。Hermes は
+次回接続時に再度 initialize するため実用上は自動で戻る）。
+
+**検証**: `tests/test_resident_v0520.py`（16 件）。`--restart` と note の有無・stale 警告（新旧両方向・
+非 active は出ない）・`proxy_waiting_note`（待機／認証済み／ログ無し）・`verify_generated` の
+systemd-analyze（失敗を積む／通れば空／ツール無しでスキップ／基本検査落ちで実行しない／バスノイズを
+捨てる）・`_parse_systemd_timestamp`（UTC／TZ 略号／崩れた値）・ハーネス上書きログ（変化時だけ・同種
+クライアント間でも 1 行）・`verify_resident.py` の往復（擬似 MCP サーバーで成功・session 失効の再送・
+恒久失敗で exit 1）。**実機（systemd / launchd）での `--restart` 実行は未検証**（手元は Windows。
+CI の Linux ランナーで unit 生成と verify の組合せは通る）。
+
 ## 12. 検証
 
 ```bash
