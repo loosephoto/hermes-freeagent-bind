@@ -2777,8 +2777,8 @@ A（旧 Linux ユニットの `PATH` が macOS 固定）は v0.51.0 で `platfor
 
 **検証スクリプト**（issue #13 の「スクリプトは共有資産」提案）: `scripts/verify_resident.py`。素の
 `urllib` で initialize → notifications/initialized → tools/list → tools/call を 1 往復ずつ（依存ゼロ）。
-この initialize はハーネス判定を `resident-verify` に上書きする（D の stderr 1 行で見える。Hermes は
-次回接続時に再度 initialize するため実用上は自動で戻る）。
+v0.52.1 以降は既定で `x-freeagent-harness: hermes` を添えるため、稼働中の Hermes 常駐サーバーへ実行しても
+ハーネス判定を `other` へ上書きしない（`--harness ""` で未指定の挙動も検証可・`FREEAGENT_HTTP_TOKEN` / `--token` 対応）。
 
 **検証**: `tests/test_resident_v0520.py`（16 件）。`--restart` と note の有無・stale 警告（新旧両方向・
 非 active は出ない）・`proxy_waiting_note`（待機／認証済み／ログ無し）・`verify_generated` の
@@ -2787,6 +2787,32 @@ systemd-analyze（失敗を積む／通れば空／ツール無しでスキッ�
 クライアント間でも 1 行）・`verify_resident.py` の往復（擬似 MCP サーバーで成功・session 失効の再送・
 恒久失敗で exit 1）。**実機（systemd / launchd）での `--restart` 実行は未検証**（手元は Windows。
 CI の Linux ランナーで unit 生成と verify の組合せは通る）。
+
+### 6.68 常駐サーバー監査の修正一式（v0.52.1）
+
+常駐 HTTP トランスポート・状態同期・検証スクリプト・Windows/POSIX 生成器の監査で実測された不具合を塞ぐ。
+
+| 点 | 実測・根拠 | 対処 |
+|---|---|---|
+| **HTTP セッション TTL と SSE 維持** | `_http_session_get` が `HTTP_SESSION_TTL`（既定 1800 秒）を検査せず `seen` を更新して期限切れセッションを復活させる一方、SSE（`GET /mcp`）は keep-alive 中に `seen` を触れず、`HTTP_MAX_SESSIONS`（64）到達時の強制追い出しで生存中の SSE 接続が切断される | `_http_session_get` で非 SSE セッションの TTL 超過を失効させて `None`（HTTP 404）を返す。SSE ループは flush ごとに `seen` を更新し、追い出し順でも非 SSE セッションを先に落とす |
+| **IPv6 待受と `Host` 検証** | `_http_host_ok` が `:` で `rsplit(":", 1)[0]` するため `Host: [::1]:8790` / `Host: [::1]` が 403 になり、`_http_build_server` も `AF_INET` 固定で `--host ::1` / `--host ::` が `gaierror` で起動できない | `urllib.parse.urlsplit("//" + host_header).hostname` で IPv6 リテラルを解釈し、待受アドレスに `:` を含むときは `socket.AF_INET6` で待受する |
+| **HTTP 終了時の SIGTERM ドレイン** | `serve_http()` に `SIGTERM` ハンドラと `_drain_parallel_futures()` が無く、`systemctl restart` / `launchctl kickstart -k` で実行中の並列ジョブや SSE が即時切断される | メインスレッド起動時に `SIGTERM` で `server.shutdown()` を起こし、`finally` で全 SSE セッションを閉じて `_drain_parallel_futures()` を待つ |
+| **クォータ状態の mtime 同期** | `quota.py` の `_quota_load` / `_quota_write` が `S._QUOTA_LOADED` / `S._QUOTA_MTIME` でなくモジュール局所変数を書き換えていたため、`S` 側のフラグが `False` / `None` のまま毎回ディスクを再読込していた | `stats.py` と同じ `S._QUOTA_LOADED` / `S._QUOTA_MTIME` への更新に統一 |
+| **`verify_resident.py` の偽陽性と汚染** | `tools/call` が JSON-RPC `error` や空応答を返しても `not result.get("isError")` が真になって exit 0 を返し、トークン保護下で 401、さらに `x-freeagent-harness` 未送信で稼働中サーバーを `other` へ上書きしていた | `"error" not in call` かつ `isinstance(call.get("result"), dict)` を必須化。HTTP 404 失効時は再 initialize し、終了時に `DELETE` でセッションを掃除。`--token` / `FREEAGENT_HTTP_TOKEN` と `--harness`（既定 `hermes`）を追加 |
+| **Windows 常駐生成器の境界・引数反映・排他** | ① `IsServer` が `InStr` 部分一致で `--port 879` が `8790` を誤殺、② `render_worker` / `render_proxy_worker` が `%LOCALAPPDATA%\hermes` と実機 `Startup` を固定して `--hermes-home` / `--startup-dir` / `--python` / `--pythonw` を無視、③ `pyw` 不在時の `Else` が `run_server.pyw` を通らず `.env` とログを欠落、④ ログオン時の Startup と見張り同時起動に排他ロックが無い、⑤ `--task` 失敗時も rc 0 | `IsServer` を空白正規化後のトークン境界一致にし、`--hermes-home` / `--startup-dir` / `--python` / `--pythonw` を VBS 式へ反映（非 ASCII は `ChrW` で ASCII 維持）。`py` フォールバックも `run_server.pyw` 経由に統一し、`worker-<port>.lock` で同時起動を直列化、`task failed` 時は rc 1 |
+| **env ファイル優先順位・URL・Linux 時刻解釈** | `.env` で入ったキーを `freeagent.env` が上書きできず、引用符つき行のインラインコメント（`KEY="1"  # 注`）が残る。`--host 0.0.0.0` で `apply_freeagent_http.sh` が `http://0.0.0.0:...` を出力。Linux の `_linux_running_stale_notes` がロケール依存の曜日・数値 TZ で `None` になり、`test_resident_v0520.py` の固定 `TS_NEW` も時刻経過で失敗していた | 起動時の実環境集合だけを保護して `freeagent.env` による `.env` 上書きと引用符後の `#` 除去を実装。クライアント URL は `probe_host()` を通し、`systemctl show` に `LC_ALL=C` / `TZ=UTC` を付与しつつ `_parse_systemd_timestamp` で非 ASCII 曜日・数値 TZ も解釈。テストの `ts_fresh` は現在時刻基準で生成 |
+
+**検証**: `tests/test_resident_v0521.py`（20 件）で上記全項目を固定する。HTTP は `port: 0` の実ソケット
+（IPv6 ループバック・`Host: [::1]:8790`）、`serve_http` の終了経路は差し替えた server で確認（規約 65）、
+`IsServer` の境界は **`cscript.exe` で実測**、非 ASCII パスの VBS は純 ASCII を機械検査する。
+Linux の stale note（`systemctl show` の `LC_ALL=C` / `TZ=UTC`）は `systemctl` の無い環境で skip するため、
+手元（Windows）では 19 件 OK ＋ 1 skip、CI の ubuntu ランナーで全件走る。
+**全体**: unittest 1,421 件 OK（2 skip）／`check_integrity`（version=0.52.1）／`compileall`／
+`smoke_stdio` / `smoke_http` / `check_offline`（状態ディレクトリは空のまま）／`doc_drift_check` 0 件／
+`audit_probes --quick` NG 0 件。**実機の常駐（`127.0.0.1:8790`）へ `scripts/verify_resident.py` を通して
+`serverInfo 0.52.0` / `tools/list 13 件` / `freeagent_models` 成功を確認**（プロセスは再起動していない）。
+生成器を変えたので、稼働中の配線は `--write --force` で作り直すまで旧 VBS / `.pyw` のままになる
+（実測: 配備 4 ファイルが新生成物と不一致）。
 
 ## 12. 検証
 

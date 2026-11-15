@@ -301,14 +301,14 @@ def _ensure_quota_loaded() -> None:
         if S._QUOTA_LOADED and (mtime is None or mtime == S._QUOTA_MTIME):
             return
         _QUOTA.update(_quota_read(path))
-        _QUOTA_LOADED = True
-        _QUOTA_MTIME = mtime
+        S._QUOTA_LOADED = True
+        S._QUOTA_MTIME = mtime
 
 
 def _quota_write(rows: dict) -> bool:
     """ロックの内側から呼ぶ（`providers` 全体を書く）。"""
     ok = S._atomic_write(quota_path(), S._dumps({"version": 1, "providers": rows}))
-    _QUOTA_MTIME = S._file_mtime(quota_path())
+    S._QUOTA_MTIME = S._file_mtime(quota_path())
     return ok
 
 

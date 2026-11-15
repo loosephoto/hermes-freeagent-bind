@@ -216,14 +216,14 @@ python scripts/install_resident.py                          # 自動判別して
 python scripts/install_resident.py --write --force           # 生成（ランチャ / ユニット定義 / 切替スクリプト）
 python scripts/install_resident.py --write --force --task    # サービス登録・即時起動（systemctl --user / launchctl）
 python scripts/install_resident.py --write --force --task --restart  # Linux: 登録後に systemctl --user restart（下記「反映」参照）
-python scripts/verify_resident.py                            # 実 MCP 疎通の確認（initialize / tools/list / tools/call）
+python scripts/verify_resident.py                            # 実 MCP 疎通（initialize / tools/list / tools/call・token 対応）
 ```
 
 - **`--task` は稼働中のプロセスを再起動しません**: `systemctl --user enable --now` は稼働中の unit を再起動しないため、`--write --force --task` が成功しても**古い launcher / 古い `src/` を掴んだプロセスが残ります**（systemd 上は active のまま「成功に見えて未反映」）。生成物を反映するときは `--restart` を付けるか、後から `systemctl --user restart hermes-freeagent-bind.service hermes-proxy.service` を実行してください（macOS は `kickstart -k` が登録のたびに再起動、Windows は見張りタスクが待ち受けの応答を見て再起動します）。`--task` は unit の生成時刻が稼働プロセスの起動時刻より新しいとき、その旨を 1 行警告します。生成直後の自己検査には `systemd-analyze --user verify`（Linux・ツールがあるとき）が含まれ、壊れた unit 定義は `--task` の前に exit 1 で止まります。
 
 | 生成物 | 役割 |
 |---|---|
-| `~/.hermes/freeagent-service/run_server.py` | `~/.hermes/.env` と `freeagent.env` を読み、`~/.hermes/logs/freeagent-autostart.log` へ追記しつつ同一プロセスで HTTP サーバーを起動 |
+| `~/.hermes/freeagent-service/run_server.py` | `~/.hermes/.env` と `freeagent.env` を読み、`~/.hermes/logs/freeagent-autostart.log` へ追記しつつ同一プロセスで HTTP サーバーを起動（**実環境の変数は上書きせず、`freeagent.env` は `.env` を上書きできる**。引用符つきの値でも `# ` 以降のインラインコメントは値に含めない） |
 | `~/.config/systemd/user/hermes-freeagent-bind.service`（Linux）<br>`~/Library/LaunchAgents/ai.hermes.freeagent-bind.plist`（macOS） | 自動起動・異常終了時の自動復旧（Linux: `Restart=on-failure` / macOS: `KeepAlive.SuccessfulExit=false`） |
 | `~/.hermes/freeagent-service/apply_freeagent_http.sh` / `revert_freeagent_stdio.sh` | `hermes config` の HTTP 切替と stdio への戻し |
 | `~/.hermes/proxy-service/run_proxy.py` | Nous Portal プロキシ（`127.0.0.1:8645`）を起動（`--no-proxy` で省略可能）。未認証時は 1 行だけ記録して待機し、認証後に `os.execvpe` で同一 PID のまま自動起動 |

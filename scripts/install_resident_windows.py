@@ -159,7 +159,7 @@ def _python_dir_key(name: str) -> list:
 
 
 def probe_host(host: str) -> str:
-    """応答確認で叩くホスト。`0.0.0.0` / `::` の待受はループバックへ、IPv6 は角括弧つきにする。"""
+    """応答確認・クライアント接続で叩くホスト。`0.0.0.0` / `::` の待受はループバックへ、IPv6 は角括弧つきにする。"""
     host = (host or "").strip()
     if host in ("", "0.0.0.0", "*"):
         return "127.0.0.1"
@@ -168,6 +168,38 @@ def probe_host(host: str) -> str:
     if ":" in host and not host.startswith("["):
         return "[%s]" % host
     return host
+
+
+def _vbs_str(value: str) -> str:
+    """VBScript の文字列リテラル（ASCII のみ。非 ASCII を含むパスは ChrW で組む）。"""
+    if all(ord(ch) < 128 for ch in value):
+        return '"%s"' % value.replace('"', '""')
+    parts: list[str] = []
+    buf = ""
+    for ch in value:
+        if ord(ch) < 128:
+            buf += ch
+        else:
+            if buf:
+                parts.append('"%s"' % buf.replace('"', '""'))
+                buf = ""
+            parts.append("ChrW(%d)" % ord(ch))
+    if buf:
+        parts.append('"%s"' % buf.replace('"', '""'))
+    return " & ".join(parts) if parts else '""'
+
+
+def _vbs_hermes_home_expr(cfg: dict) -> str:
+    """worker VBS 内で `hermesHome` を組み立てる式（既定は `%LOCALAPPDATA%\\hermes`、明示指定はそのパス）。"""
+    raw = (cfg.get("hermes_home") or "").strip()
+    try:
+        is_default = (not raw or os.path.normcase(os.path.abspath(raw))
+                      == os.path.normcase(os.path.abspath(hermes_home_default())))
+    except OSError:
+        is_default = not raw
+    if is_default:
+        return 'sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\hermes"'
+    return "sh.ExpandEnvironmentStrings(%s)" % _vbs_str(raw)
 
 
 def discover_python(hermes_home: str) -> tuple[str, str]:
@@ -425,8 +457,8 @@ import os
 import runpy
 import sys
 
-HOME = os.path.expandvars(r"__HERMES_HOME__")
-REPO = r"__REPO__"
+HOME = os.path.expandvars(__HERMES_HOME_REPR__)
+REPO = __REPO_REPR__
 LOG = os.path.join(HOME, "logs", "__LOG_NAME__")
 PORT = __PORT__
 # 常駐サーバーは別プロセスなので Hermes の MCP `env` が届かない。起動時に .env を読む。
@@ -443,8 +475,8 @@ sys.stderr = _stream
 
 __SESSION_ENV_HELPER__
 
-def _load_env_file(path):
-    """KEY=VALUE を os.environ へ入れる（**既にある値を上書きしない**）。
+def _load_env_file(path, protected=None):
+    """KEY=VALUE を os.environ へ入れる（実環境の既存値は上書きせず、後続ファイルの上書きは許す）。
 
     Hermes の `.env` は `export KEY=VALUE` や引用符つきの行も混ざるので寛容に読む。
     値は絶対にログへ出さない（返すのは名前だけ）。
@@ -452,6 +484,7 @@ def _load_env_file(path):
     names = []
     if not path or not os.path.isfile(path):
         return names
+    skip = os.environ if protected is None else protected
     try:
         with open(path, encoding="utf-8-sig", errors="replace") as fh:
             for raw in fh:
@@ -462,14 +495,21 @@ def _load_env_file(path):
                     line = line[7:].lstrip()
                 key, sep, value = line.partition("=")
                 key = key.strip()
-                if not sep or not key or key in os.environ:
+                if not sep or not key or key in skip:
                     continue
                 value = value.strip()
-                # インラインコメント（KEY=1  # 説明）を値に混ぜない（python-dotenv と同じ扱い）。
-                if value[:1] not in ('"', "'"):
+                # 引用符つきの行でも末尾のインラインコメント（KEY="1"  # 説明）を落とす。
+                if len(value) >= 2 and value[0] in ('"', "'"):
+                    q = value[0]
+                    end = value.find(q, 1)
+                    if end != -1:
+                        tail = value[end + 1:].strip()
+                        if not tail or tail.startswith("#"):
+                            value = value[1:end]
+                else:
                     value = value.split(" #", 1)[0].strip()
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-                    value = value[1:-1]
+                    if value.startswith("#"):
+                        value = ""
                 if not value:
                     continue
                 os.environ[key] = value
@@ -507,16 +547,20 @@ _file_keys = [key for _env_path in ENV_FILES for key in _env_file_keys(_env_path
 _dropped = _drop_session_env(os.environ, _persistent_env_names(), _file_keys)
 if _dropped:
     print("[env] dropped %d session-inherited vars: %s" % (len(_dropped), ", ".join(_dropped)))
+_initial_env = set(os.environ)
 _loaded = []
 for _env_path in ENV_FILES:
-    _loaded.extend(_load_env_file(_env_path))
+    for _name in _load_env_file(_env_path, _initial_env):
+        if _name not in _loaded:
+            _loaded.append(_name)
+os.environ.setdefault("HERMES_HOME", HOME)
 print("[env] loaded %d vars: %s" % (len(_loaded), ", ".join(_loaded) or "none"))
 
-sys.argv = ["server.py", "--transport", "http", "--host", "__HOST__", "--port", str(PORT)]
+sys.argv = ["server.py", "--transport", "http", "--host", __HOST_REPR__, "--port", str(PORT)]
 runpy.run_path(os.path.join(REPO, "src", "freeagent_bind", "server.py"), run_name="__main__")
-'''.replace("__HERMES_HOME__", cfg["hermes_home"]).replace("__REPO__", cfg["repo"]).replace(
+'''.replace("__HERMES_HOME_REPR__", repr(cfg["hermes_home"])).replace("__REPO_REPR__", repr(cfg["repo"])).replace(
         "__LOG_NAME__", LOG_NAME).replace("__PORT__", str(cfg["port"])).replace(
-        "__HOST__", cfg["host"]).replace("__MARKER__", cfg["marker"]).replace(
+        "__HOST_REPR__", repr(cfg["host"])).replace("__MARKER__", cfg["marker"]).replace(
         "__SERVICE_DIR__", SERVICE_DIR_NAME).replace("__ENV_NAME__", ENV_NAME).replace(
         "__SESSION_ENV_HELPER__", _PY_SESSION_ENV.strip("\n")).lstrip("\n")
 
@@ -544,21 +588,32 @@ def render_worker(cfg: dict) -> str:
 Option Explicit
 Dim sh, fso, hermesHome, repo, logDir, logFile, watchLog, running, py, pyw, bestName, bestKey, tools, f
 Dim lf, ts, svc, procs, p, cl, nm, hit, key, wmiOk, probeUrl, strikeFile, strikes, killed
+Dim explicitPy, explicitPyw, runner, lockFile, lockHandle
 
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
-hermesHome = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\hermes"
-repo = "__REPO__"
+hermesHome = __HERMES_HOME_EXPR__
+repo = __REPO_EXPR__
 logDir = hermesHome & "\logs"
 logFile = logDir & "\__LOG_NAME__"
 watchLog = logDir & "\__WATCHDOG_LOG_NAME__"
 probeUrl = "http://__PROBE_HOST__:__PORT__/"
 strikeFile = fso.GetParentFolderName(WScript.ScriptFullName) & "\unresponsive-__PORT__.count"
+lockFile = fso.GetParentFolderName(WScript.ScriptFullName) & "\worker-__PORT__.lock"
 ts = Now
 
 If Not fso.FileExists(repo & "\src\freeagent_bind\server.py") Then WScript.Quit 0
 If Not fso.FolderExists(logDir) Then fso.CreateFolder(logDir)
+
+' Serialize concurrent Startup + Watchdog ticks so logon never double-spawns.
+On Error Resume Next
+Set lockHandle = fso.OpenTextFile(lockFile, 2, True)
+If Err.Number <> 0 Then
+  Err.Clear
+  WScript.Quit 0
+End If
+On Error GoTo 0
 
 ' Liveness: WMI on the server's own command line. Pure COM - no child process.
 ' Each value is assigned before it is tested: under "On Error Resume Next" a failing
@@ -612,12 +667,28 @@ End If
 
 ' The bundled python lives in a folder whose name changes per install (version plus
 ' build number), so enumerate the tools folder instead of hardcoding a path.
+explicitPy = __EXPLICIT_PY_EXPR__
+explicitPyw = __EXPLICIT_PYW_EXPR__
 py = ""
 pyw = ""
+If explicitPy <> "" And fso.FileExists(explicitPy) Then
+  py = explicitPy
+  If explicitPyw <> "" And fso.FileExists(explicitPyw) Then
+    pyw = explicitPyw
+  ElseIf fso.FileExists(fso.GetParentFolderName(explicitPy) & "\pythonw.exe") Then
+    pyw = fso.GetParentFolderName(explicitPy) & "\pythonw.exe"
+  End If
+ElseIf explicitPyw <> "" And fso.FileExists(explicitPyw) Then
+  pyw = explicitPyw
+  py = explicitPyw
+  If fso.FileExists(fso.GetParentFolderName(explicitPyw) & "\python.exe") Then
+    py = fso.GetParentFolderName(explicitPyw) & "\python.exe"
+  End If
+End If
 bestName = ""
 bestKey = ""
 tools = hermesHome & "\tools"
-If fso.FolderExists(tools) Then
+If py = "" And fso.FolderExists(tools) Then
   For Each f In fso.GetFolder(tools).SubFolders
     If Left(f.Name, 7) = "python-" Then
       ' Pick the NEWEST usable python-* folder by VERSION ORDER (NatKey), skipping
@@ -652,23 +723,24 @@ lf.WriteLine "[" & ts & "] starting freeagent-bind http with " & py
 lf.Close
 On Error GoTo 0
 
-' Launch console-free. Fall back to python.exe (hidden) only if pythonw is missing.
+' Launch console-free through run_server.pyw (even on python.exe fallback so .env and logs apply).
 sh.CurrentDirectory = repo
-If pyw <> "" Then
-  sh.Run "" & Chr(34) & pyw & Chr(34) & " " & Chr(34) & hermesHome & "\__SERVICE_DIR__\__LAUNCHER_NAME__" & Chr(34) & " __MARKER__", 0, False
-Else
-  sh.Run "" & Chr(34) & py & Chr(34) & " src\freeagent_bind\server.py --transport http --host __HOST__ --port __PORT__", 0, False
-End If
+runner = pyw
+If runner = "" Then runner = py
+sh.Run "" & Chr(34) & runner & Chr(34) & " " & Chr(34) & hermesHome & "\__SERVICE_DIR__\__LAUNCHER_NAME__" & Chr(34) & " --transport http --host __HOST__ --port __PORT__ __MARKER__", 0, False
+WScript.Sleep 500
 
 ' --- helpers ---------------------------------------------------------------
 
 ' True for the resident server only. The name test keeps a shell whose own command
 ' line merely mentions the marker (a search, an editor) from counting as the server.
 Function IsServer(name, cmdLine)
+  Dim norm
   IsServer = False
   If LCase(Left(name, 6)) <> "python" Then Exit Function
-  If InStr(cmdLine, "__MARKER__") > 0 Then IsServer = True
-  If InStr(cmdLine, "freeagent_bind") > 0 And InStr(cmdLine, "server.py") > 0 And InStr(cmdLine, "--port __PORT__") > 0 Then IsServer = True
+  norm = " " & Replace(cmdLine, Chr(34), " ") & " "
+  If InStr(cmdLine, "__MARKER__") > 0 And InStr(norm, " __MARKER__ ") > 0 Then IsServer = True
+  If InStr(cmdLine, "freeagent_bind") > 0 And InStr(cmdLine, "server.py") > 0 And InStr(cmdLine, "--port __PORT__") > 0 And InStr(norm, " --port __PORT__ ") > 0 Then IsServer = True
 End Function
 
 Function KillServers()
@@ -692,7 +764,10 @@ Function KillServers()
   Err.Clear
   KillServers = count
 End Function
-__VBS_PYTHON_PICK____VBS_WATCHDOG__""".replace("__HERMES_HOME__", cfg["hermes_home"]).replace("__REPO__", cfg["repo"]).replace(
+__VBS_PYTHON_PICK____VBS_WATCHDOG__""".replace("__HERMES_HOME_EXPR__", _vbs_hermes_home_expr(cfg)).replace(
+        "__REPO_EXPR__", _vbs_str(cfg["repo"])).replace(
+        "__EXPLICIT_PY_EXPR__", _vbs_str(cfg.get("explicit_python") or "")).replace(
+        "__EXPLICIT_PYW_EXPR__", _vbs_str(cfg.get("explicit_pythonw") or "")).replace(
         "__LOG_NAME__", LOG_NAME).replace("__WATCHDOG_LOG_NAME__", WATCHDOG_LOG_NAME).replace(
         "__SERVICE_DIR__", SERVICE_DIR_NAME).replace(
         "__LAUNCHER_NAME__", LAUNCHER_NAME).replace("__PORT__", str(cfg["port"])).replace(
@@ -713,12 +788,12 @@ def render_startup(cfg: dict) -> str:
 ' ASCII only: Windows Script Host reads .vbs as ANSI unless it has a UTF-16 BOM.
 Option Explicit
 Dim fso, sh, target
-target = "__WORKER__"
+target = __WORKER_EXPR__
 Set fso = CreateObject("Scripting.FileSystemObject")
 If Not fso.FileExists(target) Then WScript.Quit 0
 Set sh = CreateObject("WScript.Shell")
 sh.Run "wscript.exe " & Chr(34) & target & Chr(34), 0, False
-'''.replace("__WORKER__", cfg["paths"]["worker"]).lstrip("\n")
+'''.replace("__WORKER_EXPR__", _vbs_str(cfg["paths"]["worker"])).lstrip("\n")
 
 
 def render_proxy_launcher(cfg: dict) -> str:
@@ -765,7 +840,7 @@ import os
 import subprocess
 import sys
 
-HOME = os.path.expandvars(r"__HERMES_HOME__")
+HOME = os.path.expandvars(__HERMES_HOME_REPR__)
 REPO = os.path.join(HOME, "hermes-agent")
 LOG = os.environ.get("HERMES_PROXY_LOG") or os.path.join(HOME, "logs", "__PROXY_LOG_NAME__")
 AUTH_FILE = os.path.join(HOME, "auth.json")
@@ -893,7 +968,7 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-'''.replace("__HERMES_HOME__", cfg["hermes_home"]).replace(
+'''.replace("__HERMES_HOME_REPR__", repr(cfg["hermes_home"])).replace(
         "__PROXY_LOG_NAME__", PROXY_LOG_NAME).replace(
         "__SESSION_ENV_HELPER__", _PY_SESSION_ENV.strip("\n")).lstrip("\n")
 
@@ -919,12 +994,12 @@ def render_proxy_worker(cfg: dict) -> str:
 Option Explicit
 Dim sh, fso, home, launcher, logDir, watchLog, running, svc, procs, p, cl, nm, hit, wmiOk
 Dim tools, f, pyw, bestName, bestKey, key, port, startupDir, startupLauncher, templateLauncher
-Dim probeUrl, strikeFile, strikes, killed
+Dim probeUrl, strikeFile, strikes, killed, explicitPy, explicitPyw, lockFile, lockHandle
 
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
-home = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\hermes"
+home = __HERMES_HOME_EXPR__
 launcher = home & "\__PROXY_SERVICE_DIR__\__PROXY_LAUNCHER_NAME__"
 logDir = home & "\logs"
 watchLog = logDir & "\__PROXY_WATCHDOG_LOG_NAME__"
@@ -933,12 +1008,21 @@ port = "__PROXY_PORT__"
 If WScript.Arguments.Count > 0 Then port = WScript.Arguments(0)
 probeUrl = "http://127.0.0.1:" & port & "/"
 strikeFile = fso.GetParentFolderName(WScript.ScriptFullName) & "\unresponsive-" & port & ".count"
+lockFile = fso.GetParentFolderName(WScript.ScriptFullName) & "\worker-proxy-" & port & ".lock"
 
 If Not fso.FileExists(launcher) Then WScript.Quit 0
 If Not fso.FolderExists(logDir) Then fso.CreateFolder(logDir)
 
-' Restore the Startup launcher from the template when an update or test removed it.
-startupDir = sh.SpecialFolders("Startup")
+On Error Resume Next
+Set lockHandle = fso.OpenTextFile(lockFile, 2, True)
+If Err.Number <> 0 Then
+  Err.Clear
+  WScript.Quit 0
+End If
+On Error GoTo 0
+
+' Restore the Startup launcher from the template when an update removed it.
+startupDir = __PROXY_STARTUP_DIR_EXPR__
 startupLauncher = startupDir & "\__PROXY_WORKER_NAME__"
 templateLauncher = home & "\__PROXY_SERVICE_DIR__\__PROXY_TEMPLATE_NAME__"
 On Error Resume Next
@@ -1005,11 +1089,22 @@ End If
 ' pythonw.exe lives in a folder whose name changes per install (version + build),
 ' so enumerate the tools folder instead of hardcoding a path. Version order (NatKey),
 ' skipping folders without a standard library - see the helpers below.
+explicitPy = __EXPLICIT_PY_EXPR__
+explicitPyw = __EXPLICIT_PYW_EXPR__
 pyw = ""
+If explicitPyw <> "" And fso.FileExists(explicitPyw) Then
+  pyw = explicitPyw
+ElseIf explicitPy <> "" And fso.FileExists(explicitPy) Then
+  If fso.FileExists(fso.GetParentFolderName(explicitPy) & "\pythonw.exe") Then
+    pyw = fso.GetParentFolderName(explicitPy) & "\pythonw.exe"
+  Else
+    pyw = explicitPy
+  End If
+End If
 bestName = ""
 bestKey = ""
 tools = home & "\tools"
-If fso.FolderExists(tools) Then
+If pyw = "" And fso.FolderExists(tools) Then
   For Each f In fso.GetFolder(tools).SubFolders
     If Left(f.Name, 7) = "python-" Then
       If fso.FileExists(f.Path & "\pythonw.exe") And HasStdlib(f) Then
@@ -1039,6 +1134,7 @@ If port = "__HERMES_DEFAULT_PORT__" Then
 Else
   sh.Run "" & Chr(34) & pyw & Chr(34) & " " & Chr(34) & launcher & Chr(34) & " --port " & port & " hermes-proxy-" & port, 0, False
 End If
+WScript.Sleep 500
 
 ' --- helpers ---------------------------------------------------------------
 
@@ -1078,7 +1174,14 @@ Function KillProxies()
   Err.Clear
   KillProxies = count
 End Function
-__VBS_PYTHON_PICK____VBS_WATCHDOG__""".replace("__PROXY_SERVICE_DIR__", PROXY_SERVICE_DIR_NAME).replace(
+__VBS_PYTHON_PICK____VBS_WATCHDOG__""".replace("__HERMES_HOME_EXPR__", _vbs_hermes_home_expr(cfg)).replace(
+        "__PROXY_STARTUP_DIR_EXPR__", (
+            "sh.ExpandEnvironmentStrings(%s)" % _vbs_str(cfg["custom_startup_dir"])
+            if cfg.get("custom_startup_dir") else 'sh.SpecialFolders("Startup")'
+        )).replace(
+        "__EXPLICIT_PY_EXPR__", _vbs_str(cfg.get("explicit_python") or "")).replace(
+        "__EXPLICIT_PYW_EXPR__", _vbs_str(cfg.get("explicit_pythonw") or "")).replace(
+        "__PROXY_SERVICE_DIR__", PROXY_SERVICE_DIR_NAME).replace(
         "__PROXY_LAUNCHER_NAME__", PROXY_LAUNCHER_NAME).replace(
         "__PROXY_WORKER_NAME__", PROXY_WORKER_NAME).replace(
         "__PROXY_TEMPLATE_NAME__", PROXY_TEMPLATE_NAME).replace(
@@ -1097,12 +1200,12 @@ def render_proxy_startup(cfg: dict) -> str:
 ' ASCII only.
 Option Explicit
 Dim fso, sh, target
-target = "__PROXY_WORKER__"
+target = __PROXY_WORKER_EXPR__
 Set fso = CreateObject("Scripting.FileSystemObject")
 If Not fso.FileExists(target) Then WScript.Quit 0
 Set sh = CreateObject("WScript.Shell")
 sh.Run "wscript.exe " & Chr(34) & target & Chr(34), 0, False
-'''.replace("__PROXY_WORKER__", cfg["paths"]["proxy_worker"]).lstrip("\n")
+'''.replace("__PROXY_WORKER_EXPR__", _vbs_str(cfg["paths"]["proxy_worker"])).lstrip("\n")
 
 
 def render_apply(cfg: dict) -> str:
@@ -1118,7 +1221,7 @@ hermes config set mcp_servers.freeagent-bind.url http://__HOST__:__PORT__/mcp
 hermes config set mcp_servers.freeagent-bind.headers.x-freeagent-harness hermes
 echo '--- 現在の設定 ---' && hermes config get mcp_servers.freeagent-bind
 echo '--- 接続テスト ---' && hermes mcp test freeagent-bind
-'''.replace("__HOST__", cfg["host"]).replace("__PORT__", str(cfg["port"])).replace(
+'''.replace("__HOST__", probe_host(cfg["host"])).replace("__PORT__", str(cfg["port"])).replace(
         "__SERVICE_DIR__", SERVICE_DIR_NAME).replace("__WORKER_NAME__", WORKER_NAME)
 
 
@@ -1191,6 +1294,9 @@ def build_config(hermes_home: str, repo: str, host: str, port: int,
         "with_proxy": with_proxy,
         "python": python or found_py,
         "pythonw": pythonw or found_pyw,
+        "explicit_python": python,
+        "explicit_pythonw": pythonw,
+        "custom_startup_dir": startup_dir,
         "marker": marker_for(port),
         "proxy_marker": proxy_marker_for(proxy_port),
         "paths": paths,
@@ -1394,7 +1500,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("hermes home : %s" % cfg["hermes_home"])
     print("repo        : %s" % cfg["repo"])
-    print("endpoint    : http://%s:%d/mcp" % (cfg["host"], cfg["port"]))
+    print("endpoint    : http://%s:%d/mcp" % (probe_host(cfg["host"]), cfg["port"]))
     if cfg.get("with_proxy", True):
         print("proxy       : http://127.0.0.1:%d/v1" % cfg["proxy_port"])
     print("python      : %s" % (cfg["python"] or "(not found - pass --python)"))
@@ -1425,9 +1531,13 @@ def main(argv: list[str] | None = None) -> int:
                 fh.write(render_service_env(cfg))
             print("wrote: %s" % _env_path)
         if args.task:
-            print(register_task(cfg, args.task_name, args.interval_minutes))
+            task_lines = [register_task(cfg, args.task_name, args.interval_minutes)]
             if cfg.get("with_proxy", True):
-                print(register_proxy_task(cfg, args.proxy_task_name, args.interval_minutes))
+                task_lines.append(register_proxy_task(cfg, args.proxy_task_name, args.interval_minutes))
+            for line in task_lines:
+                print(line)
+            if any(line.startswith("task failed") for line in task_lines):
+                return 1
     return 0
 
 

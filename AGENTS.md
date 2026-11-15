@@ -362,6 +362,16 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     生成直後の `verify_generated()` は `systemd-analyze --user verify` を**基本検査を通ったとき
     だけ**通す（stub 環境での二重報告とバス接続ノイズを避ける）。proxy の「未認証待機」は
     ログ末尾のスキップ 1 行との一致で判定して note に出す（新しい状態ファイルは作らない）。
+    (m) **常駐の境界一致・排他・TTL・検証の厳密化**（v0.52.1・SPEC §6.68）。Windows worker の `IsServer` は
+    空白正規化後の**トークン境界**で照合する（`--port 879` が `8790` に当たると無関係な常駐を殺す）。
+    ログオン時の Startup と見張りタスクの同時発火は `worker-<port>.lock` で直列化する。
+    `--hermes-home` / `--startup-dir` / `--python` / `--pythonw` は生成 VBS に反映し（非 ASCII は `ChrW` で
+    組んで VBS を ASCII に保つ）、`pyw` 不在でも `run_server.pyw` を通す（`.env` とログを落とさない）。
+    `freeagent.env` は**実環境の変数を壊さずに `.env` を上書き**でき、クライアント URL は `probe_host` を通す。
+    HTTP セッションは非 SSE で TTL 失効・SSE 接続中は `seen` を更新し（生存中の接続を追い出さない）、
+    IPv6 待受と `Host: [::1]:8790` の検証、`SIGTERM` でのドレインを備える。`verify_resident.py` は
+    JSON-RPC `result` を厳密に検査し（`error` や空応答を成功にしない）、既定で
+    `x-freeagent-harness: hermes` を添えて稼働中サーバーの判定を汚さない。
 44. **知識取得の読み取りは壁時計でも打ち切る**（§5.8）。`urlopen(timeout=…)` の上限は
     「ソケット 1 回の待ち」の上限であって**リクエスト全体の壁時計制限ではない**。1 バイトずつ
     drip する提供元では読みが終わるまで何分も待つ（実測: ローカル drip サーバで 98.0 秒 =

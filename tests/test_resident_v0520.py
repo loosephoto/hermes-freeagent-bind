@@ -126,8 +126,9 @@ class TestRestartAndStaleNotes(ResidentV0520Base):
     def test_fresh_process_and_inactive_units_are_not_reported(self):
         cfg = self._cfg()
         self._write_units(cfg)
+        ts_fresh = time.strftime("%a %Y-%m-%d %H:%M:%S UTC", time.gmtime(time.time() + 60))
         fresh = ("ActiveState=active\nMainPID=12421\n"
-                 "ExecMainStartTimestamp=%s\n" % TS_NEW)
+                 "ExecMainStartTimestamp=%s\n" % ts_fresh)
         inactive = ("ActiveState=inactive\nMainPID=0\n"
                     "ExecMainStartTimestamp=%s\n" % TS_OLD)
         for stdout in (fresh, inactive):

@@ -73,31 +73,46 @@ def _http_session_new() -> str:
         if len(_HTTP_SESSIONS) >= S.HTTP_MAX_SESSIONS:
             _http_sessions_prune_locked(force=True)
         _HTTP_SESSIONS[sid] = {"created": S.now_ts(), "seen": S.now_ts(),
-                               "queue": [], "cv": threading.Condition(), "closed": False}
+                               "queue": [], "cv": threading.Condition(), "closed": False,
+                               "sse_open": 0}
     return sid
 
 
 def _http_session_get(sid: str):
     if not sid:
         return None
+    now = S.now_ts()
     with _HTTP_SESSIONS_LOCK:
         session = _HTTP_SESSIONS.get(sid)
-        if session is not None:
-            session["seen"] = S.now_ts()
+        if session is None:
+            return None
+        if not session.get("sse_open", 0) and now - S.as_float(session.get("seen"), 0.0) > S.HTTP_SESSION_TTL:
+            _HTTP_SESSIONS.pop(sid, None)
+            session["closed"] = True
+            with session["cv"]:
+                session["cv"].notify_all()
+            return None
+        session["seen"] = now
         return session
 
 
 def _http_session_touch(session) -> None:
     if session is not None:
-        session["seen"] = S.now_ts()
+        with _HTTP_SESSIONS_LOCK:
+            session["seen"] = S.now_ts()
 
 
 def _http_sessions_prune_locked(force: bool = False) -> int:
     """呼び出し側が `_HTTP_SESSIONS_LOCK` を保持した状態で期限切れセッションを落とす。"""
     now = S.now_ts()
-    stale = [k for k, v in _HTTP_SESSIONS.items() if now - S.as_float(v.get("seen"), 0.0) > S.HTTP_SESSION_TTL]
+    stale = [k for k, v in _HTTP_SESSIONS.items()
+             if not v.get("sse_open", 0) and now - S.as_float(v.get("seen"), 0.0) > S.HTTP_SESSION_TTL]
     if not stale and force:
-        order = sorted(_HTTP_SESSIONS, key=lambda k: S.as_float(_HTTP_SESSIONS[k].get("seen"), 0.0))
+        order = sorted(
+            _HTTP_SESSIONS,
+            key=lambda k: (1 if _HTTP_SESSIONS[k].get("sse_open", 0) else 0,
+                           S.as_float(_HTTP_SESSIONS[k].get("seen"), 0.0)),
+        )
         stale = order[:max(1, S.HTTP_MAX_SESSIONS // 4)]
     for k in stale:
         session = _HTTP_SESSIONS.pop(k, None)
@@ -226,16 +241,18 @@ def _http_host_ok(headers, allowed_hosts: set[str]) -> tuple[bool, str]:
 
     `Host` が偽装されると、攻撃者のドメインが 127.0.0.1 へ解決される。
     ブラウザは `Origin` も付けるので Origin 検証が主だが、非ブラウザの
-    クライアントにもこの制約を掛ける。
+    クライアントにもこの制約を掛ける。IPv6 リテラル（`[::1]` / `[::1]:8790`）も解釈する。
     """
     host_header = (headers.get("host") or "").strip().lower()
     if not host_header:
         return True, ""   # HTTP/1.0 には Host が無い
-    if ":" in host_header:
-        host_header = host_header.rsplit(":", 1)[0]
-    if host_header in allowed_hosts:
+    try:
+        parsed_host = urllib.parse.urlsplit("//" + host_header).hostname
+    except ValueError:
+        parsed_host = None
+    if parsed_host and parsed_host in allowed_hosts:
         return True, ""
-    return False, f"Host が許可されていません: {host_header[:80]}"
+    return False, f"Host が許可されていません: {(parsed_host or host_header)[:80]}"
 
 
 def _http_make_handler(config: dict):
@@ -244,7 +261,9 @@ def _http_make_handler(config: dict):
     # Origin / Host の検証で許可するホスト。待受のホスト自身と、そのローカル別名。
     # 待ち受けが 0.0.0.0 / :: なら wildcard 扱いでどの Host も通す（LAN 公開のとき）。
     bind_host = str(config.get("host") or S.HTTP_DEFAULT_HOST).strip().lower()
-    if bind_host in ("0.0.0.0", "::", "[::]", "*", ""):
+    if bind_host.startswith("[") and bind_host.endswith("]"):
+        bind_host = bind_host[1:-1]
+    if bind_host in ("0.0.0.0", "::", "*", ""):
         allowed_hosts: set[str] = set()      # 空 = 制限しない
     else:
         allowed_hosts = {bind_host, "127.0.0.1", "localhost", "::1"}
@@ -371,6 +390,8 @@ def _http_make_handler(config: dict):
             self.send_header("X-Accel-Buffering", "no")
             self.send_header("Connection", "close")
             self.end_headers()
+            with _HTTP_SESSIONS_LOCK:
+                session["sse_open"] = int(session.get("sse_open", 0)) + 1
             try:
                 self.wfile.flush()
                 while True:
@@ -388,8 +409,12 @@ def _http_make_handler(config: dict):
                         data = _dumps(note)
                         self.wfile.write(f"event: message\ndata: {data}\n\n".encode("utf-8"))
                     self.wfile.flush()
+                    _http_session_touch(session)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                 pass
+            finally:
+                with _HTTP_SESSIONS_LOCK:
+                    session["sse_open"] = max(0, int(session.get("sse_open", 0)) - 1)
             return
 
         def do_DELETE(self):  # noqa: N802 - 親の API 名
@@ -460,8 +485,14 @@ def _http_port(config: dict) -> int:
 def _http_build_server(config: dict):
     """待受ソケットを作って返す（`serve_forever` は呼び出し側。テストが自前で止められるように分ける）。"""
     import http.server
+    import socket
+
+    raw_host = _http_host(config)
+    bind_addr = raw_host[1:-1] if raw_host.startswith("[") and raw_host.endswith("]") else raw_host
+    family = socket.AF_INET6 if ":" in bind_addr else socket.AF_INET
 
     class _Server(http.server.ThreadingHTTPServer):
+        address_family = family
         # Windows の SO_REUSEADDR は「同じポートへの二重バインド」を許すため False にする。
         # POSIX（Linux / macOS）では SO_REUSEADDR でも生きた LISTEN への二重起動は失敗し、
         # False だと常駐サービスの再起動直後に TIME_WAIT でバインドできなくなる。
@@ -482,7 +513,7 @@ def _http_build_server(config: dict):
                 return
             super().handle_error(request, client_address)
 
-    return _Server((_http_host(config), _http_port(config)), _http_make_handler(config))
+    return _Server((bind_addr, _http_port(config)), _http_make_handler(config))
 
 
 def serve_http(config: dict) -> None:
@@ -515,12 +546,35 @@ def serve_http(config: dict) -> None:
         sys.stderr.flush()
     except Exception:
         pass
+    import signal
+    prev_sigterm = None
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None and threading.current_thread() is threading.main_thread():
+        def _on_sigterm(_signum, _frame):
+            threading.Thread(target=server.shutdown, daemon=True).start()
+        try:
+            prev_sigterm = signal.signal(sigterm, _on_sigterm)
+        except (OSError, ValueError):
+            prev_sigterm = None
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if sigterm is not None and prev_sigterm is not None:
+            try:
+                signal.signal(sigterm, prev_sigterm)
+            except (OSError, ValueError):
+                pass
+        with _HTTP_SESSIONS_LOCK:
+            sessions = list(_HTTP_SESSIONS.values())
+            _HTTP_SESSIONS.clear()
+        for sess in sessions:
+            sess["closed"] = True
+            with sess["cv"]:
+                sess["cv"].notify_all()
         server.server_close()
+        S._drain_parallel_futures()
 
 
 EXPORTS = {name: globals()[name] for name in (

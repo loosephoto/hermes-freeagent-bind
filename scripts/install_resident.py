@@ -33,6 +33,7 @@ from collections.abc import Mapping
 from typing import Any
 import argparse
 import calendar
+import re
 import importlib.util
 import os
 import plistlib
@@ -341,11 +342,12 @@ sys.stdout = _stream
 sys.stderr = _stream
 
 
-def _load_env_file(path):
-    """KEY=VALUE を os.environ へ入れる（既にある値は上書きしない）。"""
+def _load_env_file(path, protected=None):
+    """KEY=VALUE を os.environ へ入れる（実環境の既存値は上書きせず、後続ファイルの上書きは許す）。"""
     names = []
     if not path or not os.path.isfile(path):
         return names
+    skip = os.environ if protected is None else protected
     try:
         with open(path, encoding="utf-8-sig", errors="replace") as fh:
             for raw in fh:
@@ -356,13 +358,20 @@ def _load_env_file(path):
                     line = line[7:].lstrip()
                 key, sep, value = line.partition("=")
                 key = key.strip()
-                if not sep or not key or key in os.environ:
+                if not sep or not key or key in skip:
                     continue
                 value = value.strip()
-                if value[:1] not in ('"', "'"):
+                if len(value) >= 2 and value[0] in ('"', "'"):
+                    q = value[0]
+                    end = value.find(q, 1)
+                    if end != -1:
+                        tail = value[end + 1:].strip()
+                        if not tail or tail.startswith("#"):
+                            value = value[1:end]
+                else:
                     value = value.split(" #", 1)[0].strip()
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-                    value = value[1:-1]
+                    if value.startswith("#"):
+                        value = ""
                 if not value:
                     continue
                 os.environ[key] = value
@@ -372,9 +381,13 @@ def _load_env_file(path):
     return names
 
 
+_initial_env = set(os.environ)
 _loaded = []
 for _env_path in ENV_FILES:
-    _loaded.extend(_load_env_file(_env_path))
+    for _name in _load_env_file(_env_path, _initial_env):
+        if _name not in _loaded:
+            _loaded.append(_name)
+os.environ.setdefault("HERMES_HOME", HOME)
 print("[env] loaded %d vars: %s" % (len(_loaded), ", ".join(_loaded) or "none"))
 
 sys.argv = ["server.py", "--transport", "http", "--host", __HOST_REPR__, "--port", str(PORT)]
@@ -763,7 +776,7 @@ hermes config set mcp_servers.freeagent-bind.url http://__HOST__:__PORT__/mcp
 hermes config set mcp_servers.freeagent-bind.headers.x-freeagent-harness hermes
 echo '--- 現在の設定 ---' && hermes config get mcp_servers.freeagent-bind
 echo '--- 接続テスト ---' && hermes mcp test freeagent-bind
-""".replace("__HOST__", cfg["host"]).replace("__PORT__", str(cfg["port"])).replace(
+""".replace("__HOST__", _WIN.probe_host(cfg["host"])).replace("__PORT__", str(cfg["port"])).replace(
         "__START_HINT__", hint)
 
 
@@ -1059,35 +1072,43 @@ def proxy_waiting_note(cfg: dict) -> str | None:
 def _parse_systemd_timestamp(raw: str) -> float | None:
     """`ExecMainStartTimestamp`（例: `Tue 2026-11-14 08:26:53 UTC`）を epoch 秒へ。失敗は None。
 
-    systemd は既定で**ローカル時刻＋TZ 略号**を出す。`UTC` / `GMT` は確実に判定できるので
-    `timegm` で epoch 化し、それ以外の略号（JST など）は落として**ローカル時刻**として読む
-    （unit の mtime と同じローカル基準。値は「警告を出すか」の閾値比較にしか使わず、
-    パースに失敗したら黙って警告を出さない＝誤報しない）。
+    `systemctl show` 呼び出し側では `LC_ALL=C` / `TZ=UTC` を渡すが、直接呼び出しで日本語曜日
+    （`日 2026-11-15 ...`）や数値オフセット（`+09` / `+0900` / `+09:00`）が来ても解釈する。
     """
     text = (raw or "").strip()
     if not text:
         return None
     utc = False
+    offset_s: int | None = None
     for marker in (" UTC", " GMT"):
         if text.endswith(marker):
             utc = True
             text = text[: -len(marker)].strip()
             break
     if not utc:
-        # それ以外の TZ 略号（JST 等）は落としてローカル時刻として読む（誤報しない方へ倒す）。
         parts = text.rsplit(" ", 1)
-        if len(parts) == 2 and parts[1].isupper() and 2 <= len(parts[1]) <= 5 and parts[1].isalpha():
-            text = parts[0].strip()
-    st = None
-    for fmt in ("%a %Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-        try:
-            st = time.strptime(text, fmt)
-            break
-        except ValueError:
-            continue
-    if st is None:
+        if len(parts) == 2:
+            tz_tok = parts[1]
+            m_off = re.fullmatch(r"([+-])(\d{2})(?::?(\d{2}))?", tz_tok)
+            if m_off:
+                sign = 1 if m_off.group(1) == "+" else -1
+                hh = int(m_off.group(2))
+                mm = int(m_off.group(3) or "0")
+                offset_s = sign * (hh * 3600 + mm * 60)
+                text = parts[0].strip()
+            elif tz_tok.isupper() and 2 <= len(tz_tok) <= 5 and tz_tok.isalpha():
+                text = parts[0].strip()
+    # ロケール依存の曜日接頭辞（`日 2026-...` / `Tue 2026-...`）を剥がして YYYY-MM-DD HH:MM:SS を抜く。
+    m_dt = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})$", text)
+    if m_dt:
+        text = m_dt.group(1)
+    try:
+        st = time.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
         return None
-    return calendar.timegm(st) if utc else time.mktime(st)
+    if offset_s is not None:
+        return float(calendar.timegm(st) - offset_s)
+    return float(calendar.timegm(st) if utc else time.mktime(st))
 
 
 def _linux_running_stale_notes(cfg: dict, run_env: Mapping[str, str]) -> list[str]:
@@ -1111,11 +1132,12 @@ def _linux_running_stale_notes(cfg: dict, run_env: Mapping[str, str]) -> list[st
         except OSError:
             continue
         try:
+            show_env = {**run_env, "LC_ALL": "C", "TZ": "UTC"}
             proc = subprocess.run(
                 ["systemctl", "--user", "show", unit,
                  "--property=ActiveState", "--property=MainPID",
                  "--property=ExecMainStartTimestamp"],
-                capture_output=True, text=True, timeout=10, env=run_env, creationflags=nw,
+                capture_output=True, text=True, timeout=10, env=show_env, creationflags=nw,
             )
         except (OSError, subprocess.SubprocessError):
             continue
@@ -1455,7 +1477,7 @@ def main(argv: list[str] | None = None) -> int:
     print("platform    : %s" % cfg["platform"])
     print("hermes home : %s" % cfg["hermes_home"])
     print("repo        : %s" % cfg["repo"])
-    print("endpoint    : http://%s:%d/mcp" % (cfg["host"], cfg["port"]))
+    print("endpoint    : http://%s:%d/mcp" % (_WIN.probe_host(cfg["host"]), cfg["port"]))
     if cfg.get("with_proxy", True):
         print("proxy       : http://127.0.0.1:%d/v1" % cfg["proxy_port"])
     print("python      : %s" % (cfg["python"] or "(not found - fallback /usr/bin/env python3 or pass --python)"))
