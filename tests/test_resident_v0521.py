@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from unittest import mock
@@ -463,9 +464,8 @@ class WindowsWorkerTest(unittest.TestCase):
         self.assertIn("task failed", buf.getvalue())
 
 
-@unittest.skipUnless(shutil.which("systemctl"), "systemctl が無い環境")
 class LinuxStaleNoteTest(unittest.TestCase):
-    """11. `systemctl show` に C ロケールを強制する。"""
+    """11. `systemctl show` に C ロケールを強制する（`subprocess.run` は差し替えるので OS 非依存）。"""
 
     def test_systemctl_show_runs_with_c_locale_and_utc(self):
         tmp = tempfile.mkdtemp(prefix="fa-linux-v0521-")
@@ -476,7 +476,10 @@ class LinuxStaleNoteTest(unittest.TestCase):
         os.makedirs(os.path.dirname(unit_path), exist_ok=True)
         with open(unit_path, "w", encoding="utf-8") as fh:
             fh.write("[Unit]\nDescription=stub\n")
-        os.utime(unit_path, (0, 0))     # 生成物を十分に古くする（更新より前のプロセスを作る）
+        # 警告の条件は「unit の mtime より**前**に起動したプロセス」＝生成物のほうが新しい。
+        # 逆向きにすると（mtime を 1970 にすると）警告は出ないのが正しい（実測で踏んだ）。
+        now = time.time()
+        os.utime(unit_path, (now, now))
         seen_envs: list[dict] = []
 
         def fake_run(cmd, **kw):

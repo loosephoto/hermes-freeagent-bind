@@ -2805,9 +2805,10 @@ CI の Linux ランナーで unit 生成と verify の組合せは通る）。
 **検証**: `tests/test_resident_v0521.py`（20 件）で上記全項目を固定する。HTTP は `port: 0` の実ソケット
 （IPv6 ループバック・`Host: [::1]:8790`）、`serve_http` の終了経路は差し替えた server で確認（規約 65）、
 `IsServer` の境界は **`cscript.exe` で実測**、非 ASCII パスの VBS は純 ASCII を機械検査する。
-Linux の stale note（`systemctl show` の `LC_ALL=C` / `TZ=UTC`）は `systemctl` の無い環境で skip するため、
-手元（Windows）では 19 件 OK ＋ 1 skip、CI の ubuntu ランナーで全件走る。
-**全体**: unittest 1,421 件 OK（2 skip）／`check_integrity`（version=0.52.1）／`compileall`／
+Linux の stale note（`systemctl show` の `LC_ALL=C` / `TZ=UTC`）は `subprocess.run` を差し替えるので
+OS 非依存に走らせる（最初 `systemctl` の有無で skip したため、**警告の向きを取り違えたまま Windows で緑・
+CI の ubuntu 3 ジョブだけ赤**になった。mtime は「unit のほうが新しい」側に置く）。
+**全体**: unittest 1,421 件 OK（1 skip）／`check_integrity`（version=0.52.1）／`compileall`／
 `smoke_stdio` / `smoke_http` / `check_offline`（状態ディレクトリは空のまま）／`doc_drift_check` 0 件／
 `audit_probes --quick` NG 0 件。**実機の常駐（`127.0.0.1:8790`）へ `scripts/verify_resident.py` を通して
 `serverInfo 0.52.0` / `tools/list 13 件` / `freeagent_models` 成功を確認**（プロセスは再起動していない）。
