@@ -115,6 +115,10 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     モデル ID のアルファベット順で 1 プロバイダが枠を独占する。プロバイダ順は最良モデルの順位で決める。
 19. HF の料金・文脈長は**提供元単位**（`providers[]`）。`status == "live"` かつ `is_free`／価格 0 の
     提供元があるときだけ Free と判定する（`_is_hf` / `_free_providers` / `_context_length`）。
+    **2026-11-16 に HF のチャット推論ルータは OpenRouter のものへ置き換わり、実測（2026-11-17）では
+    `is_free` が全件 false・全モデルが 402 になった**ため、HF は `free_kind="hf_credits"` の **opt-in**
+    （`FREEAGENT_HF_CREDITS=1` + `/api/whoami-v2` の `isPro`/`canPay`）にし、既定では `PROVIDER_ORDER`
+    （一覧・自動選抜）へ載せない。`hf_router` の印で判定し、分類名の改名に依存させない。
 20. ツールを増減したら `README.md` のツール表・`SPEC.md`・`tests/`・`scripts/` を同一変更内で更新する。
     README の「**期待しないこと（実測に基づく）**」節は**超高性能にはならない**旨を明示する場所で、
     数値（起動時間・スキーマ文字数など）は**測り直して**書く（推測値・他プロジェクトの値を流用しない）。

@@ -88,12 +88,12 @@
 
 ### 4.1 プロバイダ（18 つ）
 
-| プロバイダ | base_url | Free 判定 | 一覧の取得 | 実測（2026-09 時点） |
+| プロバイダ | base_url | Free 判定 | 一覧の取得 | 実測（`openrouter` と `huggingface` は 2026-11-17 に再測） |
 |---|---|---|---|---|
 | `nous` | ローカルプロキシ | プロキシの申告 | 要プロキシ起動 | プロキシ停止中は接続エラー |
-| `openrouter` | `openrouter.ai/api/v1` | `:free` または pricing が全部 0 | **未認証可** | 458 モデル / Free 21 / 生存 11 |
+| `openrouter` | `openrouter.ai/api/v1` | `:free` または pricing が全部 0 | **未認証可** | 470 モデル / Free 17（`:free` 14 ＋ 0 円 SKU 3）/ 生存 11（2026-11-17 再測） |
 | `nvidia` | `integrate.api.nvidia.com/v1` | `free_kind="credit"`（全件が無料枠） | **未認証可** | 82 モデル / **55 件が 404=EOL** / 生存 15 |
-| `huggingface` | `router.huggingface.co/v1` | **提供元単位**（`providers[].is_free` または pricing 0） | **未認証可** | 137 モデル / Free 3 / 生存 1（`:together` は Cloudflare Error 1010 で要再確認） |
+| `huggingface` | `router.huggingface.co/v1` | **提供元単位**（`providers[].is_free` または pricing 0）。**opt-in**（`FREEAGENT_HF_CREDITS=1`）のときだけクレジット枠として全件 Free | **未認証可** | 164 モデル / Free 0 / 生存 0（全件 402。2026-11-17） |
 | `groq` | `api.groq.com/openai/v1` | Free plan確認 + 3 ID許可リスト | API key必須 (`/models`) | 未実測（資格情報なし）。Free limitsは組織/モデル別 |
 | `cloudflare` | `api.cloudflare.com/client/v4/accounts/{id}/ai` | Workers Free確認 + 2 ID許可リスト | API token必須。`/models/search?format=openrouter` | 未実測（資格情報なし）。Free割当 10,000 Neurons/日 |
 | `gemini` | `generativelanguage.googleapis.com/v1beta/openai` | Unpaid確認・データ利用確認 + 2 ID許可リスト | API key必須 (`/models`) | 未実測（資格情報なし）。OpenAI互換はBeta |
@@ -145,7 +145,7 @@
 | `nous` | 不要（プロキシが資格情報を付与） | — |
 | `openrouter` | `OPENROUTER_API_KEY` | — |
 | `nvidia` | `NVIDIA_API_KEY` | — |
-| `huggingface` | `HF_TOKEN`（別名 `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN`） | — |
+| `huggingface` | `HF_TOKEN`（別名 `HUGGINGFACE_API_KEY` / `HUGGINGFACEHUB_API_TOKEN`） | — （在庫に載せるには**任意の opt-in** `FREEAGENT_HF_CREDITS`） |
 | `groq` | `GROQ_API_KEY` | `FREEAGENT_GROQ_FREE_TIER` |
 | `cloudflare` | `CLOUDFLARE_API_TOKEN` ＋ `CLOUDFLARE_ACCOUNT_ID`（32 桁 hex） | `FREEAGENT_CLOUDFLARE_FREE_PLAN` |
 | `gemini` | `GEMINI_API_KEY`（別名 `GOOGLE_API_KEY`） | `FREEAGENT_GEMINI_FREE_TIER` / `FREEAGENT_GEMINI_UNPAID_DATA_ACK` |
@@ -200,7 +200,7 @@
   混同しない）。
 - モデルは**消える前提**。呼び出しのたびに一覧から解決し、落ちたら代替へ回す。落とす条件は
   `_FALLBACK_STATUS = {402,400,401,403,404,410,429,500,502,503,504}`（`_MAX_ATTEMPTS = 4`）。
-  `402`（クレジット枯渇）も**フォールバック対象**。入れないと代替へ回らず即エラーで止まる（実測: HF の月次無料枠が尽きたとき全モデルが 402 になり、パネルが「失敗」に見えた）。402 はキーや権限の問題ではないので**プロバイダ記憶には入れない**（翌月に回復する性質）。
+  `402`（クレジット枯渇）も**フォールバック対象**。入れないと代替へ回らず即エラーで止まる（実測: HF の月次無料枠が尽きたとき全モデルが 402 になり、パネルが「失敗」に見えた）。402 はキーや権限の問題ではないので `provider_auth.json`（認証失敗）には入れず、**別ファイル `provider_credit.json` にプロバイダ単位で**覚える（既定 15 分・`FREEAGENT_CREDIT_TTL`）。実測（2026-11-17）: HF は 164 件すべてが同じ「Purchase pre-paid credits」を返し、モデル単位のクールダウンだけでは候補の数だけ 402 を繰り返した。通れば `clear_provider_credit` で即座に戻す。
 - `select_models(size, requested, prefer, exclude)` の優先順は **明示 > prefer > 品質統計**。
   選んだ根拠（`available` / `status` / `notes`）を返す。
 - **クールダウン中は除外せず後回し**（空きが足りないときだけ補充）。除外にすると選択肢が痩せ、
@@ -436,7 +436,9 @@ MCP の `notifications/cancelled`（`params.requestId`）を受けたら、**そ
   `avoided_duplicates` 付きのエラー（脱落）にする。同じモデルで 2 枠を埋めて「独立 2 体」に見せない
   （実測: 代替案の提案者の枠を、同じ呼び出しの検証者と同じモデルが埋めた）。対象は panel / consult / 討論 /
   grounded / think。`ask_map`（fanout / map）は枠ごとに依頼が違い独立性を主張しないので対象外。
-  HF のモデルは提供元サフィックスの有無・相違にかかわらず選抜と予備候補の独立性判定で同一とする。
+  HF のモデルは提供元サフィックスの有無・相違（`:together` / `:fastest` / `:cheapest`）にかかわらず選抜と予備候補の独立性判定で同一とする。
+  加えて **2026-11-16 以降 HF のチャット推論は OpenRouter のルータそのもの**なので、OpenRouter の `hugging_face_id` が同じモデル
+  （実測: HF の一覧 164 件のうち 116 件）も `hub/<hub_id>` の同一 identity にまとめる（同じ重みを別プロバイダとして 2 票に数えない）。
   旧 consult セッションの保存枠または再利用する適合査読結果に同一モデルの重複がある場合、重複を示して再開を拒否する。
   過去の査読者を避ける際、非 HF は厳密 ID とし、明示 `exclude` と環境変数の基底 ID は従来どおりサフィックス付きにも一致させる。
   この同一性を料金・許可判定に使わない。nous / OpenRouter の `:free` と基底 ID は別のカタログ ID として照合する。
@@ -2814,6 +2816,27 @@ CI の ubuntu 3 ジョブだけ赤**になった。mtime は「unit のほうが
 `serverInfo 0.52.0` / `tools/list 13 件` / `freeagent_models` 成功を確認**（プロセスは再起動していない）。
 生成器を変えたので、稼働中の配線は `--write --force` で作り直すまで旧 VBS / `.pyw` のままになる
 （実測: 配備 4 ファイルが新生成物と不一致）。
+
+### 6.69 HF の OpenRouter 統合への追随（v0.53.0）
+
+2026-11-16 に **Hugging Face の Inference Providers（チャット推論）のルータが OpenRouter のものへ置き換わった**
+（URL・トークンは不変。課金は HF アカウントに一本化・HF の手数料なし・PRO は月 $2・**独自プロバイダキーは使用不可**）。
+このサーバーの「Free だけを使う」契約に直接効くため、実測して設計を追随させた。
+
+| 点 | 実測（2026-11-17） | 対処 |
+|---|---|---|
+| **HF の Free 在庫が消えた** | `/v1/models` は 164 件（前回 137 件）。`providers[].is_free` は**全件 false**、価格 0 の提供元も 0 件。HF トークンでの推論は全件 `402`（"Purchase pre-paid credits"）。`/api/whoami-v2` は `isPro=false / canPay=false / billingMode=prepaid` | `free_kind` を `hf_credits` に改め、**opt-in（`FREEAGENT_HF_CREDITS=1`）が無ければ HF を Free 在庫に数えない**。申告があっても whoami が「PRO でも支払い手段でもない」と言えば数えない（402 にしかならないため）。whoami が取れないときは申告を信じる（規約 21） |
+| **既定で一覧に出さない** | 一覧に 164 件並ぶのに 1 件も呼べない状態は「壊れている」と区別できない。明示指定しても 402（一覧が温まっていれば `_is_known_paid_model` で拒否） | `opt_in_env` を持つプロバイダは `PROVIDER_ORDER`（巡回順・一覧・自動選抜）に載せない。`hidden_providers()` で**理由と戻し方**を `freeagent_models` に出す（黙って消さない）。`FREEAGENT_PROVIDER_ORDER` に明示すれば切り分け用に載る |
+| **402 はアカウント単位** | 5 モデル試して 5 回 402。モデル単位のクールダウンだけでは候補の数だけ同じ 402 を繰り返す | `provider_credit.json` に**プロバイダ単位**で記憶（既定 15 分・`FREEAGENT_CREDIT_TTL`）。自動選抜とフォールバックから外し、通れば `clear_provider_credit` で戻す。認証失敗（`provider_auth.json`）とは分ける（402 はキーの問題ではない） |
+| **エラー封筒が OpenRouter 形式** | `{"error":{"message","type","param","code"}}`。提供元不一致は **400 `model_not_supported`**（以前の Cloudflare 1010 の 403 は再現せず）。`fireworks` は `fireworks-ai` に正規化 | `_auth_hint` に HF の 400 `model_not_supported` を追加し、`:提供元` を外す／`:fastest`・`:cheapest` を試す、**`:free` は提供元名として扱われる**旨を返す |
+| **HF と OpenRouter は同じ経路** | HF 164 件のうち **116 件が OpenRouter の `hugging_face_id` と一致**（残り 48 は FP8/NVFP4 などの量子化違い・日付違い） | `_model_identity` を `hub/<hub_id>` に統一し、同じ重みを「独立した 2 意見」に数えない（料金・許可の判定には使わない） |
+| **一覧のキーが増減** | `providers[]` に `first_token_latency_ms` / `throughput` / `uptime_last_day_percent` / `supports_tools` が増え、`pricing` と `context_length` が**任意**（context 無し 26 行）。`architecture.output_modalities` が全行に付く | 既存の `_context_length`（最大値・無ければ null）と `is_chat_model`（用途の目印が優先・宣言は B 群のみ）で吸収。実測差は 3 件（`aya-vision-32b` 等が chat 扱いに＝妥当） |
+
+**検証**: `tests/test_hf_openrouter_integration.py`（20 件）で判定・opt-in・非表示・identity・402 の単位・
+ヒント文を固定。`tests/test_freeagent_bind.py`（登録 18 社と `PROVIDER_ORDER` の差）と
+`tests/test_docs_provider_table.py`（表は登録済み全社と一致）を v0.53.0 の意味に更新。
+**全体**: unittest 1,442 件 OK（1 skip）／`check_integrity`（version=0.53.0）／`compileall`／
+`smoke_stdio` / `smoke_http` / `check_offline`。
 
 ## 12. 検証
 

@@ -30,10 +30,19 @@ def _render_models(data: dict) -> str:
         lines.append(f"  {mark} {row['provider']:11} {row['models']:4} モデル / Free {row['free']:3}{note}")
         if row.get("error"):
             lines.append(f"      到達不可: {row['error'][:100]}")
+    # **既定で一覧に出さない提供元**（opt-in）を沈黙させない。使いたい人の戻し方まで書く。
+    for row in data.get("hidden_providers") or []:
+        mark = "○" if row.get("ready") else "—"
+        lines.append(f"  {mark} {row['provider']:11} 既定は非表示 / {row.get('reason') or ''}"
+                     f"  [有効化: {row.get('opt_in_env')}=1]")
     head = (f"サブLLMバックエンド（{sum(1 for r in data.get('providers') or [] if r.get('ready'))} プロバイダ有効）\n"
             + "\n".join(lines))
     head += (f"\nFree候補 {data.get('free_candidates')} 件（うち今すぐ使用可 {data.get('usable_now')}）"
              f" / 全 {data.get('total_models')} モデル\n既定: {data.get('default_model')}")
+    blocked = data.get("credit_blocked") or {}
+    if blocked:
+        head += ("\nクレジット枯渇（402）で自動選抜から除外: " + ", ".join(sorted(blocked))
+                 + "（残高を足すか、通れば自動で戻ります）")
     non_chat = data.get("non_chat_candidates") or 0
     if non_chat:
         # 選抜から外した分を黙って消さない（「要約で無い」と「そもそも無い」を混同させない）。

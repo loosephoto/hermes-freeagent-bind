@@ -297,6 +297,114 @@ def provider_auth_blocked(provider: str) -> dict | None:
         return dict(entry)
 
 
+# ---------------------------------------------------------------- クレジット枯渇（402）
+# 402 は**アカウント全体**の状態（実測: HF は 164 件すべてが同じ「Purchase pre-paid credits」を返した）。
+# モデル単位のクールダウンだけだと候補の数だけ同じ 402 を繰り返すので、プロバイダ単位で覚える。
+# 認証失敗（provider_auth.json）とは**別ファイル**にする: 混ぜると「キーが悪い」と表示されて
+# 直し方を誤る（402 はキー/権限の問題ではない）。
+_CREDIT: dict[str, dict] = {}
+
+_CREDIT_LOADED = False
+
+_CREDIT_LOCK = threading.Lock()
+
+
+CREDIT_TTL_S = S._env_float("FREEAGENT_CREDIT_TTL", 900.0)
+
+
+def credit_path() -> str:
+    return os.environ.get("FREEAGENT_CREDIT_PATH") or os.path.join(S.state_dir(),
+                                                                  "provider_credit.json")
+
+
+def _credit_prune(entries: dict, now: float) -> dict:
+    return {p: e for p, e in entries.items()
+            if isinstance(e, dict) and S.as_float(e.get("until"), 0.0) > now}
+
+
+def _ensure_credit_loaded() -> None:
+    global _CREDIT_LOADED
+    if _CREDIT_LOADED:
+        return
+    with _CREDIT_LOCK:
+        if _CREDIT_LOADED:
+            return
+        data = S._load_json(credit_path(), {})
+        saved = data.get("providers") if isinstance(data, dict) else None
+        if isinstance(saved, dict):
+            _CREDIT.update(_credit_prune(saved, S.now_ts()))
+        _CREDIT_LOADED = True
+
+
+def _credit_save() -> bool:
+    """メモリの内容をファイルへ書く（他プロセスの項目と期限の長い方を残す）。"""
+    path = credit_path()
+    with S._file_lock(path):
+        with _CREDIT_LOCK:
+            now = S.now_ts()
+            data = S._load_json(path, {})
+            saved = data.get("providers") if isinstance(data, dict) else None
+            merged = dict(saved) if isinstance(saved, dict) else {}
+            for provider, entry in _CREDIT.items():
+                cur = merged.get(provider)
+                if cur is None or S.as_float(entry.get("until"), 0.0) >= S.as_float(cur.get("until"), 0.0):
+                    merged[provider] = entry
+            merged = _credit_prune(merged, now)
+            ok = S._atomic_write(path, S._dumps({"version": 1, "saved_at": now, "providers": merged}))
+            if ok:
+                _CREDIT.clear()
+                _CREDIT.update(merged)
+        return ok
+
+
+def note_provider_credit(provider: str, status: int = 402, detail: str = "") -> float:
+    """402（クレジット枯渇）を**プロバイダ単位**で覚え、期限を返す。既存の期限が長いときは伸ばさない。"""
+    if not provider:
+        return 0.0
+    _ensure_credit_loaded()
+    until = S.now_ts() + max(1.0, CREDIT_TTL_S)
+    with _CREDIT_LOCK:
+        cur = _CREDIT.get(provider)
+        if cur and S.as_float(cur.get("until"), 0.0) > until:
+            return S.as_float(cur.get("until"), 0.0)
+        _CREDIT[provider] = {"until": until, "status": int(status), "at": S.now_ts(),
+                             "detail": S.truncate(detail or "", 200)}
+    _credit_save()
+    return until
+
+
+def clear_provider_credit(provider: str) -> None:
+    """呼び出しが通ったら消す（チャージ直後に待たせ続けない）。"""
+    if not provider:
+        return
+    _ensure_credit_loaded()
+    path = credit_path()
+    with S._file_lock(path):
+        with _CREDIT_LOCK:
+            _CREDIT.pop(provider, None)
+            now = S.now_ts()
+            data = S._load_json(path, {})
+            saved = data.get("providers") if isinstance(data, dict) else None
+            merged = dict(saved) if isinstance(saved, dict) else {}
+            merged.pop(provider, None)          # ファイル側も消す（merge だけで書くと残る）
+            merged = _credit_prune(merged, now)
+            ok = S._atomic_write(path, S._dumps({"version": 1, "saved_at": now, "providers": merged}))
+            if ok:
+                _CREDIT.clear()
+                _CREDIT.update(merged)
+
+
+def provider_credit_blocked(provider: str) -> dict | None:
+    """クレジット枯渇の記憶が生きていればその内容を返す（自動選抜の除外判断に使う）。"""
+    _ensure_credit_loaded()
+    now = S.now_ts()
+    with _CREDIT_LOCK:
+        entry = _CREDIT.get(provider)
+        if not entry or S.as_float(entry.get("until"), 0.0) <= now:
+            return None
+        return dict(entry)
+
+
 EXPORTS = {
     "_COOLDOWN": _COOLDOWN,
     "_COOLDOWN_LOCK": _COOLDOWN_LOCK,
@@ -325,4 +433,14 @@ EXPORTS = {
     "note_provider_auth": note_provider_auth,
     "clear_provider_auth": clear_provider_auth,
     "provider_auth_blocked": provider_auth_blocked,
+    "_CREDIT": _CREDIT,
+    "_CREDIT_LOCK": _CREDIT_LOCK,
+    "CREDIT_TTL_S": CREDIT_TTL_S,
+    "credit_path": credit_path,
+    "_credit_prune": _credit_prune,
+    "_ensure_credit_loaded": _ensure_credit_loaded,
+    "_credit_save": _credit_save,
+    "note_provider_credit": note_provider_credit,
+    "clear_provider_credit": clear_provider_credit,
+    "provider_credit_blocked": provider_credit_blocked,
 }

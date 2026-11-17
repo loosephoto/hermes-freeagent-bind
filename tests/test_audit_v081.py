@@ -254,7 +254,7 @@ class TestModelsResponseShape(unittest.TestCase):
     """`freeagent_models` の返り値は**モードでキーを変えない**。"""
 
     def test_both_keys_are_always_present(self):
-        with mock.patch.object(S, "all_models", lambda ttl=600.0: []), \
+        with mock.patch.object(S, "all_models", lambda ttl=600.0, extra_providers=None: []), \
              mock.patch.object(S, "provider_status", lambda: []), \
              mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: ["a/b"]):
             searched = S.tool_models({"query": "x"})

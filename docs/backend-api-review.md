@@ -89,7 +89,7 @@ freeagent-bind の実装契約（AGENTS.md / SPEC.md）から、候補は次の�
 | nous | hermes proxy (127.0.0.1:8645/v1) | pricing | 資格情報を代理付与・キー不要 |
 | openrouter | openrouter.ai/api/v1 | pricing | `:free` SKU。一覧は未認証可 |
 | nvidia | integrate.api.nvidia.com/v1 | credit | 一覧に廃止・未有効が混在 → probe 必須 |
-| huggingface | router.huggingface.co/v1 | hf_providers | 提供元単位の free 判定 |
+| huggingface | router.huggingface.co/v1 | hf_credits | 2026-11-16 から中身は OpenRouter のルータ。`is_free` は全件 false・推論は全件 402（実測 2026-11-17）→ 既定 off（`FREEAGENT_HF_CREDITS=1` でクレジット枠） |
 | groq | api.groq.com/openai/v1 | allowlist | Free tier 確認必須 |
 | cloudflare | api.cloudflare.com/.../ai | allowlist | Workers Free 確認必須 |
 | gemini | generativelanguage.googleapis.com/v1beta/openai | allowlist | tier とデータ利用の二重確認 |

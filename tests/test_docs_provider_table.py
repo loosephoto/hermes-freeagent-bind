@@ -29,12 +29,13 @@ class TestKeyTable(unittest.TestCase):
         self.assertTrue(SECTION, "SPEC に §4.1.2（キーと確認変数）が無い")
 
     def test_every_provider_is_listed(self):
-        missing = [name for name in S.PROVIDER_ORDER if f"`{name}`" not in SECTION]
+        # opt-in のプロバイダ（HF）は巡回順に居ないが、**仕様表には載る**（登録はしている）。
+        missing = [name for name in S.PROVIDER_SPECS if f"`{name}`" not in SECTION]
         self.assertEqual(missing, [], f"SPEC §4.1.2 に無いプロバイダ: {missing}")
 
     def test_every_key_env_is_listed(self):
         missing = []
-        for name in S.PROVIDER_ORDER:
+        for name in S.PROVIDER_SPECS:
             key_env = (S.PROVIDER_SPECS.get(name) or {}).get("key_env")
             if key_env and key_env not in SECTION:
                 missing.append(f"{name}:{key_env}")
@@ -42,7 +43,7 @@ class TestKeyTable(unittest.TestCase):
 
     def test_every_required_flag_is_listed(self):
         missing = []
-        for name in S.PROVIDER_ORDER:
+        for name in S.PROVIDER_SPECS:
             spec = S.PROVIDER_SPECS.get(name) or {}
             for flag in list(spec.get("required_env_flags") or ()) + \
                     list(spec.get("required_env_values") or ()):
@@ -53,8 +54,10 @@ class TestKeyTable(unittest.TestCase):
     def test_table_row_count_matches_the_registry(self):
         rows = [ln for ln in SECTION.splitlines()
                 if re.match(r"^\|\s*`[a-z0-9]+`\s*\|", ln)]
-        self.assertEqual(len(rows), len(S.PROVIDER_ORDER),
-                         f"表の行 {len(rows)} 件 / 実装 {len(S.PROVIDER_ORDER)} 社")
+        # 表は**登録済みの全プロバイダ**（opt-in の HF を含む）を載せる。巡回順（`PROVIDER_ORDER`）は
+        # 既定で使う集合なので、opt-in を外すと表の方が 1 行多くなる（v0.53.0）。
+        self.assertEqual(len(rows), len(S.PROVIDER_SPECS),
+                         f"表の行 {len(rows)} 件 / 実装 {len(S.PROVIDER_SPECS)} 社")
 
 
 if __name__ == "__main__":

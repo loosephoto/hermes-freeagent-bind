@@ -95,7 +95,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.52.1"
+SERVER_VERSION = "0.53.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -199,6 +199,28 @@ PROACTIVE_INSTRUCTIONS = (
 PROVIDER_ORDER = [n.strip() for n in os.environ.get(
     "FREEAGENT_PROVIDER_ORDER", ",".join(_providers.NAMES)).split(",")
     if n.strip() in PROVIDER_SPECS] or ["nous"]
+
+# **opt-in プロバイダは既定で巡回順に載せない**（`FREEAGENT_HF_CREDITS=1` 等の申告があるときだけ）。
+# 2026-11-16 に HF のチャット推論は OpenRouter のルータへ置き換わり、無料の提供元が 0 件になった
+# （実測: 164 件すべて `is_free=false`・推論は全件 402）。一覧と自動選抜に出し続けると
+# 「使えるように見えて必ず 402」になるので、既定は非表示にし、申告で在庫へ戻す（§4.1）。
+# `FREEAGENT_PROVIDER_ORDER` で名前を明示した場合は、その指定を優先して載せる（切り分け用）。
+_explicit_provider_order = [n.strip() for n in os.environ.get(
+    "FREEAGENT_PROVIDER_ORDER", "").split(",") if n.strip()]
+
+
+def _provider_listed(name: str) -> bool:
+    """その提供元を既定の巡回順（一覧・自動選抜）に載せるか。opt-in は申告があるときだけ載せる。"""
+    spec = PROVIDER_SPECS.get(name) or {}
+    opt_in = spec.get("opt_in_env")
+    if not opt_in:
+        return True
+    if name in _explicit_provider_order:
+        return True
+    return _env_on(opt_in, False)
+
+
+PROVIDER_ORDER = [name for name in PROVIDER_ORDER if _provider_listed(name)] or ["nous"]
 
 # 知識バックエンドの識別用 User-Agent。MediaWiki / OpenAlex / Crossref は連絡先入りの UA を求める。
 KB_USER_AGENT = os.environ.get(
@@ -1098,7 +1120,9 @@ TOOLS: list[dict] = [
             "品質統計やクールダウンを確認したいとき。"
             "【差分】`query`（ID の部分一致）と `provider`（" + " / ".join(PROVIDER_ORDER)
             + "）で絞り込む。"
-            "返る `ref` は他ツールの `models` 引数にそのまま渡せる（HF は `:提供元` を付けて経路を固定できる）。"
+            "返る `ref` は他ツールの `models` 引数にそのまま渡せる（HF は `:提供元` / `:fastest` / "
+            "`:cheapest` で経路を選べる。HF は 2026-11-16 から OpenRouter のルータ経由・Free の在庫 0 件"
+            "なので既定では一覧に出ない（`FREEAGENT_HF_CREDITS=1` で在庫に戻る・前払い/PRO クレジットが必要））。"
             "`Free候補` は**サブLLM に使えるモデルだけ**（埋め込み・分類器・画像/音声生成は自動選抜から外す。"
             "件数は `non_chat_candidates`）。"
             "**`free_candidates` は在庫・`usable_now` はクールダウンと直近 404/410 を除いた数**で、"

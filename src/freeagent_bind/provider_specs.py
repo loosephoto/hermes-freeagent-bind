@@ -13,6 +13,7 @@ import ssl
 import subprocess
 import threading
 import urllib
+import urllib.request
 
 from . import server as S  # noqa: E402
 
@@ -141,8 +142,15 @@ def provider_http(path: str, provider: str = "nous", payload: dict | None = None
 
 
 def _is_hf(provider: str) -> bool:
-    """HF（Inference Providers router）か。料金と文脈長が**提供元ごと**という違いを 1 か所で判定する。"""
-    return (S.PROVIDER_SPECS.get(provider) or {}).get("free_kind") == "hf_providers"
+    """HF（Inference Providers router）か。料金と文脈長が**提供元ごと**という違いを 1 か所で判定する。
+
+    2026-11-16 に HF のルータの中身が OpenRouter になったため分類名を `hf_providers` から
+    `hf_credits` へ変えた。**分類名に依存させず** `hf_router` の印を第一に見る（旧名も受ける）。
+    """
+    spec = S.PROVIDER_SPECS.get(provider) or {}
+    if spec.get("hf_router"):
+        return True
+    return spec.get("free_kind") in ("hf_providers", "hf_credits")
 
 
 def _free_providers(row: dict) -> list[str]:
@@ -170,6 +178,77 @@ def _free_providers(row: dict) -> list[str]:
     return out
 
 
+_HF_ACCOUNT: dict = {}          # `/api/whoami-v2` の結果（プロセス内キャッシュ）
+_HF_ACCOUNT_LOCK = threading.Lock()
+_HF_WHOAMI_TTL_S = S._env_float("FREEAGENT_HF_WHOAMI_TTL", 900.0)
+_HF_WHOAMI_URL = os.environ.get("FREEAGENT_HF_WHOAMI_URL", "https://huggingface.co/api/whoami-v2")
+
+
+def hf_credits_enabled() -> bool:
+    """`FREEAGENT_HF_CREDITS=1` の申告（利用者がクレジット消費を了承した印）。
+
+    既定は無効。実測（2026-11-17）では HF の一覧に Free の提供元が 1 件も無く、推論は全件 402
+    だったので、**申告が無い限り HF を Free 在庫に数えない**（誤って有料を呼ばない）。
+    """
+    return S._env_on("FREEAGENT_HF_CREDITS", False)
+
+
+def hf_account_state(refresh: bool = False) -> dict:
+    """`/api/whoami-v2` で HF アカウントの課金状態を読む（キャッシュ・失敗しても例外にしない）。
+
+    実測（2026-11-17）: `{"isPro": false, "canPay": false, "billingMode": "prepaid", "periodEnd": …}`。
+    クレジット残高を返す API は無い（`/v1/credits` / `/v1/usage` / `/v1/key` はいずれも 404）ので、
+    **加入（isPro）と支払い手段（canPay）の有無だけ**が分かる。取得は best-effort（短い期限・無音）。
+    """
+    spec = S.PROVIDER_SPECS.get("huggingface") or {}
+    key = S.as_str(spec.get("key"))
+    with _HF_ACCOUNT_LOCK:
+        hit = dict(_HF_ACCOUNT) if _HF_ACCOUNT else {}
+    if hit and not refresh and S.now_ts() - S.as_float(hit.get("at"), 0.0) < _HF_WHOAMI_TTL_S:
+        return hit
+    if not key:
+        return {"checked": False, "at": S.now_ts(), "error": "HF_TOKEN 未設定"}
+    state: dict = {"checked": False, "at": S.now_ts()}
+    try:
+        req = urllib.request.Request(_HF_WHOAMI_URL, headers={
+            "Authorization": f"Bearer {key}", "Accept": "application/json"})
+        with S._urlopen(req, timeout=min(8.0, S.READ_TIMEOUT)) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        if isinstance(data, dict):
+            state.update({
+                "checked": True,
+                "is_pro": data.get("isPro") is True,
+                "can_pay": data.get("canPay") is True,
+                "plan": S.as_str(data.get("plan")) or ("pro" if data.get("isPro") is True else ""),
+                "billing_mode": S.as_str(data.get("billingMode")),
+                "period_end": data.get("periodEnd"),
+            })
+    except Exception as exc:              # 規約 21: 環境障害で設定を無効化しない（申告だけを信じる）
+        state["error"] = f"{type(exc).__name__}: {S.truncate(str(exc), 120)}"
+    with _HF_ACCOUNT_LOCK:
+        _HF_ACCOUNT.clear()
+        _HF_ACCOUNT.update(state)
+    return dict(state)
+
+
+def hf_credits_active() -> bool:
+    """HF をクレジット枠として在庫に数えてよいか（申告 + 課金手段の確認）。
+
+    (a) `FREEAGENT_HF_CREDITS=1` が前提。(b) whoami が取れて **isPro も canPay も false** なら
+    課金手段が無く 402 にしかならないので数えない（実測: このホストのアカウント）。whoami が
+    取れないときは申告だけを信じる（規約 21: 不通で利用者の設定を無効化しない）。
+    """
+    if not hf_credits_enabled():
+        return False
+    spec = S.PROVIDER_SPECS.get("huggingface") or {}
+    if not S.as_str(spec.get("key")):
+        return False                       # トークンが無ければ何も呼べない（在庫にも数えない）
+    state = S.hf_account_state()
+    if state.get("checked") and not (state.get("is_pro") or state.get("can_pay")):
+        return False
+    return True
+
+
 def _is_free(provider: str, row: dict) -> bool:
     """Free 判定。NIM は「無料クレジット枠」なので全モデルが対象、HF は提供元単位、他は pricing が 0。"""
     kind = (S.PROVIDER_SPECS.get(provider) or {}).get("free_kind")
@@ -178,7 +257,9 @@ def _is_free(provider: str, row: dict) -> bool:
     if kind == "allowlist":
         return S.provider_model_allowed(provider, S.as_str(row.get("id")))
     if _is_hf(provider):
-        return bool(_free_providers(row))
+        # 2026-11 以降 `is_free` は全件 false（HF の課金は OpenRouter 経由に一本化）。提供元の Free が
+        # 戻れば従来どおり拾い、無いときはクレジット枠の申告があるときだけ Free と数える（§4.1）。
+        return bool(_free_providers(row)) or S.hf_credits_active()
     if str(row.get("id") or "").endswith(":free"):
         return True
     pricing = row.get("pricing")
@@ -220,6 +301,13 @@ EXPORTS = {
     "provider_http": provider_http,
     "_is_hf": _is_hf,
     "_free_providers": _free_providers,
+    "_HF_ACCOUNT": _HF_ACCOUNT,
+    "_HF_ACCOUNT_LOCK": _HF_ACCOUNT_LOCK,
+    "_HF_WHOAMI_TTL_S": _HF_WHOAMI_TTL_S,
+    "_HF_WHOAMI_URL": _HF_WHOAMI_URL,
+    "hf_credits_enabled": hf_credits_enabled,
+    "hf_account_state": hf_account_state,
+    "hf_credits_active": hf_credits_active,
     "_is_free": _is_free,
     "_context_length": _context_length,
 }

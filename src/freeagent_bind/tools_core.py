@@ -377,7 +377,9 @@ def tool_models(args: dict) -> dict:
     `query` / `provider` を付けると、その条件に合うモデルを（Free かどうか付きで）返す。引数なしなら
     プロバイダの要約と Free モデル一覧を返す。`probe=true` なら候補を実際に 1 回ずつ呼び、
     **一覧に載っているが呼べないモデル**（廃止 410 / アカウント未有効 404 など）を除外する。
-    ここで得た `provider/model`（HF は `:提供元` を付けられる）は他ツールの `models` 引数に渡せる。
+    ここで得た `provider/model`（HF は `:提供元` / `:fastest` / `:cheapest` を付けられる）は他ツールの
+    `models` 引数に渡せる。HF は 2026-11-16 から中身が OpenRouter のルータで Free の在庫が 0 件のため、
+    既定では一覧に出ない（`hidden_providers` に戻し方つきで出る）。
     """
     status = S.provider_status()
     free = S.free_model_refs(chat_only=True)          # サブLLM に使える Free だけ（§3.2）
@@ -408,9 +410,18 @@ def tool_models(args: dict) -> dict:
     query = S.as_str(args.get("query")) or S.as_str(args.get("q"))
     provider_filter = S.as_str(args.get("provider"))
     limit = S.as_int(args.get("limit"), 40, 1, 200)
+    # **既定で巡回順に載せないプロバイダ**（opt-in）を黙って消さない。理由と戻し方（env）を返す。
+    hidden = S.hidden_providers()
+    credit_blocked = {}
+    for _name in S.PROVIDER_ORDER:
+        _entry = S.provider_credit_blocked(_name)
+        if _entry:
+            credit_blocked[_name] = _entry
     shown: list[dict] = []          # 検索モードで絞り込んだ一覧（非検索モードでは空）
     data = {
         "providers": status,
+        "hidden_providers": hidden,
+        "credit_blocked": credit_blocked,
         "total_models": sum(row["models"] for row in status),
         "free_candidates": len(free),
         "non_chat_candidates": sum(row.get("non_chat", 0) for row in status),
@@ -434,7 +445,8 @@ def tool_models(args: dict) -> dict:
     # probe は実際にモデルを呼ぶため、free_only 省略時でも有料モデルは対象にしない。
     free_only = S.as_flag(args.get("free_only")) or bool(args.get("probe"))
     if searching:
-        rows = S.all_models()
+        # 明示指定されたプロバイダは巡回順に無くても在庫を見る（HF は既定で巡回順に居ない）。
+        rows = S.all_models(extra_providers=[provider_filter] if provider_filter else None)
         needle = query.lower()
         matched = [r for r in rows
                    if (not provider_filter or r.get("provider") == provider_filter)

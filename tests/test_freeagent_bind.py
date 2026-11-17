@@ -1141,14 +1141,32 @@ class TestMultiProvider(unittest.TestCase):
 
     def test_registry_has_eighteen_providers(self):
         # v0.12.0 で 6 社追加（cerebras / sambanova / novita / siliconflow / longcat / opencode）。
+        # v0.53.0: HF は 2026-11-16 の OpenRouter 統合で Free の在庫が 0 件になったため、**登録は残すが
+        # 既定の巡回順（一覧・自動選抜）には載せない**（`FREEAGENT_HF_CREDITS=1` で戻る）。
         expected = ("nous", "openrouter", "nvidia", "huggingface", "groq", "cloudflare", "gemini",
                     "vercel", "ollama", "zai", "mistral", "modelscope",
                     "cerebras", "sambanova", "novita", "siliconflow", "longcat", "opencode")
         for name in expected:
             self.assertIn(name, S.PROVIDER_SPECS)
-            self.assertIn(name, S.PROVIDER_ORDER, "PROVIDER_ORDER に無いと一覧に出ない")
+        listed = tuple(name for name in expected if name != "huggingface")
+        self.assertEqual(tuple(S.PROVIDER_ORDER), listed)
         self.assertEqual(len(S.PROVIDER_SPECS), len(expected))
         self.assertEqual(S.PROVIDER_ORDER[0], "nous")
+
+    def test_opt_in_provider_is_hidden_but_reachable(self):
+        """opt-in のプロバイダは既定で一覧に出ない。申告（または明示順）で戻る。"""
+        spec = S.PROVIDER_SPECS["huggingface"]
+        self.assertEqual(spec.get("opt_in_env"), "FREEAGENT_HF_CREDITS")
+        self.assertEqual(spec.get("free_kind"), "hf_credits")
+        self.assertNotIn("huggingface", S.PROVIDER_ORDER)
+        hidden = [row["provider"] for row in S.hidden_providers()]
+        self.assertIn("huggingface", hidden)
+        with unittest.mock.patch.dict(os.environ, {"FREEAGENT_HF_CREDITS": "1"}):
+            self.assertTrue(S._provider_listed("huggingface"))
+        with unittest.mock.patch.object(S, "_explicit_provider_order", ["huggingface"]):
+            self.assertTrue(S._provider_listed("huggingface"))
+        with unittest.mock.patch.dict(os.environ, {"FREEAGENT_HF_CREDITS": "0"}):
+            self.assertFalse(S._provider_listed("huggingface"))
 
     def test_hf_free_detection(self):
         """HF はモデルではなく**提供元**に料金が付く（実測: providers[].is_free / pricing）。"""
@@ -1193,7 +1211,7 @@ class TestMultiProvider(unittest.TestCase):
             {"id": "Qwen/Qwen-c", "provider": "huggingface", "free": True, "free_via": ["novita"]},
             {"id": "meta/llama", "provider": "nvidia", "free": True, "free_via": []},
         ]
-        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
+        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0, extra_providers=None: list(rows)), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
              unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []), \
              unittest.mock.patch.object(S, "provider_ready", lambda p: True):
@@ -1317,7 +1335,7 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
             {"id": "paid-a", "provider": "openrouter", "free": False},
             {"id": "free-b", "provider": "openrouter", "free": True},
         ]
-        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
+        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0, extra_providers=None: list(rows)), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
              unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []):
             got = S.tool_models({"provider": "openrouter", "all": True, "free_only": True})
@@ -1350,7 +1368,7 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
                      "openrouter/alive-1": {"text": "2", "served_by": "openrouter/alive-1"}}
             return table[ref.split(":", 1)[0]]
 
-        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
+        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0, extra_providers=None: list(rows)), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
              unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []), \
              unittest.mock.patch.object(S, "call_model", fake_call):
@@ -1386,7 +1404,7 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
             return {"error": 'HTTP 403（huggingface）: 403 Forbidden / 応答: {"type":"https://developers.'
                              'cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/"}'}
 
-        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
+        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0, extra_providers=None: list(rows)), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
              unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []), \
              unittest.mock.patch.object(S, "call_model", fake_call):
@@ -1428,7 +1446,7 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
         self.assertFalse(plain.startswith("⚠️"))
 
     def test_models_probe_off_by_default(self):
-        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: []), \
+        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0, extra_providers=None: []), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
              unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []), \
              unittest.mock.patch.object(S, "call_model",
@@ -1442,7 +1460,7 @@ class TestProbeSelectionAndAuthMemory(unittest.TestCase):
         実測: 以前は検索時だけ `free_models` が無く、引数なしだと `models` が無かった。
         利用側がモードで別のキーを読むと詰まるので、**常に両方**を返す。
         """
-        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0: []), \
+        with unittest.mock.patch.object(S, "all_models", lambda ttl=600.0, extra_providers=None: []), \
              unittest.mock.patch.object(S, "provider_status", lambda: []), \
              unittest.mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: ["a/b"]):
             searched = S.tool_models({"query": "x"})

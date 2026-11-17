@@ -6,7 +6,7 @@
 論文・百科事典・GitHub を調べたりします。**最終的な判断はメイン LLM が行います。**
 
 - Python 3.11 以上。サーバーの実行に追加ライブラリは不要です。
-- 13 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社）、検索は **30 ソース（既定 6 ＋ 明示指定 24）** に対応します。
+- 13 個のツール。推論は **18 プロバイダ**（Nous / OpenRouter / NVIDIA NIM / Hugging Face / Groq / Cloudflare Workers AI / Gemini API / Vercel AI Gateway / Ollama Cloud / Z.ai（GLM）/ Mistral / ModelScope ＋ 無料枠の確認が必要な 6 社／**Hugging Face は既定 off**）、検索は **30 ソース（既定 6 ＋ 明示指定 24）** に対応します。
 - Free と判定されたモデル・無料クレジット枠を利用します。**無制限無料ではなく、提供元の利用枠・権限・契約条件が適用されます。**
 
 **対象分野は科学（物理・数学・計算機）とプログラミングです。医学・生物学は対象外です。**
@@ -294,7 +294,7 @@ freeagent_think で、この設計案を手順に分解してから検討して�
 
 モデルを固定したい場合は、`freeagent_models` が返す `ref`（`provider/model`）を使います。
 `ask` / `map` は単数の `model`、`panel` などは配列の `models` です。
-HF はモデル ID の末尾に `:提供元` を付けて経路を固定できます。
+HF はモデル ID の末尾に `:提供元` / `:fastest` / `:cheapest` を付けて経路を選べます（`:free` は提供元名として扱われます）。
 
 ### 🧪 「仕様どおりか」と「品質」を分けて査読する（2 段）
 
@@ -729,8 +729,8 @@ Hugging Face の同じモデルは、提供元サフィックスの有無や違�
 | 検索はできるが相談だけ失敗する | 推論の接続問題です。キー未設定なら設定。Nous を使うなら `hermes proxy start` |
 | `nous` が `WinError 10061` | ローカルプロキシが停止しています。他プロバイダが使えるなら全体は止まりません |
 | `401`、認証を示す `403` | キー・トークン権限を確認。HF では **Make calls to Inference Providers** が必要。変更後は再起動 |
-| HF の一部だけ `403` / Cloudflare 1010 | キーではなく提供元・CDN の拒否かもしれません。`model:提供元` で別経路を試す |
-| HF が `402` | 月次クレジット枯渇。連続再試行せず別プロバイダへ。キーを変えるだけでは直りません |
+| HF の一部だけ `400 model_not_supported` | その提供元はこのモデルを配信していません（HF の設定で提供元を切っている場合もあります）。`:提供元` を外すか `:fastest` / `:cheapest` を試す |
+| HF が `402` | HF アカウントの推論クレジットが 0（キーや権限の問題ではありません）。PRO の月次クレジットか前払いクレジットが必要で、`FREEAGENT_HF_CREDITS=1` だけでは直りません |
 | NVIDIA が `404` / `410` | 未有効・廃止など。一覧の件数を信用せず、少数を `probe=true` で確認 |
 | `429` / クールダウン | 枠や頻度の制限。待つ、`size`・並列度を減らす、別モデルへ。プローブの連打は避ける |
 | 10 秒で `TimeoutError` | 接続（TCP / TLS）が上限に届かなかった場合です。生成が長いだけなら、ヘッダ待ちは読み取り上限まで待てます。下の説明を参照 |
@@ -1208,7 +1208,7 @@ FREEAGENT_QIITA_TOKEN=
 | **Nous**（キー不要） | `hermes proxy start` で起動するローカルプロキシ | `hermes portal` でログイン。Portal の利用枠が必要。プロキシ停止中はこのプロバイダだけ使えません |
 | **OpenRouter** | `OPENROUTER_API_KEY` | [API Keys](https://openrouter.ai/settings/keys)。`:free` モデルでもキーは必須。レート制限・モデル単位の拒否があります |
 | **NVIDIA NIM** | `NVIDIA_API_KEY` | [NVIDIA Build](https://build.nvidia.com)。一覧に未有効・廃止モデルが混じるため生存確認を推奨 |
-| **Hugging Face** | `HF_TOKEN` | [Access Tokens](https://huggingface.co/settings/tokens)。**Make calls to Inference Providers** 権限と月次クレジット残が必要 |
+| **Hugging Face** | `HF_TOKEN`（＋使うなら `FREEAGENT_HF_CREDITS=1`） | [Access Tokens](https://huggingface.co/settings/tokens)。**Make calls to Inference Providers** 権限が必要。2026-11-16 に中身が OpenRouter のルータへ置き換わり、**Free の在庫は 0 件・課金は HF アカウント**（PRO 月 $2 か前払いクレジット）。そのため既定では一覧に出ません（下の「Hugging Face が既定で出ない理由」） |
 
 <details>
 <summary>追加の14プロバイダ：無料プラン・無料枠の確認が必要な接続先</summary>
@@ -1237,6 +1237,26 @@ API キーに加えて、契約プランやデータの扱いを確認したこ�
 - Z.ai は**提供元の一覧 API が Free の ID を返さない**ため（実測: 有料の旗艦だけ 11 件）、公表された Free の ID を在庫として補います（許可リスト方式 + `synthesize_free_ids`）。他の許可リスト方式（Groq / Cloudflare / Gemini / Vercel）は一覧が ID を返すので補いません。Mistral / ModelScope は Free 判定を API が返さないのでクレジット枠＋プラン確認で扱い、対象は `probe` で確認します。
 - Ollama は無料対象の範囲が非公開でAPIから判定できないため許可リストを作らず、クレジット枠として扱います。**対象外のモデルは提供元が 402 を返し**、フォールバックします（モデルの失敗としては記録しません）。Vercel も同様に、無料対象はカタログのごく一部です。Free枠・モデルの提供条件は変更されるため、最新の提供元ページも確認してください。
 </details>
+
+#### Hugging Face が既定で出ない理由（v0.53.0）
+
+2026-11-16 に **HF のチャット推論ルータは OpenRouter のものへ置き換わりました**（URL・トークンはそのまま・課金は HF アカウント・HF の手数料なし・**独自のプロバイダキーは使えません**）。実測（2026-11-17）:
+
+| 項目 | 実測値 |
+|---|---|
+| `/v1/models` | 164 件（38 ラボ）。`providers[].is_free` は**全件 false**・価格 0 の提供元も 0 件 |
+| 推論 | 全件 `402`「Purchase pre-paid credits」。`/api/whoami-v2` は `isPro=false / canPay=false / billingMode=prepaid` |
+| モデル ID の接尾辞 | `:提供元` / `:fastest` / `:cheapest` が使える。**`:free` は提供元名として扱われ 400** |
+| OpenRouter 側 | 470 モデル・`:free` 14 件。HF と同じモデルは `hugging_face_id` で対応づく（HF の 164 件のうち 116 件） |
+
+このサーバーは「Free と判定したモデルだけを使う」契約なので、**Free の在庫が 0 件の HF は既定で一覧・自動選抜に出しません**（`freeagent_models` には「既定は非表示」と戻し方つきで出ます）。使う場合だけ:
+
+```bash
+# PRO の月次クレジット / 前払いクレジットで使う（課金は HF アカウント）
+FREEAGENT_HF_CREDITS=1
+```
+
+`/api/whoami-v2` が「PRO でも支払い手段でもない」と答えた場合は、申告しても在庫に載せません（必ず 402 になるため）。**HF と OpenRouter は同じルータなので、同じモデルを 2 つの独立した意見として数えません**（`hub/<モデルID>` で同一視）。
 
 全プロバイダ未設定でも、知識検索と思考ノート（サブを呼ばない範囲）は使えます。
 
@@ -2037,8 +2057,11 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_ROUTING_LONG_CHARS` | 6000 | この文字数以上の入力を `long` 層とみなす（200〜200000） |
 | `FREEAGENT_ROUTING_LIGHT_MAX_TOKENS` | 400 | `map` / `ask` でこの `max_tokens` 以下なら `light` 層（16〜4000） |
 | `FREEAGENT_ROUTING_LIGHT_MIN_QUALITY` | 0.5 | `light` 層で先頭に置く最低品質（これを割ったモデルは速くても後ろ） |
-| `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,huggingface,groq,cloudflare,gemini,vercel,ollama,zai,mistral,modelscope,cerebras,sambanova,novita,siliconflow,longcat,opencode` | 一覧に出すプロバイダと優先順。**末尾の 6 社は v0.12.0 の追加分**（オプション）。確認変数が無い間は通信しない |
+| `FREEAGENT_PROVIDER_ORDER` | `nous,openrouter,nvidia,groq,cloudflare,gemini,vercel,ollama,zai,mistral,modelscope,cerebras,sambanova,novita,siliconflow,longcat,opencode`（`huggingface` は既定 off・明示すれば載る） | 一覧に出すプロバイダと優先順。**末尾の 6 社は v0.12.0 の追加分**（オプション）。確認変数が無い間は通信しない |
 | `FREEAGENT_AUTH_TTL` | 900 | 認証失敗を覚えて自動選抜から外す時間（秒） |
+| `FREEAGENT_CREDIT_TTL` | 900 | クレジット枯渇（402）を**プロバイダ単位**で覚えて自動選抜・フォールバックから外す時間（秒）。通れば即解除 |
+| `FREEAGENT_HF_CREDITS` | 空 | HF を「PRO 月次クレジット枠」として在庫に載せる申告（実測では Free の在庫 0 件・全件 402 のため既定 off。`/api/whoami-v2` が `isPro=false` かつ `canPay=false` なら申告しても載せない） |
+| `FREEAGENT_HF_WHOAMI_TTL` | 900 | `/api/whoami-v2`（PRO・支払い手段の確認）のキャッシュ秒数 |
 | `FREEAGENT_PROBE_TIMEOUT` | 25.0 | 生存確認 1 件の読み取りタイムアウト（秒） |
 | `FREEAGENT_PROBE_WORKERS` | 8 | 生存確認の並列度（1〜8） |
 | `FREEAGENT_SESSIONS` | 1 | 相談セッションを永続化する |
@@ -2163,6 +2186,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 |---|---|
 | `FREEAGENT_COOLDOWN_PATH` | `cooldowns.json`（404/410 は 1 時間、429 は `Retry-After`） |
 | `FREEAGENT_AUTH_PATH` | `provider_auth.json`（プロバイダ単位の認証失敗・`FREEAGENT_AUTH_TTL` 秒） |
+| `FREEAGENT_CREDIT_PATH` | `provider_credit.json`（プロバイダ単位のクレジット枯渇・`FREEAGENT_CREDIT_TTL` 秒） |
 | `FREEAGENT_STATS_PATH` | `model_stats.json`（品質統計） |
 | `FREEAGENT_TRACE_PATH` | `traces.jsonl`（トレース） |
 | `FREEAGENT_SESSIONS_PATH` | `sessions.json`（相談セッション） |

@@ -187,10 +187,23 @@ def env_excluded_models() -> list[str]:
 
 
 def _model_identity(ref: str) -> str:
-    """Identity for independent opinions, not for catalog pricing or authorization."""
+    """Identity for independent opinions, not for catalog pricing or authorization.
+
+    HF は `model:提供元` / `model:fastest` / `model:cheapest` のサフィックスを落として同一視する
+    （従来の規則）。加えて **2026-11-16 以降 HF のチャット推論は OpenRouter のルータそのもの**なので、
+    OpenRouter の `hugging_face_id` が同じモデル（実測 164 件中 116 件）も同じ identity にする
+    （`hub/<hub_id>`）。同じ重みを別プロバイダとして 2 票に数えないため。価格・許可の判定には
+    この identity を使わない（そちらは完全一致で別扱い — 規約 19・§3.2）。
+    """
     provider, model = S.split_ref(ref)
+    base = model
     if S._is_hf(provider) and ":" in model:
-        return S.make_ref(provider, model.rsplit(":", 1)[0])
+        base = model.rsplit(":", 1)[0]
+    hub = S.hf_identity(provider, base) if provider else ""
+    if hub:
+        return f"hub/{hub}"
+    if base != model:
+        return S.make_ref(provider, base)
     return ref
 
 
@@ -262,12 +275,20 @@ def select_models(size: int, requested: list[str] | None = None, *,
         cooling = S.cooling_refs()
         # **認証で駄目だったプロバイダを自動選抜から外す**（実測: HF の権限不足で 3 体が空振りし、
         # 代替へ回る分だけ遅くなる）。明示 `requested` は上の add() で既に入っているので影響しない。
-        auth_blocked = {p: S.provider_auth_blocked(p) for p in S.PROVIDER_ORDER}
+        # 登録済みの全プロバイダで見る（opt-in で巡回順に居ない HF も、明示指定やフォールバック先に出る）。
+        auth_blocked = {p: S.provider_auth_blocked(p) for p in S.PROVIDER_SPECS}
         blocked = {p for p, e in auth_blocked.items() if e}
         if blocked:
             pool = [r for r in pool if r.split("/", 1)[0] not in blocked]
             notes.append("認証で失敗中のため自動選抜から除外: " + ", ".join(sorted(blocked))
                          + "（明示指定すれば試します。キー/権限を直せば数分で戻ります）")
+        # **クレジット枯渇はアカウント単位**（実測: HF は全 164 件が同じ 402 を返した）。モデル単位で
+        # 休ませるだけでは候補の数だけ同じ 402 を繰り返すので、プロバイダ単位で一定時間外す。
+        credit_blocked = {p for p in S.PROVIDER_SPECS if S.provider_credit_blocked(p)}
+        if credit_blocked:
+            pool = [r for r in pool if r.split("/", 1)[0] not in credit_blocked]
+            notes.append("クレジット枯渇（402）で自動選抜から除外: " + ", ".join(sorted(credit_blocked))
+                         + "（チャージ後に自動で戻ります）")
         # **直近 404/410（gone）は自動選抜から外す**（v0.50.0・issue #12）。廃止済みが既定に選ばれると
         # `model` 省略の ask が 404 で落ち、同じ失敗が続くとクライアント側がサーバーを一時停止する。
         # 在庫（一覧）からは消さない（`freeagent_models` が理由つきで返す）。

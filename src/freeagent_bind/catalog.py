@@ -157,6 +157,9 @@ def _fetch_provider_catalog(provider: str, spec: dict) -> list[dict]:
                 "context_length": S._context_length(provider, raw),
                 "pricing": raw.get("pricing") or {},
                 "access": raw.get("access"),
+                # OpenRouter は配信元の Hub モデル ID を返す（実測 470 件中 188 件が非空）。HF の一覧と
+                # 同じモデルを指すので、独立意見の同一性判定（`hf_identity`）に使う。
+                "hf_id": S.as_str(raw.get("hugging_face_id")),
             })
         rows = _with_allowlisted_rows(provider, spec, rows)
     except Exception as exc:
@@ -344,14 +347,79 @@ def is_chat_model(provider: str, raw: dict) -> bool:
     return not _NON_CHAT_OUTPUT_RE.search(model_id)
 
 
-def all_models(ttl: float = CATALOG_TTL) -> list[dict]:
-    """全プロバイダの一覧。**プロバイダごとに並列に取り、全体の締め切りで打ち切る**（§3.3）。"""
-    S._catalog_prefetch(list(S.PROVIDER_ORDER), ttl)
+def all_models(ttl: float = CATALOG_TTL, extra_providers: list[str] | None = None) -> list[dict]:
+    """全プロバイダの一覧。**プロバイダごとに並列に取り、全体の締め切りで打ち切る**（§3.3）。
+
+    `extra_providers` は既定の巡回順に無いプロバイダ（opt-in の HF など）を**明示指定時だけ**
+    足すためのもの。`freeagent_models(provider="huggingface")` の検索が在庫を返せるようにする。
+    """
+    order = list(S.PROVIDER_ORDER)
+    for name in extra_providers or ():
+        if name in S.PROVIDER_SPECS and name not in order:
+            order.append(name)
+    S._catalog_prefetch(order, ttl)
     out: list[dict] = []
-    for provider in S.PROVIDER_ORDER:
+    for provider in order:
         rows = S._models_memory(provider, ttl)
         out.extend(rows if rows is not None else _catalog_stale_rows(provider))
     return out
+
+
+def hidden_providers() -> list[dict]:
+    """既定で巡回順に載せない（opt-in）プロバイダの要約。**黙って消さず**理由と戻し方を返す。"""
+    out: list[dict] = []
+    for name, spec in S.PROVIDER_SPECS.items():
+        env_name = spec.get("opt_in_env")
+        if not env_name or name in S.PROVIDER_ORDER:
+            continue
+        out.append({
+            "provider": name,
+            "ready": S.provider_ready(name),
+            "opt_in_env": env_name,
+            "free_kind": spec.get("free_kind"),
+            "reason": "Free の在庫が無いため既定では一覧・自動選抜に出しません",
+            "note": spec.get("note"),
+        })
+    return out
+
+
+_HF_ID_CACHE: dict = {"key": None, "map": {}}
+
+
+def _hf_id_index() -> dict[str, str]:
+    """OpenRouter の `hugging_face_id` から「Hub 上の同じモデル」の索引を作る（一覧が替わったら作り直す）。"""
+    with S._MODELS_LOCK:
+        rows = list((S._MODELS_CACHE.get("openrouter") or {}).get("rows") or [])
+    key = (id(rows), len(rows))
+    if _HF_ID_CACHE.get("key") == key and _HF_ID_CACHE.get("map"):
+        return _HF_ID_CACHE["map"]
+    index: dict[str, str] = {}
+    for row in rows:
+        hub = S.as_str(row.get("hf_id"))
+        model = S.as_str(row.get("id"))
+        if hub and model:
+            index[model.casefold()] = hub.casefold()
+    _HF_ID_CACHE["key"] = key
+    _HF_ID_CACHE["map"] = index
+    return index
+
+
+def hf_identity(provider: str, model: str) -> str:
+    """同じ重みを配信している別プロバイダを同一視するための identity（無ければ空文字）。
+
+    2026-11-16 以降 HF のチャット推論は OpenRouter のルータが担うので、`huggingface/LiquidAI/LFM3-1.7B`
+    と `openrouter/liquid/lfm-3-1.7b:free` は**同じモデル・同じ経路**になり得る。独立した 2 意見として
+    数えないために共通の identity を返す。実測（2026-11-17）: HF の一覧 164 件のうち 116 件が
+    OpenRouter の `hugging_face_id` と一致した。**価格・認可の判定には使わない**（独立性のためだけ）。
+    """
+    name = S.as_str(model)
+    if not name:
+        return ""
+    if S._is_hf(provider):
+        return name.casefold()
+    if provider != "openrouter":
+        return ""
+    return _hf_id_index().get(name.casefold(), "")
 
 
 def provider_status() -> list[dict]:
@@ -367,6 +435,8 @@ def provider_status() -> list[dict]:
         rows.append({
             "provider": provider,
             "ready": S.provider_ready(provider),
+            "free_kind": spec.get("free_kind"),
+            "opt_in_env": spec.get("opt_in_env"),
             "models": len(models),
             "free": sum(1 for m in models if m.get("free")),
             # Free のうちサブLLM に使えない（非チャット）件数。選抜には載せない（§3.2）。
@@ -469,6 +539,10 @@ EXPORTS = {
     "_declared_output_modalities": _declared_output_modalities,
     "is_chat_model": is_chat_model,
     "all_models": all_models,
+    "hidden_providers": hidden_providers,
+    "_HF_ID_CACHE": _HF_ID_CACHE,
+    "_hf_id_index": _hf_id_index,
+    "hf_identity": hf_identity,
     "provider_status": provider_status,
     "free_model_refs": free_model_refs,
     "default_model": default_model,

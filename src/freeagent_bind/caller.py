@@ -109,7 +109,10 @@ def _candidates(ref: str, free_only: bool = True) -> list[str]:
     out = [ref] if ref and ref not in cooling else []
     if len(out) >= S._MAX_ATTEMPTS:
         return out[:S._MAX_ATTEMPTS]
-    blocked = {name for name in S.PROVIDER_ORDER if S.provider_auth_blocked(name)}
+    # 枯渇・認証の記憶は**登録済みの全プロバイダ**で見る（opt-in で巡回順に居ない HF も、
+    # 明示指定の候補やフォールバック先には現れる）。
+    blocked = {name for name in S.PROVIDER_SPECS if S.provider_auth_blocked(name)}
+    blocked |= {name for name in S.PROVIDER_SPECS if S.provider_credit_blocked(name)}
     ex_set = set(S.env_excluded_models())
     pool = [other for other in S.free_model_refs(free_only=free_only, chat_only=True)
             if other != ref and other not in cooling and other not in out
@@ -157,14 +160,30 @@ def _auth_hint(provider: str, status: int, body: str) -> str:
                     "Developer tierは従量課金です。"
                     f" / 応答: {tail}")
         if provider == "gemini":
-            return ("HTTP 402（gemini）: Free tierのプロジェクト割当またはBilling設定を確認してください。"
+            return ("HTTP 402（gemini）: Free tier のプロジェクト割当またはBilling設定を確認してください。"
                     "Billing有効時は課金が発生する場合があります。"
                     f" / 応答: {tail}")
+        if provider == "huggingface":
+            # 2026-11-16 に HF のチャット推論は OpenRouter のルータ経由になり、課金は HF アカウントに
+            # 一本化された（実測: 全 164 件が同じ 402「Purchase pre-paid credits」）。キーを疑わせない。
+            return ("HTTP 402（huggingface）: クレジット枯渇です（HF アカウントの推論クレジットが 0・"
+                    "キーや権限の問題ではありません）。PRO の月次クレジットか前払いクレジットが必要です。"
+                    "`FREEAGENT_HF_CREDITS=1` は在庫へ戻すだけで、残高が無ければ 402 のままです"
+                    f" / 応答: {tail}")
         # クレジット枯渇。キーや権限の問題ではないので取り違えさせない（実測: HF の月次無料枠は
-        # 生存確認やパネルを繰り返すと尽き、全モデルが 402 になる）。翌月に回復するため
-        # **プロバイダ記憶（15 分）には入れない**。
+        # 生存確認やパネルを繰り返すと尽き、全モデルが 402 になる）。認証失敗とは別の
+        # **プロバイダ単位の記憶**（provider_credit.json・`FREEAGENT_CREDIT_TTL`）に入れ、
+        # 通った時点で消す（`clear_provider_credit`）。
         return (f"HTTP 402（{provider}）: クレジット枯渇（キーや権限の問題ではありません）。"
                 f"別のプロバイダへ回します / 応答: {tail}")
+    if status == 400 and provider == "huggingface" and "model_not_supported" in (body or "").lower():
+        # 2026-11-16 以降 HF のルータは OpenRouter の形式でエラーを返す（実測）。提供元サフィックスの
+        # 不一致は 400 `model_not_supported` で、`:free` も「提供元名 free」として同じ 400 になる。
+        return ("HTTP 400（huggingface）: その提供元はこのモデルを配信していません"
+                "（`:提供元` が合っていないか、HF の設定で提供元を切っています）。"
+                "`:提供元` を外すか `:fastest` / `:cheapest` を試してください。"
+                "**HF の `:free` は無料の意味ではなく提供元名として扱われます**"
+                f" / 応答: {tail}")
     if provider == "huggingface":
         if "inference providers" in (body or "").lower():
             return ("HTTP 403（huggingface）: トークンに Inference Providers の権限がありません。"
@@ -305,9 +324,10 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
                 S.note_unavailable(cand, exc.status)
                 skipped.append(cand)
             elif exc.status == 402:
-                # クレジット枯渇はプロバイダ全体の認証障害ではないが、同一モデルへの
-                # 連続要求を避けるため短時間だけモデル単位で休ませる。
+                # クレジット枯渇は**アカウント単位**の状態（実測: HF は全 164 件が同じ 402 を返した）。
+                # モデル単位の休止に加えてプロバイダ単位でも覚え、同じ 402 を候補の数だけ繰り返さない。
                 S.note_cooldown(cand, S._COOLDOWN_DEFAULT_S, "HTTP 402 (credit depleted)")
+                S.note_provider_credit(c_provider, exc.status, exc.body)
                 skipped.append(cand)
                 last_error = _auth_hint(c_provider, exc.status, exc.body)
                 S._debug("credit_exhausted", {"ref": cand})
@@ -407,6 +427,7 @@ def _call_model_uncached(ref: str, prompt: str, *, system: str = "", max_tokens:
             out["quota_accounting"] = "; ".join(quota_warnings)
         S.PROVIDER_GATE.note_success(c_provider)   # 枠が縮んでいたら 1 本ずつ戻す
         S.clear_provider_auth(c_provider)   # 通ったら「認証で駄目」の記憶を消す
+        S.clear_provider_credit(c_provider)  # 通ったら「クレジット枯渇」の記憶も消す（チャージ後の復帰）
         # 統計・トレースは**答えたモデル**に付ける（要求元に付けると、代替で答えた事実が消える）。
         S.observe_call(dict(out, ref=cand), kind, text)
         return out

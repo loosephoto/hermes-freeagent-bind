@@ -815,7 +815,7 @@ class TestLiveAuditFixes(unittest.TestCase):
             called.append(ref)
             return {"text": "2", "served_by": ref}
 
-        with mock.patch.object(S, "all_models", lambda ttl=600.0: list(rows)), \
+        with mock.patch.object(S, "all_models", lambda ttl=600.0, extra_providers=None: list(rows)), \
              mock.patch.object(S, "provider_status", lambda: []), \
              mock.patch.object(S, "free_model_refs", lambda free_only=True, chat_only=False: []), \
              mock.patch.object(S, "provider_ready", lambda p: p == "nous"), \
