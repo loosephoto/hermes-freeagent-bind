@@ -73,7 +73,8 @@ def tool_grounded(args: dict) -> dict:
     if not citations:
         return {"error": "根拠が 0 件でした。query を変えるか sources を広げてください",
                 "lookup": {"sources": kb.get("sources"), "errors": kb.get("errors"),
-                           "unknown_sources": kb.get("unknown_sources") or []}}
+                           "unknown_sources": kb.get("unknown_sources") or [],
+                           **({"routed": True, "routing": kb["routing"]} if kb.get("routed") else {})}}
     window = _evidence_window(citations)
     if not window["numbers"]:
         return {"error": "本文根拠を注入できませんでした。根拠の取得・本文予算を確認してください"}
@@ -109,6 +110,7 @@ def tool_grounded(args: dict) -> dict:
         "question": question, "search_query": search_query,
         "citations": citations, "citation_count": len(citations),
         "sources_used": kb.get("sources"), "source_errors": kb.get("errors"),
+        **({"routed": True, "routing": kb["routing"]} if kb.get("routed") else {}),
         "injected_citations": window["numbers"], "not_injected_citations": window["omitted"],
         "evidence_citation_count": len(window["numbers"]),
         "unsupported_citations": sorted({n for row in good for n in row.get("unsupported_citations", [])}),
@@ -579,6 +581,7 @@ def _agent_tool_call(parsed: dict) -> dict:
     if tool == "lookup" or tool in S.KB_BACKENDS:
         sources = S.as_str_list(parsed.get("sources")) or ([tool] if tool in S.KB_BACKENDS else None)
         out = S.knowledge_lookup(query, sources, limit=S.as_int(parsed.get("limit"), 2, 1, 5),
+                               lang=S.as_str(parsed.get("lang"), ""),
                                kind=S.as_str(parsed.get("kind"), "repo"),
                                datacite_kind=S.as_str(parsed.get("datacite_kind"), "all"), fallback=parsed.get("fallback") is True)
         all_cites = out.get("citations") or []

@@ -2838,7 +2838,7 @@ CI の ubuntu 3 ジョブだけ赤**になった。mtime は「unit のほうが
 **全体**: unittest 1,442 件 OK（1 skip）／`check_integrity`（version=0.53.0）／`compileall`／
 `smoke_stdio` / `smoke_http` / `check_offline`。
 
-### 6.70 知識ソースの決定論自動選定（v0.54.0）
+### 6.70 知識ソースの決定論自動選定（v0.54.0 / v0.54.1）
 
 `freeagent_lookup` / `freeagent_grounded` / `freeagent_agent` で `sources=["auto"]` を渡すか、
 環境変数 `FREEAGENT_SOURCE_ROUTING=auto`（既定 `off`）を有効にすると、問いの内容から最適な知識ソースを
@@ -2846,12 +2846,12 @@ CI の ubuntu 3 ジョブだけ赤**になった。mtime は「unit のほうが
 
 - **既定の互換性**: 規約 28 を守り、`FREEAGENT_SOURCE_ROUTING` が `off`（既定）かつ `sources` 省略時は従来どおり `DEFAULT_SOURCES`（6 種）をそのまま使う。`["auto", "hn"]` のように明示ソースと混在指定すると、自動選定結果に明示ソースを重複なく合流する。
 - **3 段の選定規則**:
-  1. **強識別子（正規表現）**: CVE/GHSA（`osv, nvd, github`）、RFC / Internet-Draft（`ietf, wikipedia`）、arXiv ID / DOI（`arxiv, crossref, openalex`）、OEIS ID（`oeis, wikipedia`）。
-  2. **ドメイン語彙（10 領域）**: 脆弱性・Web 標準（`mdn`）・npm・Rust/crates・Terraform・ML/HF Hub/OpenReview・物理/数学・技術議論（`hn`/`qiita`）・歴史資料（`ia`）・学術論文。
+  1. **強識別子（4 規則）**: CVE/GHSA（`osv, nvd, github`）、RFC / Internet-Draft（`ietf, wikipedia`）、arXiv ID / DOI（`arxiv, crossref, openalex`）、OEIS ID（`oeis, wikipedia`）。
+  2. **ドメイン語彙（12 領域）**: 脆弱性・Web 標準（`mdn`）・npm・Rust/crates・Terraform・ML/HF Hub/OpenReview・**整数列/OEIS**・**数学/定理**（`arxiv, crossref, openalex, zbmath, wikipedia`）・**物理/宇宙物理/量子**（`inspirehep, arxiv, openalex, wikipedia`）・技術議論（`hn`/`qiita`）・歴史資料（`ia`）・学術論文。v0.54.1 で旧「物理・数学」を 3 領域へ分離し、純粋数学クエリでの `inspirehep`/`oeis` ノイズを抑止しつつ、物理・宇宙物理・量子クエリを既定フォールバックではなく `inspirehep` 含む専用経路へ向けた。
   3. **制約フィルタとフォールバック**: 未設定の API キー／規約同意ゲート（`cinii`, `librariesio`, `zbmath`）、未認証レート制限が狭い `qiita`（60 回/時）、CJK のみクエリに対する英語必須ソース（`arxiv`, `ia`, `openreview`, `nvd`, `zbmath`）、`need_evidence=True` 時の `metadata_only` ソース（`devdocs`, `ror`, `zbmath`）、直近一時遮断中ホスト（`_kb_is_blocked`）を除外し、最大 `SOURCE_ROUTING_MAX`（6）件に収める。一致が無い場合は `DEFAULT_SOURCES` にフォールバックする。
-- **透過性**: 自動選定時は `structuredContent` に `routed: true` と `routing: {reasons, skipped, fallback_default}` を返し、`_render_lookup` にも選定・除外の 1 行要約を出す。
+- **透過性と整合性**: 自動選定時は `freeagent_lookup`・`freeagent_grounded`（根拠 0 件早期返却を含む）の両方で `routed: true` と `routing: {reasons, skipped, fallback_default}` を返し、`_render_lookup` にも選定・除外の 1 行要約を出す。また `_agent_tool_call` も `lang=""` を渡して `wikipedia` の自動言語判定を統一した（v0.54.1）。
 
-**検証**: `tests/test_source_routing.py`（9 件）で全 30 ソースのメタ網羅・強識別子・ドメイン語彙・キー/規約同意ゲート・未認証 `qiita`・CJK 除外・遮断ホスト・フォールバック・混在/env を固定。実 API 疎通（`sources=["auto"]`, `limit=2`）で `CVE-2024-3094`（osv/nvd/github・5 件・0.36〜0.55 秒）、`RFC 9110`（ietf/wikipedia・3 件・0.59〜0.60 秒）、`CSS popover`（mdn/github/wikipedia・5 件・0.39〜5.22 秒）を確認。
+**検証**: `tests/test_source_routing.py`（11 件）で全 30 ソースのメタ網羅・強識別子・12 領域の分離・キー/規約同意ゲート・未認証 `qiita`・CJK 除外・遮断ホスト・フォールバック・`tool_grounded` 伝搬・`_agent_tool_call` の `lang=""` を固定。実 API 疎通（6 科学ニュースクエリ・`sources=["auto"]`, `limit=3`）で全件 1.50〜3.02 秒・タイムアウト 0 件を確認。
 
 ## 12. 検証
 

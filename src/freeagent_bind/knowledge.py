@@ -705,8 +705,12 @@ _SOURCE_DOMAIN_RULES: tuple[tuple[re.Pattern, str, tuple[str, ...]], ...] = (
      "Terraform モジュール領域", ("terraform", "github")),
     (re.compile(r"\b(?:huggingface|hf\s*hub|lora|gguf|openreview|iclr|neurips|icml|llm|transformer|diffusion)\b", re.I),
      "ML モデル・機械学習会議領域", ("hfhub", "arxiv", "openreview", "github")),
-    (re.compile(r"\b(?:oeis|integer\s+sequence|zbmath|hep-(?:th|ph|ex|lat)|quantum\s+field|lagrangian|theorem|conjecture)\b|数列|定理|素粒子", re.I),
-     "物理・数学領域", ("inspirehep", "oeis", "arxiv", "zbmath", "wikipedia")),
+    (re.compile(r"\b(?:oeis|integer\s+sequence|fibonacci|prime\s+number|catalan\s+number|collatz)\b|数列|素数列", re.I),
+     "整数列・OEIS 領域", ("oeis", "arxiv", "wikipedia")),
+    (re.compile(r"\b(?:zbmath|theorem|conjecture|hypothesis|topology|harmonic\s+analysis|graph\s+theory|manifold|number\s+theory)\b|定理|予想|位相幾何", re.I),
+     "数学・定理領域", ("arxiv", "crossref", "openalex", "zbmath", "wikipedia")),
+    (re.compile(r"\b(?:hep-(?:th|ph|ex|lat)|quantum(?:\s+(?:field|simulation|comput\w*|algorithm|gravity|entanglement))?|lagrangian|dark\s+matter|dark\s+energy|birefringence|pulsar|astrophysic\w*|cosmolog\w*|superconduct\w*|ising\s+(?:model|field)|particle\s+(?:physics|collision)|neutrino|gravitational\s+wave)\b|素粒子|量子|暗黒物質|宇宙物理|超伝導", re.I),
+     "物理・宇宙物理・量子領域", ("inspirehep", "arxiv", "openalex", "wikipedia")),
     (re.compile(r"\b(?:hacker\s*news|qiita|show\s+hn|ask\s+hn|discussion|opinion)\b|議論|評判|技術記事", re.I),
      "技術議論・実務記事領域", ("hn", "qiita", "github")),
     (re.compile(r"\b(?:internet\s+archive|fortran|cobol|pdp-\d+|manual|19[6789]\d)\b|歴史|アーカイブ", re.I),
@@ -851,7 +855,7 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
             # 「本文根拠が要る場面か」= `grounded`。**根拠の確保を最優先する場面**と
             # **書誌の網羅性を最優先する場面**は違う（§6.18）。
             "need_evidence": need_evidence is True}
-    by_source, timings = _kb_gather(picked, query, limit, opts, deadline)
+    by_source, timings = S._kb_gather(picked, query, limit, opts, deadline)
     citations: list[dict] = []
     errors = {}
     for src, res in by_source.items():

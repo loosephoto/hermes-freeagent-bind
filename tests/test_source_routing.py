@@ -89,18 +89,31 @@ class TestSourceRouting(unittest.TestCase):
         self.assertTrue(any(s in r["sources"] for s in ("crossref", "openalex", "wikipedia")))
 
     def test_zbmath_consent_gate_and_need_evidence(self) -> None:
-        r1 = S.route_sources("prime number theorem zbmath")
+        r1 = S.route_sources("local smoothing conjecture zbmath")
         self.assertNotIn("zbmath", r1["sources"])
         self.assertIn("zbmath", r1["skipped"])
+        # Pure math conjecture should not pull particle physics (inspirehep)
+        self.assertNotIn("inspirehep", r1["sources"])
+        self.assertIn("arxiv", r1["sources"])
+        self.assertIn("openalex", r1["sources"])
 
         os.environ["FREEAGENT_ZBMATH_ACK"] = "1"
-        r2 = S.route_sources("prime number theorem zbmath", need_evidence=False)
+        r2 = S.route_sources("local smoothing conjecture zbmath", need_evidence=False)
         self.assertIn("zbmath", r2["sources"])
 
         # When need_evidence=True (grounded), zbmath is metadata_only -> skipped
-        r3 = S.route_sources("prime number theorem zbmath", need_evidence=True)
+        r3 = S.route_sources("local smoothing conjecture zbmath", need_evidence=True)
         self.assertNotIn("zbmath", r3["sources"])
         self.assertIn("zbmath", r3["skipped"])
+
+    def test_physics_and_sequence_domains_separated(self) -> None:
+        r_phys = S.route_sources("cosmic birefringence dark matter")
+        self.assertFalse(r_phys["fallback_default"])
+        self.assertEqual(r_phys["sources"], ["inspirehep", "arxiv", "openalex", "wikipedia"])
+
+        r_seq = S.route_sources("integer sequence Fibonacci")
+        self.assertEqual(r_seq["sources"][:2], ["oeis", "arxiv"])
+        self.assertNotIn("inspirehep", r_seq["sources"])
 
     def test_blocked_host_is_skipped(self) -> None:
         S._kb_block("developer.mozilla.org", secs=60.0)
@@ -147,6 +160,29 @@ class TestSourceRouting(unittest.TestCase):
             # 5. Renderer shows routing summary
             rendered = S._render_lookup(out_auto)
             self.assertIn("自動選定", rendered)
+
+    def test_grounded_propagates_routing_and_agent_passes_auto_lang(self) -> None:
+        # 1. tool_grounded propagates routing metadata on 0-citation early return
+        def fake_gather_empty(picked, query, limit, opts, deadline):
+            return ({src: {"source": src, "items": [], "citations": [], "error": "該当なし"} for src in picked},
+                    {src: 0.01 for src in picked})
+
+        with mock.patch.object(S, "_kb_gather", side_effect=fake_gather_empty):
+            res = S.tool_grounded({"question": "CVE-2024-3094 について", "search_query": "CVE-2024-3094", "sources": ["auto"]})
+            self.assertIn("lookup", res)
+            self.assertTrue(res["lookup"].get("routed"))
+            self.assertEqual(res["lookup"]["sources"], ["osv", "nvd", "github"])
+
+        # 2. _agent_tool_call passes lang="" by default so wikipedia auto-detects language
+        captured = {}
+
+        def fake_lookup(query, sources=None, **kwargs):
+            captured["lang"] = kwargs.get("lang")
+            return {"results": {}, "citations": [], "errors": {}}
+
+        with mock.patch.object(S, "knowledge_lookup", side_effect=fake_lookup):
+            S._agent_tool_call({"tool": "lookup", "query": "Transformer"})
+            self.assertEqual(captured["lang"], "")
 
 
 if __name__ == "__main__":
