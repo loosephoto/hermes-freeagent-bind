@@ -81,7 +81,7 @@ def _resource_sources() -> str:
         f"既定で引くのは {len(defaults)} 種: " + ", ".join(defaults),
         "",
         "明示指定は `freeagent_lookup` / `freeagent_grounded` の `sources` に名前を並べる",
-        "（`sources` の説明に使う条件がある）。",
+        "（`sources=[\"auto\"]` または `FREEAGENT_SOURCE_ROUTING=auto` で問いから自動選定も可）。",
         "",
         _md_table(["source", "既定/明示"], rows),
     ])
@@ -231,7 +231,7 @@ def _resource_skill_grounded() -> str:
         "- まず `freeagent_lookup`（**モデルを呼ばない**＝幻覚が入らない）。本文を読ませたいなら `freeagent_grounded`。",
         "- 検索語は**英語の語**にする。日本語の質問のまま arXiv / Crossref / Internet Archive を引くと 0 件になりやすい",
         "  （`grounded` は `search_query` に分けて渡せる）。",
-        f"- 既定のソースは {len(defaults)} 種: " + ", ".join(defaults) + "。追加は `sources` に明示する。",
+        f"- 既定のソースは {len(defaults)} 種: " + ", ".join(defaults) + "。追加は `sources` に明示する（`sources=[\"auto\"]` で問いから自動選定）。",
         f"- 取得の締め切りは既定 {S.KB_DEADLINE:g} 秒（`FREEAGENT_KB_DEADLINE`）。間に合わないソースは `timed_out` として",
         "  返り、裏の取得は続いて次回はキャッシュから返る。",
         "",

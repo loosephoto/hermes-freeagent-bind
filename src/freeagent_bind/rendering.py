@@ -195,6 +195,15 @@ def _render_lookup(data: dict) -> str:
     if late:
         head += f" / 締め切り {data.get('deadline_s')} 秒に間に合わず {len(late)} 件"
     lines = [head]
+    if data.get("routed"):
+        routing = data.get("routing") or {}
+        skipped = routing.get("skipped") or {}
+        note = "🧭 自動選定"
+        if routing.get("fallback_default"):
+            note += "（既定フォールバック）"
+        if skipped:
+            note += " / 除外: " + ", ".join(f"{k}({v})" for k, v in skipped.items())
+        lines.append(note)
     if data.get("citations_in_results") is False:
         lines.append("ℹ️ 引用は citations に統合済み（results の各ソース内には重複して置きません）")
     # **指定したのに使えなかったソース名を隠さない**（typo を黙って捨てない）。

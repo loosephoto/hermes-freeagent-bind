@@ -636,6 +636,175 @@ def _kb_gather(picked: list[str], query: str, limit: int, opts: dict,
     return {src: by_source[src] for src in picked}, timings
 
 
+SOURCE_ROUTING_ENV = "FREEAGENT_SOURCE_ROUTING"
+
+
+SOURCE_ROUTING_MAX = 6
+
+
+# 各ソースの自動選定メタデータ（規約 28・29・33・36・37 を機械的に守るための表）。
+SOURCE_ROUTING_META: dict[str, dict] = {
+    "wikipedia":   {"host": "en.wikipedia.org"},
+    "wikidata":    {"host": "www.wikidata.org"},
+    "arxiv":       {"host": "export.arxiv.org", "en_only": True},
+    "crossref":    {"host": "api.crossref.org"},
+    "openalex":    {"host": "api.openalex.org"},
+    "github":      {"host": "api.github.com"},
+    "datacite":    {"host": "api.datacite.org"},
+    "openaire":    {"host": "api.openaire.eu"},
+    "zenodo":      {"host": "zenodo.org"},
+    "ror":         {"host": "api.ror.org", "evidence_capable": False},
+    "doaj":        {"host": "doaj.org"},
+    "npm":         {"host": "registry.npmjs.org"},
+    "crates":      {"host": "crates.io"},
+    "cinii":       {"host": "cir.nii.ac.jp", "gate_env": "FREEAGENT_CINII_APPID"},
+    "osv":         {"host": "api.osv.dev"},
+    "ietf":        {"host": "datatracker.ietf.org"},
+    "inspirehep":  {"host": "inspirehep.net"},
+    "oeis":        {"host": "oeis.org"},
+    "hfhub":       {"host": "huggingface.co"},
+    "hn":          {"host": "hn.algolia.com"},
+    "swh":         {"host": "archive.softwareheritage.org"},
+    "librariesio": {"host": "libraries.io", "gate_env": "FREEAGENT_LIBRARIESIO_KEY"},
+    "ia":          {"host": "archive.org", "en_only": True},
+    "qiita":       {"host": "qiita.com", "token_preferred_env": "FREEAGENT_QIITA_TOKEN"},
+    "openreview":  {"host": "api2.openreview.net", "en_only": True},
+    "mdn":         {"host": "developer.mozilla.org"},
+    "devdocs":     {"host": "devdocs.io", "evidence_capable": False},
+    "nvd":         {"host": "services.nvd.nist.gov", "en_only": True},
+    "terraform":   {"host": "registry.terraform.io"},
+    "zbmath":      {"host": "api.zbmath.org", "en_only": True, "gate_env": "FREEAGENT_ZBMATH_ACK",
+                    "gate_bool": True, "evidence_capable": False},
+}
+
+
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+_ASCII_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,}")
+
+_SOURCE_ID_RULES: tuple[tuple[re.Pattern, str, tuple[str, ...]], ...] = (
+    (re.compile(r"\b(?:CVE-\d{4}-\d{4,}|GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})\b", re.I),
+     "脆弱性 ID（CVE/GHSA）に一致", ("osv", "nvd", "github")),
+    (re.compile(r"\b(?:RFC\s*\d{3,5}|draft-[a-z0-9-]+)\b", re.I),
+     "RFC / Internet-Draft に一致", ("ietf", "wikipedia")),
+    (re.compile(r"\b(?:arXiv:\s*\d{4}\.\d{4,5}|10\.\d{4,9}/\S+)\b", re.I),
+     "論文 ID（arXiv/DOI）に一致", ("arxiv", "crossref", "openalex")),
+    (re.compile(r"\bA\d{6}\b"),
+     "OEIS 数列 ID に一致", ("oeis", "wikipedia")),
+)
+
+_SOURCE_DOMAIN_RULES: tuple[tuple[re.Pattern, str, tuple[str, ...]], ...] = (
+    (re.compile(r"\b(?:vulnerabilit(?:y|ies)|cve|ghsa|cvss|exploit|advisory|cwe-\d+)\b|脆弱性|セキュリティ勧告", re.I),
+     "脆弱性・セキュリティ領域", ("osv", "nvd", "github")),
+    (re.compile(r"\b(?:css|html5?|dom|web\s*api|popover|anchor\s+positioning|view\s+transition|aria|wcag|fetch\s+api|service\s+worker|webassembly|wasm|mdn|ecmascript)\b", re.I),
+     "Web 標準・フロントエンド領域", ("mdn", "github", "wikipedia")),
+    (re.compile(r"\b(?:npm|package\.json|node_modules|npmjs)\b", re.I),
+     "npm パッケージ領域", ("npm", "github", "librariesio")),
+    (re.compile(r"\b(?:crates?\.io|cargo\.toml|rust\s+crate|\bcrate)\b", re.I),
+     "Rust / crates.io 領域", ("crates", "github", "librariesio")),
+    (re.compile(r"\b(?:terraform|opentofu|hcl\s+module|terraform\s+provider)\b", re.I),
+     "Terraform モジュール領域", ("terraform", "github")),
+    (re.compile(r"\b(?:huggingface|hf\s*hub|lora|gguf|openreview|iclr|neurips|icml|llm|transformer|diffusion)\b", re.I),
+     "ML モデル・機械学習会議領域", ("hfhub", "arxiv", "openreview", "github")),
+    (re.compile(r"\b(?:oeis|integer\s+sequence|zbmath|hep-(?:th|ph|ex|lat)|quantum\s+field|lagrangian|theorem|conjecture)\b|数列|定理|素粒子", re.I),
+     "物理・数学領域", ("inspirehep", "oeis", "arxiv", "zbmath", "wikipedia")),
+    (re.compile(r"\b(?:hacker\s*news|qiita|show\s+hn|ask\s+hn|discussion|opinion)\b|議論|評判|技術記事", re.I),
+     "技術議論・実務記事領域", ("hn", "qiita", "github")),
+    (re.compile(r"\b(?:internet\s+archive|fortran|cobol|pdp-\d+|manual|19[6789]\d)\b|歴史|アーカイブ", re.I),
+     "歴史資料・アーカイブ領域", ("ia", "wikipedia")),
+    (re.compile(r"\b(?:paper|preprint|survey|citation|doi|peer\s*review|journal)\b|論文|査読|研究", re.I),
+     "学術論文領域", ("arxiv", "crossref", "openalex", "cinii", "doaj", "wikipedia")),
+)
+
+
+def source_routing_enabled() -> bool:
+    """`FREEAGENT_SOURCE_ROUTING` が有効なときだけ未指定時に自動選定する（既定 off）。"""
+    return (os.environ.get(SOURCE_ROUTING_ENV) or "off").strip().lower() in ("auto", "on", "1", "true")
+
+
+def _source_skip_reason(src: str, *, has_cjk_only: bool, need_evidence: bool) -> str | None:
+    """自動選定時にそのソースを外すべき理由を返す（使えるなら None）。"""
+    meta = SOURCE_ROUTING_META.get(src) or {}
+    gate_env = meta.get("gate_env")
+    if gate_env:
+        if meta.get("gate_bool"):
+            if not S._env_on(gate_env, False):
+                return f"規約同意フラグ未設定({gate_env})"
+        elif not (os.environ.get(gate_env) or "").strip():
+            return f"APIキー未設定({gate_env})"
+    tok_env = meta.get("token_preferred_env")
+    if tok_env and not (os.environ.get(tok_env) or "").strip():
+        return f"未認証レート制限のため除外({tok_env}未設定)"
+    if meta.get("en_only") and has_cjk_only:
+        return "英語クエリ必須"
+    if need_evidence and meta.get("evidence_capable") is False:
+        return "metadata_onlyのため根拠向きではない"
+    host = meta.get("host")
+    if host and _kb_is_blocked(host):
+        return f"ホスト一時遮断中({host})"
+    return None
+
+
+def route_sources(query: str, *, need_evidence: bool = False,
+                  max_sources: int = SOURCE_ROUTING_MAX) -> dict:
+    """問いの内容から最適な知識ソースを決定論で選定する（LLM 不使用）。
+
+    強い識別子（CVE / RFC / arXiv / DOI / OEIS）→ ドメイン語彙 → 制約フィルタの 3 段で絞り、
+    一致が無い場合は安全側として `DEFAULT_SOURCES` にフォールバックする。
+    """
+    text = S.as_str(query)
+    cap = S.as_int(max_sources, SOURCE_ROUTING_MAX, 1, 12)
+    has_cjk_only = bool(_CJK_RE.search(text)) and not bool(_ASCII_WORD_RE.search(text))
+    candidates: list[tuple[str, str]] = []
+    for pattern, label, srcs in _SOURCE_ID_RULES:
+        if pattern.search(text):
+            for s in srcs:
+                candidates.append((s, label))
+    for pattern, label, srcs in _SOURCE_DOMAIN_RULES:
+        if pattern.search(text):
+            for s in srcs:
+                candidates.append((s, label))
+
+    picked: list[str] = []
+    reasons: dict[str, str] = {}
+    skipped: dict[str, str] = {}
+    seen: set[str] = set()
+    for src, label in candidates:
+        if src in seen or src not in S.KB_BACKENDS:
+            continue
+        seen.add(src)
+        skip = _source_skip_reason(src, has_cjk_only=has_cjk_only, need_evidence=need_evidence)
+        if skip:
+            skipped[src] = skip
+            continue
+        picked.append(src)
+        reasons[src] = label
+        if len(picked) >= cap:
+            break
+
+    fallback_default = False
+    if not picked:
+        fallback_default = True
+        defaults = [s for s in DEFAULT_SOURCES if s in S.KB_BACKENDS]
+        for src in defaults:
+            skip = _source_skip_reason(src, has_cjk_only=has_cjk_only, need_evidence=need_evidence)
+            if skip:
+                skipped[src] = skip
+                continue
+            picked.append(src)
+            reasons[src] = "既定フォールバック"
+        if not picked:
+            picked = defaults[:cap]
+            for src in picked:
+                reasons[src] = "既定フォールバック"
+
+    return {
+        "sources": picked[:cap],
+        "reasons": reasons,
+        "skipped": skipped,
+        "fallback_default": fallback_default,
+    }
+
+
 def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int = 3,
                      lang: str = "ja", kind: str = "repo", max_workers: int | None = None,
                      deadline: float | None = None, datacite_kind: str = "all", fallback: bool = False,
@@ -644,13 +813,28 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
 
     全体の締め切り（`KB_DEADLINE`）までに届いた分だけ返す（§5.8）。`max_workers` は互換のため
     受け取るが使わない（ソースごとに専用スレッド）。
+    `sources` に `"auto"` を含むか `FREEAGENT_SOURCE_ROUTING=auto` のときは `route_sources()` で選定する。
     """
     query = S.as_str(query)
     if not query:
         return {"error": "query は必須です", "query": query}
     requested = S.as_str_list(sources)
-    picked = list(dict.fromkeys(s for s in requested if s in S.KB_BACKENDS)) if requested else [s for s in DEFAULT_SOURCES if s in S.KB_BACKENDS]
-    unknown = [s for s in requested if s not in S.KB_BACKENDS]
+    use_auto = any(s.lower() == "auto" for s in requested) or (not requested and source_routing_enabled())
+    explicit = [s for s in requested if s.lower() != "auto"]
+    routing_info: dict | None = None
+    if use_auto:
+        route = S.route_sources(query, need_evidence=need_evidence)
+        merged = list(route["sources"]) + [s for s in explicit if s in S.KB_BACKENDS]
+        picked = list(dict.fromkeys(merged))
+        unknown = [s for s in explicit if s not in S.KB_BACKENDS]
+        routing_info = {
+            "reasons": route["reasons"],
+            "skipped": route["skipped"],
+            "fallback_default": route["fallback_default"],
+        }
+    else:
+        picked = list(dict.fromkeys(s for s in explicit if s in S.KB_BACKENDS)) if explicit else [s for s in DEFAULT_SOURCES if s in S.KB_BACKENDS]
+        unknown = [s for s in explicit if s not in S.KB_BACKENDS]
     if requested and not picked:
         message = "有効な sources がありません。利用可能: " + ", ".join(S.KB_BACKENDS)
         return {"query": query, "sources": [], "unknown_sources": unknown,
@@ -692,6 +876,9 @@ def knowledge_lookup(query: str, sources: list[str] | None = None, *, limit: int
            "deadline_s": KB_DEADLINE if deadline is None else deadline}
     if late:
         out["timed_out"] = late
+    if routing_info is not None:
+        out["routed"] = True
+        out["routing"] = routing_info
     return out
 
 
@@ -1122,6 +1309,12 @@ EXPORTS = {
     "KB_BACKENDS": KB_BACKENDS,
     "KB_DEADLINE": KB_DEADLINE,
     "_kb_gather": _kb_gather,
+    "SOURCE_ROUTING_ENV": SOURCE_ROUTING_ENV,
+    "SOURCE_ROUTING_MAX": SOURCE_ROUTING_MAX,
+    "SOURCE_ROUTING_META": SOURCE_ROUTING_META,
+    "source_routing_enabled": source_routing_enabled,
+    "_source_skip_reason": _source_skip_reason,
+    "route_sources": route_sources,
     "knowledge_lookup": knowledge_lookup,
     "_literal_search": _literal_search,
     "_kb_new_cached": _kb_new_cached,

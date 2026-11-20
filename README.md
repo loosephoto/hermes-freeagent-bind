@@ -2053,6 +2053,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_RANK_KIND_BIAS` | 0 | `1` で**種別（kind）ごとの品質バイアス**を自動選抜に入れる（同じ kind の空応答・ハード失敗率を選抜順位から引く。他 kind の成績は参照しない）。実測では失敗の大半が空応答で、短答の kind で好成績の思考モデルが長答の kind でも選ばれ続けていた。**既定 off で従来と同一の並び** |
 | `FREEAGENT_REFINE_BAND` | 0.05 | `panel(refine)` の**統合役**を、品質点が先頭からこの差以内の帯の中で**最も速い**モデルにする（0 で品質順の先頭に戻る）。refine 段は panel の壁の 35〜63% を占めるので効く（SPEC §6.26） |
 | `FREEAGENT_ROUTING` | `off` | `auto` で**タスク分類カスケード**（light / long / reason の層で並べ方を変える）。off は従来と同一 |
+| `FREEAGENT_SOURCE_ROUTING` | `off` | `auto` で `sources` 省略時に問いから知識ソースを決定論で自動選定（`sources=["auto"]` なら env が `off` でも都度有効）。off の既定は従来 6 ソース |
 | `FREEAGENT_ROUTING_TIER` | 空 | 測定用に層を強制（`light` / `long` / `reason`）。`measure_quality.py` と組み合わせて A/B する |
 | `FREEAGENT_ROUTING_LONG_CHARS` | 6000 | この文字数以上の入力を `long` 層とみなす（200〜200000） |
 | `FREEAGENT_ROUTING_LIGHT_MAX_TOKENS` | 400 | `map` / `ask` でこの `max_tokens` 以下なら `light` 層（16〜4000） |
