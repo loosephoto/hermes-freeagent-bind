@@ -899,6 +899,7 @@ v0.46.0 は §6 の前半（プロンプト・応答の解析・`models`/`ask`/`
 v0.48.0（Linux / macOS の常駐配線）と v0.49.0〜v0.49.2（Windows 常駐の硬化・Linux ユニットの修正・
 その文書）は**ツール定義に触れていない**（24,520 文字のまま）。v0.50.0 は `freeagent_models` に
 `include_gone` と鮮度（`gone` / `gone_models` / 各行の `freshness`）の説明を足して **24,841 文字（+321）**。
+v0.54.0〜v0.54.2 は `freeagent_lookup` / `freeagent_grounded` の `sources` 説明に決定論自動選定（`["auto"]` / `FREEAGENT_SOURCE_ROUTING=auto`）を足して **25,039 文字（+198）**。
 v0.47.0 は issue #5 の案3 と #8 の案2 を実装: **多数派シェア** `consensus_share`（最大クラスタ / 参加者数。短答は完全一致、長文は類似度 0.55 以上の単連結クラスタ）を `panel` / `consult` / `grounded` が返し、「確信度の代理」として割れを見られるようにした。`freeagent_models(probe=true)` は各モデルの `budget {asked, effective, completion, chars, respected}` と `probe_budget`（**実効の予算**で比較・逸脱は名指し）を返す。機械分割で混入した `"S.confidence_warning"` のような壊れたキー 4 件も修復し、再発防止のテスト（`test_split_hygiene.py`）を足した。ツール定義は不変で **24,520 文字のまま**。
 以下は新しい順の内訳です。
 
@@ -2063,6 +2064,7 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_CREDIT_TTL` | 900 | クレジット枯渇（402）を**プロバイダ単位**で覚えて自動選抜・フォールバックから外す時間（秒）。通れば即解除 |
 | `FREEAGENT_HF_CREDITS` | 空 | HF を「PRO 月次クレジット枠」として在庫に載せる申告（実測では Free の在庫 0 件・全件 402 のため既定 off。`/api/whoami-v2` が `isPro=false` かつ `canPay=false` なら申告しても載せない） |
 | `FREEAGENT_HF_WHOAMI_TTL` | 900 | `/api/whoami-v2`（PRO・支払い手段の確認）のキャッシュ秒数 |
+| `FREEAGENT_HF_WHOAMI_URL` | `https://huggingface.co/api/whoami-v2` | Hugging Face のアカウント状態確認エンドポイント（テスト・プロキシ差し替え用） |
 | `FREEAGENT_PROBE_TIMEOUT` | 25.0 | 生存確認 1 件の読み取りタイムアウト（秒） |
 | `FREEAGENT_PROBE_WORKERS` | 8 | 生存確認の並列度（1〜8） |
 | `FREEAGENT_SESSIONS` | 1 | 相談セッションを永続化する |

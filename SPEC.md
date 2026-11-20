@@ -2838,7 +2838,7 @@ CI の ubuntu 3 ジョブだけ赤**になった。mtime は「unit のほうが
 **全体**: unittest 1,442 件 OK（1 skip）／`check_integrity`（version=0.53.0）／`compileall`／
 `smoke_stdio` / `smoke_http` / `check_offline`。
 
-### 6.70 知識ソースの決定論自動選定（v0.54.0 / v0.54.1）
+### 6.70 知識ソースの決定論自動選定と全体整合（v0.54.0〜v0.54.2）
 
 `freeagent_lookup` / `freeagent_grounded` / `freeagent_agent` で `sources=["auto"]` を渡すか、
 環境変数 `FREEAGENT_SOURCE_ROUTING=auto`（既定 `off`）を有効にすると、問いの内容から最適な知識ソースを
@@ -2850,6 +2850,7 @@ CI の ubuntu 3 ジョブだけ赤**になった。mtime は「unit のほうが
   2. **ドメイン語彙（12 領域）**: 脆弱性・Web 標準（`mdn`）・npm・Rust/crates・Terraform・ML/HF Hub/OpenReview・**整数列/OEIS**・**数学/定理**（`arxiv, crossref, openalex, zbmath, wikipedia`）・**物理/宇宙物理/量子**（`inspirehep, arxiv, openalex, wikipedia`）・技術議論（`hn`/`qiita`）・歴史資料（`ia`）・学術論文。v0.54.1 で旧「物理・数学」を 3 領域へ分離し、純粋数学クエリでの `inspirehep`/`oeis` ノイズを抑止しつつ、物理・宇宙物理・量子クエリを既定フォールバックではなく `inspirehep` 含む専用経路へ向けた。
   3. **制約フィルタとフォールバック**: 未設定の API キー／規約同意ゲート（`cinii`, `librariesio`, `zbmath`）、未認証レート制限が狭い `qiita`（60 回/時）、CJK のみクエリに対する英語必須ソース（`arxiv`, `ia`, `openreview`, `nvd`, `zbmath`）、`need_evidence=True` 時の `metadata_only` ソース（`devdocs`, `ror`, `zbmath`）、直近一時遮断中ホスト（`_kb_is_blocked`）を除外し、最大 `SOURCE_ROUTING_MAX`（6）件に収める。一致が無い場合は `DEFAULT_SOURCES` にフォールバックする。
 - **透過性と整合性**: 自動選定時は `freeagent_lookup`・`freeagent_grounded`（根拠 0 件早期返却を含む）の両方で `routed: true` と `routing: {reasons, skipped, fallback_default}` を返し、`_render_lookup` にも選定・除外の 1 行要約を出す。また `_agent_tool_call` も `lang=""` を渡して `wikipedia` の自動言語判定を統一した（v0.54.1）。
+- **監査・文書整合（v0.54.2）**: `doc_drift_check.py` / `audit_probes.py` で検出された ①`README.md` のツール一覧スキーマ文字数（`24,841` → **`25,039` 文字（+198）**）②環境変数表から漏れていた `FREEAGENT_HF_WHOAMI_URL`（全 154 変数網羅）③`tests/test_consensus_probe_v0470.py` の `open().read()` 未クローズによる `ResourceWarning` 3 件を修正し、`moji_scan` 0 行・`doc_drift_check` 0 件・`audit_probes --quick` NG 0 / OK 13 を確認。
 
 **検証**: `tests/test_source_routing.py`（11 件）で全 30 ソースのメタ網羅・強識別子・12 領域の分離・キー/規約同意ゲート・未認証 `qiita`・CJK 除外・遮断ホスト・フォールバック・`tool_grounded` 伝搬・`_agent_tool_call` の `lang=""` を固定。実 API 疎通（6 科学ニュースクエリ・`sources=["auto"]`, `limit=3`）で全件 1.50〜3.02 秒・タイムアウト 0 件を確認。
 

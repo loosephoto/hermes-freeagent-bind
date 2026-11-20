@@ -758,7 +758,7 @@ CI の cp1252 では、日本語の `print` が `UnicodeEncodeError` になり�
     Dryad は robots の Disallow（検索パスを名指し）で落ち、MS Learn / Sourcegraph は非公開の内部 API、
     CDS / HepData / scholar.archive はボット壁、searchcode / fatcat は廃止・到達不能だった。
 
-91. **知識ソースの自動選定は opt-in・決定論・ゲート遵守**（v0.54.0 / v0.54.1・SPEC §6.70）。
+91. **知識ソースの自動選定は opt-in・決定論・ゲート遵守**（v0.54.0〜v0.54.2・SPEC §6.70）。
     `sources=["auto"]` または `FREEAGENT_SOURCE_ROUTING=auto`（既定 `off`）のときだけ `route_sources()` が
     強識別子（4 規則）→ドメイン語彙（12 領域: 整数列/OEIS・数学/定理・物理/宇宙物理/量子を分離）→制約フィルタの 3 段で選ぶ（LLM は呼ばない）。規約 28 を壊さず、`off` 時の既定 6 ソースは不変。
     キー必須（`cinii` / `librariesio`）・規約同意（`zbmath`・`_env_on(..., False)` で既定偽）・未認証 `qiita`（60 回/時）・

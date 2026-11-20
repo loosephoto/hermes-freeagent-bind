@@ -70,8 +70,9 @@ class ProbeBudgetContract(unittest.TestCase):
     """probe の予算判定は**実効の予算**で行う（v0.42.5 の訂正を壊さない）。"""
 
     def setUp(self):
-        self.src = open(os.path.join(ROOT, "src", "freeagent_bind", "tools_core.py"),
-                        encoding="utf-8").read()
+        with open(os.path.join(ROOT, "src", "freeagent_bind", "tools_core.py"),
+                  encoding="utf-8") as fh:
+            self.src = fh.read()
 
     def test_budget_dict_has_the_five_fields(self):
         tree = ast.parse(self.src)
@@ -94,7 +95,8 @@ class ProbeBudgetContract(unittest.TestCase):
 
     def test_panel_and_consult_expose_consensus(self):
         for rel in ("tools_core.py", "answers.py"):
-            body = open(os.path.join(ROOT, "src", "freeagent_bind", rel), encoding="utf-8").read()
+            with open(os.path.join(ROOT, "src", "freeagent_bind", rel), encoding="utf-8") as fh:
+                body = fh.read()
             self.assertIn('"consensus_share"', body, rel)
 
 
