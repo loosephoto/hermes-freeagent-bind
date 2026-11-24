@@ -48,7 +48,7 @@ def _wiki_exact_hit(data) -> dict | None:
             continue
         title = S.as_str(page.get("title"))
         extract = S.as_str(page.get("extract"))
-        if title and re.sub(r"<[^>]+>", "", extract).strip():
+        if title and S._html_to_markdown(extract, limit=1200).strip():
             return {"title": title, "extract": extract}
     return None
 
@@ -114,7 +114,7 @@ def kb_wikipedia(query: str, lang: str = "", limit: int = 3) -> dict:
             if not title:
                 continue
             page_url = f"{base}/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
-            summary = re.sub(r"<[^>]+>", "", S.as_str(hit.get("extract")))
+            summary = S._html_to_markdown(S.as_str(hit.get("extract")), limit=1200)
             items.append({"title": title, "url": page_url, "summary": S.truncate(summary, 1200),
                           "snippet": S.truncate(summary, 300)})
             cites.append(S._cite("wikipedia", title, page_url, lang=lang,

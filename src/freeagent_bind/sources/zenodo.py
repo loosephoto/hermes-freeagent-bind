@@ -38,7 +38,7 @@ def kb_zenodo(query: str, limit: int = 3) -> dict:
             if not link:
                 continue
             description = " ".join(S.as_str(meta.get(k)) for k in ("description", "notes"))
-            summary = S._open_metadata_text(description)
+            summary = S._open_metadata_text(description, markdown=True)
             year = S.as_str(meta.get("publication_date"))[:4]
             authors = [S._open_metadata_text(a.get("name"), 100) for a in S._kb_array(meta.get("creators"), "creators")
                        if isinstance(a, dict)]

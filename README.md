@@ -2095,7 +2095,8 @@ python scripts/apply_proactive.py --remove-snippet '<アクティブプロファ
 | `FREEAGENT_ADMIT_MAX_BYTES` | 5000000 | 受付ログ（`admission.jsonl`）の最大サイズ（バイト）。超過で `.1` へ退避（traces と同じ型） |
 | `FREEAGENT_DIAG_MAX_LINES` | 20000 | `freeagent_diagnose` が読むトレースの行数上限（末尾から。絞った件数は `notes` に出ます） |
 | `FREEAGENT_TRACE` / `FREEAGENT_STATS` / `FREEAGENT_COOLDOWN` | 1 | トレース・品質統計・クールダウンの記録 |
-| `FREEAGENT_DEBUG_LOG` | 空 | 指定パスへ stdio の送受信を 1 行ずつ追記（クライアント互換の切り分け用） |
+| `FREEAGENT_DEBUG_LOG` | 空 | 指定パスへ stdio の送受信を JSONL（`{"ts","kind","payload"}`）で 1 行ずつ追記（クライアント互換の切り分け用） |
+| `FREEAGENT_CONTENT_FORMAT` | `plain` | `markdown`（または `md`）で高密度ツール（`models` / `panel` / `consult` / `diagnose`）の `content` を Markdown 見出し・表で出力（v0.55.0） |
 | `FREEAGENT_REDACT_SECRETS` | 1 | 上流へ送る前に既知の形の秘密（`sk-` / `ghp_` / `AKIA` / Bearer / JWT / 秘密鍵）を伏せる（0 で無効）。件数は返り値の `redactions` に出る（v0.35.0） |
 | `FREEAGENT_HERMES_BIN` | `hermes`（`which` で探索） | `freeagent_delegate` に使う実行ファイル |
 | `FREEAGENT_TRANSPORT` | `stdio` | `http` で HTTP モード（1 プロセス共有）。`--transport` が優先 |

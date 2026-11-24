@@ -95,7 +95,7 @@ if __package__ in (None, ""):
 # ================================================================ §0 定数・設定
 
 SERVER_NAME = "hermes-freeagent-bind"
-SERVER_VERSION = "0.54.2"
+SERVER_VERSION = "0.55.0"
 
 # クライアントが提示した版をそのまま返す（交渉）。自前実装で版を固定すると、新しい版を提示する
 # クライアント（例: Hermes の MCP クライアントは 2025-11-25）が接続直後に tools/list を cancel
@@ -274,13 +274,19 @@ def _debug(kind: str, payload) -> None:
     if not DEBUG_LOG:
         return
     try:
-        line = _dumps(payload)
+        raw = _dumps(payload)
+        trimmed = payload if len(raw) <= 4000 else raw[:4000]
     except Exception:
-        line = repr(payload)
+        trimmed = repr(payload)[:4000]
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "kind": str(kind),
+        "payload": trimmed,
+    }
     try:
         with _DEBUG_LOCK:
             with open(DEBUG_LOG, "a", encoding="utf-8") as fh:
-                fh.write(f"[{time.strftime('%H:%M:%S')}] {kind} {line[:4000]}\n")
+                fh.write(_dumps(entry) + "\n")
     except Exception:
         pass
 

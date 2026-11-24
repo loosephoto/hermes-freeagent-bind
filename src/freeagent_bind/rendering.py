@@ -6,10 +6,189 @@
 """
 from __future__ import annotations
 
+import os
+
 from . import server as S  # noqa: E402
+
+
+def _content_is_markdown() -> bool:
+    """`FREEAGENT_CONTENT_FORMAT=markdown|md` のとき高密度ツールの `content` を Markdown 出力する。"""
+    return os.environ.get("FREEAGENT_CONTENT_FORMAT", "").strip().lower() in ("markdown", "md")
+
+
+def _md_escape_cell(value) -> str:
+    """Markdown テーブルセル内の改行・パイプをエスケープして表崩れを防ぐ。"""
+    text = " ".join(str(value if value is not None else "").split())
+    return text.replace("|", "\\|")
+
+
+def _md_table(headers: list[str], rows: list[list]) -> str:
+    """エスケープ済みの Markdown 表を組み立てる。"""
+    head = "| " + " | ".join(_md_escape_cell(h) for h in headers) + " |"
+    sep = "| " + " | ".join("---" for _ in headers) + " |"
+    body = ["| " + " | ".join(_md_escape_cell(c) for c in row) + " |" for row in rows]
+    return "\n".join([head, sep, *body])
+
+
+def _render_models_md(data: dict) -> str:
+    """`freeagent_models` の Markdown 描画（`FREEAGENT_CONTENT_FORMAT=markdown` 時）。"""
+    providers = data.get("providers") or []
+    ready_n = sum(1 for r in providers if r.get("ready"))
+    parts = [f"### サブLLMバックエンド（{ready_n} プロバイダ有効）"]
+    rows = []
+    for row in providers:
+        mark = "✓" if (row.get("ready") and not row.get("error")) else ("⚠" if row.get("ready") else "—")
+        if row.get("error"):
+            note = f"到達不可: {str(row['error'])[:80]}"
+        elif not row.get("ready") and row.get("requires_activation"):
+            missing = ", ".join(row.get("missing_settings") or []) or "設定確認"
+            note = f"無効: {missing}"
+        elif not row.get("ready") and row.get("key_env"):
+            note = f"{row['key_env']} 未設定 → 検索のみ"
+        else:
+            note = ""
+        rows.append([mark, row.get("provider", ""), row.get("models", 0), row.get("free", 0), note])
+    for row in data.get("hidden_providers") or []:
+        mark = "○" if row.get("ready") else "—"
+        note = f"既定は非表示 / {row.get('reason') or ''} [有効化: {row.get('opt_in_env')}=1]"
+        rows.append([mark, row.get("provider", ""), "—", "—", note])
+    if rows:
+        parts.append(_md_table(["状態", "プロバイダ", "モデル数", "Free", "備考"], rows))
+    parts.append(
+        f"- Free候補: **{data.get('free_candidates')}** 件（うち今すぐ使用可 **{data.get('usable_now')}**）"
+        f" / 全 {data.get('total_models')} モデル\n"
+        f"- 既定: `{data.get('default_model')}`"
+    )
+    blocked = data.get("credit_blocked") or {}
+    if blocked:
+        parts.append("- クレジット枯渇（402）で自動選抜から除外: " + ", ".join(sorted(blocked)))
+    cooling = data.get("cooling") or {}
+    if cooling:
+        shown = list(cooling)[:8]
+        more = f" … 他 {len(cooling) - len(shown)} 件" if len(cooling) > len(shown) else ""
+        parts.append(f"- クールダウン中 {len(cooling)} 件: " + ", ".join(shown) + more)
+    q = data.get("query")
+    if q:
+        parts.append(
+            f"#### 検索結果（`{q.get('query') or ''}` / provider={q.get('provider')} → "
+            f"{q.get('matched')} 件・表示 {q.get('shown')} 件）"
+        )
+        mrows = []
+        for m in (data.get("models") or []):
+            tags = []
+            if m.get("free"):
+                tags.append("Free" + (f" via {','.join(m['free_via'])}" if m.get("free_via") else ""))
+            if not m.get("usable"):
+                tags.append("キー未設定")
+            if m.get("probe") and m["probe"] != "alive":
+                tags.append(f"要再確認={m['probe']}")
+            mrows.append([f"`{m.get('ref', '')}`", m.get("context_length") or "—", ", ".join(tags) or "有料"])
+        if mrows:
+            parts.append(_md_table(["モデル", "ctx", "状態"], mrows))
+    stats = data.get("stats") or []
+    if stats:
+        srows = [[f"`{r.get('model', '')}`", r.get("status", ""), r.get("quality", ""), r.get("observations", 0)]
+                 for r in stats[:12]]
+        parts.append("#### 品質統計\n" + _md_table(["モデル", "状態", "品質", "観測"], srows))
+    return "\n\n".join(parts)
+
+
+def _render_panel_md(data: dict) -> str:
+    """`freeagent_panel` の Markdown 描画（`FREEAGENT_CONTENT_FORMAT=markdown` 時）。"""
+    parts_meta = data.get("participants") or {}
+    asked = S.as_int(parts_meta.get("requested"), 0, 0, 10 ** 9) or len(data.get("models") or [])
+    got = S.as_int(parts_meta.get("answered"), 0, 0, 10 ** 9) or S.as_int(data.get("answered"), 0, 0, 10 ** 9)
+    conf_mean = data.get("confidence_mean")
+    conf_note = f" / 確信度平均 {conf_mean}" if isinstance(conf_mean, (int, float)) else ""
+    out = [f"### パネル回答（{got}/{asked} 体 / 独立 {data.get('independent_sources', data.get('answered'))} 体 / 合意度 {data.get('agreement')}{conf_note}）"]
+    if S.as_str(data.get("confidence_warning")):
+        out.append(f"> ⚠️ {data['confidence_warning']}")
+    groups = data.get("consensus") or []
+    if groups:
+        rows = [[", ".join(g.get("models") or []), S.truncate(g.get("excerpt") or "", 160)] for g in groups[:5]]
+        out.append(_md_table(["モデル", "結論の要旨"], rows))
+    if data.get("open_questions"):
+        q_lines = ["#### メインに確認したい点"] + [
+            f"- **{row['model']}**: {S.truncate(row['question'], 160)}" for row in data["open_questions"][:5]
+        ]
+        out.append("\n".join(q_lines))
+    refined = data.get("refined")
+    if isinstance(refined, dict):
+        if refined.get("error"):
+            out.append(f"⚠️ 統合に失敗: {S.truncate(refined['error'], 120)}")
+        elif refined.get("conclusion"):
+            out.append(f"#### 統合（`{refined.get('model')}`）\n{S.truncate(refined['conclusion'], 220)}")
+    out.append("_ℹ️ 合意度は表層・短答の一致であって正しさの保証ではありません。_")
+    return "\n\n".join(out)
+
+
+def _render_consult_md(data: dict) -> str:
+    """`freeagent_consult` の Markdown 描画（`FREEAGENT_CONTENT_FORMAT=markdown` 時）。"""
+    out = [
+        f"### 相談 `{data.get('session_id')}`（mode={data.get('mode')} / ラウンド{data.get('rounds_run')} / stage={data.get('stage')}）\n"
+        f"- 合意度: **{data.get('agreement')}** / 確信度平均: **{data.get('confidence_mean')}**"
+    ]
+    cons = data.get("consensus") or []
+    if cons:
+        rows = [[f"`{r.get('model', '')}`", r.get("confidence") if isinstance(r.get("confidence"), int) else "—",
+                 S.truncate(r.get("conclusion") or "", 160)] for r in cons[:5]]
+        out.append(_md_table(["モデル", "確信度", "結論"], rows))
+    failed_rows = data.get("failed") or []
+    if failed_rows:
+        out.append("\n".join(f"- ✗ `{r.get('model')}`（脱落）: {S.truncate(r.get('error') or '', 90)}" for r in failed_rows))
+    fs = data.get("findings_summary")
+    if fs:
+        status = "**blocking**" if fs.get("blocking") else "差し戻し不要"
+        out.append(
+            f"- 重要度: critical {fs.get('critical', 0)} / required {fs.get('required', 0)} / "
+            f"optional {fs.get('optional', 0)} / nit {fs.get('nit', 0)}（{status}）"
+        )
+    if data.get("open_questions_for_main"):
+        defaults = {q["question"]: q.get("default") for q in (data.get("open_questions") or [])}
+        q_lines = ["#### メインに確認したい点"] + [
+            f"- {q}" + (f"（既定: {defaults[q]}）" if defaults.get(q) else "")
+            for q in data["open_questions_for_main"][:5]
+        ]
+        out.append("\n".join(q_lines))
+    out.append("_ℹ️ 最終判断はメイン。サブの出力は仮説として扱ってください。_")
+    return "\n\n".join(out)
+
+
+def _render_diagnose_md(data: dict) -> str:
+    """`freeagent_diagnose` の Markdown 描画（`FREEAGENT_CONTENT_FORMAT=markdown` 時）。"""
+    window = data.get("window") or {}
+    totals = data.get("totals") or {}
+    latency = data.get("latency") or {}
+    advice = data.get("advice") or {}
+    out = [f"### 診断: 直近 {S.as_int(window.get('days'), 7, 0, 365)} 日（{S.as_str(window.get('since_utc'))} 〜 {S.as_str(window.get('until_utc'))}）"]
+    calls = S.as_int(totals.get("calls"), 0, 0, 10 ** 9)
+    if not calls:
+        out.append("呼び出しの記録がありません（traces が空・窓の外・絞り込みで 0 件）。")
+    else:
+        rate = totals.get("ok_rate")
+        rate_text = f"{S.as_float(rate, 0.0):.1%}" if rate is not None else "-"
+        summary = [f"- 呼び出し: **{calls}** 件 / 成功 **{S.as_int(totals.get('ok'), 0, 0, 10 ** 9)}** / 失敗 **{S.as_int(totals.get('failed'), 0, 0, 10 ** 9)}**（成功率 {rate_text}）"]
+        if S.as_int(latency.get("n"), 0, 0, 10 ** 9):
+            summary.append(f"- 遅延: p50 `{latency.get('p50')}s` / p90 `{latency.get('p90')}s` / p95 `{latency.get('p95')}s` / p99 `{latency.get('p99')}s`（n={S.as_int(latency.get('n'), 0, 0, 10 ** 9)}）")
+        out.append("\n".join(summary))
+    slow = data.get("slowest_models") or []
+    if slow:
+        rows = [[f"`{S.as_str(r.get('model'))}`", S.as_int(r.get("n"), 0, 0, 10 ** 9), f"{r.get('p50')}s", f"{r.get('p95')}s"]
+                for r in slow[:5]]
+        out.append("#### 遅いモデル（p95）\n" + _md_table(["モデル", "件数", "p50", "p95"], rows))
+    errors = data.get("top_errors") or []
+    if errors:
+        rows = [[S.as_int(r.get("count"), 0, 0, 10 ** 9), S.truncate(S.as_str(r.get("error")), 100)] for r in errors[:5]]
+        out.append("#### 多い失敗\n" + _md_table(["件数", "エラー"], rows))
+    if advice:
+        out.append(f"#### 次の一手（`{S.as_str(advice.get('kind')) or '-'}`）\n{S.as_str(advice.get('advice'))}")
+    return "\n\n".join(out)
+
 
 def _render_models(data: dict) -> str:
     """`freeagent_models` の本文（`content` = 人間向け日本語）。"""
+    if _content_is_markdown():
+        return _render_models_md(data)
     lines = []
     for row in data.get("providers") or []:
         # ✓ は「資格情報がある」だけでなく「一覧が取れている」ことも表す。取れていないのに ✓ だと、
@@ -136,6 +315,8 @@ def _render_fanout(data: dict) -> str:
 
 def _render_panel(data: dict) -> str:
     """`freeagent_panel` の本文（`content` = 人間向け日本語）。"""
+    if _content_is_markdown():
+        return _render_panel_md(data)
     conf_mean = data.get("confidence_mean")
     conf_note = f"（確信度平均 {conf_mean}）" if isinstance(conf_mean, (int, float)) else ""
     parts = data.get("participants") or {}
@@ -313,6 +494,8 @@ def _render_map(data: dict) -> str:
 
 def _render_consult(data: dict) -> str:
     """`freeagent_consult` の本文（`content` = 人間向け日本語）。"""
+    if _content_is_markdown():
+        return _render_consult_md(data)
     lines = [f"相談 {data.get('session_id')} / mode={data.get('mode')} / "
              f"ラウンド{data.get('rounds_run')} / stage={data.get('stage')}",
              f"合意度 {data.get('agreement')} / 確信度平均 {data.get('confidence_mean')}"]
@@ -527,6 +710,8 @@ def _render_delegate(data: dict) -> str:
 
 def _render_diagnose(data: dict) -> str:
     """診断の本文（人間向け）。**記録に無いことは「無い」と書く**。"""
+    if _content_is_markdown():
+        return _render_diagnose_md(data)
     window = data.get("window") or {}
     totals = data.get("totals") or {}
     latency = data.get("latency") or {}
@@ -645,6 +830,8 @@ def _render_body(name: str, data: dict) -> str:
 
 # server.py 側の互換（テストは server.<name> を直接参照する）
 EXPORTS = {
+    "_content_is_markdown": _content_is_markdown,
+    "_md_escape_cell": _md_escape_cell,
     "_render_models": _render_models,
     "_render_ask": _render_ask,
     "_render_fanout": _render_fanout,

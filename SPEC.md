@@ -2854,6 +2854,18 @@ CI の ubuntu 3 ジョブだけ赤**になった。mtime は「unit のほうが
 
 **検証**: `tests/test_source_routing.py`（11 件）で全 30 ソースのメタ網羅・強識別子・12 領域の分離・キー/規約同意ゲート・未認証 `qiita`・CJK 除外・遮断ホスト・フォールバック・`tool_grounded` 伝搬・`_agent_tool_call` の `lang=""` を固定。実 API 疎通（6 科学ニュースクエリ・`sources=["auto"]`, `limit=3`）で全件 1.50〜3.02 秒・タイムアウト 0 件を確認。
 
+### 6.71 Markdown・JSON 処理の強化（v0.55.0）
+
+内部処理のうち非 Markdown・非 JSON だった 5 箇所を、既存互換と Free モデルの途中切断耐性を保ったまま構造化した。
+
+- **構造化応答の JSON 優先 + 既存行ラベルフォールバック（`tools_core.py` / `think_tools.py`）**: `CONSULT_SYSTEM` / `REVIEW_SYSTEM` / `COMPLIANCE_SYSTEM` / `THINK_CRITIC_SYSTEM` / `THINK_ALT_SYSTEM` で JSON 出力を許容し、`parse_labeled()` / `parse_review()` / `parse_compliance()` / `parse_verdict()` / `parse_alternatives()` は `S._jsonutil.extract_object()` を先に試す。途中切断や非 JSON 応答時は従来の正規表現行パーサへ安全にフォールバックする。`parse_review()` では JSON の `axes` / `findings` から軸を抽出して本文の否定表現への誤爆を抑止。
+- **入力プロンプトの Markdown 見出し化（`answers.py`）**: `tool_grounded()` / `_consult_prompt()` / `tool_agent()` / `DELEGATE_VERIFY_PREFIX` のセクション見出しを `## ...` に統一し、英語系 Free モデルでの文脈分離精度を向上。
+- **知識ソース HTML の軽量 Markdown 化（`knowledge.py` / `sources/zenodo.py` / `sources/wikipedia.py`）**: `HTMLParser` ベースの `_html_to_markdown()` を追加（`<script>`/`<style>`/`<img>` 除外、`<code>`・`<li>`・段落区切り保持）。`_open_metadata_text(..., markdown=True)`（既定 `False` は互換維持・メール除外維持）および `wikipedia` の抽出経路へ適用。
+- **デバッグログの JSONL 化（`server.py::_debug`）**: `FREEAGENT_DEBUG_LOG` の出力を UTC ISO-8601 タイムスタンプ付きの 1 行 1 JSON（`{"ts", "kind", "payload"}`）へ変更。
+- **高密度ツールの条件付き Markdown 出力（`rendering.py`）**: `FREEAGENT_CONTENT_FORMAT=markdown`（または `md`）のとき `_render_models` / `_render_panel` / `_render_consult` / `_render_diagnose` をエスケープ済み Markdown 見出し・表で出力（既定 `plain` で既存互換を維持）。
+
+**検証**: `tests/test_md_json_processing.py`（10 件）を追加し、全オフライン回帰 1,464 件 OK（1 skip）・`check_integrity`（version=0.55.0）・`compileall`・`smoke_stdio`・`smoke_http`・`check_offline` 全通過を確認。
+
 ## 12. 検証
 
 ```bash

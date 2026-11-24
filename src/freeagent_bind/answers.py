@@ -85,10 +85,10 @@ def tool_grounded(args: dict) -> dict:
     if not refs:
         return S._no_models()
     prompt = (
-        "次の【根拠】だけを情報源として質問に答えてください。\n"
+        "次の「## 根拠」だけを情報源として質問に答えてください。\n"
         "根拠に無い事実は書かない。書けない場合は「根拠に無い」と明示する。\n"
         "本文中で根拠を示すときは [番号] を付ける。\n\n"
-        f"【根拠】\n{window['text']}\n\n【質問】\n{question}"
+        f"## 根拠\n{window['text']}\n\n## 質問\n{question}"
     )
     results = S.ask_many(refs, prompt, max_tokens=S.as_int(args.get("max_tokens"), 700, 16, 4000),
                        kind="grounded", avoid=S.as_str_list(args.get("exclude")) or None)
@@ -200,26 +200,26 @@ def tool_map(args: dict) -> dict:
 def _consult_prompt(question: str, main_reply: str, round_no: int, peers: list[dict] | None = None,
                     mode: str = "discuss", draft: str = "", basis: str = "",
                     stage: str = "quality") -> str:
-    parts = [f"【問い】\n{question}"]
+    parts = [f"## 問い\n{question}"]
     if mode == "review" and draft:
-        parts.append(f"【査読対象の下書き】\n{S.truncate(draft, 4000)}")
+        parts.append(f"## 査読対象の下書き\n{S.truncate(draft, 4000)}")
     if basis:
-        parts.append(f"【仕様・計画（これに適合するかを見る）】\n{S.truncate(basis, 3000)}")
+        parts.append(f"## 仕様・計画（これに適合するかを見る）\n{S.truncate(basis, 3000)}")
     if main_reply:
-        parts.append(f"【メインからの回答（権威ある前提として扱う）】\n{S.truncate(main_reply, 3000)}")
+        parts.append(f"## メインからの回答（権威ある前提として扱う）\n{S.truncate(main_reply, 3000)}")
     if peers:
         block = "\n".join(f"- {p['model']}: {S.truncate(p.get('conclusion') or p.get('text') or '', 400)}"
                           for p in peers)
-        parts.append(f"【他の参加者の回答（第{round_no}ラウンド）】\n{block}")
+        parts.append(f"## 他の参加者の回答（第{round_no}ラウンド）\n{block}")
     if stage == "compliance":
-        parts.append("上の形式（結論/判定/指摘/メインに確認したい点）だけで答えてください。"
+        parts.append("上の形式（JSON または 結論/判定/指摘/メインに確認したい点）だけで答えてください。"
                      "**品質の良し悪しは書かず**、仕様・計画の各要件を満たすかどうかだけを見てください。")
     elif mode == "review" and draft:
-        parts.append("上の形式（結論/重要度/指摘/メインに確認したい点）だけで答えてください。"
+        parts.append("上の形式（JSON または 結論/重要度/指摘/メインに確認したい点）だけで答えてください。"
                      "5 軸（correctness / readability / architecture / security / performance）を"
                      "一通り見てから、最も重い重要度を 1 つ名乗ってください。")
     else:
-        parts.append("上の形式（結論/確信度/メインに確認したい点）だけで答えてください。"
+        parts.append("上の形式（JSON または 結論/確信度/メインに確認したい点）だけで答えてください。"
                      "確認したい点は最も重要な 1 つだけにし、推奨の既定値を「既定: …」で添えてください。")
     return "\n\n".join(parts)
 
@@ -637,9 +637,9 @@ def tool_agent(args: dict) -> dict:
     max_steps = S.as_int(args.get("max_steps"), 2, 1, 4)
     main_reply = S.as_str(args.get("main_reply"))
     max_tokens = S.as_int(args.get("max_tokens"), 600, 16, 3000)
-    base = f"【依頼】\n{task}"
+    base = f"## 依頼\n{task}"
     if main_reply:
-        base += f"\n\n【メインからの回答（最優先の前提）】\n{S.truncate(main_reply, 3000)}"
+        base += f"\n\n## メインからの回答（最優先の前提）\n{S.truncate(main_reply, 3000)}"
 
     claims = S._ModelClaims(refs, S.as_str_list(args.get("exclude")) + S.env_excluded_models() or None)
 
@@ -694,7 +694,7 @@ def tool_agent(args: dict) -> dict:
                 window = _evidence_window([c for _, c in added], item_chars=300, total_chars=1200,
                                           numbers=[n for n, _ in added])
                 injected.update(window["numbers"])
-                history += (f"\n\n【ツール結果 {parsed.get('tool')}】\n"
+                history += (f"\n\n## ツール結果 ({parsed.get('tool')})\n"
                             + (window["text"] or "本文根拠を注入できませんでした（書誌のみ・本文予算不足等）"))
                 continue
             answer = S.as_str(parsed.get("answer"))
@@ -748,12 +748,12 @@ def tool_agent(args: dict) -> dict:
 
 
 DELEGATE_VERIFY_PREFIX = (
-    "【完了報告の条件（この依頼では必ず守る）】\n"
+    "## 完了報告の条件（この依頼では必ず守る）\n"
     "- 最終報告に、実行した検証コマンドとその出力（成功/失敗）を必ず含める\n"
     "- 確かめていない項目は「未検証」と明記する（推測で埋めない）\n"
     "- 失敗が 1 つでもあれば「完了」と書かない\n"
     "\n"
-    "【依頼】\n"
+    "## 依頼\n"
 )
 
 

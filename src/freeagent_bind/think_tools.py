@@ -474,9 +474,11 @@ def tool_think(args: dict) -> dict:
 
 THINK_ALT_SYSTEM = (
     "あなたは代替案の提案者です。与えられた思考の道筋とは**異なる**仮説・解法・道筋を挙げてください。"
-    "出力は次の形式の行だけです（最大3行）。\n"
+    "JSON 1つ、または次の形式の行だけで答えてください（最大3案）。\n"
+    'JSON の例: {"alternatives": ["<1〜2文。どこが今の道筋と違うかが分かるように>"]}\n'
+    "行形式の例:\n"
     "代替: <1〜2文。どこが今の道筋と違うかが分かるように>\n"
-    "今の道筋の言い換えや賛成は書かない。無ければ「代替: なし」の1行だけ。"
+    "今の道筋の言い換えや賛成は書かない。無ければ {\"alternatives\": []} または「代替: なし」。"
     "前置き・思考過程・挨拶・Markdown の見出しは書かない。"
 )
 
@@ -490,12 +492,36 @@ _BULLET = re.compile(r"^(?:[-*・•]|\d+[.)．、])\s+(.+)")
 
 
 def parse_alternatives(text, limit: int = 3, *, truncated: bool = False) -> list[str]:
-    """提案者の「代替: …」行を取り出す。ラベルが 1 つも無ければ箇条書きだけを拾う（推測で埋めない）。
+    """提案者の代替案を取り出す（JSON 優先・行ラベル/箇条書きへフォールバック）。
 
-    `truncated`（max_tokens で打ち切られた応答）のときは、**本文の最終行にあたる案**を捨てる。
-    打ち切りは最終行の途中で起きるので、それを案として渡すと文の途中で切れた提案が
-    完全な案として台帳に残る（実測「代替: 親プロセスのコマン」）。
+    `truncated`（max_tokens で打ち切られた応答）のときは、不完全な JSON は `extract_object` が
+    空 dict を返して行パーサへ落ち、**本文の最終行にあたる案**を捨てる。
     """
+    if isinstance(text, str) and "{" in text:
+        obj = S._jsonutil.extract_object(text)
+        if obj:
+            raw = None
+            for key in ("alternatives", "代替案", "代替", "alternative"):
+                if key in obj:
+                    raw = obj[key]
+                    break
+            if raw is not None:
+                items = [raw] if isinstance(raw, str) else (raw if isinstance(raw, list) else [])
+                out_json: list[str] = []
+                for item in items:
+                    if isinstance(item, dict):
+                        val = next((str(item[k]).strip() for k in ("text", "alternative", "proposal", "summary", "代替")
+                                    if isinstance(item.get(k), str) and item[k].strip()), "")
+                    elif isinstance(item, str):
+                        val = item.strip()
+                    else:
+                        continue
+                    val = val.strip("* ")
+                    if val and not S._is_no_answer(val):
+                        out_json.append(S.truncate(val, 300))
+                    if len(out_json) >= limit:
+                        break
+                return out_json
     lines = [ln.strip() for ln in (text if isinstance(text, str) else "").splitlines() if ln.strip()]
     if truncated and lines:
         lines = lines[:-1]

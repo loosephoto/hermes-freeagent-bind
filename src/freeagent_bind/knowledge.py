@@ -1197,8 +1197,87 @@ def _kb_object(value, field: str) -> dict:
     return value
 
 
-def _open_metadata_text(value, limit: int = 600) -> str:
-    """非本文HTMLとメールを除外する。除外だけの値は空で返す。"""
+def _html_to_markdown(value, limit: int = 600) -> str:
+    """HTML を軽量な Markdown（箇条書き・インラインコード・段落区切り保持、非本文タグ除外）へ変換する。"""
+    from html.parser import HTMLParser
+    _SKIP = ("script", "style", "template", "noscript", "head")
+    _BLOCKS = ("p", "div", "br", "tr", "section", "article", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6")
+
+    class MdReader(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts: list[str] = []
+            self.hidden: list[str] = []
+            self.in_pre = 0
+            self.in_code = 0
+
+        def handle_starttag(self, tag, attrs):
+            t = tag.lower()
+            if t in _SKIP:
+                self.hidden.append(t)
+                return
+            if self.hidden:
+                return
+            if t == "pre":
+                self.in_pre += 1
+                self.parts.append("\n")
+            elif t == "code":
+                self.in_code += 1
+                if not self.in_pre:
+                    self.parts.append("`")
+            elif t == "li":
+                self.parts.append("\n- ")
+            elif t in _BLOCKS:
+                self.parts.append("\n")
+            elif t != "img":
+                self.parts.append(" ")
+
+        def handle_endtag(self, tag):
+            t = tag.lower()
+            if t in self.hidden:
+                self.hidden = self.hidden[:self.hidden.index(t)]
+                return
+            if self.hidden:
+                return
+            if t == "pre":
+                self.in_pre = max(0, self.in_pre - 1)
+                self.parts.append("\n")
+            elif t == "code":
+                if not self.in_pre and self.in_code > 0:
+                    self.parts.append("`")
+                self.in_code = max(0, self.in_code - 1)
+            elif t in _BLOCKS or t == "li":
+                self.parts.append("\n")
+
+        def handle_data(self, data):
+            if not self.hidden:
+                self.parts.append(data)
+
+    reader = MdReader()
+    reader.feed(S.as_str(value))
+    reader.close()
+    raw = "".join(reader.parts)
+    lines = []
+    for ln in raw.splitlines():
+        cleaned = " ".join(ln.split())
+        if cleaned:
+            lines.append(cleaned)
+    return S.truncate("\n".join(lines), limit)
+
+
+def _open_metadata_text(value, limit: int = 600, *, markdown: bool = False) -> str:
+    """非本文HTMLとメールを除外する。除外だけの値は空で返す。`markdown=True` で軽量 Markdown 構造を保持。"""
+    if markdown:
+        text = _html_to_markdown(value, limit=max(limit * 2, 1200))
+        lines = []
+        for ln in text.splitlines():
+            cleaned = re.sub(r'(?:"[^"]*"|[^ @<>]+) *@ *[^ <>]+', " ", ln)
+            if "@" in cleaned:
+                return ""
+            cleaned = " ".join(cleaned.split())
+            if cleaned:
+                lines.append(cleaned)
+        return S.truncate("\n".join(lines), limit)
     from html.parser import HTMLParser
     class Reader(HTMLParser):
         def __init__(self):
@@ -1344,6 +1423,7 @@ EXPORTS = {
     "_kb_citation_key": _kb_citation_key,
     "_kb_merge_citations": _kb_merge_citations,
     "_kb_object": _kb_object,
+    "_html_to_markdown": _html_to_markdown,
     "_open_metadata_text": _open_metadata_text,
     "_kb_package_result": _kb_package_result,
     "_kb_generic_result": _kb_generic_result,

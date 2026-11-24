@@ -11,7 +11,10 @@ import re
 from . import server as S  # noqa: E402
 
 CONSULT_SYSTEM = (
-    "あなたはメインLLMの補佐です。出力は必ず次の3行だけで答えてください。\n"
+    "あなたはメインLLMの補佐です。JSON 1つ、または次の3行だけで答えてください。\n"
+    'JSON の例: {"conclusion": "<1〜3文。断定を避け、確信が無い部分は「不明」と書く>", '
+    '"confidence": 80, "question": "<前提が足りず判断できない点。無ければ なし>"}\n'
+    "行形式の例:\n"
     "結論: <1〜3文。断定を避け、確信が無い部分は「不明」と書く>\n"
     "確信度: <0〜100 の整数>\n"
     "メインに確認したい点: <前提が足りず判断できない点。無ければ なし>\n"
@@ -29,7 +32,11 @@ DEBATE_SYSTEM = (
 
 
 REVIEW_SYSTEM = (
-    "あなたは下書きの査読者です。出力は必ず次の4行だけです。\n"
+    "あなたは下書きの査読者です。JSON 1つ、または次の4行だけで答えてください。\n"
+    'JSON の例: {"conclusion": "<総評を1〜3文>", "severity": "required", '
+    '"axes": ["correctness"], "findings": ["[correctness] 箇所 — 理由"], '
+    '"question": "<確認したい点。既定: …。無ければ なし>"}\n'
+    "行形式の例:\n"
     "結論: <総評を1〜3文>\n"
     "重要度: <critical / required / optional / nit のうち最も重いものを1つ>\n"
     "指摘: <根拠つきの指摘を最大3個。各「[軸] 箇所 — 理由」。軸は correctness / readability / "
@@ -42,7 +49,11 @@ REVIEW_SYSTEM = (
 
 COMPLIANCE_SYSTEM = (
     "あなたは仕様適合の査読者です。**品質の良し悪しは判定せず**、下書きが【仕様・計画】の要件を"
-    "満たしているかだけを見てください。出力は必ず次の4行だけです。\n"
+    "満たしているかだけを見てください。JSON 1つ、または次の4行だけで答えてください。\n"
+    'JSON の例: {"conclusion": "<満たしている点と足りない点を1〜3文>", "verdict": "partial", '
+    '"findings": ["[要件] 該当箇所 — 何が足りないか"], '
+    '"question": "<確認したい点。既定: …。無ければ なし>"}\n'
+    "行形式の例:\n"
     "結論: <満たしている点と足りない点を1〜3文>\n"
     "判定: <compliant / partial / noncompliant のうち1つ>\n"
     "指摘: <満たしていない要件を最大3個。各「[要件] 該当箇所 — 何が足りないか」>\n"
@@ -91,7 +102,10 @@ AGENT_SYSTEM = (
 
 THINK_CRITIC_SYSTEM = (
     "あなたは思考ステップの検証者です。同意を探すのではなく**反証**を探してください。"
-    "出力は必ず次の4行だけです。\n"
+    "JSON 1つ、または次の4行だけで答えてください。\n"
+    'JSON の例: {"verdict": "要修正", "objection": "<最も強い反証を1〜2文。無ければ なし>", '
+    '"oversight": "<見落としを1つ。無ければ なし>", "confidence": 75}\n'
+    "行形式の例:\n"
     "判定: <妥当 / 要修正 / 根拠不足 のいずれか1つ>\n"
     "反証: <この思考への最も強い反証を1〜2文。無ければ なし>\n"
     "見落とし: <検討されていない観点を1つ。無ければ なし>\n"
@@ -113,9 +127,96 @@ _LABEL_QUESTION = re.compile(r"(?:メインに確認したい点|確認したい
 _NO_ANSWER = ("なし", "無し", "ありません", "none", "-", "n/a", "特になし")
 
 
+def _json_first(obj: dict, *keys: str):
+    """JSON オブジェクトから候補キーのうち最初に見つかった非 None 値を返す。"""
+    if not isinstance(obj, dict):
+        return None
+    low = {k.lower(): v for k, v in obj.items() if isinstance(k, str)}
+    for key in keys:
+        if key in obj and obj[key] is not None:
+            return obj[key]
+        kl = key.lower()
+        if kl in low and low[kl] is not None:
+            return low[kl]
+    return None
+
+
+def _json_confidence(raw) -> int | None:
+    """JSON 値の確信度を 0〜100 の整数に正規化する（bool や範囲外は None）。"""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        if 0.0 < val <= 1.0 and isinstance(raw, float):
+            val *= 100.0
+    elif isinstance(raw, str):
+        s = raw.strip().rstrip("%％").strip()
+        val = S.as_float(s, -1.0)
+        if "." in s and 0.0 <= val <= 1.0:
+            val *= 100.0
+    else:
+        return None
+    if 0.0 <= val <= 100.0:
+        return int(val)
+    return None
+
+
+def _json_findings(raw, limit: int = 6, max_chars: int = 240) -> list[str]:
+    """JSON の指摘一覧（str / list[str|dict]）を文字列配列に正規化する。"""
+    if isinstance(raw, str):
+        items = [raw]
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        return []
+    out: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            axis = S.as_str(_json_first(item, "axis", "軸", "requirement", "要件")).strip()
+            loc = S.as_str(_json_first(item, "location", "箇所", "where", "target")).strip()
+            body = S.as_str(_json_first(item, "reason", "detail", "message", "issue", "description", "理由", "内容")).strip()
+            prefix = f"[{axis}] " if axis else ""
+            if loc and body:
+                text = f"{prefix}{loc} — {body}"
+            else:
+                text = f"{prefix}{body or loc}"
+        elif isinstance(item, str):
+            text = item.strip()
+        else:
+            continue
+        text = text.strip("* ")
+        if not text or _is_no_answer(text):
+            continue
+        out.append(S.truncate(text, max_chars))
+        if len(out) >= limit:
+            break
+    return out
+
+
 def parse_labeled(text: str) -> dict:
-    """「結論/確信度/確認したい点」形式の回答を構造化する。取れない項目は None（推測しない）。"""
+    """「結論/確信度/確認したい点」形式（JSON 優先・行ラベルへフォールバック）を構造化する。"""
     out = {"conclusion": "", "confidence": None, "question": "", "labels_found": 0}
+    if isinstance(text, str) and "{" in text:
+        obj = S._jsonutil.extract_object(text)
+        if obj:
+            conc = _json_first(obj, "conclusion", "結論", "summary", "まとめ")
+            if isinstance(conc, str) and conc.strip():
+                out["conclusion"] = S.truncate(conc.strip().strip("* "), 600)
+                out["labels_found"] += 1
+            conf = _json_confidence(_json_first(obj, "confidence", "確信度", "自信"))
+            if conf is not None:
+                out["confidence"] = conf
+                out["labels_found"] += 1
+            qraw = _json_first(obj, "question", "questions", "メインに確認したい点", "確認したい点", "質問")
+            if isinstance(qraw, list):
+                qraw = next((x for x in qraw if isinstance(x, str) and x.strip()), "")
+            if isinstance(qraw, str):
+                value = qraw.strip().strip("* ")
+                empty_value = value.lower().rstrip(" .。!?！？;；").strip()
+                out["question"] = "" if (not value or empty_value in _NO_ANSWER) else S.truncate(value, 400)
+                out["labels_found"] += 1
+            if out["labels_found"] > 0:
+                return out
     for line in (text or "").splitlines():
         line = line.strip()
         if not line:
@@ -152,8 +253,36 @@ _LABEL_DEFAULT = re.compile(r"既定\s*[:：]\s*([^。\n]{1,60})")
 
 
 def parse_review(text: str) -> dict:
-    """査読回答から重要度・指摘・軸を取る。取れない項目は空（推測で埋めない）。"""
+    """査読回答から重要度・指摘・軸を取る（JSON 優先・行ラベルへフォールバック）。"""
     out = {"severity": "", "findings": [], "axes": []}
+    if isinstance(text, str) and "{" in text:
+        obj = S._jsonutil.extract_object(text)
+        if obj:
+            sev_raw = _json_first(obj, "severity", "重要度", "重大度")
+            if isinstance(sev_raw, str) and sev_raw.strip():
+                out["severity"] = _SEVERITY_ALIAS.get(sev_raw.strip().lower(), "unknown")
+            findings_raw = _json_first(obj, "findings", "指摘")
+            if findings_raw is not None:
+                out["findings"] = _json_findings(findings_raw, limit=6, max_chars=240)
+            axes_raw = _json_first(obj, "axes", "軸")
+            axes_explicit = False
+            if isinstance(axes_raw, str):
+                axes_raw = [x.strip() for x in re.split(r"[,、/\s]+", axes_raw) if x.strip()]
+            if isinstance(axes_raw, list):
+                axes_explicit = True
+                seen_axes = []
+                for ax in axes_raw:
+                    if isinstance(ax, str):
+                        axl = ax.strip().lower()
+                        if axl in REVIEW_AXES and axl not in seen_axes:
+                            seen_axes.append(axl)
+                out["axes"] = seen_axes
+            if out["severity"] or out["findings"] or axes_explicit:
+                if not axes_explicit:
+                    # JSON に axes が無い場合は findings 内から軸を拾う（本文中の否定表現への誤爆を避ける）
+                    f_low = "\n".join(out["findings"]).lower()
+                    out["axes"] = [axis for axis in REVIEW_AXES if axis in f_low]
+                return out
     for line in (text or "").splitlines():
         line = line.strip()
         if not line:
@@ -205,8 +334,19 @@ _COMPLIANCE_ALIAS = {
 
 
 def parse_compliance(text: str) -> dict:
-    """仕様適合の判定を取る。語彙外・名乗りなしは `unknown` として残す（推測で丸めない）。"""
+    """仕様適合の判定を取る（JSON 優先・行ラベルへフォールバック）。語彙外・名乗りなしは `unknown`。"""
     out = {"verdict": "", "findings": []}
+    if isinstance(text, str) and "{" in text:
+        obj = S._jsonutil.extract_object(text)
+        if obj:
+            v_raw = _json_first(obj, "verdict", "compliance", "判定", "適合")
+            if isinstance(v_raw, str) and v_raw.strip():
+                out["verdict"] = _COMPLIANCE_ALIAS.get(v_raw.strip().lower(), "unknown")
+            f_raw = _json_first(obj, "findings", "指摘")
+            if f_raw is not None:
+                out["findings"] = _json_findings(f_raw, limit=6, max_chars=240)
+            if out["verdict"] or out["findings"]:
+                return out
     for line in (text or "").splitlines():
         line = line.strip()
         if not line:
@@ -263,8 +403,39 @@ def _is_no_answer(value: str) -> bool:
 
 
 def parse_verdict(text: str) -> dict:
-    """検証者の「判定/反証/見落とし/確信度」を構造化する。取れない項目は空（推測しない）。"""
+    """検証者の「判定/反証/見落とし/確信度」を構造化する（JSON 優先・行ラベルへフォールバック）。"""
     out = {"verdict": "", "objection": "", "oversight": "", "confidence": None, "labels_found": 0}
+    if isinstance(text, str) and "{" in text:
+        obj = S._jsonutil.extract_object(text)
+        if obj:
+            v_raw = _json_first(obj, "verdict", "判定", "assessment")
+            if isinstance(v_raw, str) and v_raw.strip():
+                vl = v_raw.strip().lower()
+                if vl in ("妥当", "ok", "valid"):
+                    out["verdict"] = "妥当"
+                    out["labels_found"] += 1
+                elif vl.startswith("needs") or vl in ("要修正", "revise"):
+                    out["verdict"] = "要修正"
+                    out["labels_found"] += 1
+                elif vl in ("根拠不足", "insufficient"):
+                    out["verdict"] = "根拠不足"
+                    out["labels_found"] += 1
+            obj_raw = _json_first(obj, "objection", "反証", "反論", "counterargument", "counter")
+            if isinstance(obj_raw, str):
+                value = obj_raw.strip().strip("* ")
+                out["objection"] = "" if _is_no_answer(value) else S.truncate(value, 400)
+                out["labels_found"] += 1
+            ov_raw = _json_first(obj, "oversight", "見落とし", "抜け", "missing")
+            if isinstance(ov_raw, str):
+                value = ov_raw.strip().strip("* ")
+                out["oversight"] = "" if _is_no_answer(value) else S.truncate(value, 400)
+                out["labels_found"] += 1
+            conf = _json_confidence(_json_first(obj, "confidence", "確信度", "自信"))
+            if conf is not None:
+                out["confidence"] = conf
+                out["labels_found"] += 1
+            if out["labels_found"] > 0:
+                return out
     for line in (text if isinstance(text, str) else "").splitlines():
         line = line.strip()
         if not line:
